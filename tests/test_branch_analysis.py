@@ -8,6 +8,7 @@ from circuit_viewer import (
     BranchAnalysisResult,
     BranchIssue,
     BranchRecord,
+    BranchType,
     analyze_branches,
 )
 from circuit_viewer.model import (
@@ -107,6 +108,8 @@ class BranchAnalysisTests(unittest.TestCase):
         self.assertTrue(BranchRecord.__dataclass_fields__)
         self.assertTrue(BranchIssue.__dataclass_fields__)
         self.assertTrue(BranchAnalysisResult.__dataclass_fields__)
+        self.assertEqual(BranchType.MONOPHASIC.value, "MONOFASICO")
+        self.assertEqual(BranchType.BIPHASIC.value, "BIFASICO")
 
     def test_bifurcated_component_metrics_loads_phase_and_switch_depth(self) -> None:
         bars = make_bars(7)
@@ -129,6 +132,7 @@ class BranchAnalysisTests(unittest.TestCase):
         self.assertEqual(len(result.records), 1)
         record = result.records[0]
         self.assertEqual(record.circuit_id, "C1")
+        self.assertEqual(record.branch_type, BranchType.MONOPHASIC)
         self.assertEqual(record.connection_bar_id, "B1")
         self.assertEqual(record.connection_bar_code, "CB1")
         self.assertEqual(record.first_segment_id, "T2")
@@ -167,6 +171,159 @@ class BranchAnalysisTests(unittest.TestCase):
 
         self.assertIsNone(record.total_length)
         self.assertEqual(record.missing_length_count, 1)
+
+    def test_biphasic_branch_incorporates_every_single_phase_subtree(self) -> None:
+        bars = make_bars(7)
+        network = make_network(
+            bars,
+            [0, 1, 1, 3, 4, 4],
+            [1, 2, 3, 4, 5, 6],
+            ["DEF", "DEF", "AB", "ab", "D", "E"],
+        )
+        switches = make_switch(network, 4)
+        catalog = CircuitCatalogModel.build(
+            network,
+            switches,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+        loads = make_loads(bars, [1, 3, 4, 5, 6])
+
+        result = analyze_branches(catalog, PHASES, loads)
+
+        self.assertEqual(len(result.records), 1)
+        record = result.records[0]
+        self.assertEqual(record.branch_type, BranchType.BIPHASIC)
+        self.assertEqual(record.phases2, "AB")
+        self.assertEqual(record.phase, "AB")
+        self.assertEqual(set(record.segment_indices), {2, 3, 4, 5})
+        self.assertEqual(set(record.bar_indices), {3, 4, 5, 6})
+        self.assertEqual(set(record.load_indices), {1, 2, 3, 4})
+        self.assertEqual(record.load_count, 4)
+        self.assertEqual(record.first_switch_position, 3)
+        self.assertTrue(record.removable)
+        self.assertEqual(record.topology, "Bifurcado")
+
+    def test_monophasic_and_biphasic_branches_coexist(self) -> None:
+        bars = make_bars(5)
+        network = make_network(
+            bars,
+            [0, 1, 1, 2],
+            [1, 2, 3, 4],
+            ["DEF", "DEF", "AB", "D"],
+        )
+        catalog = CircuitCatalogModel.build(
+            network,
+            None,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+
+        result = analyze_branches(catalog, PHASES)
+
+        self.assertEqual(
+            [record.branch_type for record in result.records],
+            [BranchType.BIPHASIC, BranchType.MONOPHASIC],
+        )
+        self.assertEqual([record.branch_id for record in result.records], [1, 2])
+
+    def test_shared_single_phase_component_is_excluded_without_load_duplication(self) -> None:
+        bars = make_bars(7)
+        network = make_network(
+            bars,
+            [0, 1, 1, 2, 4, 6],
+            [1, 2, 4, 5, 6, 5],
+            ["DEF", "DEF", "AB", "AB", "D", "E"],
+        )
+        catalog = CircuitCatalogModel.build(
+            network,
+            None,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+        loads = make_loads(bars, [4, 5, 6])
+
+        result = analyze_branches(catalog, PHASES, loads)
+
+        self.assertEqual(len(result.records), 2)
+        self.assertTrue(
+            all(record.branch_type == BranchType.BIPHASIC for record in result.records)
+        )
+        self.assertEqual(
+            set().union(*(set(record.segment_indices) for record in result.records)),
+            {2, 3},
+        )
+        self.assertEqual(
+            set().union(*(set(record.load_indices) for record in result.records)),
+            {0, 1},
+        )
+        self.assertTrue(
+            any(
+                issue.kind == "ambiguous-single-phase-subtree"
+                for issue in result.issues
+            )
+        )
+
+    def test_single_phase_bridge_to_trunk_is_excluded_and_reported(self) -> None:
+        bars = make_bars(5)
+        network = make_network(
+            bars,
+            [0, 1, 1, 3, 4],
+            [1, 2, 3, 4, 2],
+            ["DEF", "DEF", "AB", "D", "D"],
+        )
+        catalog = CircuitCatalogModel.build(
+            network,
+            None,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+        loads = make_loads(bars, [3, 4])
+
+        result = analyze_branches(catalog, PHASES, loads)
+
+        self.assertEqual(len(result.records), 1)
+        record = result.records[0]
+        self.assertEqual(record.branch_type, BranchType.BIPHASIC)
+        self.assertEqual(set(record.segment_indices), {2})
+        self.assertEqual(set(record.load_indices), {0})
+        self.assertTrue(
+            any(issue.kind == "single-phase-trunk-bridge" for issue in result.issues)
+        )
+
+    def test_biphasic_transition_is_a_boundary_and_cycle_is_classified(self) -> None:
+        bars = make_bars(5)
+        transition_phases = PhaseConfiguration(
+            (*PHASES.entries, PhaseMappingEntry("bc", "BC", 2))
+        )
+        transition_network = make_network(
+            bars,
+            [0, 1, 2],
+            [1, 2, 3],
+            ["DEF", "AB", "BC"],
+        )
+        catalog = CircuitCatalogModel.build(
+            transition_network,
+            None,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+
+        result = analyze_branches(catalog, transition_phases)
+
+        self.assertEqual(set(result.records[0].segment_indices), {1})
+        self.assertTrue(any(issue.kind == "two-phase-transition" for issue in result.issues))
+
+        cycle_bars = make_bars(4)
+        cycle_network = make_network(
+            cycle_bars,
+            [0, 1, 2, 3],
+            [1, 2, 3, 1],
+            ["DEF", "AB", "AB", "AB"],
+        )
+        cycle_catalog = CircuitCatalogModel.build(
+            cycle_network,
+            None,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+        cycle_record = analyze_branches(cycle_catalog, PHASES).records[0]
+        self.assertEqual(cycle_record.branch_type, BranchType.BIPHASIC)
+        self.assertIn("Cíclico", cycle_record.topology)
 
     def test_multiple_trunk_connections_form_one_deterministic_record(self) -> None:
         bars = make_bars(5)

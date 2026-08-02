@@ -6,7 +6,7 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt6.QtCore import Qt
+    from PyQt6.QtCore import QPoint, QSize, Qt
     from PyQt6.QtGui import QKeySequence
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication
@@ -92,7 +92,18 @@ class GlobalSearchUiTests(unittest.TestCase):
         self.app.processEvents()
         return window, bars, segments, switches, catalog
 
-    def test_action_opens_overlay_and_lists_duplicate_types(self) -> None:
+    def wait_until(self, predicate, timeout_ms: int = 3_000) -> bool:
+        elapsed = 0
+        while elapsed < timeout_ms:
+            self.app.processEvents()
+            if predicate():
+                return True
+            QTest.qWait(20)
+            elapsed += 20
+        self.app.processEvents()
+        return bool(predicate())
+
+    def test_action_opens_dialog_and_lists_duplicate_types(self) -> None:
         empty = MainWindow()
         self.addCleanup(empty.close)
         self.assertFalse(empty.search_action.isEnabled())
@@ -117,8 +128,8 @@ class GlobalSearchUiTests(unittest.TestCase):
         self.assertTrue(any("Trecho · T0" in label for label in labels))
         self.assertTrue(any("Chave · CH0 · T0" in label for label in labels))
         self.assertTrue(any("Circuito · C0 · origem B0" in label for label in labels))
-        self.assertLessEqual(window.search_palette.width(), 520)
-        self.assertLessEqual(window.search_palette.height(), 360)
+        self.assertFalse(window.search_palette.isModal())
+        self.assertIs(window.search_palette.parentWidget(), window)
 
         first_item = window.search_palette.results_list.item(0)
         item_rect = window.search_palette.results_list.visualItemRect(first_item)
@@ -147,6 +158,115 @@ class GlobalSearchUiTests(unittest.TestCase):
         window.search_action.trigger()
         QTest.keyClick(window.search_palette.input, Qt.Key.Key_Escape)
         self.assertFalse(window.search_palette.isVisible())
+
+    def test_dialog_can_close_move_resize_and_preserves_session_state(self) -> None:
+        window, _, _, _, _ = self.make_window()
+        dialog = window.search_palette
+        window.search_action.trigger()
+        dialog.input.setText("dup")
+        dialog.any_column_checkbox.setChecked(True)
+        target_position = dialog.pos() + QPoint(35, 25)
+        target_size = QSize(640, 460)
+        dialog.move(target_position)
+        dialog.resize(target_size)
+
+        close_button = dialog.buttons.buttons()[0]
+        QTest.mouseClick(close_button, Qt.MouseButton.LeftButton)
+        self.assertFalse(dialog.isVisible())
+
+        window.search_action.trigger()
+        self.assertEqual(dialog.pos(), target_position)
+        self.assertEqual(dialog.size(), target_size)
+        self.assertEqual(dialog.input.text(), "dup")
+        self.assertTrue(dialog.any_column_checkbox.isChecked())
+
+        dialog.close()  # mesmo closeEvent acionado pelo X da barra de título
+        self.assertFalse(dialog.isVisible())
+        window.search_action.trigger()
+        QTest.keyClick(dialog.input, Qt.Key.Key_Escape)
+        self.assertFalse(dialog.isVisible())
+
+    def test_any_column_mode_is_async_limited_by_length_and_finds_fields(self) -> None:
+        window, _, _, _, _ = self.make_window()
+        self.assertTrue(
+            self.wait_until(lambda: window.search_index.fields_ready),
+            "o índice de todas as colunas não ficou pronto",
+        )
+        window.search_action.trigger()
+        dialog = window.search_palette
+        dialog.any_column_checkbox.setChecked(True)
+        dialog.input.setText("ab")
+        self.assertEqual(dialog.results_list.count(), 0)
+        self.assertIn("pelo menos 3", dialog.summary.text())
+
+        dialog.input.setText("500100")
+        self.assertTrue(
+            self.wait_until(
+                lambda: dialog.results_list.count() == 1
+                and "Buscando" not in dialog.summary.text()
+            ),
+            dialog.summary.text(),
+        )
+        item = dialog.results_list.item(0)
+        self.assertIn("Barra · B1", item.text())
+        self.assertIn("X: 500100.000", item.text())
+
+        dialog.input.setText("8000000")
+        self.assertTrue(
+            self.wait_until(
+                lambda: dialog.results_list.count() == 3
+                and "Buscando" not in dialog.summary.text()
+            ),
+            dialog.summary.text(),
+        )
+        self.assertTrue(
+            all(
+                "Y: 8000000.000" in dialog.results_list.item(row).text()
+                for row in range(dialog.results_list.count())
+            )
+        )
+
+    def test_search_action_is_available_when_only_codes_are_empty(self) -> None:
+        bars = CircuitModel(
+            ["BARRA-SEM-CODIGO"],
+            [""],
+            [500_000.0],
+            [8_000_000.0],
+            UtmCrs(21, northern=False),
+        )
+        window = MainWindow()
+        self.addCleanup(window.close)
+        window._on_import_finished(
+            CsvLoadResult(bars, "utf-8-sig", 1, 1, 0, (), 0)
+        )
+        self.assertTrue(window.search_action.isEnabled())
+        self.assertEqual(len(window.search_index), 0)
+
+    def test_reimport_discards_pending_any_column_results(self) -> None:
+        window, _, _, _, _ = self.make_window()
+        self.assertTrue(self.wait_until(lambda: window.search_index.fields_ready))
+        window.search_action.trigger()
+        dialog = window.search_palette
+        dialog.any_column_checkbox.setChecked(True)
+        dialog.input.setText("500100")
+
+        replacement = CircuitModel(
+            ["B-NOVA"],
+            ["NOVA"],
+            [600_000.0],
+            [8_100_000.0],
+            UtmCrs(21, northern=False),
+        )
+        window._on_import_finished(
+            CsvLoadResult(replacement, "utf-8-sig", 1, 1, 0, (), 0)
+        )
+
+        self.assertEqual(dialog.results_list.count(), 0)
+        self.assertTrue(self.wait_until(lambda: window.search_index.fields_ready))
+        self.assertTrue(
+            self.wait_until(lambda: dialog.summary.text() == "Nenhum elemento encontrado.")
+        )
+        self.assertEqual(dialog.results_list.count(), 0)
 
     def test_switch_and_circuit_results_map_to_graphic_targets(self) -> None:
         window, _, _, _, _ = self.make_window()

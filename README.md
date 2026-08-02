@@ -90,6 +90,10 @@ para o mesmo circuito.
   O modo também colore as chaves, preservando sua espessura diferenciada. A
   legenda permanece fixa no canto inferior esquerdo durante zoom, pan e
   enquadramentos.
+- **Visualizar > Rede simplificada por ramais**: após confirmação e análise,
+  substitui cada ramal por uma carga equivalente na sua conexão com o tronco.
+  Trechos, barras internas, chaves e cargas agregadas ficam ocultos somente na
+  projeção visual; desativar o modo restaura imediatamente a rede original.
 - **Visualizar > Circuitos…**: abre a tabela não modal de circuitos. Desmarcar um
   circuito oculta suas barras, trechos e chaves sem apagar a associação calculada.
   A coluna **Cor** mostra a cor automática do circuito e abre um seletor ao ser
@@ -98,12 +102,21 @@ para o mesmo circuito.
   circuito. O relatório também é aberto automaticamente quando uma sobreposição
   é encontrada.
 - **Enquadrar tudo** ou tecla `F`: mostra todo o conjunto.
-- **Buscar** ou `Ctrl+F`: abre uma paleta sobre o mapa para localizar barras,
-  trechos, chaves, cargas e circuitos pelo campo `CODIGO`. A busca aceita prefixos e
-  ignora diferenças entre maiúsculas, minúsculas e acentos.
-- **Ferramentas > Ramais…**: identifica os componentes monofásicos ligados ao
-  tronco trifásico de cada circuito. Um clique na tabela destaca todo o ramal;
-  duplo clique ou `Enter` também o enquadra no canvas.
+- **Buscar** ou `Ctrl+F`: abre uma janela não modal que pode ser movida,
+  redimensionada e fechada pelo `X`, pelo botão **Fechar** ou por `Esc`. No modo
+  padrão, localiza barras, trechos, chaves, cargas e circuitos pelo campo
+  `CODIGO`, aceitando prefixos e ignorando diferenças entre maiúsculas,
+  minúsculas e acentos. A consulta e a posição da janela são preservadas durante
+  a execução.
+- **Buscar valor em qualquer coluna**: amplia a consulta para todas as colunas
+  conhecidas dos cinco tipos importados. Esse modo usa correspondência por
+  ocorrência, requer ao menos três caracteres e apresenta até 200 elementos,
+  indicando o campo encontrado e solicitando refinamento quando necessário.
+  Patamares, ramais, cargas equivalentes e colunas extras ignoradas na importação
+  não participam desse índice.
+- **Ferramentas > Ramais…**: identifica ramais monofásicos e bifásicos ligados
+  ao tronco trifásico de cada circuito. Um clique na tabela destaca todo o
+  ramal; duplo clique ou `Enter` também o enquadra no canvas.
 - `S` e `M`: ativam Selecionar e Mover.
 
 ## Configuração de fases
@@ -138,17 +151,51 @@ circuitos, desde que `fases2.json` seja válido. A análise usa a topologia elé
 energizada: chaves abertas interrompem o percurso e somente chaves fechadas do
 próprio circuito são atravessadas. Cargas e chaves são opcionais.
 
-Cada linha representa um componente contínuo da mesma fase conectado ao tronco.
-Além da conexão, primeiro trecho, quantidade, comprimento, cargas, fase e
-indicador `REMANEJAVEL`, a tabela informa circuito, barras, chaves, posição da
-primeira chave, conexões adicionais, comprimentos ausentes e classificação da
-topologia. `REMANEJAVEL=1` significa que há uma chave em até cinco níveis do
-início do ramal. Se algum `COMPR` estiver vazio, o total é exibido como `—`.
+Cada linha representa um ramal `MONOFASICO` ou `BIFASICO` conectado ao tronco.
+`RAMAL_ID` é um inteiro global e sequencial no resultado atual; `TIPO_RAMAL`
+informa a classificação, `FASES2` preserva o código original do primeiro trecho
+e `FASE` mostra sua interpretação pelo JSON. Ramais bifásicos são reconhecidos
+somente para valores configurados com `NUMERO_FASES=2` e incorporam integralmente
+suas subárvores monofásicas a jusante, mesmo quando elas usam diferentes valores
+`FASES2`.
+
+Uma componente monofásica ligada a mais de um núcleo bifásico, ou ligada
+simultaneamente ao tronco e a um núcleo bifásico por caminhos distintos, é
+excluída de todos os ramais envolvidos e registrada nos diagnósticos. Isso evita
+duplicar trechos, cargas e potência agregada. Transições entre códigos bifásicos
+distintos também interrompem o ramal e são reportadas.
+
+Além da conexão, primeiro trecho, quantidade, comprimento, cargas e fase, a
+tabela informa barras, chaves, posição da primeira chave, conexões adicionais,
+comprimentos ausentes e classificação da topologia. `REMANEJAVEL=1` significa
+que há uma chave em até cinco níveis do início do conjunto completo do ramal,
+inclusive em uma subárvore monofásica incorporada. Se algum `COMPR` estiver
+vazio, o total é exibido como `—`.
 
 A tabela pode ser ordenada e filtrada por circuito. Selecionar um ramal reativa
 seu circuito caso ele esteja oculto, sem alterar o modo de coloração por fases.
 Resultados são descartados automaticamente quando barras, trechos, cargas,
 chaves ou circuitos forem substituídos.
+
+### Rede simplificada e cargas equivalentes
+
+O modo simplificado cria um snapshot lógico derivado, sem remover ou modificar
+qualquer registro importado. Cada ramal recebe uma carga com `CARGA_ID` explícito
+no formato `RAMAL-1`, `RAMAL-2`, etc., `ORIGEM=Ramal agregado` e `BARRA_ID` igual
+à conexão principal. `SNOM` e `SADM` são somados com aritmética decimal; vazios ou
+valores inválidos tornam somente o total correspondente indisponível e geram um
+diagnóstico.
+
+Quando os patamares estiverem carregados, a aplicação agrega `PD`, `PE`, `PF`,
+`QD`, `QE` e `QF` por `NPAT`. A tabela equivalente é apresentada apenas quando
+todas as cargas do ramal possuem os quatro patamares completos e numéricos. A
+carga derivada é selecionável e o painel lateral informa sua origem, ramal,
+`TIPO_RAMAL`, `REMANEJAVEL`, circuito, conexão, cargas de origem e totais.
+
+Filtros de circuito também se aplicam à projeção. Em circuitos sobrepostos, um
+elemento original permanece visível enquanto for necessário por outro circuito
+visível. **Mostrar cargas** controla conjuntamente cargas originais preservadas e
+cargas equivalentes, e **Enquadrar tudo** usa os limites da projeção ativa.
 
 ## Testes e benchmark
 
@@ -171,8 +218,9 @@ Os benchmarks geram temporariamente 100 mil barras, 17 mil trechos e 17 mil
 chaves, medem a importação/indexação, o desenho agregado em 1920×1080 e a
 latência p95 da seleção geométrica de trechos. O benchmark de circuitos também
 mede a geração da paleta, a categorização agregada e a troca de cor sem reconstruir
-a geometria. O benchmark de ramais cobre 100 mil trechos, 100 circuitos e 100 mil
-cargas, incluindo a construção do destaque vetorial.
+a geometria. O benchmark de ramais cobre 100 mil trechos, 100 circuitos, 100 mil
+cargas e 400 mil registros de patamares, incluindo análise, agregação equivalente,
+atualização das máscaras e construção do destaque vetorial.
 
 ## Organização
 
@@ -185,6 +233,7 @@ cargas, incluindo a construção do destaque vetorial.
 - `circuit_viewer/circuits_window.py`: tabela de visibilidade e cores dos circuitos.
 - `circuit_viewer/overlap_report.py`: relatório tabular das sobreposições.
 - `circuit_viewer/branch_analysis.py`: análise topológica dos ramais.
+- `circuit_viewer/equivalent_network.py`: projeção e agregação das cargas equivalentes.
 - `circuit_viewer/branch_window.py`: tabela, filtro e avisos dos ramais.
 - `circuit_viewer/graphics.py`: canvas, visão agregada e virtualização.
 - `circuit_viewer/main_window.py`: interface e integração assíncrona.

@@ -22,10 +22,13 @@ from PyQt6.QtWidgets import (
 )
 
 from .branch_analysis import BranchAnalysisResult, BranchRecord
+from .equivalent_network import EquivalentNetworkResult
 
 
 class BranchTableModel(QAbstractTableModel):
     HEADERS = (
+        "RAMAL_ID",
+        "TIPO_RAMAL",
         "CIRC_ID",
         "BARRA_ID",
         "BARRA_CODIGO",
@@ -34,6 +37,7 @@ class BranchTableModel(QAbstractTableModel):
         "NUM_TRECHOS",
         "COMPR",
         "NUM_CARGAS",
+        "FASES2",
         "FASE",
         "REMANEJAVEL",
         "NUM_BARRAS",
@@ -43,7 +47,7 @@ class BranchTableModel(QAbstractTableModel):
         "NUM_COMPR_AUSENTE",
         "TOPOLOGIA",
     )
-    NUMERIC_COLUMNS = frozenset({5, 6, 7, 9, 10, 11, 12, 13, 14})
+    NUMERIC_COLUMNS = frozenset({0, 7, 8, 9, 12, 13, 14, 15, 16, 17})
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
@@ -84,6 +88,8 @@ class BranchTableModel(QAbstractTableModel):
     @staticmethod
     def _raw_values(record: BranchRecord) -> tuple[object, ...]:
         return (
+            record.branch_id,
+            record.branch_type.value,
             record.circuit_id,
             record.connection_bar_id,
             record.connection_bar_code,
@@ -92,6 +98,7 @@ class BranchTableModel(QAbstractTableModel):
             record.segment_count,
             record.total_length,
             record.load_count,
+            record.phases2,
             record.phase,
             int(record.removable),
             record.bar_count,
@@ -112,7 +119,7 @@ class BranchTableModel(QAbstractTableModel):
                 return float("inf") if index.column() in self.NUMERIC_COLUMNS else ""
             return value
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            if index.column() == 9:
+            if index.column() == 12:
                 return Qt.AlignmentFlag.AlignCenter
             if index.column() in self.NUMERIC_COLUMNS:
                 return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -124,7 +131,7 @@ class BranchTableModel(QAbstractTableModel):
             return None
         if value is None or value == "":
             display = "—"
-        elif index.column() == 6:
+        elif index.column() == 8:
             display = f"{float(value):.3f}"
         elif isinstance(value, int):
             display = f"{value:n}"
@@ -170,6 +177,7 @@ class BranchesWindow(QDialog):
         self.setModal(False)
         self.resize(1_180, 560)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self._equivalent_result: EquivalentNetworkResult | None = None
 
         layout = QVBoxLayout(self)
         self.summary_label = QLabel("Execute a análise para identificar os ramais.")
@@ -223,6 +231,7 @@ class BranchesWindow(QDialog):
         self.table.activated.connect(self._activate_index)
 
     def set_result(self, result: BranchAnalysisResult | None) -> None:
+        self._equivalent_result = None
         source = self.proxy_model.sourceModel()
         assert isinstance(source, BranchTableModel)
         self.table.clearSelection()
@@ -245,23 +254,51 @@ class BranchesWindow(QDialog):
             self.summary_label.setText(
                 "Execute a análise para identificar os ramais."
             )
-            issue_count = 0
-            issue_lines: list[str] = []
         else:
             circuit_count = len({record.circuit_id for record in result.records})
             self.summary_label.setText(
                 f"{len(result.records):n} ramal(is) em {circuit_count:n} circuito(s); "
                 f"{result.analyzed_circuit_count:n} circuito(s) analisado(s)."
             )
-            issue_count = len(result.issues) + result.omitted_issue_count
-            issue_lines = [
+        self._refresh_issues()
+        self.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+
+    def set_equivalent_result(
+        self,
+        result: EquivalentNetworkResult | None,
+    ) -> None:
+        self._equivalent_result = result
+        self._refresh_issues()
+
+    def _refresh_issues(self) -> None:
+        source = self.proxy_model.sourceModel()
+        branch_result = (
+            None if not isinstance(source, BranchTableModel) else source.result
+        )
+        issue_lines: list[str] = []
+        issue_count = 0
+        if branch_result is not None:
+            issue_count += len(branch_result.issues) + branch_result.omitted_issue_count
+            issue_lines.extend(
                 f"[{issue.circuit_id}] {issue.message}"
                 + (f" ({issue.segment_id})" if issue.segment_id else "")
-                for issue in result.issues
-            ]
-            if result.omitted_issue_count:
+                for issue in branch_result.issues
+            )
+            if branch_result.omitted_issue_count:
                 issue_lines.append(
-                    f"… e mais {result.omitted_issue_count:n} ocorrência(s)."
+                    f"… e mais {branch_result.omitted_issue_count:n} ocorrência(s) topológica(s)."
+                )
+        equivalent = self._equivalent_result
+        if equivalent is not None:
+            issue_count += len(equivalent.issues) + equivalent.omitted_issue_count
+            issue_lines.extend(
+                f"[RAMAL-{issue.branch_id}] {issue.message}"
+                + (f" (carga {issue.load_id})" if issue.load_id else "")
+                for issue in equivalent.issues
+            )
+            if equivalent.omitted_issue_count:
+                issue_lines.append(
+                    f"… e mais {equivalent.omitted_issue_count:n} ocorrência(s) de agregação."
                 )
         self.issues_label.setText(
             "Nenhuma ocorrência de diagnóstico."
@@ -270,7 +307,6 @@ class BranchesWindow(QDialog):
         )
         self.issues_text.setPlainText("\n".join(issue_lines))
         self.issues_text.setVisible(issue_count > 0)
-        self.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
 
     def clear_selection(self) -> None:
         self.table.clearSelection()

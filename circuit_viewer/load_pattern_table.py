@@ -4,21 +4,18 @@ from __future__ import annotations
 
 from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt
 
-from .model import LoadPatternRecord
-
-
 class LoadPatternTableModel(QAbstractTableModel):
     HEADERS = ("CARGA_ID", "NPAT", "PD", "PE", "PF", "QD", "QE", "QF")
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
-        self._records: tuple[LoadPatternRecord, ...] = ()
+        self._records: tuple[object, ...] = ()
 
     @property
-    def records(self) -> tuple[LoadPatternRecord, ...]:
+    def records(self) -> tuple[object, ...]:
         return self._records
 
-    def set_records(self, records: tuple[LoadPatternRecord, ...]) -> None:
+    def set_records(self, records: tuple[object, ...]) -> None:
         values = tuple(records)
         if values and (
             len(values) != 4
@@ -54,7 +51,7 @@ class LoadPatternTableModel(QAbstractTableModel):
             Qt.ItemDataRole.DisplayRole,
             Qt.ItemDataRole.ToolTipRole,
         }:
-            return value or "—"
+            return "—" if value is None or value == "" else str(value)
         if role == Qt.ItemDataRole.TextAlignmentRole:
             horizontal = (
                 Qt.AlignmentFlag.AlignLeft

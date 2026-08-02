@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QThread, QTimer, Qt
+from PyQt6.QtCore import QSignalBlocker, QThread, QTimer, Qt
 from PyQt6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 
 from .branch_analysis import BranchAnalysisResult, BranchRecord
 from .branch_window import BranchesWindow, BranchTableModel
+from .equivalent_network import EquivalentNetworkResult
 from .circuit_import import CircuitLoadResult
 from .circuits_window import CircuitTableModel, CircuitsWindow
 from .csv_import import CsvLoadResult
@@ -43,6 +44,7 @@ from .graphics import (
     ItemVirtualizer,
     LineNetworkItem,
     LoadVirtualizer,
+    load_layout_offsets_for_models,
     SegmentSelectionOverlayItem,
     SwitchNetworkItem,
 )
@@ -82,6 +84,7 @@ from .workers import (
     LoadPatternImportWorker,
     SegmentImportWorker,
     SwitchImportWorker,
+    EquivalentNetworkWorker,
 )
 
 
@@ -235,11 +238,16 @@ class MainWindow(QMainWindow):
         self._circuit_catalog: CircuitCatalogModel | None = None
         self._circuit_visibility: CircuitVisibilityController | None = None
         self._branch_analysis_result: BranchAnalysisResult | None = None
+        self._equivalent_network_result: EquivalentNetworkResult | None = None
         self._selected_branch: BranchRecord | None = None
         self._selected_feature: FeatureSelection | None = None
+        self._effective_bar_mask = None
+        self._effective_segment_mask = None
+        self._effective_load_mask = None
         self._search_focus_active = False
         self._active_bar_count = 0
         self._active_load_count = 0
+        self._active_equivalent_load_count = 0
         self.phase_configuration_path = (
             default_phase_configuration_path()
             if phase_configuration_path is None
@@ -272,6 +280,13 @@ class MainWindow(QMainWindow):
         self._branch_progress_dialog: QProgressDialog | None = None
         self._branch_analysis_snapshot: tuple[object, ...] | None = None
         self._close_after_branch_analysis = False
+        self._show_branches_after_analysis = True
+        self._pending_simplified_activation = False
+        self._equivalent_thread: QThread | None = None
+        self._equivalent_worker: EquivalentNetworkWorker | None = None
+        self._equivalent_progress_dialog: QProgressDialog | None = None
+        self._equivalent_snapshot: tuple[object, ...] | None = None
+        self._close_after_equivalent_build = False
 
         self.scene = QGraphicsScene(self)
         self.scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
@@ -284,6 +299,13 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.view.set_load_layer(self.load_virtualizer)
+        self.equivalent_load_virtualizer = LoadVirtualizer(
+            self.scene,
+            self.view,
+            parent=self,
+        )
+        self.equivalent_load_virtualizer.set_loads_visible(False)
+        self.view.set_equivalent_load_layer(self.equivalent_load_virtualizer)
         self.segment_selection_overlay = SegmentSelectionOverlayItem()
         self.scene.addItem(self.segment_selection_overlay)
         self.branch_highlight_overlay = BranchHighlightOverlayItem()
@@ -292,7 +314,7 @@ class MainWindow(QMainWindow):
         self.search_palette = SearchPalette(
             self.search_index,
             self._is_search_result_hidden,
-            self.view.viewport(),
+            self,
         )
         self.phase_legend = PhaseLegend(self.view.viewport())
         self._overlay_position_timer = QTimer(self)
@@ -374,6 +396,23 @@ class MainWindow(QMainWindow):
             self._set_phase_coloring_enabled
         )
 
+        self.simplified_network_action = QAction(
+            "Rede simplificada por ramais",
+            self,
+        )
+        self.simplified_network_action.setCheckable(True)
+        self.simplified_network_action.setEnabled(False)
+        self.simplified_network_action.setToolTip(
+            "Representar cada ramal como uma carga equivalente derivada"
+        )
+        if self._phase_configuration_error is not None:
+            self.simplified_network_action.setToolTip(
+                self._phase_configuration_error
+            )
+        self.simplified_network_action.toggled.connect(
+            self._set_simplified_network_enabled
+        )
+
         self.circuits_action = QAction("Circuitos…", self)
         self.circuits_action.setEnabled(False)
         self.circuits_action.triggered.connect(self._show_circuits_window)
@@ -425,6 +464,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.show_bars_action)
         view_menu.addAction(self.show_loads_action)
         view_menu.addAction(self.phase_coloring_action)
+        view_menu.addAction(self.simplified_network_action)
         view_menu.addAction(self.circuits_action)
         view_menu.addAction(self.overlaps_action)
         view_menu.addSeparator()
@@ -458,7 +498,7 @@ class MainWindow(QMainWindow):
         self.empty_details_page = QWidget(self.details_stack)
         empty_layout = QVBoxLayout(self.empty_details_page)
         empty_message = QLabel(
-            "Clique em uma barra, trecho ou carga para ver seus dados."
+            "Clique em uma barra, trecho, carga ou carga equivalente para ver seus dados."
         )
         empty_message.setWordWrap(True)
         empty_layout.addWidget(empty_message)
@@ -610,6 +650,76 @@ class MainWindow(QMainWindow):
         self.load_details_page.setWidget(self.load_details_body)
         self.details_stack.addWidget(self.load_details_page)
 
+        equivalent_fields = (
+            ("origin", "ORIGEM:"),
+            ("load_id", "CARGA_ID:"),
+            ("branch_id", "RAMAL_ID:"),
+            ("branch_type", "TIPO_RAMAL:"),
+            ("removable", "REMANEJAVEL:"),
+            ("circuit_id", "CIRC_ID:"),
+            ("bar_id", "BARRA_ID:"),
+            ("first_segment_id", "TRECHO_ID:"),
+            ("phases2", "FASES2:"),
+            ("phase", "FASE:"),
+            ("source_load_count", "NUM_CARGAS:"),
+            ("snom", "SNOM:"),
+            ("sadm", "SADM:"),
+            ("source_load_ids", "CARGAS_ORIGEM:"),
+        )
+        self.equivalent_details_page = QScrollArea(self.details_stack)
+        self.equivalent_details_page.setFrameShape(QFrame.Shape.NoFrame)
+        self.equivalent_details_page.setWidgetResizable(True)
+        self.equivalent_details_body = QWidget(self.equivalent_details_page)
+        equivalent_layout = QVBoxLayout(self.equivalent_details_body)
+        self.equivalent_table_title = QLabel("Carga equivalente de ramal")
+        equivalent_layout.addWidget(self.equivalent_table_title)
+        (
+            self.equivalent_details_table,
+            self.equivalent_detail_labels,
+            self.equivalent_caption_labels,
+            self.equivalent_details_grid,
+        ) = create_table(equivalent_fields, self.equivalent_details_body)
+        equivalent_layout.addWidget(self.equivalent_details_table)
+
+        self.equivalent_patterns_section = QWidget(self.equivalent_details_body)
+        equivalent_pattern_layout = QVBoxLayout(self.equivalent_patterns_section)
+        equivalent_pattern_layout.setContentsMargins(0, 0, 0, 0)
+        equivalent_pattern_layout.addWidget(QLabel("Patamares equivalentes"))
+        self.equivalent_pattern_table_model = LoadPatternTableModel(self)
+        self.equivalent_patterns_table = QTableView(
+            self.equivalent_patterns_section
+        )
+        self.equivalent_patterns_table.setModel(
+            self.equivalent_pattern_table_model
+        )
+        self.equivalent_patterns_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.equivalent_patterns_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectItems
+        )
+        self.equivalent_patterns_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.equivalent_patterns_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.equivalent_patterns_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.equivalent_patterns_table.verticalHeader().hide()
+        self.equivalent_patterns_table.verticalHeader().setDefaultSectionSize(28)
+        self.equivalent_patterns_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.equivalent_patterns_table.setFixedHeight(table_height)
+        equivalent_pattern_layout.addWidget(self.equivalent_patterns_table)
+        self.equivalent_patterns_section.setVisible(False)
+        equivalent_layout.addWidget(self.equivalent_patterns_section)
+        equivalent_layout.addStretch(1)
+        self.equivalent_details_page.setWidget(self.equivalent_details_body)
+        self.details_stack.addWidget(self.equivalent_details_page)
+
         segment_fields = (
             ("segment_id", "TRECHO_ID:"),
             ("code", "CODIGO:"),
@@ -699,6 +809,9 @@ class MainWindow(QMainWindow):
         self.load_virtualizer.countsChanged.connect(
             self._update_load_status_counts
         )
+        self.equivalent_load_virtualizer.countsChanged.connect(
+            self._update_equivalent_load_status_counts
+        )
         self.virtualizer.modeChanged.connect(self.mode_status.setText)
         self.circuit_table_model.visibilityChanged.connect(
             self._schedule_circuit_visibility_update
@@ -716,7 +829,11 @@ class MainWindow(QMainWindow):
         self.branches_window.closed.connect(self._clear_branch_highlight)
 
     def _choose_import(self) -> None:
-        if self._import_thread is not None or self._branch_thread is not None:
+        if (
+            self._import_thread is not None
+            or self._branch_thread is not None
+            or self._equivalent_thread is not None
+        ):
             return
         dialog = ImportChoiceDialog(
             self._model is not None,
@@ -740,7 +857,11 @@ class MainWindow(QMainWindow):
             self._choose_circuits_csv()
 
     def _choose_csv(self) -> None:
-        if self._import_thread is not None or self._branch_thread is not None:
+        if (
+            self._import_thread is not None
+            or self._branch_thread is not None
+            or self._equivalent_thread is not None
+        ):
             return
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -760,6 +881,7 @@ class MainWindow(QMainWindow):
         if (
             self._import_thread is not None
             or self._branch_thread is not None
+            or self._equivalent_thread is not None
             or self._model is None
         ):
             return
@@ -776,6 +898,7 @@ class MainWindow(QMainWindow):
         if (
             self._import_thread is not None
             or self._branch_thread is not None
+            or self._equivalent_thread is not None
             or self._line_model is None
         ):
             return
@@ -792,6 +915,7 @@ class MainWindow(QMainWindow):
         if (
             self._import_thread is not None
             or self._branch_thread is not None
+            or self._equivalent_thread is not None
             or self._model is None
         ):
             return
@@ -808,6 +932,7 @@ class MainWindow(QMainWindow):
         if (
             self._import_thread is not None
             or self._branch_thread is not None
+            or self._equivalent_thread is not None
             or self._load_model is None
         ):
             return
@@ -824,6 +949,7 @@ class MainWindow(QMainWindow):
         if (
             self._import_thread is not None
             or self._branch_thread is not None
+            or self._equivalent_thread is not None
             or self._line_model is None
         ):
             return
@@ -1085,7 +1211,8 @@ class MainWindow(QMainWindow):
         self._set_load_model(None)
         self._set_line_model(None)
         self._model = result.model
-        self.search_index.set_bars(result.model)
+        self.search_index.set_bars(result.model, build_fields=False)
+        self.search_palette.schedule_field_index("bar", result.model)
         self._sync_search_availability()
         self._selected_feature = None
         self.view.set_model(result.model)
@@ -1210,7 +1337,8 @@ class MainWindow(QMainWindow):
             )
         else:
             self.phase_legend.hide()
-        self.search_index.set_segments(model)
+        self.search_index.set_segments(model, build_fields=False)
+        self.search_palette.schedule_field_index("segment", model)
         self._sync_search_availability()
         self.view.set_line_model(model)
         if model is not None:
@@ -1231,10 +1359,12 @@ class MainWindow(QMainWindow):
             self._set_selection(None)
         self._set_load_pattern_model(None)
         self._load_model = model
-        self.search_index.set_loads(model)
+        self.search_index.set_loads(model, build_fields=False)
+        self.search_palette.schedule_field_index("load", model)
         self._sync_search_availability()
         self.view.set_load_model(model)
         self.load_virtualizer.reset_model(model)
+        self._sync_load_layout()
         self.show_loads_action.setEnabled(model is not None)
         self.load_status.setText(f"Cargas: {len(model) if model is not None else 0:n}")
         self._apply_circuit_visibility()
@@ -1245,6 +1375,13 @@ class MainWindow(QMainWindow):
     def _set_load_pattern_model(self, model: LoadPatternModel | None) -> None:
         if model is not None and model.loads is not self._load_model:
             raise ValueError("Os patamares devem pertencer às cargas exibidas.")
+        rebuild_equivalent = (
+            self.simplified_network_action.isChecked()
+            and self._branch_analysis_result is not None
+        )
+        self._invalidate_equivalent_network(
+            keep_requested=rebuild_equivalent
+        )
         self._load_pattern_model = model
         selection = self._selected_feature
         if selection is not None and selection.kind == "load":
@@ -1255,6 +1392,8 @@ class MainWindow(QMainWindow):
         elif model is None:
             self.load_pattern_table_model.set_records(())
             self.load_patterns_section.setVisible(False)
+        if rebuild_equivalent and self._import_thread is None:
+            self._start_equivalent_build()
 
     def _set_switch_model(self, model: SwitchModel | None) -> None:
         self._invalidate_branch_analysis()
@@ -1277,7 +1416,8 @@ class MainWindow(QMainWindow):
             self.scene.removeItem(self._switch_item)
             self._switch_item = None
         self._switch_model = model
-        self.search_index.set_switches(model)
+        self.search_index.set_switches(model, build_fields=False)
+        self.search_palette.schedule_field_index("switch", model)
         self._sync_search_availability()
         if self._line_item is not None:
             self._line_item.set_switch_segment_indices(
@@ -1339,7 +1479,8 @@ class MainWindow(QMainWindow):
                 raise ValueError("Os circuitos devem usar as chaves exibidas.")
         self._circuit_visibility_timer.stop()
         self._circuit_catalog = catalog
-        self.search_index.set_circuits(catalog)
+        self.search_index.set_circuits(catalog, build_fields=False)
+        self.search_palette.schedule_field_index("circuit", catalog)
         self._circuit_visibility = (
             None
             if catalog is None
@@ -1385,14 +1526,33 @@ class MainWindow(QMainWindow):
             if controller is None or self._load_model is None
             else controller.bar_visible_mask[self._load_model.bar_indices]
         )
+        equivalent_mask = None
+        simplified = (
+            self.simplified_network_action.isChecked()
+            and self._equivalent_network_result is not None
+            and controller is not None
+        )
+        if simplified:
+            masks = self._equivalent_network_result.model.visibility_masks(
+                controller.checked_states
+            )
+            bar_mask = masks.bar_mask
+            segment_mask = masks.segment_mask
+            load_mask = masks.source_load_mask
+            equivalent_mask = masks.equivalent_load_mask
         colors = () if controller is None else controller.colors
         phase_mode = (
             self.phase_coloring_action.isChecked()
             and self._phase_classification is not None
         )
         self.view.set_feature_visibility_masks(bar_mask, segment_mask)
+        self._effective_bar_mask = bar_mask
+        self._effective_segment_mask = segment_mask
+        self._effective_load_mask = load_mask
         self.virtualizer.set_visibility_mask(bar_mask)
         self.load_virtualizer.set_visibility_mask(load_mask)
+        if self._equivalent_network_result is not None:
+            self.equivalent_load_virtualizer.set_visibility_mask(equivalent_mask)
         if self._line_item is not None:
             if phase_mode:
                 self._line_item.set_phase_rendering(
@@ -1427,18 +1587,20 @@ class MainWindow(QMainWindow):
         if selection is not None and controller is not None:
             hidden = (
                 selection.kind == "bar"
-                and not bool(controller.bar_visible_mask[selection.index])
+                and bar_mask is not None
+                and not bool(bar_mask[selection.index])
             ) or (
                 selection.kind == "segment"
-                and not bool(controller.segment_visible_mask[selection.index])
+                and segment_mask is not None
+                and not bool(segment_mask[selection.index])
             ) or (
                 selection.kind == "load"
-                and self._load_model is not None
-                and not bool(
-                    controller.bar_visible_mask[
-                        int(self._load_model.bar_indices[selection.index])
-                    ]
-                )
+                and load_mask is not None
+                and not bool(load_mask[selection.index])
+            ) or (
+                selection.kind == "equivalent_load"
+                and equivalent_mask is not None
+                and not bool(equivalent_mask[selection.index])
             )
             if hidden and not self._search_focus_active:
                 self._set_selection(None)
@@ -1470,10 +1632,73 @@ class MainWindow(QMainWindow):
             and self._phase_configuration is not None
             and self._import_thread is None
             and self._branch_thread is None
+            and self._equivalent_thread is None
         )
         self.branches_action.setEnabled(available)
+        self.simplified_network_action.setEnabled(available)
+
+    def _sync_load_layout(self) -> None:
+        equivalent_model = (
+            None
+            if self._equivalent_network_result is None
+            else self._equivalent_network_result.model
+        )
+        if (
+            self.simplified_network_action.isChecked()
+            and equivalent_model is not None
+        ):
+            models = tuple(
+                model
+                for model in (self._load_model, equivalent_model)
+                if model is not None
+            )
+        else:
+            models = () if self._load_model is None else (self._load_model,)
+        if not models:
+            return
+        layouts = load_layout_offsets_for_models(models)
+        layout_index = 0
+        if self._load_model is not None:
+            self.load_virtualizer.set_layout_offsets(*layouts[layout_index])
+            layout_index += 1
+        if (
+            self.simplified_network_action.isChecked()
+            and equivalent_model is not None
+        ):
+            self.equivalent_load_virtualizer.set_layout_offsets(
+                *layouts[layout_index]
+            )
+
+    def _invalidate_equivalent_network(
+        self,
+        *,
+        keep_requested: bool = False,
+    ) -> None:
+        if self._equivalent_worker is not None:
+            self._equivalent_worker.cancel()
+        if (
+            self._selected_feature is not None
+            and self._selected_feature.kind == "equivalent_load"
+        ):
+            self._set_selection(None)
+        self._equivalent_snapshot = None
+        self._equivalent_network_result = None
+        self.branches_window.set_equivalent_result(None)
+        self.view.set_equivalent_load_model(None)
+        self.equivalent_load_virtualizer.reset_model(None)
+        self.equivalent_load_virtualizer.set_loads_visible(False)
+        self.equivalent_pattern_table_model.set_records(())
+        self.equivalent_patterns_section.setVisible(False)
+        self._pending_simplified_activation = bool(keep_requested)
+        if not keep_requested:
+            blocker = QSignalBlocker(self.simplified_network_action)
+            self.simplified_network_action.setChecked(False)
+            del blocker
+        self._sync_load_layout()
+        self._apply_circuit_visibility()
 
     def _invalidate_branch_analysis(self) -> None:
+        self._invalidate_equivalent_network()
         if self._branch_worker is not None:
             self._branch_worker.cancel()
         self._branch_analysis_snapshot = None
@@ -1485,8 +1710,13 @@ class MainWindow(QMainWindow):
         self._sync_branches_availability()
 
     def _show_or_analyze_branches(self) -> None:
+        self._show_branches_after_analysis = True
+        self._start_branch_analysis()
+
+    def _start_branch_analysis(self) -> None:
         if self._branch_analysis_result is not None:
-            self._show_branches_window()
+            if self._show_branches_after_analysis:
+                self._show_branches_window()
             return
         if (
             self._circuit_catalog is None
@@ -1494,6 +1724,7 @@ class MainWindow(QMainWindow):
             or self._phase_configuration is None
             or self._import_thread is not None
             or self._branch_thread is not None
+            or self._equivalent_thread is not None
         ):
             return
 
@@ -1527,6 +1758,7 @@ class MainWindow(QMainWindow):
         )
         self.import_action.setEnabled(False)
         self.branches_action.setEnabled(False)
+        self.simplified_network_action.setEnabled(False)
 
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_branch_analysis_progress)
@@ -1574,7 +1806,10 @@ class MainWindow(QMainWindow):
             return
         self._branch_analysis_result = result
         self.branches_window.set_result(result)
-        if not self._close_after_branch_analysis:
+        if (
+            not self._close_after_branch_analysis
+            and self._show_branches_after_analysis
+        ):
             self._show_branches_window()
             self.statusBar().showMessage(
                 f"Análise concluída: {len(result.records):n} ramal(is).",
@@ -1583,6 +1818,8 @@ class MainWindow(QMainWindow):
 
     def _on_branch_analysis_failed(self, message: str) -> None:
         self._close_branch_progress()
+        if self._pending_simplified_activation:
+            self._cancel_simplified_request()
         if not self._close_after_branch_analysis:
             QMessageBox.critical(
                 self,
@@ -1592,6 +1829,8 @@ class MainWindow(QMainWindow):
 
     def _on_branch_analysis_cancelled(self) -> None:
         self._close_branch_progress()
+        if self._pending_simplified_activation:
+            self._cancel_simplified_request()
         if not self._close_after_branch_analysis:
             self.statusBar().showMessage("Análise de ramais cancelada.", 5_000)
 
@@ -1602,9 +1841,213 @@ class MainWindow(QMainWindow):
         self._branch_analysis_snapshot = None
         self.import_action.setEnabled(True)
         self._sync_branches_availability()
+        if (
+            self._pending_simplified_activation
+            and self._branch_analysis_result is not None
+            and not self._close_after_branch_analysis
+        ):
+            self._start_equivalent_build()
         if self._close_after_branch_analysis:
             self._close_after_branch_analysis = False
             self.close()
+
+    def _cancel_simplified_request(self) -> None:
+        self._pending_simplified_activation = False
+        blocker = QSignalBlocker(self.simplified_network_action)
+        self.simplified_network_action.setChecked(False)
+        del blocker
+
+    def _set_simplified_network_enabled(self, enabled: bool) -> None:
+        if not enabled:
+            self._pending_simplified_activation = False
+            if self._equivalent_worker is not None:
+                self._equivalent_worker.cancel()
+            if (
+                self._selected_feature is not None
+                and self._selected_feature.kind == "equivalent_load"
+            ):
+                self._set_selection(None)
+            self.equivalent_load_virtualizer.set_loads_visible(False)
+            self._sync_load_layout()
+            self._apply_circuit_visibility()
+            self.statusBar().showMessage("Rede original restaurada.", 4_000)
+            return
+        if (
+            self._circuit_catalog is None
+            or self._line_model is None
+            or self._phase_configuration is None
+        ):
+            self._cancel_simplified_request()
+            return
+        if self._equivalent_network_result is not None:
+            self._activate_simplified_network()
+            return
+        self._pending_simplified_activation = True
+        if self._branch_analysis_result is None:
+            answer = QMessageBox.question(
+                self,
+                "Analisar ramais",
+                "A rede simplificada precisa identificar os ramais. "
+                "Deseja iniciar a análise agora?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._cancel_simplified_request()
+                return
+            self._show_branches_after_analysis = False
+            self._start_branch_analysis()
+            return
+        self._start_equivalent_build()
+
+    def _start_equivalent_build(self) -> None:
+        if (
+            not self._pending_simplified_activation
+            or self._branch_analysis_result is None
+            or self._equivalent_thread is not None
+            or self._import_thread is not None
+            or self._branch_thread is not None
+        ):
+            return
+        if not self._branch_analysis_result.records:
+            self._cancel_simplified_request()
+            self.statusBar().showMessage(
+                "Nenhum ramal foi identificado para simplificar.",
+                5_000,
+            )
+            return
+        branches = self._branch_analysis_result
+        loads = self._load_model
+        patterns = self._load_pattern_model
+        thread = QThread(self)
+        worker = EquivalentNetworkWorker(branches, loads, patterns)
+        worker.moveToThread(thread)
+        progress = QProgressDialog(
+            "Construindo cargas equivalentes…",
+            "Cancelar",
+            0,
+            len(branches.records),
+            self,
+        )
+        progress.setWindowTitle("Rede simplificada")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._equivalent_thread = thread
+        self._equivalent_worker = worker
+        self._equivalent_progress_dialog = progress
+        self._equivalent_snapshot = (branches, loads, patterns)
+        self.import_action.setEnabled(False)
+        self.branches_action.setEnabled(False)
+        self.simplified_network_action.setEnabled(False)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_equivalent_progress)
+        worker.finished.connect(self._on_equivalent_finished)
+        worker.failed.connect(self._on_equivalent_failed)
+        worker.cancelled.connect(self._on_equivalent_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(worker.cancel)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_equivalent_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_equivalent_progress(self, current: int, total: int) -> None:
+        if self._equivalent_progress_dialog is None:
+            return
+        maximum = max(1, int(total))
+        self._equivalent_progress_dialog.setMaximum(maximum)
+        self._equivalent_progress_dialog.setValue(min(int(current), maximum))
+        self._equivalent_progress_dialog.setLabelText(
+            f"Construindo cargas equivalentes… {current:n}/{total:n}"
+        )
+
+    def _close_equivalent_progress(self) -> None:
+        if self._equivalent_progress_dialog is not None:
+            self._equivalent_progress_dialog.close()
+
+    def _on_equivalent_finished(self, result: EquivalentNetworkResult) -> None:
+        self._close_equivalent_progress()
+        current_snapshot = (
+            self._branch_analysis_result,
+            self._load_model,
+            self._load_pattern_model,
+        )
+        snapshot = self._equivalent_snapshot
+        if snapshot is None or any(
+            expected is not current
+            for expected, current in zip(snapshot, current_snapshot, strict=True)
+        ):
+            self.statusBar().showMessage(
+                "A rede equivalente foi descartada porque os dados mudaram.",
+                5_000,
+            )
+            return
+        self._equivalent_network_result = result
+        self.branches_window.set_equivalent_result(result)
+        self.view.set_equivalent_load_model(result.model)
+        self.equivalent_load_virtualizer.reset_model(result.model)
+        self._activate_simplified_network()
+
+    def _on_equivalent_failed(self, message: str) -> None:
+        self._close_equivalent_progress()
+        self._cancel_simplified_request()
+        if not self._close_after_equivalent_build:
+            QMessageBox.critical(
+                self,
+                "Falha na rede simplificada",
+                message,
+            )
+
+    def _on_equivalent_cancelled(self) -> None:
+        self._close_equivalent_progress()
+        self._cancel_simplified_request()
+        if not self._close_after_equivalent_build:
+            self.statusBar().showMessage(
+                "Construção da rede simplificada cancelada.",
+                5_000,
+            )
+
+    def _on_equivalent_thread_finished(self) -> None:
+        self._equivalent_thread = None
+        self._equivalent_worker = None
+        self._equivalent_progress_dialog = None
+        self._equivalent_snapshot = None
+        self.import_action.setEnabled(True)
+        self._sync_branches_availability()
+        if self._close_after_equivalent_build:
+            self._close_after_equivalent_build = False
+            self.close()
+
+    def _activate_simplified_network(self) -> None:
+        result = self._equivalent_network_result
+        if result is None or not self.simplified_network_action.isChecked():
+            return
+        self._pending_simplified_activation = False
+        self._sync_load_layout()
+        self.equivalent_load_virtualizer.set_loads_visible(
+            self.show_loads_action.isChecked()
+        )
+        self._apply_circuit_visibility()
+        self.load_virtualizer.refresh(force=True)
+        self.equivalent_load_virtualizer.refresh(force=True)
+        issue_count = len(result.issues) + result.omitted_issue_count
+        suffix = (
+            ""
+            if issue_count == 0
+            else f"; {issue_count:n} diagnóstico(s) de agregação"
+        )
+        self.statusBar().showMessage(
+            f"Rede simplificada ativa: {len(result.model):n} carga(s) "
+            f"equivalente(s){suffix}.",
+            8_000,
+        )
 
     def _show_branches_window(self) -> None:
         if self._branch_analysis_result is None:
@@ -1673,6 +2116,7 @@ class MainWindow(QMainWindow):
             return
         self.virtualizer.refresh(force=True)
         self.load_virtualizer.refresh(force=True)
+        self.equivalent_load_virtualizer.refresh(force=True)
         self.view.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _show_import_report(self, result: CsvLoadResult) -> None:
@@ -1889,6 +2333,12 @@ class MainWindow(QMainWindow):
         self._progress_dialog = None
         self.import_action.setEnabled(True)
         self._sync_branches_availability()
+        if (
+            self._pending_simplified_activation
+            and self._branch_analysis_result is not None
+            and not self._close_after_import
+        ):
+            self._start_equivalent_build()
         if self._close_after_import:
             self._close_after_import = False
             self.close()
@@ -1896,9 +2346,20 @@ class MainWindow(QMainWindow):
     def _fit_all(self) -> None:
         if self._model is None:
             return
-        self.view.fit_model()
+        if (
+            self.simplified_network_action.isChecked()
+            and self._equivalent_network_result is not None
+            and self._circuit_visibility is not None
+        ):
+            masks = self._equivalent_network_result.model.visibility_masks(
+                self._circuit_visibility.checked_states
+            )
+            self.view.fit_visible_features(masks.bar_mask, masks.segment_mask)
+        else:
+            self.view.fit_model()
         self.virtualizer.refresh(force=True)
         self.load_virtualizer.refresh(force=True)
+        self.equivalent_load_virtualizer.refresh(force=True)
 
     def _show_phase_configuration_error(self) -> None:
         if self._phase_configuration_error is None:
@@ -1953,15 +2414,13 @@ class MainWindow(QMainWindow):
         self._overlay_position_timer.start()
 
     def _position_viewport_overlays(self) -> None:
-        if self.search_palette.isVisible():
-            self._position_search_palette()
         self._position_phase_legend()
 
     def _show_zoom_limit_reached(self) -> None:
         self.statusBar().showMessage("Limite máximo de zoom atingido.", 3_000)
 
     def _sync_search_availability(self) -> None:
-        available = len(self.search_index) > 0
+        available = self.search_index.entity_count > 0
         self.search_action.setEnabled(available)
         if self.search_palette.isVisible():
             if available:
@@ -1974,19 +2433,7 @@ class MainWindow(QMainWindow):
             return
         if self._search_focus_active:
             self._set_selection(None)
-        self._position_search_palette()
         self.search_palette.open()
-
-    def _position_search_palette(self) -> None:
-        viewport = self.view.viewport()
-        available_width = max(1, viewport.width())
-        available_height = max(1, viewport.height())
-        width = min(520, max(220, available_width - 32))
-        height = min(360, max(180, available_height - 32))
-        left = max(0, (available_width - width) // 2)
-        top = min(16, max(0, available_height - height))
-        self.search_palette.setGeometry(left, top, width, height)
-        self.search_palette.set_height_limit(height)
 
     def _is_search_result_hidden(self, result: SearchResult) -> bool:
         target = result.target
@@ -1994,24 +2441,17 @@ class MainWindow(QMainWindow):
         if target.kind == "bar":
             if not self.view.bars_visible:
                 return True
-            return (
-                controller is not None
-                and not bool(controller.bar_visible_mask[target.index])
+            return self._effective_bar_mask is not None and not bool(
+                self._effective_bar_mask[target.index]
             )
         if target.kind == "load":
             if not self.load_virtualizer.loads_visible or self._load_model is None:
                 return True
-            return (
-                controller is not None
-                and not bool(
-                    controller.bar_visible_mask[
-                        int(self._load_model.bar_indices[target.index])
-                    ]
-                )
+            return self._effective_load_mask is not None and not bool(
+                self._effective_load_mask[target.index]
             )
-        return (
-            controller is not None
-            and not bool(controller.segment_visible_mask[target.index])
+        return self._effective_segment_mask is not None and not bool(
+            self._effective_segment_mask[target.index]
         )
 
     def _activate_search_result(self, result: SearchResult) -> None:
@@ -2076,11 +2516,16 @@ class MainWindow(QMainWindow):
         if (
             not visible
             and self._selected_feature is not None
-            and self._selected_feature.kind == "load"
+            and self._selected_feature.kind in {"load", "equivalent_load"}
             and not self._search_focus_active
         ):
             self._set_selection(None)
         self.load_virtualizer.set_loads_visible(visible)
+        self.equivalent_load_virtualizer.set_loads_visible(
+            visible
+            and self.simplified_network_action.isChecked()
+            and self._equivalent_network_result is not None
+        )
         if self.search_palette.isVisible():
             self.search_palette.refresh_results()
         state = "visíveis" if visible else "ocultas"
@@ -2099,14 +2544,19 @@ class MainWindow(QMainWindow):
         if selection is None or selection.kind != "load":
             self.load_pattern_table_model.set_records(())
             self.load_patterns_section.setVisible(False)
+        if selection is None or selection.kind != "equivalent_load":
+            self.equivalent_pattern_table_model.set_records(())
+            self.equivalent_patterns_section.setVisible(False)
         if self._model is None or selection is None:
             self._selected_feature = None
             self.virtualizer.set_selected_index(None)
             self.load_virtualizer.set_selected_index(None)
+            self.equivalent_load_virtualizer.set_selected_index(None)
             self.segment_selection_overlay.clear()
             for label in (
                 *self.bar_detail_labels.values(),
                 *self.load_detail_labels.values(),
+                *self.equivalent_detail_labels.values(),
                 *self.segment_detail_labels.values(),
                 *self.switch_detail_labels.values(),
             ):
@@ -2122,6 +2572,7 @@ class MainWindow(QMainWindow):
             self._selected_feature = selection
             self.segment_selection_overlay.clear()
             self.load_virtualizer.set_selected_index(None)
+            self.equivalent_load_virtualizer.set_selected_index(None)
             self.virtualizer.set_selected_index(
                 selection.index,
                 reveal_hidden=reveal_hidden,
@@ -2148,6 +2599,7 @@ class MainWindow(QMainWindow):
             self._selected_feature = selection
             self.virtualizer.set_selected_index(None)
             self.segment_selection_overlay.clear()
+            self.equivalent_load_virtualizer.set_selected_index(None)
             self.load_virtualizer.set_selected_index(
                 selection.index,
                 reveal_hidden=reveal_hidden,
@@ -2179,11 +2631,70 @@ class MainWindow(QMainWindow):
             self.load_details_page.verticalScrollBar().setValue(0)
             return
 
+        if selection.kind == "equivalent_load":
+            result = self._equivalent_network_result
+            if result is None or not 0 <= selection.index < len(result.model):
+                return
+            self._selected_feature = selection
+            self.virtualizer.set_selected_index(None)
+            self.load_virtualizer.set_selected_index(None)
+            self.segment_selection_overlay.clear()
+            self.equivalent_load_virtualizer.set_selected_index(selection.index)
+            self.switch_details_section.setVisible(False)
+            record = result.model.record(selection.index)
+
+            def decimal_text(value) -> str:  # noqa: ANN001
+                if value is None:
+                    return "—"
+                text = format(value, "f")
+                if "." in text:
+                    text = text.rstrip("0").rstrip(".")
+                return text or "0"
+
+            source_ids = (
+                ()
+                if self._load_model is None
+                else tuple(
+                    self._load_model.load_ids[int(index)]
+                    for index in record.source_load_indices
+                )
+            )
+            shown_ids = source_ids[:50]
+            source_text = ", ".join(shown_ids) or "—"
+            if len(source_ids) > len(shown_ids):
+                source_text += f" … e mais {len(source_ids) - len(shown_ids):n}"
+            values = {
+                "origin": "Ramal agregado",
+                "load_id": record.load_id,
+                "branch_id": str(record.branch_id),
+                "branch_type": record.branch_type.value,
+                "removable": "SIM (1)" if record.removable else "NÃO (0)",
+                "circuit_id": record.circuit_id,
+                "bar_id": record.bar_id,
+                "first_segment_id": record.first_segment_id,
+                "phases2": record.phases2,
+                "phase": record.phase,
+                "source_load_count": str(record.source_load_count),
+                "snom": decimal_text(record.snom),
+                "sadm": decimal_text(record.sadm),
+                "source_load_ids": source_text,
+            }
+            for key, value in values.items():
+                self.equivalent_detail_labels[key].setText(value or "—")
+            pattern_records = result.model.records_for_load(selection.index)
+            self.equivalent_pattern_table_model.set_records(pattern_records)
+            self.equivalent_patterns_section.setVisible(bool(pattern_records))
+            self.details_dock.setWindowTitle("Carga equivalente de ramal")
+            self.details_stack.setCurrentWidget(self.equivalent_details_page)
+            self.equivalent_details_page.verticalScrollBar().setValue(0)
+            return
+
         if self._line_model is None or not 0 <= selection.index < len(self._line_model):
             return
         self._selected_feature = selection
         self.virtualizer.set_selected_index(None)
         self.load_virtualizer.set_selected_index(None)
+        self.equivalent_load_virtualizer.set_selected_index(None)
         self.segment_selection_overlay.bind(self._line_model, selection.index)
         record = self._line_model.record(selection.index)
         values = {
@@ -2240,9 +2751,14 @@ class MainWindow(QMainWindow):
         self._active_load_count = int(active)
         self._refresh_active_status()
 
+    def _update_equivalent_load_status_counts(self, active: int) -> None:
+        self._active_equivalent_load_count = int(active)
+        self._refresh_active_status()
+
     def _refresh_active_status(self) -> None:
         self.active_status.setText(
-            f"Itens ativos: {self._active_bar_count + self._active_load_count:n}"
+            "Itens ativos: "
+            f"{self._active_bar_count + self._active_load_count + self._active_equivalent_load_count:n}"
         )
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001, N802
@@ -2262,4 +2778,14 @@ class MainWindow(QMainWindow):
             self._close_after_branch_analysis = True
             event.ignore()
             return
+        if (
+            self._equivalent_thread is not None
+            and self._equivalent_thread.isRunning()
+        ):
+            if self._equivalent_worker is not None:
+                self._equivalent_worker.cancel()
+            self._close_after_equivalent_build = True
+            event.ignore()
+            return
+        self.search_palette.shutdown()
         super().closeEvent(event)

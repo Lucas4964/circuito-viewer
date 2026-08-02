@@ -236,6 +236,10 @@ class CircuitModelTests(unittest.TestCase):
         self.assertFalse(loads.bar_indices.flags.writeable)
         self.assertEqual(loads.spatial_index.nearest(10.0, 5.0, 0.0), 0)
         self.assertEqual(FeatureSelection("load", 0).kind, "load")
+        self.assertEqual(
+            FeatureSelection("equivalent_load", 1).kind,
+            "equivalent_load",
+        )
 
         with self.assertRaisesRegex(ValueError, "duplicado"):
             LoadModel(

@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication
 
 from circuit_viewer.branch_analysis import analyze_branches
+from circuit_viewer.equivalent_network import build_equivalent_network
 from circuit_viewer.graphics import BranchHighlightOverlayItem
 from circuit_viewer.model import (
     CircuitCatalogModel,
@@ -18,6 +19,8 @@ from circuit_viewer.model import (
     CircuitModel,
     LineNetworkModel,
     LoadModel,
+    LoadPatternModel,
+    LoadPatternRecord,
     UtmCrs,
 )
 from circuit_viewer.phase_config import PhaseConfiguration, PhaseMappingEntry
@@ -27,6 +30,7 @@ CIRCUIT_COUNT = 100
 SEGMENTS_PER_CIRCUIT = 1_000
 ANALYSIS_TARGET_SECONDS = 5.0
 HIGHLIGHT_TARGET_SECONDS = 0.1
+MASK_TARGET_SECONDS = 0.1
 
 
 def build_models():  # noqa: ANN201
@@ -47,7 +51,12 @@ def build_models():  # noqa: ANN201
         for local_segment in range(SEGMENTS_PER_CIRCUIT):
             starts.append(base + local_segment)
             ends.append(base + local_segment + 1)
-            phases.append("DEF" if local_segment < 500 else "D")
+            if local_segment < 500:
+                phases.append("DEF")
+            elif local_segment < 750:
+                phases.append("AB")
+            else:
+                phases.append("D")
     bars = CircuitModel(
         bar_ids,
         [""] * len(bar_ids),
@@ -75,8 +84,8 @@ def build_models():  # noqa: ANN201
         list(range(1, load_count + 1)),
         [""] * load_count,
         [""] * load_count,
-        [""] * load_count,
-        [""] * load_count,
+        ["1"] * load_count,
+        ["1"] * load_count,
         [""] * load_count,
         [""] * load_count,
         [""] * load_count,
@@ -84,10 +93,30 @@ def build_models():  # noqa: ANN201
     configuration = PhaseConfiguration(
         (
             PhaseMappingEntry("d", "D", 1),
+            PhaseMappingEntry("ab", "AB", 2),
             PhaseMappingEntry("def", "DEF", 3),
         )
     )
-    return catalog, loads, configuration
+    patterns = LoadPatternModel(
+        loads,
+        [
+            tuple(
+                LoadPatternRecord(
+                    load_id,
+                    npat,
+                    "1",
+                    "1",
+                    "1",
+                    "1",
+                    "1",
+                    "1",
+                )
+                for npat in range(4)
+            )
+            for load_id in loads.load_ids
+        ],
+    )
+    return catalog, loads, patterns, configuration
 
 
 def main() -> int:
@@ -96,10 +125,15 @@ def main() -> int:
     args = parser.parse_args()
     app = QApplication.instance() or QApplication([])
 
-    catalog, loads, configuration = build_models()
+    catalog, loads, patterns, configuration = build_models()
     started = time.perf_counter()
     result = analyze_branches(catalog, configuration, loads)
+    equivalent = build_equivalent_network(result, loads, patterns)
     analysis_seconds = time.perf_counter() - started
+
+    started = time.perf_counter()
+    equivalent.model.visibility_masks([True] * len(catalog))
+    mask_seconds = time.perf_counter() - started
 
     overlay = BranchHighlightOverlayItem()
     started = time.perf_counter()
@@ -111,11 +145,13 @@ def main() -> int:
     print(f"Cargas: {len(loads):n}")
     print(f"Circuitos: {len(catalog):n}")
     print(f"Ramais encontrados: {len(result.records):n}")
-    print(f"Análise: {analysis_seconds:.3f} s")
+    print(f"Análise + agregação: {analysis_seconds:.3f} s")
+    print(f"Atualização das máscaras: {mask_seconds * 1_000:.3f} ms")
     print(f"Construção do destaque: {highlight_seconds * 1_000:.3f} ms")
     app.processEvents()
     if args.enforce and (
         analysis_seconds > ANALYSIS_TARGET_SECONDS
+        or mask_seconds > MASK_TARGET_SECONDS
         or highlight_seconds > HIGHLIGHT_TARGET_SECONDS
     ):
         return 1

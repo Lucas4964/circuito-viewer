@@ -46,6 +46,10 @@ from .model import (
     LoadModel,
     SwitchModel,
 )
+from .equivalent_network import EquivalentNetworkModel
+
+
+LoadRenderModel = LoadModel | EquivalentNetworkModel
 
 
 POINT_DIAMETER_PX = 5.0
@@ -130,30 +134,54 @@ def _render_colors(colors: Sequence[str]) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _load_layout_offsets(model: LoadModel) -> tuple[np.ndarray, np.ndarray]:
-    """Distribui cargas da mesma barra em uma grade determinística."""
+def load_layout_offsets_for_models(
+    models: Sequence[LoadRenderModel],
+) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
+    """Distribui conjuntamente modelos de cargas na mesma grade por barra."""
 
-    x_offsets = np.zeros(len(model), dtype=np.float64)
-    y_offsets = np.full(len(model), LOAD_CONNECTOR_LENGTH_PX, dtype=np.float64)
-    by_bar: dict[int, list[int]] = {}
-    for index, bar_index in enumerate(model.bar_indices):
-        by_bar.setdefault(int(bar_index), []).append(index)
+    offsets = [
+        (
+            np.zeros(len(model), dtype=np.float64),
+            np.full(len(model), LOAD_CONNECTOR_LENGTH_PX, dtype=np.float64),
+        )
+        for model in models
+    ]
+    by_bar: dict[int, list[tuple[int, int]]] = {}
+    for model_index, model in enumerate(models):
+        for index, bar_index in enumerate(model.bar_indices):
+            by_bar.setdefault(int(bar_index), []).append((model_index, index))
     for indices in by_bar.values():
-        indices.sort(key=lambda index: (model.load_ids[index].casefold(), index))
+        indices.sort(
+            key=lambda value: (
+                models[value[0]].load_ids[value[1]].casefold(),
+                value[0],
+                value[1],
+            )
+        )
         columns = max(1, math.ceil(math.sqrt(len(indices))))
         for row, start in enumerate(range(0, len(indices), columns)):
             row_indices = indices[start : start + columns]
             row_size = len(row_indices)
-            for column, index in enumerate(row_indices):
+            for column, (model_index, index) in enumerate(row_indices):
+                x_offsets, y_offsets = offsets[model_index]
                 x_offsets[index] = (
                     column - (row_size - 1) / 2.0
                 ) * LOAD_HORIZONTAL_PITCH_PX
                 y_offsets[index] = (
                     LOAD_CONNECTOR_LENGTH_PX + row * LOAD_VERTICAL_PITCH_PX
                 )
-    x_offsets.setflags(write=False)
-    y_offsets.setflags(write=False)
-    return x_offsets, y_offsets
+    result: list[tuple[np.ndarray, np.ndarray]] = []
+    for x_offsets, y_offsets in offsets:
+        x_offsets.setflags(write=False)
+        y_offsets.setflags(write=False)
+        result.append((x_offsets, y_offsets))
+    return tuple(result)
+
+
+def _load_layout_offsets(model: LoadRenderModel) -> tuple[np.ndarray, np.ndarray]:
+    """Distribui cargas da mesma barra em uma grade determinística."""
+
+    return load_layout_offsets_for_models((model,))[0]
 
 
 def _load_rect(x_offset: float, y_offset: float) -> QRectF:
@@ -233,7 +261,7 @@ class BarsOverviewItem(QGraphicsItem):
 class LoadsOverviewItem(QGraphicsItem):
     """Marcadores agregados de cargas, desenhados sob as barras."""
 
-    def __init__(self, model: LoadModel) -> None:
+    def __init__(self, model: LoadRenderModel) -> None:
         super().__init__()
         self._model = model
         self._visibility_mask = np.ones(len(model), dtype=np.bool_)
@@ -847,7 +875,7 @@ class LoadItem(QGraphicsObject):
 
     def bind(
         self,
-        model: LoadModel,
+        model: LoadRenderModel,
         index: int,
         x_offset: float,
         y_offset: float,
@@ -858,7 +886,11 @@ class LoadItem(QGraphicsObject):
         self._y_offset = float(y_offset)
         bar_index = int(model.bar_indices[self.index])
         self.setPos(_scene_point(model.bars, bar_index))
-        self.setToolTip(model.load_ids[self.index])
+        tooltip = model.load_ids[self.index]
+        record = model.record(self.index)
+        if getattr(record, "origin_kind", None) == "branch_aggregate":
+            tooltip += " — carga equivalente de ramal"
+        self.setToolTip(tooltip)
         self.setSelected(False)
         self.setVisible(True)
         self.update()
@@ -943,6 +975,8 @@ class DiagramView(QGraphicsView):
         self._line_model: LineNetworkModel | None = None
         self._load_model: LoadModel | None = None
         self._load_layer: LoadVirtualizer | None = None
+        self._equivalent_load_model: EquivalentNetworkModel | None = None
+        self._equivalent_load_layer: LoadVirtualizer | None = None
         self._bar_visibility_mask: BoolArray | None = None
         self._segment_visibility_mask: BoolArray | None = None
         self._bars_visible = True
@@ -1016,6 +1050,11 @@ class DiagramView(QGraphicsView):
             self._segment_visibility_mask = None
         if self._load_model is not None and self._load_model.bars is not model:
             self._load_model = None
+        if (
+            self._equivalent_load_model is not None
+            and self._equivalent_load_model.bars is not model
+        ):
+            self._equivalent_load_model = None
         if model is None:
             self.setSceneRect(QRectF(-500.0, -500.0, 1_000.0, 1_000.0))
             return
@@ -1040,6 +1079,19 @@ class DiagramView(QGraphicsView):
 
     def set_load_layer(self, layer: LoadVirtualizer | None) -> None:
         self._load_layer = layer
+
+    def set_equivalent_load_model(
+        self,
+        model: EquivalentNetworkModel | None,
+    ) -> None:
+        if model is not None and model.bars is not self._model:
+            raise ValueError(
+                "As cargas equivalentes devem referenciar as barras exibidas na view."
+            )
+        self._equivalent_load_model = model
+
+    def set_equivalent_load_layer(self, layer: LoadVirtualizer | None) -> None:
+        self._equivalent_load_layer = layer
 
     def set_feature_visibility_masks(
         self,
@@ -1091,6 +1143,57 @@ class DiagramView(QGraphicsView):
             Qt.AspectRatioMode.KeepAspectRatio,
         )
         self._cap_current_scale(padded_rect.center())
+        self.viewport().update()
+        self.viewportChanged.emit()
+
+    def fit_visible_features(
+        self,
+        bar_mask: BoolArray | None,
+        segment_mask: BoolArray | None,
+    ) -> None:
+        """Enquadra apenas a projeção atualmente visível da rede."""
+
+        if self._model is None:
+            return
+        indices: list[np.ndarray] = []
+        if bar_mask is not None:
+            values = _visibility_mask(bar_mask, len(self._model), "barras")
+            indices.append(np.flatnonzero(values).astype(np.intp, copy=False))
+        if self._line_model is not None and segment_mask is not None:
+            values = _visibility_mask(
+                segment_mask,
+                len(self._line_model),
+                "trechos",
+            )
+            segments = np.flatnonzero(values).astype(np.intp, copy=False)
+            if segments.size:
+                indices.extend(
+                    (
+                        self._line_model.start_indices[segments],
+                        self._line_model.end_indices[segments],
+                    )
+                )
+        if not indices:
+            self.fit_model()
+            return
+        bar_indices = np.unique(np.concatenate(indices))
+        if bar_indices.size == 0:
+            self.fit_model()
+            return
+        x_values = self._model.x[bar_indices]
+        y_values = -self._model.y[bar_indices]
+        left = float(x_values.min())
+        right = float(x_values.max())
+        top = float(y_values.min())
+        bottom = float(y_values.max())
+        width = max(right - left, 10.0)
+        height = max(bottom - top, 10.0)
+        rect = QRectF(left, top, width, height)
+        pad_x = max(width * 0.05, 5.0)
+        pad_y = max(height * 0.05, 5.0)
+        padded = rect.adjusted(-pad_x, -pad_y, pad_x, pad_y)
+        self.fitInView(padded, Qt.AspectRatioMode.KeepAspectRatio)
+        self._cap_current_scale(padded.center())
         self.viewport().update()
         self.viewportChanged.emit()
 
@@ -1268,40 +1371,65 @@ class DiagramView(QGraphicsView):
         x, y = self.model_point_at(position)
         scale = abs(self.transform().m11())
         tolerance = CLICK_TOLERANCE_PX / max(scale, 1e-12)
-        if self._load_layer is not None:
-            load_index = self._load_layer.hit_test(position, overview=False)
+        load_layers = (
+            (
+                "equivalent_load",
+                self._equivalent_load_layer,
+                self._equivalent_load_model,
+            ),
+            ("load", self._load_layer, self._load_model),
+        )
+        for kind, layer, _ in load_layers:
+            if layer is None:
+                continue
+            load_index = layer.hit_test(position, overview=False)
             if load_index is not None:
-                self.selectionRequested.emit(FeatureSelection("load", load_index))
+                self.selectionRequested.emit(FeatureSelection(kind, load_index))
                 return
-        overview_load_index = (
-            None
-            if self._load_layer is None
-            else self._load_layer.hit_test(position, overview=True)
+        overview_candidates: list[tuple[float, int, str, int, LoadRenderModel]] = []
+        for priority, (kind, layer, model) in enumerate(load_layers):
+            if layer is None or model is None:
+                continue
+            load_index = layer.hit_test(position, overview=True)
+            if load_index is None:
+                continue
+            load_bar_index = int(model.bar_indices[load_index])
+            anchor = self.mapFromScene(_scene_point(model.bars, load_bar_index))
+            distance = float(
+                (position.x() - anchor.x()) ** 2 + (position.y() - anchor.y()) ** 2
+            )
+            overview_candidates.append(
+                (distance, priority, kind, load_index, model)
+            )
+        overview_candidate = (
+            None if not overview_candidates else min(overview_candidates)
         )
         if self._bars_visible:
             bar_index = self._model.spatial_index.nearest(
                 x, y, tolerance, self._bar_visibility_mask
             )
             if bar_index is not None:
-                if overview_load_index is not None and self._load_model is not None:
-                    load_bar_index = int(
-                        self._load_model.bar_indices[overview_load_index]
+                if overview_candidate is not None:
+                    _, _, load_kind, overview_load_index, overview_model = (
+                        overview_candidate
                     )
-                    anchor = self.mapFromScene(
-                        _scene_point(self._load_model.bars, load_bar_index)
-                    )
+                    load_bar_index = int(overview_model.bar_indices[overview_load_index])
+                    anchor = self.mapFromScene(_scene_point(overview_model.bars, load_bar_index))
                     dx = position.x() - anchor.x()
                     dy = position.y() - anchor.y()
                     center_radius = POINT_DIAMETER_PX / 2.0
                     if dx * dx + dy * dy > center_radius * center_radius:
                         self.selectionRequested.emit(
-                            FeatureSelection("load", overview_load_index)
+                            FeatureSelection(load_kind, overview_load_index)
                         )
                         return
                 self.selectionRequested.emit(FeatureSelection("bar", bar_index))
                 return
-        if overview_load_index is not None:
-            self.selectionRequested.emit(FeatureSelection("load", overview_load_index))
+        if overview_candidate is not None:
+            _, _, load_kind, overview_load_index, _ = overview_candidate
+            self.selectionRequested.emit(
+                FeatureSelection(load_kind, overview_load_index)
+            )
             return
         if self._line_model is not None:
             segment_index = self._line_model.spatial_index.nearest(
@@ -1707,7 +1835,7 @@ class LoadVirtualizer(QObject):
         self.scene = scene
         self.view = view
         self.max_active_items = max_active_items
-        self.model: LoadModel | None = None
+        self.model: LoadRenderModel | None = None
         self.overview_item: LoadsOverviewItem | None = None
         self._loads_visible = True
         self._visibility_mask: BoolArray | None = None
@@ -1750,7 +1878,7 @@ class LoadVirtualizer(QObject):
     def layout_offsets(self) -> tuple[np.ndarray, np.ndarray]:
         return self._x_offsets, self._y_offsets
 
-    def reset_model(self, model: LoadModel | None) -> None:
+    def reset_model(self, model: LoadRenderModel | None) -> None:
         self._refresh_timer.stop()
         self._batch_timer.stop()
         self._pending_indices.clear()
@@ -1778,6 +1906,38 @@ class LoadVirtualizer(QObject):
             self.overview_item.setVisible(self._loads_visible)
         self._mode = "Visão geral"
         self.countsChanged.emit(0)
+
+    def set_layout_offsets(
+        self,
+        x_offsets: Sequence[float] | np.ndarray,
+        y_offsets: Sequence[float] | np.ndarray,
+    ) -> None:
+        if self.model is None:
+            raise ValueError("Não há modelo de cargas para receber o layout.")
+        x_values = np.ascontiguousarray(x_offsets, dtype=np.float64)
+        y_values = np.ascontiguousarray(y_offsets, dtype=np.float64)
+        if (
+            x_values.ndim != 1
+            or y_values.ndim != 1
+            or x_values.size != len(self.model)
+            or y_values.size != len(self.model)
+        ):
+            raise ValueError("O layout deve corresponder às cargas do modelo.")
+        if not np.isfinite(x_values).all() or not np.isfinite(y_values).all():
+            raise ValueError("O layout das cargas deve usar posições finitas.")
+        x_values.setflags(write=False)
+        y_values.setflags(write=False)
+        self._x_offsets = x_values
+        self._y_offsets = y_values
+        for index, item in self._active.items():
+            item.bind(
+                self.model,
+                index,
+                float(self._x_offsets[index]),
+                float(self._y_offsets[index]),
+            )
+        self._sync_selection()
+        self.view.viewport().update()
 
     def schedule_refresh(self) -> None:
         if self.model is not None and self._loads_visible:

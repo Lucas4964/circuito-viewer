@@ -6,16 +6,18 @@ import threading
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
-from .branch_analysis import analyze_branches
+from .branch_analysis import BranchAnalysisResult, analyze_branches
 from .circuit_import import load_circuits_csv
 from .csv_import import CsvImportCancelled, load_csv
 from .load_import import load_loads_csv
 from .load_pattern_import import load_load_patterns_csv
+from .equivalent_network import build_equivalent_network
 from .model import (
     CircuitCatalogModel,
     CircuitModel,
     LineNetworkModel,
     LoadModel,
+    LoadPatternModel,
     SwitchModel,
     UtmCrs,
 )
@@ -265,6 +267,45 @@ class BranchAnalysisWorker(QObject):
                 self.catalog,
                 self.phase_configuration,
                 self.loads,
+                cancel_check=self._cancel_event.is_set,
+                progress=lambda current, total: self.progress.emit(current, total),
+            )
+        except InterruptedError:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class EquivalentNetworkWorker(QObject):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        branches: BranchAnalysisResult,
+        loads: LoadModel | None,
+        patterns: LoadPatternModel | None,
+    ) -> None:
+        super().__init__()
+        self.branches = branches
+        self.loads = loads
+        self.patterns = patterns
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = build_equivalent_network(
+                self.branches,
+                self.loads,
+                self.patterns,
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
             )

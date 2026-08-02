@@ -182,11 +182,11 @@ class CircuitMembership:
 class FeatureSelection:
     """Referência leve para um elemento selecionado em um dos modelos."""
 
-    kind: Literal["bar", "segment", "load"]
+    kind: Literal["bar", "segment", "load", "equivalent_load"]
     index: int
 
     def __post_init__(self) -> None:
-        if self.kind not in {"bar", "segment", "load"}:
+        if self.kind not in {"bar", "segment", "load", "equivalent_load"}:
             raise ValueError(f"Tipo de elemento desconhecido: {self.kind}")
         if self.index < 0:
             raise ValueError("O índice selecionado não pode ser negativo.")
@@ -636,6 +636,14 @@ class LoadModel:
     @property
     def codes(self) -> tuple[str, ...]:
         return self._codes
+
+    @property
+    def snom_values(self) -> tuple[str, ...]:
+        return self._snom_values
+
+    @property
+    def sadm_values(self) -> tuple[str, ...]:
+        return self._sadm_values
 
     @property
     def spatial_index(self) -> StaticPointIndex:

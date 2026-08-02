@@ -232,8 +232,13 @@ class PhaseVisualizationUiTests(unittest.TestCase):
         self.assertEqual(warning.call_count, 1)
         self.assertFalse(window.phase_coloring_action.isEnabled())
         self.assertFalse(window.branches_action.isEnabled())
+        self.assertFalse(window.simplified_network_action.isEnabled())
         self.assertIn("Não foi possível ler", window.phase_coloring_action.toolTip())
         self.assertIn("Não foi possível ler", window.branches_action.toolTip())
+        self.assertIn(
+            "Não foi possível ler",
+            window.simplified_network_action.toolTip(),
+        )
         self.assertIn(str(missing), warning.call_args.args[2])
 
 
