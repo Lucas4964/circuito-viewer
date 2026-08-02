@@ -25,7 +25,9 @@ circuit-viewer = "circuit_viewer.__main__:main"
 [tool.setuptools.packages.find]
 include = ["circuit_viewer*"]
 
+[tool.setuptools.package-data]
+circuit_viewer = ["config/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-

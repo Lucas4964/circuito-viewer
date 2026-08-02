@@ -43,6 +43,7 @@ from .model import (
     CircuitModel,
     FeatureSelection,
     LineNetworkModel,
+    LoadModel,
     SwitchModel,
 )
 
@@ -59,6 +60,10 @@ VIRTUALIZATION_DEBOUNCE_MS = 120
 MAX_ACTIVE_ITEMS = 1_000
 MATERIALIZE_BATCH_SIZE = 250
 MAX_POOL_SIZE = 1_000
+MIN_ZOOM_SCALE = 1e-8
+MAX_USEFUL_ZOOM_SCALE = 100.0
+QT_SCROLLBAR_COORDINATE_LIMIT = float((1 << 31) - 1)
+QT_SCROLLBAR_SAFETY_FACTOR = 0.5
 
 POINT_COLOR = QColor("#202020")
 SELECTED_COLOR = QColor("#ffcc00")
@@ -69,6 +74,13 @@ SWITCH_COLOR = QColor("#ff0000")
 SEGMENT_SELECTION_WIDTH_PX = 3.0
 NORMAL_SEGMENT_WIDTH_PX = 3.0
 SWITCH_SEGMENT_WIDTH_PX = 1.0
+LOAD_WIDTH_PX = 12.0
+LOAD_HEIGHT_PX = 8.0
+LOAD_CONNECTOR_LENGTH_PX = 6.0
+LOAD_HORIZONTAL_PITCH_PX = 15.0
+LOAD_VERTICAL_PITCH_PX = 12.0
+LOAD_OVERVIEW_DIAMETER_PX = 7.0
+LOAD_COLOR = QColor("#202020")
 
 
 def _scene_point(model: CircuitModel, index: int) -> QPointF:
@@ -116,6 +128,41 @@ def _render_colors(colors: Sequence[str]) -> tuple[str, ...]:
             raise ValueError(f"Cor inválida: {value}")
         normalized.append(color.name().upper())
     return tuple(normalized)
+
+
+def _load_layout_offsets(model: LoadModel) -> tuple[np.ndarray, np.ndarray]:
+    """Distribui cargas da mesma barra em uma grade determinística."""
+
+    x_offsets = np.zeros(len(model), dtype=np.float64)
+    y_offsets = np.full(len(model), LOAD_CONNECTOR_LENGTH_PX, dtype=np.float64)
+    by_bar: dict[int, list[int]] = {}
+    for index, bar_index in enumerate(model.bar_indices):
+        by_bar.setdefault(int(bar_index), []).append(index)
+    for indices in by_bar.values():
+        indices.sort(key=lambda index: (model.load_ids[index].casefold(), index))
+        columns = max(1, math.ceil(math.sqrt(len(indices))))
+        for row, start in enumerate(range(0, len(indices), columns)):
+            row_indices = indices[start : start + columns]
+            row_size = len(row_indices)
+            for column, index in enumerate(row_indices):
+                x_offsets[index] = (
+                    column - (row_size - 1) / 2.0
+                ) * LOAD_HORIZONTAL_PITCH_PX
+                y_offsets[index] = (
+                    LOAD_CONNECTOR_LENGTH_PX + row * LOAD_VERTICAL_PITCH_PX
+                )
+    x_offsets.setflags(write=False)
+    y_offsets.setflags(write=False)
+    return x_offsets, y_offsets
+
+
+def _load_rect(x_offset: float, y_offset: float) -> QRectF:
+    return QRectF(
+        x_offset - LOAD_WIDTH_PX / 2.0,
+        y_offset,
+        LOAD_WIDTH_PX,
+        LOAD_HEIGHT_PX,
+    )
 
 
 class BarsOverviewItem(QGraphicsItem):
@@ -177,6 +224,73 @@ class BarsOverviewItem(QGraphicsItem):
         pen = QPen(POINT_COLOR)
         pen.setWidthF(POINT_DIAMETER_PX)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.drawPoints(self._points)
+        painter.restore()
+
+
+class LoadsOverviewItem(QGraphicsItem):
+    """Marcadores agregados de cargas, desenhados sob as barras."""
+
+    def __init__(self, model: LoadModel) -> None:
+        super().__init__()
+        self._model = model
+        self._visibility_mask = np.ones(len(model), dtype=np.bool_)
+        self._points = QPolygonF()
+        self._rebuild_points()
+        bounds = model.bars.bounds
+        width = max(bounds.width, 1.0)
+        height = max(bounds.height, 1.0)
+        self._bounds = QRectF(bounds.left, -bounds.bottom, width, height).adjusted(
+            -LOAD_OVERVIEW_DIAMETER_PX,
+            -LOAD_OVERVIEW_DIAMETER_PX,
+            LOAD_OVERVIEW_DIAMETER_PX,
+            LOAD_OVERVIEW_DIAMETER_PX,
+        )
+        self.setZValue(-11.0)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self.setCacheMode(
+            QGraphicsItem.CacheMode.DeviceCoordinateCache,
+            QSize(4_096, 4_096),
+        )
+
+    @property
+    def visible_point_count(self) -> int:
+        return self._points.size()
+
+    def set_visibility_mask(self, mask: BoolArray | None) -> None:
+        values = _visibility_mask(mask, len(self._model), "cargas")
+        if np.array_equal(values, self._visibility_mask):
+            return
+        self._visibility_mask = values.copy()
+        self._rebuild_points()
+        self.update()
+
+    def _rebuild_points(self) -> None:
+        indices = np.flatnonzero(self._visibility_mask)
+        bars = self._model.bars
+        self._points = QPolygonF(
+            [
+                QPointF(
+                    float(bars.x[int(self._model.bar_indices[index])]),
+                    -float(bars.y[int(self._model.bar_indices[index])]),
+                )
+                for index in indices
+            ]
+        )
+
+    def boundingRect(self) -> QRectF:  # noqa: N802
+        return self._bounds
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
+        del option, widget
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        pen = QPen(LOAD_COLOR)
+        pen.setWidthF(LOAD_OVERVIEW_DIAMETER_PX)
+        pen.setCapStyle(Qt.PenCapStyle.SquareCap)
         pen.setCosmetic(True)
         painter.setPen(pen)
         painter.drawPoints(self._points)
@@ -294,6 +408,22 @@ class LineNetworkItem(QGraphicsItem):
         style_indices: Sequence[int] | None,
         colors: Sequence[str],
     ) -> None:
+        self._set_rendering(mask, style_indices, colors)
+
+    def set_phase_rendering(
+        self,
+        mask: BoolArray | None,
+        style_indices: Sequence[int],
+        colors: Sequence[str],
+    ) -> None:
+        self._set_rendering(mask, style_indices, colors)
+
+    def _set_rendering(
+        self,
+        mask: BoolArray | None,
+        style_indices: Sequence[int] | None,
+        colors: Sequence[str],
+    ) -> None:
         visibility = _visibility_mask(mask, len(self._model), "trechos")
         styles = _style_indices(style_indices, len(self._model))
         palette = _render_colors(colors)
@@ -345,6 +475,7 @@ class SwitchNetworkItem(QGraphicsItem):
             len(model.segments), -1, dtype=np.intp
         )
         self._colors: tuple[str, ...] = ()
+        self._phase_rendering = False
         self._visible_switch_count = len(model)
         self._red_path = QPainterPath()
         self._colored_paths: dict[int, QPainterPath] = {}
@@ -365,6 +496,7 @@ class SwitchNetworkItem(QGraphicsItem):
 
     def _rebuild_paths(self) -> None:
         red_path = QPainterPath()
+        colored_paths: dict[int, QPainterPath] = {}
         segments = self._model.segments
         bars = segments.bars
         visible_count = 0
@@ -380,10 +512,15 @@ class SwitchNetworkItem(QGraphicsItem):
             start_y = -float(bars.y[start])
             end_x = float(bars.x[end])
             end_y = -float(bars.y[end])
-            red_path.moveTo(start_x, start_y)
-            red_path.lineTo(end_x, end_y)
+            if self._phase_rendering:
+                category = max(style_index, -1)
+                path = colored_paths.setdefault(category, QPainterPath())
+            else:
+                path = red_path
+            path.moveTo(start_x, start_y)
+            path.lineTo(end_x, end_y)
         self._red_path = red_path
-        self._colored_paths = {}
+        self._colored_paths = colored_paths
         self._visible_switch_count = visible_count
         self._geometry_revision += 1
 
@@ -404,17 +541,52 @@ class SwitchNetworkItem(QGraphicsItem):
         return self._geometry_revision
 
     def set_visibility_mask(self, segment_mask: BoolArray | None) -> None:
-        self.set_circuit_rendering(
-            segment_mask,
-            self._segment_style_indices,
-            self._colors,
-        )
+        if self._phase_rendering:
+            self.set_phase_rendering(
+                segment_mask,
+                self._segment_style_indices,
+                self._colors,
+            )
+        else:
+            self.set_circuit_rendering(
+                segment_mask,
+                self._segment_style_indices,
+                self._colors,
+            )
 
     def set_circuit_rendering(
         self,
         segment_mask: BoolArray | None,
         style_indices: Sequence[int] | None,
         colors: Sequence[str],
+    ) -> None:
+        self._set_rendering(
+            segment_mask,
+            style_indices,
+            colors,
+            phase_rendering=False,
+        )
+
+    def set_phase_rendering(
+        self,
+        segment_mask: BoolArray | None,
+        style_indices: Sequence[int],
+        colors: Sequence[str],
+    ) -> None:
+        self._set_rendering(
+            segment_mask,
+            style_indices,
+            colors,
+            phase_rendering=True,
+        )
+
+    def _set_rendering(
+        self,
+        segment_mask: BoolArray | None,
+        style_indices: Sequence[int] | None,
+        colors: Sequence[str],
+        *,
+        phase_rendering: bool,
     ) -> None:
         visibility = _visibility_mask(
             segment_mask, len(self._model.segments), "trechos"
@@ -427,13 +599,16 @@ class SwitchNetworkItem(QGraphicsItem):
                 raise ValueError("Um estilo de chave não possui cor correspondente.")
         geometry_changed = not np.array_equal(
             visibility, self._segment_visibility_mask
-        ) or not np.array_equal(styles, self._segment_style_indices)
+        ) or not np.array_equal(
+            styles, self._segment_style_indices
+        ) or phase_rendering != self._phase_rendering
         color_changed = palette != self._colors
         if not geometry_changed and not color_changed:
             return
         self._segment_visibility_mask = visibility.copy()
         self._segment_style_indices = styles.copy()
         self._colors = palette
+        self._phase_rendering = phase_rendering
         if geometry_changed:
             self._rebuild_paths()
         self.update()
@@ -453,6 +628,11 @@ class SwitchNetworkItem(QGraphicsItem):
         pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
         painter.setPen(pen)
         painter.drawPath(self._red_path)
+        for category, path in self._colored_paths.items():
+            color = LINE_COLOR if category < 0 else QColor(self._colors[category])
+            pen.setColor(color)
+            painter.setPen(pen)
+            painter.drawPath(path)
         painter.restore()
 
 
@@ -500,6 +680,76 @@ class SegmentSelectionOverlayItem(QGraphicsLineItem):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         super().paint(painter, option, widget)
+        painter.restore()
+
+
+class BranchHighlightOverlayItem(QGraphicsItem):
+    """Destaca um conjunto de trechos em uma única operação vetorial."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._path = QPainterPath()
+        self._bounds = QRectF()
+        self._segment_indices: tuple[int, ...] = ()
+        self.setZValue(95.0)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self.setVisible(False)
+
+    @property
+    def segment_indices(self) -> tuple[int, ...]:
+        return self._segment_indices
+
+    def bind(
+        self,
+        model: LineNetworkModel,
+        segment_indices: Iterable[int],
+    ) -> None:
+        indices = tuple(int(value) for value in segment_indices)
+        if not indices:
+            raise ValueError("O destaque deve possuir ao menos um trecho.")
+        if any(index < 0 or index >= len(model) for index in indices):
+            raise IndexError("O destaque referencia um trecho inexistente.")
+        path = QPainterPath()
+        bars = model.bars
+        for index in indices:
+            start = int(model.start_indices[index])
+            end = int(model.end_indices[index])
+            path.moveTo(float(bars.x[start]), -float(bars.y[start]))
+            path.lineTo(float(bars.x[end]), -float(bars.y[end]))
+        self.prepareGeometryChange()
+        self._path = path
+        self._bounds = path.boundingRect().adjusted(-1.0, -1.0, 1.0, 1.0)
+        self._segment_indices = indices
+        self.setVisible(True)
+        self.update()
+
+    def clear(self) -> None:
+        if not self._segment_indices:
+            self.setVisible(False)
+            return
+        self.prepareGeometryChange()
+        self._path = QPainterPath()
+        self._bounds = QRectF()
+        self._segment_indices = ()
+        self.setVisible(False)
+        self.update()
+
+    def boundingRect(self) -> QRectF:  # noqa: N802
+        return self._bounds
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
+        del option, widget
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(SELECTED_COLOR)
+        pen.setWidthF(SEGMENT_SELECTION_WIDTH_PX)
+        pen.setCosmetic(True)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(self._path)
         painter.restore()
 
 
@@ -580,10 +830,110 @@ class SelectionOverlayItem(QGraphicsItem):
         painter.restore()
 
 
+class LoadItem(QGraphicsObject):
+    """Símbolo reciclável de uma carga, com geometria fixa em pixels."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.index = -1
+        self._x_offset = 0.0
+        self._y_offset = LOAD_CONNECTOR_LENGTH_PX
+        self.setZValue(20.0)
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+            | QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations
+        )
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+
+    def bind(
+        self,
+        model: LoadModel,
+        index: int,
+        x_offset: float,
+        y_offset: float,
+    ) -> None:
+        self.prepareGeometryChange()
+        self.index = int(index)
+        self._x_offset = float(x_offset)
+        self._y_offset = float(y_offset)
+        bar_index = int(model.bar_indices[self.index])
+        self.setPos(_scene_point(model.bars, bar_index))
+        self.setToolTip(model.load_ids[self.index])
+        self.setSelected(False)
+        self.setVisible(True)
+        self.update()
+
+    def unbind(self) -> None:
+        self.setSelected(False)
+        self.setVisible(False)
+        self.setToolTip("")
+        self.index = -1
+
+    @property
+    def symbol_rect(self) -> QRectF:
+        return _load_rect(self._x_offset, self._y_offset)
+
+    def boundingRect(self) -> QRectF:  # noqa: N802
+        rect = self.symbol_rect.united(
+            QRectF(0.0, 0.0, self._x_offset, self._y_offset).normalized()
+        )
+        return rect.adjusted(-2.0, -2.0, 2.0, 2.0)
+
+    def shape(self):  # noqa: ANN201
+        path = QPainterPath()
+        path.addRect(self.symbol_rect)
+        return path
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
+        del option, widget
+        selected = self.isSelected()
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, selected)
+        pen = QPen(SELECTED_OUTLINE if selected else LOAD_COLOR, 1.0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(
+            QPointF(0.0, 0.0),
+            QPointF(self._x_offset, self._y_offset),
+        )
+        painter.setBrush(QBrush(SELECTED_COLOR if selected else CANVAS_BACKGROUND))
+        painter.drawRect(self.symbol_rect)
+        painter.restore()
+
+
+class LoadSelectionOverlayItem(LoadItem):
+    """Mantém a carga selecionada visível fora da camada materializada."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setZValue(110.0)
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setVisible(False)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
+        del option, widget
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(SELECTED_OUTLINE, 1.0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(
+            QPointF(0.0, 0.0),
+            QPointF(self._x_offset, self._y_offset),
+        )
+        painter.setBrush(QBrush(SELECTED_COLOR))
+        painter.drawRect(self.symbol_rect)
+        painter.restore()
+
+
 class DiagramView(QGraphicsView):
     """View geográfica com navegação e seleção indexada."""
 
     viewportChanged = pyqtSignal()
+    zoomLimitReached = pyqtSignal()
     selectionRequested = pyqtSignal(object)
     mouseCoordinateChanged = pyqtSignal(float, float)
 
@@ -591,6 +941,8 @@ class DiagramView(QGraphicsView):
         super().__init__(scene, parent)
         self._model: CircuitModel | None = None
         self._line_model: LineNetworkModel | None = None
+        self._load_model: LoadModel | None = None
+        self._load_layer: LoadVirtualizer | None = None
         self._bar_visibility_mask: BoolArray | None = None
         self._segment_visibility_mask: BoolArray | None = None
         self._bars_visible = True
@@ -600,6 +952,7 @@ class DiagramView(QGraphicsView):
         self._pan_last = QPoint()
         self._press_pos = QPoint()
         self._pan_moved = False
+        self._zoom_limit_notified = False
 
         # Os pontos comuns são rasterizados sem suavização. O destaque amarelo
         # habilita antialiasing localmente no seu próprio paint().
@@ -629,8 +982,31 @@ class DiagramView(QGraphicsView):
         return self._line_model
 
     @property
+    def load_model(self) -> LoadModel | None:
+        return self._load_model
+
+    @property
     def bars_visible(self) -> bool:
         return self._bars_visible
+
+    @property
+    def maximum_zoom_scale(self) -> float:
+        """Maior escala útil que também preserva a faixa inteira do Qt."""
+
+        rect = self.sceneRect().normalized()
+        largest_coordinate = max(
+            abs(rect.left()),
+            abs(rect.right()),
+            abs(rect.top()),
+            abs(rect.bottom()),
+            1.0,
+        )
+        safe_scale = (
+            QT_SCROLLBAR_COORDINATE_LIMIT
+            * QT_SCROLLBAR_SAFETY_FACTOR
+            / largest_coordinate
+        )
+        return max(MIN_ZOOM_SCALE, min(MAX_USEFUL_ZOOM_SCALE, safe_scale))
 
     def set_model(self, model: CircuitModel | None) -> None:
         self._model = model
@@ -638,6 +1014,8 @@ class DiagramView(QGraphicsView):
         if self._line_model is not None and self._line_model.bars is not model:
             self._line_model = None
             self._segment_visibility_mask = None
+        if self._load_model is not None and self._load_model.bars is not model:
+            self._load_model = None
         if model is None:
             self.setSceneRect(QRectF(-500.0, -500.0, 1_000.0, 1_000.0))
             return
@@ -654,6 +1032,14 @@ class DiagramView(QGraphicsView):
             raise ValueError("Os trechos devem referenciar as barras exibidas na view.")
         self._line_model = model
         self._segment_visibility_mask = None
+
+    def set_load_model(self, model: LoadModel | None) -> None:
+        if model is not None and model.bars is not self._model:
+            raise ValueError("As cargas devem referenciar as barras exibidas na view.")
+        self._load_model = model
+
+    def set_load_layer(self, layer: LoadVirtualizer | None) -> None:
+        self._load_layer = layer
 
     def set_feature_visibility_masks(
         self,
@@ -699,11 +1085,113 @@ class DiagramView(QGraphicsView):
         rect = QRectF(bounds.left, -bounds.bottom, width, height)
         pad_x = max(width * 0.05, 5.0)
         pad_y = max(height * 0.05, 5.0)
+        padded_rect = rect.adjusted(-pad_x, -pad_y, pad_x, pad_y)
         self.fitInView(
-            rect.adjusted(-pad_x, -pad_y, pad_x, pad_y),
+            padded_rect,
             Qt.AspectRatioMode.KeepAspectRatio,
         )
+        self._cap_current_scale(padded_rect.center())
+        self.viewport().update()
         self.viewportChanged.emit()
+
+    def focus_bar(self, index: int) -> None:
+        """Centraliza uma barra mantendo 500 metros de contexto em cada eixo."""
+
+        if self._model is None or not 0 <= int(index) < len(self._model):
+            raise IndexError(index)
+        point = _scene_point(self._model, int(index))
+        self._fit_focus_rect(
+            QRectF(point.x() - 250.0, point.y() - 250.0, 500.0, 500.0)
+        )
+
+    def focus_segment(self, index: int) -> None:
+        """Enquadra um trecho com margem geográfica e zoom máximo previsível."""
+
+        if self._line_model is None or not 0 <= int(index) < len(self._line_model):
+            raise IndexError(index)
+        segment = int(index)
+        bars = self._line_model.bars
+        start = _scene_point(bars, int(self._line_model.start_indices[segment]))
+        end = _scene_point(bars, int(self._line_model.end_indices[segment]))
+        left = min(start.x(), end.x())
+        top = min(start.y(), end.y())
+        width = abs(start.x() - end.x())
+        height = abs(start.y() - end.y())
+        padding = max(max(width, height) * 0.2, 50.0)
+        self._fit_focus_rect(
+            QRectF(
+                left - padding,
+                top - padding,
+                width + padding * 2.0,
+                height + padding * 2.0,
+            )
+        )
+
+    def focus_segments(self, indices: Iterable[int]) -> None:
+        """Enquadra um conjunto de trechos com margem e zoom contextual."""
+
+        if self._line_model is None:
+            raise ValueError("Não há trechos disponíveis para enquadrar.")
+        values = np.fromiter((int(index) for index in indices), dtype=np.intp)
+        if values.size == 0:
+            raise ValueError("Informe ao menos um trecho para enquadrar.")
+        if (values < 0).any() or (values >= len(self._line_model)).any():
+            raise IndexError("O enquadramento referencia um trecho inexistente.")
+        model = self._line_model
+        bars = model.bars
+        starts = model.start_indices[values]
+        ends = model.end_indices[values]
+        x_values = np.concatenate((bars.x[starts], bars.x[ends]))
+        y_values = -np.concatenate((bars.y[starts], bars.y[ends]))
+        left = float(x_values.min())
+        right = float(x_values.max())
+        top = float(y_values.min())
+        bottom = float(y_values.max())
+        width = right - left
+        height = bottom - top
+        padding = max(max(width, height) * 0.2, 50.0)
+        self._fit_focus_rect(
+            QRectF(
+                left - padding,
+                top - padding,
+                width + padding * 2.0,
+                height + padding * 2.0,
+            )
+        )
+
+    def focus_load(self, index: int) -> None:
+        """Centraliza a barra associada à carga com 500 metros de contexto."""
+
+        if self._load_model is None or not 0 <= int(index) < len(self._load_model):
+            raise IndexError(index)
+        bar_index = int(self._load_model.bar_indices[int(index)])
+        point = _scene_point(self._load_model.bars, bar_index)
+        self._fit_focus_rect(
+            QRectF(point.x() - 250.0, point.y() - 250.0, 500.0, 500.0)
+        )
+
+    def _fit_focus_rect(self, rect: QRectF, *, maximum_scale: float = 4.0) -> None:
+        self.fitInView(rect.normalized(), Qt.AspectRatioMode.KeepAspectRatio)
+        current_scale = abs(self.transform().m11())
+        effective_maximum = min(maximum_scale, self.maximum_zoom_scale)
+        if current_scale > effective_maximum:
+            self.scale(
+                effective_maximum / current_scale,
+                effective_maximum / current_scale,
+            )
+        self.centerOn(rect.center())
+        self._zoom_limit_notified = False
+        self.viewport().update()
+        self.viewportChanged.emit()
+
+    def _cap_current_scale(self, center: QPointF) -> None:
+        current_scale = abs(self.transform().m11())
+        maximum_scale = self.maximum_zoom_scale
+        if current_scale > maximum_scale:
+            factor = maximum_scale / current_scale
+            self.scale(factor, factor)
+            self.centerOn(center)
+        self._zoom_limit_notified = False
 
     def model_point_at(self, viewport_position: QPoint) -> tuple[float, float]:
         point = self.mapToScene(viewport_position)
@@ -780,13 +1268,41 @@ class DiagramView(QGraphicsView):
         x, y = self.model_point_at(position)
         scale = abs(self.transform().m11())
         tolerance = CLICK_TOLERANCE_PX / max(scale, 1e-12)
+        if self._load_layer is not None:
+            load_index = self._load_layer.hit_test(position, overview=False)
+            if load_index is not None:
+                self.selectionRequested.emit(FeatureSelection("load", load_index))
+                return
+        overview_load_index = (
+            None
+            if self._load_layer is None
+            else self._load_layer.hit_test(position, overview=True)
+        )
         if self._bars_visible:
             bar_index = self._model.spatial_index.nearest(
                 x, y, tolerance, self._bar_visibility_mask
             )
             if bar_index is not None:
+                if overview_load_index is not None and self._load_model is not None:
+                    load_bar_index = int(
+                        self._load_model.bar_indices[overview_load_index]
+                    )
+                    anchor = self.mapFromScene(
+                        _scene_point(self._load_model.bars, load_bar_index)
+                    )
+                    dx = position.x() - anchor.x()
+                    dy = position.y() - anchor.y()
+                    center_radius = POINT_DIAMETER_PX / 2.0
+                    if dx * dx + dy * dy > center_radius * center_radius:
+                        self.selectionRequested.emit(
+                            FeatureSelection("load", overview_load_index)
+                        )
+                        return
                 self.selectionRequested.emit(FeatureSelection("bar", bar_index))
                 return
+        if overview_load_index is not None:
+            self.selectionRequested.emit(FeatureSelection("load", overview_load_index))
+            return
         if self._line_model is not None:
             segment_index = self._line_model.spatial_index.nearest(
                 x, y, tolerance, self._segment_visibility_mask
@@ -803,12 +1319,6 @@ class DiagramView(QGraphicsView):
             return
         steps = delta / 120.0
         factor = math.pow(1.15, steps)
-        current_scale = abs(self.transform().m11())
-        next_scale = current_scale * factor
-        if not 1e-8 <= next_scale <= 1e6:
-            event.accept()
-            return
-
         self.zoom_at(event.position().toPoint(), factor)
         event.accept()
 
@@ -817,11 +1327,29 @@ class DiagramView(QGraphicsView):
 
         if factor <= 0 or not math.isfinite(factor):
             raise ValueError("O fator de zoom deve ser finito e positivo.")
+        current_scale = abs(self.transform().m11())
+        requested_scale = current_scale * factor
+        maximum_scale = self.maximum_zoom_scale
+        target_scale = min(max(requested_scale, MIN_ZOOM_SCALE), maximum_scale)
+        reached_maximum = requested_scale > maximum_scale
+        if reached_maximum:
+            if not self._zoom_limit_notified:
+                self._zoom_limit_notified = True
+                self.zoomLimitReached.emit()
+        elif target_scale < maximum_scale:
+            self._zoom_limit_notified = False
+
+        if math.isclose(target_scale, current_scale, rel_tol=1e-12, abs_tol=0.0):
+            self.viewport().update()
+            return
+
+        effective_factor = target_scale / current_scale
         scene_before = self.mapToScene(viewport_position)
-        self.scale(factor, factor)
+        self.scale(effective_factor, effective_factor)
         scene_after = self.mapToScene(viewport_position)
         correction = scene_after - scene_before
         self.translate(correction.x(), correction.y())
+        self.viewport().update()
         self.viewportChanged.emit()
 
     def keyPressEvent(self, event) -> None:  # noqa: ANN001, N802
@@ -842,6 +1370,10 @@ class DiagramView(QGraphicsView):
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001, N802
         super().resizeEvent(event)
+        self.viewportChanged.emit()
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:  # noqa: N802
+        super().scrollContentsBy(dx, dy)
         self.viewportChanged.emit()
 
 
@@ -875,6 +1407,7 @@ class ItemVirtualizer(QObject):
         self._loaded_rect: QRectF | None = None
         self._last_view_rect: QRectF | None = None
         self._selected_index: int | None = None
+        self._reveal_hidden_selection = False
         self._pending_indices: list[int] = []
         self._mode = "Visão geral"
 
@@ -916,6 +1449,7 @@ class ItemVirtualizer(QObject):
         self._loaded_rect = None
         self._last_view_rect = None
         self._selected_index = None
+        self._reveal_hidden_selection = False
         self.selection_overlay.setVisible(False)
         if model is not None:
             self.overview_item = BarsOverviewItem(model)
@@ -983,7 +1517,12 @@ class ItemVirtualizer(QObject):
             return False
         inside = self._loaded_rect.contains(viewport_rect)
         zoomed_in_far = viewport_rect.width() < self._last_view_rect.width() * 0.5
-        return inside and not zoomed_in_far
+        zoomed_out = (
+            viewport_rect.width() > self._last_view_rect.width() * (1.0 + 1e-9)
+            or viewport_rect.height()
+            > self._last_view_rect.height() * (1.0 + 1e-9)
+        )
+        return inside and not zoomed_in_far and not zoomed_out
 
     def _materialize_next_batch(self) -> None:
         if self.model is None or not self._bars_visible:
@@ -1043,9 +1582,15 @@ class ItemVirtualizer(QObject):
         self.countsChanged.emit(0)
         self.view.viewport().update()
 
-    def set_selected_index(self, index: int | None) -> None:
+    def set_selected_index(
+        self,
+        index: int | None,
+        *,
+        reveal_hidden: bool = False,
+    ) -> None:
         previous = self._selected_index
         self._selected_index = index
+        self._reveal_hidden_selection = index is not None and bool(reveal_hidden)
         if previous is not None and previous in self._active:
             self._active[previous].setSelected(False)
         self._sync_selection()
@@ -1063,7 +1608,7 @@ class ItemVirtualizer(QObject):
                 self.overview_item.setVisible(False)
             for item in self._active.values():
                 item.setVisible(False)
-            self.selection_overlay.setVisible(False)
+            self._sync_selection()
             self.view.viewport().update()
             return
 
@@ -1107,22 +1652,25 @@ class ItemVirtualizer(QObject):
             self.view.viewport().update()
 
     def _sync_selection(self) -> None:
-        if (
-            not self._bars_visible
-            or self.model is None
-            or self._selected_index is None
-        ):
+        if self.model is None or self._selected_index is None:
             self.selection_overlay.setVisible(False)
             return
         index = self._selected_index
         if not 0 <= index < len(self.model):
             self.selection_overlay.setVisible(False)
             return
-        if self._visibility_mask is not None and not self._visibility_mask[index]:
+        hidden = not self._bars_visible or (
+            self._visibility_mask is not None and not self._visibility_mask[index]
+        )
+        if hidden:
             active_item = self._active.get(index)
             if active_item is not None:
                 active_item.setSelected(False)
-            self.selection_overlay.setVisible(False)
+            if self._reveal_hidden_selection:
+                self.selection_overlay.setPos(_scene_point(self.model, index))
+                self.selection_overlay.setVisible(True)
+            else:
+                self.selection_overlay.setVisible(False)
             return
         active_item = self._active.get(index)
         if active_item is not None:
@@ -1137,6 +1685,349 @@ class ItemVirtualizer(QObject):
             return
         self._mode = mode
         self.modeChanged.emit(mode)
+
+    def active_indices(self) -> Iterable[int]:
+        return self._active.keys()
+
+
+class LoadVirtualizer(QObject):
+    """Camada híbrida que materializa somente as cargas próximas da viewport."""
+
+    countsChanged = pyqtSignal(int)
+
+    def __init__(
+        self,
+        scene: QGraphicsScene,
+        view: DiagramView,
+        *,
+        max_active_items: int = MAX_ACTIVE_ITEMS,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.scene = scene
+        self.view = view
+        self.max_active_items = max_active_items
+        self.model: LoadModel | None = None
+        self.overview_item: LoadsOverviewItem | None = None
+        self._loads_visible = True
+        self._visibility_mask: BoolArray | None = None
+        self._x_offsets = np.empty(0, dtype=np.float64)
+        self._y_offsets = np.empty(0, dtype=np.float64)
+        self.selection_overlay = LoadSelectionOverlayItem()
+        self.scene.addItem(self.selection_overlay)
+
+        self._active: dict[int, LoadItem] = {}
+        self._pool: list[LoadItem] = []
+        self._loaded_rect: QRectF | None = None
+        self._last_view_rect: QRectF | None = None
+        self._selected_index: int | None = None
+        self._reveal_hidden_selection = False
+        self._pending_indices: list[int] = []
+        self._mode = "Visão geral"
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(VIRTUALIZATION_DEBOUNCE_MS)
+        self._refresh_timer.timeout.connect(self.refresh)
+        self._batch_timer = QTimer(self)
+        self._batch_timer.setSingleShot(True)
+        self._batch_timer.timeout.connect(self._materialize_next_batch)
+        self.view.viewportChanged.connect(self.schedule_refresh)
+
+    @property
+    def active_count(self) -> int:
+        return len(self._active)
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @property
+    def loads_visible(self) -> bool:
+        return self._loads_visible
+
+    @property
+    def layout_offsets(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._x_offsets, self._y_offsets
+
+    def reset_model(self, model: LoadModel | None) -> None:
+        self._refresh_timer.stop()
+        self._batch_timer.stop()
+        self._pending_indices.clear()
+        self._clear_active()
+        if self.overview_item is not None:
+            self.scene.removeItem(self.overview_item)
+            self.overview_item = None
+        self.model = model
+        self._visibility_mask = (
+            None if model is None else np.ones(len(model), dtype=np.bool_)
+        )
+        if model is None:
+            self._x_offsets = np.empty(0, dtype=np.float64)
+            self._y_offsets = np.empty(0, dtype=np.float64)
+        else:
+            self._x_offsets, self._y_offsets = _load_layout_offsets(model)
+        self._loaded_rect = None
+        self._last_view_rect = None
+        self._selected_index = None
+        self._reveal_hidden_selection = False
+        self.selection_overlay.unbind()
+        if model is not None:
+            self.overview_item = LoadsOverviewItem(model)
+            self.scene.addItem(self.overview_item)
+            self.overview_item.setVisible(self._loads_visible)
+        self._mode = "Visão geral"
+        self.countsChanged.emit(0)
+
+    def schedule_refresh(self) -> None:
+        if self.model is not None and self._loads_visible:
+            self._refresh_timer.start()
+
+    def refresh(self, force: bool = False) -> None:
+        if not self._loads_visible or self.model is None or self.overview_item is None:
+            return
+        viewport_rect = self.view.mapToScene(self.view.viewport().rect()).boundingRect()
+        if not force and self._can_reuse_loaded_rect(viewport_rect):
+            return
+        margin_x = viewport_rect.width() * VIRTUALIZATION_MARGIN
+        margin_y = viewport_rect.height() * VIRTUALIZATION_MARGIN
+        loaded_rect = viewport_rect.adjusted(-margin_x, -margin_y, margin_x, margin_y)
+        indices = self.model.spatial_index.query_rect(_model_bounds_from_scene(loaded_rect))
+        if self._visibility_mask is not None:
+            indices = indices[self._visibility_mask[indices]]
+        self._loaded_rect = loaded_rect
+        self._last_view_rect = viewport_rect
+        self._pending_indices.clear()
+        self._batch_timer.stop()
+        if indices.size > self.max_active_items:
+            self._show_overview()
+            return
+
+        desired = {int(index) for index in indices}
+        blocker = QSignalBlocker(self.scene)
+        try:
+            for index in tuple(self._active):
+                if index not in desired:
+                    self._release_item(index)
+                else:
+                    self._active[index].setVisible(True)
+        finally:
+            del blocker
+        self._pending_indices = [index for index in desired if index not in self._active]
+        self._mode = "Detalhado"
+        if self._pending_indices:
+            self.overview_item.setVisible(True)
+            self._batch_timer.start(0)
+        else:
+            self.overview_item.setVisible(False)
+            self._sync_selection()
+            self.countsChanged.emit(self.active_count)
+
+    def _can_reuse_loaded_rect(self, viewport_rect: QRectF) -> bool:
+        if self._loaded_rect is None or self._last_view_rect is None:
+            return False
+        inside = self._loaded_rect.contains(viewport_rect)
+        zoomed_in_far = viewport_rect.width() < self._last_view_rect.width() * 0.5
+        zoomed_out = (
+            viewport_rect.width() > self._last_view_rect.width() * (1.0 + 1e-9)
+            or viewport_rect.height()
+            > self._last_view_rect.height() * (1.0 + 1e-9)
+        )
+        return inside and not zoomed_in_far and not zoomed_out
+
+    def _materialize_next_batch(self) -> None:
+        if self.model is None or not self._loads_visible:
+            self._pending_indices.clear()
+            return
+        batch = self._pending_indices[:MATERIALIZE_BATCH_SIZE]
+        del self._pending_indices[:MATERIALIZE_BATCH_SIZE]
+        blocker = QSignalBlocker(self.scene)
+        try:
+            for index in batch:
+                item = self._acquire_item()
+                item.bind(
+                    self.model,
+                    index,
+                    float(self._x_offsets[index]),
+                    float(self._y_offsets[index]),
+                )
+                self._active[index] = item
+        finally:
+            del blocker
+        self.countsChanged.emit(self.active_count)
+        self._sync_selection()
+        if self._pending_indices:
+            self._batch_timer.start(0)
+        elif self.overview_item is not None:
+            self.overview_item.setVisible(False)
+            self.view.viewport().update()
+
+    def _acquire_item(self) -> LoadItem:
+        if self._pool:
+            item = self._pool.pop()
+            self.scene.addItem(item)
+            return item
+        item = LoadItem()
+        self.scene.addItem(item)
+        return item
+
+    def _release_item(self, index: int) -> None:
+        item = self._active.pop(index)
+        self.scene.removeItem(item)
+        item.unbind()
+        if len(self._pool) < MAX_POOL_SIZE:
+            self._pool.append(item)
+        else:
+            item.deleteLater()
+
+    def _clear_active(self) -> None:
+        blocker = QSignalBlocker(self.scene)
+        try:
+            for index in tuple(self._active):
+                self._release_item(index)
+        finally:
+            del blocker
+
+    def _show_overview(self) -> None:
+        self._clear_active()
+        if self.overview_item is not None:
+            self.overview_item.setVisible(self._loads_visible)
+        self._mode = "Visão geral"
+        self._sync_selection()
+        self.countsChanged.emit(0)
+        self.view.viewport().update()
+
+    def set_selected_index(
+        self,
+        index: int | None,
+        *,
+        reveal_hidden: bool = False,
+    ) -> None:
+        previous = self._selected_index
+        self._selected_index = index
+        self._reveal_hidden_selection = index is not None and bool(reveal_hidden)
+        if previous is not None and previous in self._active:
+            self._active[previous].setSelected(False)
+        self._sync_selection()
+
+    def set_loads_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if visible == self._loads_visible:
+            return
+        self._loads_visible = visible
+        self._refresh_timer.stop()
+        self._batch_timer.stop()
+        self._pending_indices.clear()
+        if not visible:
+            if self.overview_item is not None:
+                self.overview_item.setVisible(False)
+            for item in self._active.values():
+                item.setVisible(False)
+            self._sync_selection()
+            self.view.viewport().update()
+            return
+        self._loaded_rect = None
+        self._last_view_rect = None
+        self.refresh(force=True)
+        self.view.viewport().update()
+
+    def set_visibility_mask(self, mask: BoolArray | None) -> None:
+        if self.model is None:
+            if mask is not None:
+                raise ValueError("Não há modelo de cargas para receber a máscara.")
+            self._visibility_mask = None
+            return
+        values = _visibility_mask(mask, len(self.model), "cargas")
+        if self._visibility_mask is not None and np.array_equal(
+            values, self._visibility_mask
+        ):
+            return
+        self._visibility_mask = values.copy()
+        if self.overview_item is not None:
+            self.overview_item.set_visibility_mask(values)
+        self._refresh_timer.stop()
+        self._batch_timer.stop()
+        self._pending_indices.clear()
+        blocker = QSignalBlocker(self.scene)
+        try:
+            for index in tuple(self._active):
+                if not values[index]:
+                    self._release_item(index)
+        finally:
+            del blocker
+        self._loaded_rect = None
+        self._last_view_rect = None
+        self._sync_selection()
+        self.countsChanged.emit(self.active_count)
+        if self._loads_visible:
+            self.refresh(force=True)
+        else:
+            self.view.viewport().update()
+
+    def _sync_selection(self) -> None:
+        if self.model is None or self._selected_index is None:
+            self.selection_overlay.unbind()
+            return
+        index = self._selected_index
+        if not 0 <= index < len(self.model):
+            self.selection_overlay.unbind()
+            return
+        hidden = not self._loads_visible or (
+            self._visibility_mask is not None and not self._visibility_mask[index]
+        )
+        active_item = self._active.get(index)
+        if hidden:
+            if active_item is not None:
+                active_item.setSelected(False)
+            if not self._reveal_hidden_selection:
+                self.selection_overlay.unbind()
+                return
+        elif active_item is not None:
+            active_item.setSelected(True)
+            self.selection_overlay.unbind()
+            return
+        self.selection_overlay.bind(
+            self.model,
+            index,
+            float(self._x_offsets[index]),
+            float(self._y_offsets[index]),
+        )
+        self.selection_overlay.setVisible(True)
+
+    def hit_test(self, position: QPoint, *, overview: bool) -> int | None:
+        if self.model is None or not self._loads_visible:
+            return None
+        if not overview:
+            candidates: list[tuple[float, int]] = []
+            for index, item in self._active.items():
+                if not item.isVisible():
+                    continue
+                bar_index = int(self.model.bar_indices[index])
+                anchor = self.view.mapFromScene(
+                    _scene_point(self.model.bars, bar_index)
+                )
+                local = QPointF(
+                    float(position.x() - anchor.x()),
+                    float(position.y() - anchor.y()),
+                )
+                if item.symbol_rect.contains(local):
+                    center = item.symbol_rect.center()
+                    distance = (local.x() - center.x()) ** 2 + (
+                        local.y() - center.y()
+                    ) ** 2
+                    candidates.append((distance, index))
+            return None if not candidates else min(candidates)[1]
+        if self.overview_item is None or not self.overview_item.isVisible():
+            return None
+        x, y = self.view.model_point_at(position)
+        scale = abs(self.view.transform().m11())
+        tolerance = (LOAD_OVERVIEW_DIAMETER_PX / 2.0 + 2.0) / max(scale, 1e-12)
+        return self.model.spatial_index.nearest(
+            x,
+            y,
+            tolerance,
+            self._visibility_mask,
+        )
 
     def active_indices(self) -> Iterable[int]:
         return self._active.keys()

@@ -115,6 +115,39 @@ class SwitchRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class LoadRecord:
+    """Atributos de uma carga associada a uma barra da rede."""
+
+    load_id: str
+    bar_id: str
+    external_id: str
+    code: str
+    snom: str
+    sadm: str
+    secondary_line_voltage: str
+    phases: str
+    connection_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class LoadPatternRecord:
+    """Valores complementares de uma carga em um patamar NPAT."""
+
+    load_id: str
+    npat: int
+    pd: str
+    pe: str
+    pf: str
+    qd: str
+    qe: str
+    qf: str
+
+    def __post_init__(self) -> None:
+        if type(self.npat) is not int or self.npat not in {0, 1, 2, 3}:
+            raise ValueError("NPAT deve ser um inteiro entre 0 e 3.")
+
+
+@dataclass(frozen=True, slots=True)
 class CircuitDefinition:
     """Metadados de um circuito e sua barra de partida."""
 
@@ -149,11 +182,11 @@ class CircuitMembership:
 class FeatureSelection:
     """Referência leve para um elemento selecionado em um dos modelos."""
 
-    kind: Literal["bar", "segment"]
+    kind: Literal["bar", "segment", "load"]
     index: int
 
     def __post_init__(self) -> None:
-        if self.kind not in {"bar", "segment"}:
+        if self.kind not in {"bar", "segment", "load"}:
             raise ValueError(f"Tipo de elemento desconhecido: {self.kind}")
         if self.index < 0:
             raise ValueError("O índice selecionado não pode ser negativo.")
@@ -503,6 +536,199 @@ class CircuitModel:
         )
 
 
+class LoadModel:
+    """Cargas que reutilizam as coordenadas das barras associadas."""
+
+    __slots__ = (
+        "bars",
+        "_load_ids",
+        "_bar_indices",
+        "_external_ids",
+        "_codes",
+        "_snom_values",
+        "_sadm_values",
+        "_secondary_line_voltages",
+        "_phases",
+        "_connection_types",
+        "_by_id",
+        "_spatial_index",
+        "source_path",
+    )
+
+    def __init__(
+        self,
+        bars: CircuitModel,
+        load_ids: Iterable[str],
+        bar_indices: Iterable[int] | IndexArray,
+        external_ids: Iterable[str],
+        codes: Iterable[str],
+        snom_values: Iterable[str],
+        sadm_values: Iterable[str],
+        secondary_line_voltages: Iterable[str],
+        phases: Iterable[str],
+        connection_types: Iterable[str],
+        *,
+        source_path: str | None = None,
+    ) -> None:
+        ids = tuple(str(value) for value in load_ids)
+        text_columns = tuple(
+            tuple(str(value) for value in values)
+            for values in (
+                external_ids,
+                codes,
+                snom_values,
+                sadm_values,
+                secondary_line_voltages,
+                phases,
+                connection_types,
+            )
+        )
+        associated_bars = np.ascontiguousarray(bar_indices, dtype=np.intp)
+        size = len(ids)
+        if size == 0:
+            raise ValueError("O modelo deve conter ao menos uma carga.")
+        if any(len(values) != size for values in text_columns):
+            raise ValueError("Todos os campos da carga devem possuir o mesmo tamanho.")
+        if associated_bars.ndim != 1 or associated_bars.size != size:
+            raise ValueError("Os índices de barras devem formar um vetor compatível.")
+        if (associated_bars < 0).any() or (associated_bars >= len(bars)).any():
+            raise ValueError("Uma carga referencia uma barra inexistente.")
+
+        by_id: dict[str, int] = {}
+        for index, load_id in enumerate(ids):
+            if not load_id:
+                raise ValueError("CARGA_ID não pode ser vazio.")
+            if load_id in by_id:
+                raise ValueError(f"CARGA_ID duplicado no modelo: {load_id}")
+            by_id[load_id] = index
+
+        associated_bars.setflags(write=False)
+        self.bars = bars
+        self._load_ids = ids
+        self._bar_indices = associated_bars
+        (
+            self._external_ids,
+            self._codes,
+            self._snom_values,
+            self._sadm_values,
+            self._secondary_line_voltages,
+            self._phases,
+            self._connection_types,
+        ) = text_columns
+        self._by_id = by_id
+        self._spatial_index = StaticPointIndex(
+            bars.x[associated_bars],
+            bars.y[associated_bars],
+        )
+        self.source_path = source_path
+
+    def __len__(self) -> int:
+        return len(self._load_ids)
+
+    @property
+    def load_ids(self) -> tuple[str, ...]:
+        return self._load_ids
+
+    @property
+    def bar_indices(self) -> IndexArray:
+        return self._bar_indices
+
+    @property
+    def codes(self) -> tuple[str, ...]:
+        return self._codes
+
+    @property
+    def spatial_index(self) -> StaticPointIndex:
+        return self._spatial_index
+
+    def index_for_id(self, load_id: str) -> int | None:
+        return self._by_id.get(load_id)
+
+    def record(self, index: int) -> LoadRecord:
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        return LoadRecord(
+            load_id=self._load_ids[index],
+            bar_id=self.bars.bar_ids[int(self._bar_indices[index])],
+            external_id=self._external_ids[index],
+            code=self._codes[index],
+            snom=self._snom_values[index],
+            sadm=self._sadm_values[index],
+            secondary_line_voltage=self._secondary_line_voltages[index],
+            phases=self._phases[index],
+            connection_type=self._connection_types[index],
+        )
+
+
+class LoadPatternModel:
+    """Grupos completos de quatro patamares, indexados pela carga."""
+
+    __slots__ = (
+        "loads",
+        "_records_by_load",
+        "_load_count",
+        "_record_count",
+        "source_path",
+    )
+
+    def __init__(
+        self,
+        loads: LoadModel,
+        records_by_load: Iterable[Sequence[LoadPatternRecord] | None],
+        *,
+        source_path: str | None = None,
+    ) -> None:
+        raw_groups = tuple(records_by_load)
+        if len(raw_groups) != len(loads):
+            raise ValueError("Os grupos de patamares devem corresponder às cargas.")
+
+        groups: list[tuple[LoadPatternRecord, ...] | None] = []
+        load_count = 0
+        for load_index, raw_group in enumerate(raw_groups):
+            if raw_group is None:
+                groups.append(None)
+                continue
+            group = tuple(sorted(raw_group, key=lambda record: record.npat))
+            if not group:
+                groups.append(None)
+                continue
+            if len(group) != 4 or tuple(record.npat for record in group) != (
+                0,
+                1,
+                2,
+                3,
+            ):
+                raise ValueError(
+                    "Cada carga deve possuir exatamente os patamares 0, 1, 2 e 3."
+                )
+            expected_load_id = loads.load_ids[load_index]
+            if any(record.load_id != expected_load_id for record in group):
+                raise ValueError("Um patamar referencia uma carga incompatível.")
+            groups.append(group)
+            load_count += 1
+
+        if load_count == 0:
+            raise ValueError("O modelo deve conter ao menos um grupo de patamares.")
+        self.loads = loads
+        self._records_by_load = tuple(groups)
+        self._load_count = load_count
+        self._record_count = load_count * 4
+        self.source_path = source_path
+
+    def __len__(self) -> int:
+        return self._load_count
+
+    @property
+    def record_count(self) -> int:
+        return self._record_count
+
+    def records_for_load(self, load_index: int) -> tuple[LoadPatternRecord, ...]:
+        if not 0 <= int(load_index) < len(self.loads):
+            raise IndexError(load_index)
+        group = self._records_by_load[int(load_index)]
+        return () if group is None else group
+
+
 class LineNetworkModel:
     """Trechos que referenciam as barras por índice, sem duplicar coordenadas."""
 
@@ -610,6 +836,14 @@ class LineNetworkModel:
     @property
     def segment_ids(self) -> tuple[str, ...]:
         return self._segment_ids
+
+    @property
+    def codes(self) -> tuple[str, ...]:
+        return self._codes
+
+    @property
+    def phases(self) -> tuple[str, ...]:
+        return self._phases
 
     @property
     def start_indices(self) -> IndexArray:
@@ -756,6 +990,10 @@ class SwitchModel:
         return self._switch_ids
 
     @property
+    def codes(self) -> tuple[str, ...]:
+        return self._codes
+
+    @property
     def segment_indices(self) -> IndexArray:
         return self._segment_indices
 
@@ -881,6 +1119,24 @@ class NetworkTopology:
             self._generation = 0
         self._generation += 1
         return self._generation
+
+    @property
+    def incidence_offsets(self) -> IndexArray:
+        """Offsets CSR das incidências de cada barra."""
+
+        return self._offsets
+
+    @property
+    def incidence_segments(self) -> IndexArray:
+        """Índice do trecho em cada posição da adjacência CSR."""
+
+        return self._incidence_segments
+
+    @property
+    def incidence_neighbors(self) -> IndexArray:
+        """Barra oposta ao trecho em cada posição da adjacência CSR."""
+
+        return self._incidence_neighbors
 
     def trace(
         self,

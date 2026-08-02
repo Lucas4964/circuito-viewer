@@ -11,6 +11,8 @@ try:
     from PyQt6.QtWidgets import QApplication, QDialog, QToolBar
 
     from circuit_viewer.csv_import import CsvLoadResult
+    from circuit_viewer.load_import import LoadCsvResult
+    from circuit_viewer.load_pattern_import import LoadPatternCsvResult
     from circuit_viewer.main_window import ImportChoiceDialog, MainWindow
     from circuit_viewer.segment_import import SegmentLoadResult
     from circuit_viewer.switch_import import SwitchLoadResult
@@ -20,9 +22,14 @@ except ModuleNotFoundError:
     PYQT_AVAILABLE = False
 
 from circuit_viewer.model import (
+    CircuitCatalogModel,
+    CircuitDefinition,
     CircuitModel,
     FeatureSelection,
     LineNetworkModel,
+    LoadModel,
+    LoadPatternModel,
+    LoadPatternRecord,
     SwitchModel,
     UtmCrs,
 )
@@ -82,6 +89,42 @@ class MainWindowSelectionTests(unittest.TestCase):
             ["FUSIVEL"],
         )
 
+    def _make_loads(self, bars: CircuitModel) -> LoadModel:
+        return LoadModel(
+            bars,
+            ["L1", "L2"],
+            [0, 0],
+            ["EXT-1", "EXT-2"],
+            ["CARGA-1", "CARGA-2"],
+            ["10", "20"],
+            ["8", "18"],
+            ["220", "127"],
+            ["ABC", "A"],
+            ["Y", "D"],
+        )
+
+    def _make_patterns(
+        self,
+        loads: LoadModel,
+        *,
+        pd_prefix: str = "P",
+    ) -> LoadPatternModel:
+        groups: list[tuple[LoadPatternRecord, ...] | None] = [None] * len(loads)
+        groups[0] = tuple(
+            LoadPatternRecord(
+                loads.load_ids[0],
+                npat,
+                "" if npat == 0 else f"{pd_prefix}{npat}",
+                f"PE{npat}",
+                f"PF{npat}",
+                f"QD{npat}",
+                f"QE{npat}",
+                f"QF{npat}",
+            )
+            for npat in range(4)
+        )
+        return LoadPatternModel(loads, groups)
+
     def test_single_import_action_opens_choices_with_dependency_state(self) -> None:
         window = MainWindow()
         self.addCleanup(window.close)
@@ -98,6 +141,8 @@ class MainWindowSelectionTests(unittest.TestCase):
         without_bars = ImportChoiceDialog(False, False, window)
         self.assertTrue(without_bars.bars_button.isEnabled())
         self.assertFalse(without_bars.segments_button.isEnabled())
+        self.assertFalse(without_bars.loads_button.isEnabled())
+        self.assertFalse(without_bars.load_patterns_button.isEnabled())
         self.assertFalse(without_bars.switches_button.isEnabled())
         without_bars.bars_button.click()
         self.assertEqual(without_bars.result(), QDialog.DialogCode.Accepted)
@@ -105,10 +150,26 @@ class MainWindowSelectionTests(unittest.TestCase):
 
         with_bars = ImportChoiceDialog(True, False, window)
         self.assertTrue(with_bars.segments_button.isEnabled())
+        self.assertTrue(with_bars.loads_button.isEnabled())
+        self.assertFalse(with_bars.load_patterns_button.isEnabled())
         self.assertFalse(with_bars.switches_button.isEnabled())
         with_bars.segments_button.click()
         self.assertEqual(with_bars.result(), QDialog.DialogCode.Accepted)
         self.assertEqual(with_bars.selected_kind, "segments")
+
+        loads_choice = ImportChoiceDialog(True, False, window)
+        loads_choice.loads_button.click()
+        self.assertEqual(loads_choice.selected_kind, "loads")
+
+        patterns_choice = ImportChoiceDialog(
+            True,
+            False,
+            window,
+            has_loads=True,
+        )
+        self.assertTrue(patterns_choice.load_patterns_button.isEnabled())
+        patterns_choice.load_patterns_button.click()
+        self.assertEqual(patterns_choice.selected_kind, "load_patterns")
 
         with_segments = ImportChoiceDialog(True, True, window)
         self.assertTrue(with_segments.switches_button.isEnabled())
@@ -190,6 +251,7 @@ class MainWindowSelectionTests(unittest.TestCase):
 
         for grid in (
             window.bar_details_grid,
+            window.load_details_grid,
             window.segment_details_grid,
             window.switch_details_grid,
         ):
@@ -204,6 +266,8 @@ class MainWindowSelectionTests(unittest.TestCase):
         all_cells = (
             *window.bar_caption_labels.values(),
             *window.bar_detail_labels.values(),
+            *window.load_caption_labels.values(),
+            *window.load_detail_labels.values(),
             *window.segment_caption_labels.values(),
             *window.segment_detail_labels.values(),
             *window.switch_caption_labels.values(),
@@ -240,6 +304,120 @@ class MainWindowSelectionTests(unittest.TestCase):
                 value.textInteractionFlags()
                 & Qt.TextInteractionFlag.TextSelectableByMouse
             )
+
+    def test_load_details_visibility_and_bar_reimport_invalidation(self) -> None:
+        window, bars, _ = self._make_window()
+        self.addCleanup(window.close)
+        loads = self._make_loads(bars)
+        window._on_load_import_finished(
+            LoadCsvResult(loads, "utf-8-sig", 2, 2, 0, (), 0)
+        )
+
+        self.assertTrue(window.show_loads_action.isEnabled())
+        self.assertEqual(window.load_status.text(), "Cargas: 2")
+        window._set_selection(FeatureSelection("load", 0))
+        self.assertEqual(window.details_dock.windowTitle(), "Carga selecionada")
+        self.assertEqual(window.load_detail_labels["load_id"].text(), "L1")
+        self.assertEqual(window.load_detail_labels["bar_id"].text(), "B1")
+        self.assertEqual(window.load_detail_labels["external_id"].text(), "EXT-1")
+        self.assertEqual(window.load_detail_labels["snom"].text(), "10")
+        self.assertEqual(window.load_detail_labels["connection_type"].text(), "Y")
+        self.assertTrue(window.load_virtualizer.selection_overlay.isVisible())
+
+        window.show_bars_action.setChecked(False)
+        self.assertEqual(window._selected_feature, FeatureSelection("load", 0))
+        self.assertTrue(window.load_virtualizer.loads_visible)
+        window.show_loads_action.setChecked(False)
+        self.assertIsNone(window._selected_feature)
+        self.assertFalse(window.load_virtualizer.loads_visible)
+
+        window._on_import_finished(
+            CsvLoadResult(bars, "utf-8-sig", 3, 3, 0, (), 0)
+        )
+        self.assertIsNone(window._load_model)
+        self.assertFalse(window.show_loads_action.isEnabled())
+        self.assertEqual(window.load_status.text(), "Cargas: 0")
+
+    def test_loads_follow_circuit_filters_but_not_bar_visibility(self) -> None:
+        window, bars, network = self._make_window()
+        self.addCleanup(window.close)
+        loads = self._make_loads(bars)
+        window._set_load_model(loads)
+        catalog = CircuitCatalogModel.build(
+            network,
+            None,
+            [CircuitDefinition("C1", "B1", "CIR-1", "13.8")],
+        )
+
+        window._set_circuit_catalog(catalog, checked=(False,))
+
+        self.assertFalse(window.load_virtualizer._visibility_mask[0])
+        self.assertFalse(window.load_virtualizer._visibility_mask[1])
+        self.assertEqual(window.load_virtualizer.overview_item.visible_point_count, 0)
+
+        window._set_circuit_catalog(catalog, checked=(True,))
+        window.show_bars_action.setChecked(False)
+        self.assertTrue(window.load_virtualizer._visibility_mask[0])
+        self.assertTrue(window.load_virtualizer.loads_visible)
+
+    def test_load_patterns_table_is_conditional_ordered_and_read_only(self) -> None:
+        window, bars, _ = self._make_window()
+        self.addCleanup(window.close)
+        loads = self._make_loads(bars)
+        window._set_load_model(loads)
+        window._set_selection(FeatureSelection("load", 0))
+        self.assertFalse(window.load_patterns_section.isVisible())
+        scene_items = tuple(window.scene.items())
+        search_count = len(window.search_index)
+
+        patterns = self._make_patterns(loads)
+        window._on_load_pattern_import_finished(
+            LoadPatternCsvResult(patterns, "utf-8-sig", 4, 4, 0, (), 0)
+        )
+
+        table_model = window.load_pattern_table_model
+        self.assertTrue(window.load_patterns_section.isVisible())
+        self.assertEqual(table_model.rowCount(), 4)
+        self.assertEqual(table_model.columnCount(), 8)
+        self.assertEqual(
+            [
+                table_model.headerData(
+                    column,
+                    Qt.Orientation.Horizontal,
+                    Qt.ItemDataRole.DisplayRole,
+                )
+                for column in range(8)
+            ],
+            ["CARGA_ID", "NPAT", "PD", "PE", "PF", "QD", "QE", "QF"],
+        )
+        self.assertEqual(table_model.data(table_model.index(0, 1)), "0")
+        self.assertEqual(table_model.data(table_model.index(3, 1)), "3")
+        self.assertEqual(table_model.data(table_model.index(0, 2)), "—")
+        self.assertEqual(
+            table_model.data(
+                table_model.index(1, 2),
+                Qt.ItemDataRole.ToolTipRole,
+            ),
+            "P1",
+        )
+        self.assertFalse(
+            table_model.flags(table_model.index(0, 0))
+            & Qt.ItemFlag.ItemIsEditable
+        )
+        self.assertEqual(tuple(window.scene.items()), scene_items)
+        self.assertEqual(len(window.search_index), search_count)
+
+        replacement = self._make_patterns(loads, pd_prefix="NOVO")
+        window._set_load_pattern_model(replacement)
+        self.assertEqual(table_model.data(table_model.index(1, 2)), "NOVO1")
+
+        window._set_selection(FeatureSelection("load", 1))
+        self.assertFalse(window.load_patterns_section.isVisible())
+        self.assertEqual(table_model.rowCount(), 0)
+
+        window._set_load_model(loads)
+        self.assertIsNone(window._load_pattern_model)
+        self.assertFalse(window.load_patterns_section.isVisible())
 
     def test_switch_table_is_conditional_and_reimport_preserves_selection(self) -> None:
         window, _, network = self._make_window()

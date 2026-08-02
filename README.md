@@ -30,12 +30,33 @@ colunas adicionais são ignoradas. Linhas inválidas são ignoradas e apresentad
 em um relatório; os dados anteriores só são substituídos quando a nova importação
 termina com ao menos uma barra válida.
 
-Use **Arquivo > Importar…** e escolha entre barras, trechos, chaves ou circuitos. A opção de
+Use **Arquivo > Importar…** e escolha entre barras, trechos, cargas, chaves ou
+circuitos. A opção de
 trechos fica disponível depois que as barras forem carregadas. O arquivo de
 trechos deve conter `TRECHO_ID`, `CODIGO`, `FASES2`, `BARRA1_ID`, `BARRA2_ID`,
 `ARRANJO_ID`, `CABOF_ID`, `CABON_ID` e `COMPR`. A ordem é livre e colunas
 adicionais são ignoradas. Trechos que referenciam barras inexistentes são
 omitidos e relatados.
+
+Depois das barras, é possível escolher **Importar cargas…**. O CSV deve usar
+`;` como separador e conter `CARGA_ID`, `BARRA_ID`, `EXTERN_ID`, `CODIGO`,
+`SNOM`, `SADM`, `VLINHASEC`, `FASES2` e `TIPO_LIG`. Cada carga é ligada à barra
+indicada por `BARRA_ID` e desenhada como um pequeno retângulo com terminal.
+Várias cargas na mesma barra são distribuídas automaticamente. IDs duplicados
+e referências a barras inexistentes são omitidos e incluídos no relatório de
+importação; os demais campos são preservados como texto.
+
+Após importar as cargas, a opção **Importar patamares de carga…** aceita um
+segundo CSV com `CARGA_ID`, `NPAT`, `PD`, `PE`, `PF`, `QD`, `QE` e `QF`. Cada
+carga presente nesse arquivo deve possuir exatamente os patamares `0`, `1`, `2`
+e `3`. Grupos incompletos, duplicados ou com outros valores de `NPAT` são
+descartados e relatados sem impedir a importação dos demais grupos completos.
+Os valores de potência são preservados como texto, inclusive quando vazios.
+
+Esses dados são exclusivamente informativos: ao selecionar uma carga com
+patamares, o painel lateral exibe abaixo da tabela principal uma segunda tabela
+com quatro linhas ordenadas por `NPAT`. A importação não altera símbolos,
+filtros, circuitos ou resultados da busca global.
 
 Depois dos trechos, a mesma janela permite **Importar chaves…**. O CSV deve
 conter `CHAVE_ID`, `TIPOCHV_ID`, `CIRC_ID`, `TRECHO_ID`, `CODIGO`, `ESTADO`,
@@ -52,12 +73,23 @@ para o mesmo circuito.
 
 ## Controles
 
-- Roda do mouse: zoom no cursor.
+- Roda do mouse: zoom no cursor, limitado suavemente a `100 px/m` ou ao
+  limite numérico seguro da cena (o menor dos dois). A barra de status informa
+  quando a ampliação máxima é atingida.
 - Ferramenta **Mover**, botão do meio ou `Espaço` + arraste: pan.
 - Ferramenta **Selecionar**: clique próximo de uma barra ou trecho para
   inspecioná-lo no painel lateral. Barras têm prioridade nos pontos de conexão.
 - **Visualizar > Mostrar barras**: alterna a visibilidade e a seleção das barras
   sem ocultar os trechos ou as chaves.
+- **Visualizar > Mostrar cargas**: alterna somente a camada de cargas. Elas
+  continuam acompanhando os filtros de circuito da barra associada, mas não são
+  ocultadas pela opção **Mostrar barras**.
+- **Visualizar > Colorir trechos por fases**: substitui temporariamente as cores
+  dos circuitos pela classificação configurada em `FASES2`. Monofásicos usam
+  azul, bifásicos verde, trifásicos vermelho e valores sem relação ficam cinza.
+  O modo também colore as chaves, preservando sua espessura diferenciada. A
+  legenda permanece fixa no canto inferior esquerdo durante zoom, pan e
+  enquadramentos.
 - **Visualizar > Circuitos…**: abre a tabela não modal de circuitos. Desmarcar um
   circuito oculta suas barras, trechos e chaves sem apagar a associação calculada.
   A coluna **Cor** mostra a cor automática do circuito e abre um seletor ao ser
@@ -66,7 +98,57 @@ para o mesmo circuito.
   circuito. O relatório também é aberto automaticamente quando uma sobreposição
   é encontrada.
 - **Enquadrar tudo** ou tecla `F`: mostra todo o conjunto.
+- **Buscar** ou `Ctrl+F`: abre uma paleta sobre o mapa para localizar barras,
+  trechos, chaves, cargas e circuitos pelo campo `CODIGO`. A busca aceita prefixos e
+  ignora diferenças entre maiúsculas, minúsculas e acentos.
+- **Ferramentas > Ramais…**: identifica os componentes monofásicos ligados ao
+  tronco trifásico de cada circuito. Um clique na tabela destaca todo o ramal;
+  duplo clique ou `Enter` também o enquadra no canvas.
 - `S` e `M`: ativam Selecionar e Mover.
+
+## Configuração de fases
+
+As relações entre `FASES2` e o número de fases ficam em
+`circuit_viewer/config/fases2.json`. O arquivo é lido em UTF-8 durante a
+inicialização; reinicie a aplicação depois de editá-lo. Cada item deve possuir
+`FASES2` e `NUMERO_FASES`; `NOME` é uma descrição opcional:
+
+```json
+[
+  {"FASES2": "1", "NOME": "D", "NUMERO_FASES": 1},
+  {"FASES2": "2", "NOME": "E", "NUMERO_FASES": 1},
+  {"FASES2": "3", "NOME": "F", "NUMERO_FASES": 1},
+  {"FASES2": "13", "NOME": "DEF", "NUMERO_FASES": 3}
+]
+```
+
+`NUMERO_FASES` aceita somente `1`, `2` ou `3`. Valores de `FASES2` podem ser
+texto ou número; espaços e diferenças entre maiúsculas e minúsculas são
+ignorados. Relações duplicadas ou inválidas desabilitam apenas esse modo de
+visualização e geram um aviso com o caminho e o problema encontrado.
+
+As cores são fixas: `#0000FF` para uma fase, `#00FF00` para duas fases,
+`#FF0000` para três fases e `#555555` quando não houver relação no JSON. Os
+filtros de visibilidade dos circuitos continuam sendo respeitados.
+
+## Análise de ramais
+
+A ferramenta **Ramais** fica disponível depois da importação dos trechos e dos
+circuitos, desde que `fases2.json` seja válido. A análise usa a topologia elétrica
+energizada: chaves abertas interrompem o percurso e somente chaves fechadas do
+próprio circuito são atravessadas. Cargas e chaves são opcionais.
+
+Cada linha representa um componente contínuo da mesma fase conectado ao tronco.
+Além da conexão, primeiro trecho, quantidade, comprimento, cargas, fase e
+indicador `REMANEJAVEL`, a tabela informa circuito, barras, chaves, posição da
+primeira chave, conexões adicionais, comprimentos ausentes e classificação da
+topologia. `REMANEJAVEL=1` significa que há uma chave em até cinco níveis do
+início do ramal. Se algum `COMPR` estiver vazio, o total é exibido como `—`.
+
+A tabela pode ser ordenada e filtrada por circuito. Selecionar um ramal reativa
+seu circuito caso ele esteja oculto, sem alterar o modo de coloração por fases.
+Resultados são descartados automaticamente quando barras, trechos, cargas,
+chaves ou circuitos forem substituídos.
 
 ## Testes e benchmark
 
@@ -79,13 +161,18 @@ python benchmarks\benchmark_100k.py --enforce
 python benchmarks\benchmark_segments_17k.py --enforce
 python benchmarks\benchmark_switches_17k.py --enforce
 python benchmarks\benchmark_circuits.py --enforce
+python benchmarks\benchmark_global_search.py --enforce
+python benchmarks\benchmark_loads_100k.py --enforce
+python benchmarks\benchmark_load_patterns_400k.py --enforce
+python benchmarks\benchmark_branches_100k.py --enforce
 ```
 
 Os benchmarks geram temporariamente 100 mil barras, 17 mil trechos e 17 mil
 chaves, medem a importação/indexação, o desenho agregado em 1920×1080 e a
 latência p95 da seleção geométrica de trechos. O benchmark de circuitos também
 mede a geração da paleta, a categorização agregada e a troca de cor sem reconstruir
-a geometria.
+a geometria. O benchmark de ramais cobre 100 mil trechos, 100 circuitos e 100 mil
+cargas, incluindo a construção do destaque vetorial.
 
 ## Organização
 
@@ -97,6 +184,8 @@ a geometria.
 - `circuit_viewer/circuit_colors.py`: paleta contrastante e conversão OKLCH/sRGB.
 - `circuit_viewer/circuits_window.py`: tabela de visibilidade e cores dos circuitos.
 - `circuit_viewer/overlap_report.py`: relatório tabular das sobreposições.
+- `circuit_viewer/branch_analysis.py`: análise topológica dos ramais.
+- `circuit_viewer/branch_window.py`: tabela, filtro e avisos dos ramais.
 - `circuit_viewer/graphics.py`: canvas, visão agregada e virtualização.
 - `circuit_viewer/main_window.py`: interface e integração assíncrona.
 

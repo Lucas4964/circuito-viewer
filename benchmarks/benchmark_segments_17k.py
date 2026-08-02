@@ -15,6 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from circuit_viewer.model import CircuitModel, UtmCrs
+from circuit_viewer.phase_config import PHASE_COLORS, load_phase_configuration
 from circuit_viewer.segment_import import load_segments_csv
 
 
@@ -41,13 +42,15 @@ def create_segments_csv(path: Path) -> None:
             "TRECHO_ID;CODIGO;FASES2;BARRA1_ID;BARRA2_ID;"
             "ARRANJO_ID;CABOF_ID;CABON_ID;COMPR\n"
         )
+        phase_values = ("1", "2", "13", "X")
         for index in range(SEGMENT_COUNT):
             target.write(
-                f"T{index};C{index};ABC;B{index};B{index + 1};A1;CF1;CN1;10\n"
+                f"T{index};C{index};{phase_values[index % 4]};"
+                f"B{index};B{index + 1};A1;CF1;CN1;10\n"
             )
 
 
-def render_network(model) -> tuple[float, float, float]:  # noqa: ANN001
+def render_network(model, phase_styles) -> tuple[float, float, float, float]:  # noqa: ANN001
     from PyQt6.QtCore import QRectF
     from PyQt6.QtGui import QImage, QPainter
     from PyQt6.QtWidgets import QApplication, QGraphicsScene
@@ -58,6 +61,9 @@ def render_network(model) -> tuple[float, float, float]:  # noqa: ANN001
     started = time.perf_counter()
     item = LineNetworkItem(model)
     build_seconds = time.perf_counter() - started
+    started = time.perf_counter()
+    item.set_phase_rendering(None, phase_styles, PHASE_COLORS)
+    phase_rebuild_seconds = time.perf_counter() - started
     scene = QGraphicsScene()
     scene.addItem(item)
     image = QImage(1920, 1080, QImage.Format.Format_ARGB32_Premultiplied)
@@ -72,7 +78,7 @@ def render_network(model) -> tuple[float, float, float]:  # noqa: ANN001
         painter.end()
         times.append(time.perf_counter() - started)
     app.processEvents()
-    return build_seconds, times[0], times[1]
+    return build_seconds, phase_rebuild_seconds, times[0], times[1]
 
 
 def benchmark_selection(model, query_count: int = 1_000) -> float:  # noqa: ANN001
@@ -104,16 +110,30 @@ def main() -> int:
         started = time.perf_counter()
         result = load_segments_csv(path, bars)
         import_seconds = time.perf_counter() - started
-    build_seconds, first_render, cached_render = render_network(result.model)
+    started = time.perf_counter()
+    phase_classification = load_phase_configuration().classify(result.model.phases)
+    classification_seconds = time.perf_counter() - started
+    build_seconds, phase_rebuild_seconds, first_render, cached_render = render_network(
+        result.model,
+        phase_classification.style_indices,
+    )
     selection_p95 = benchmark_selection(result.model)
     print(f"Trechos: {len(result.model):n}")
     print(f"Importação + índice: {import_seconds:.3f} s")
     print(f"Compilação do caminho: {build_seconds:.3f} s")
+    print(f"Classificação por fases: {classification_seconds:.3f} s")
+    print(f"Reconstrução em quatro categorias: {phase_rebuild_seconds:.3f} s")
     print(f"Primeiro render 1920×1080: {first_render:.3f} s")
     print(f"Render em cache 1920×1080: {cached_render:.3f} s")
     print(f"Seleção p95 (1.000 consultas): {selection_p95 * 1_000:.3f} ms")
     if args.enforce:
-        if max(import_seconds, build_seconds, first_render) > TARGET_SECONDS:
+        if max(
+            import_seconds,
+            classification_seconds,
+            build_seconds,
+            phase_rebuild_seconds,
+            first_render,
+        ) > TARGET_SECONDS:
             return 1
         if selection_p95 > SELECTION_P95_TARGET_SECONDS:
             return 1

@@ -6,9 +6,20 @@ import threading
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
+from .branch_analysis import analyze_branches
 from .circuit_import import load_circuits_csv
 from .csv_import import CsvImportCancelled, load_csv
-from .model import CircuitModel, LineNetworkModel, SwitchModel, UtmCrs
+from .load_import import load_loads_csv
+from .load_pattern_import import load_load_patterns_csv
+from .model import (
+    CircuitCatalogModel,
+    CircuitModel,
+    LineNetworkModel,
+    LoadModel,
+    SwitchModel,
+    UtmCrs,
+)
+from .phase_config import PhaseConfiguration
 from .segment_import import load_segments_csv
 from .switch_import import load_switches_csv
 
@@ -70,6 +81,74 @@ class SegmentImportWorker(QObject):
             result = load_segments_csv(
                 self.path,
                 self.bars,
+                cancel_event=self._cancel_event,
+                progress=lambda rows, current, total: self.progress.emit(
+                    rows, current, total
+                ),
+            )
+        except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class LoadImportWorker(QObject):
+    progress = pyqtSignal(int, int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, path: str, bars: CircuitModel) -> None:
+        super().__init__()
+        self.path = path
+        self.bars = bars
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = load_loads_csv(
+                self.path,
+                self.bars,
+                cancel_event=self._cancel_event,
+                progress=lambda rows, current, total: self.progress.emit(
+                    rows, current, total
+                ),
+            )
+        except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class LoadPatternImportWorker(QObject):
+    progress = pyqtSignal(int, int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, path: str, loads: LoadModel) -> None:
+        super().__init__()
+        self.path = path
+        self.loads = loads
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = load_load_patterns_csv(
+                self.path,
+                self.loads,
                 cancel_event=self._cancel_event,
                 progress=lambda rows, current, total: self.progress.emit(
                     rows, current, total
@@ -151,6 +230,45 @@ class CircuitImportWorker(QObject):
                 ),
             )
         except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class BranchAnalysisWorker(QObject):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        catalog: CircuitCatalogModel,
+        phase_configuration: PhaseConfiguration,
+        loads: LoadModel | None,
+    ) -> None:
+        super().__init__()
+        self.catalog = catalog
+        self.phase_configuration = phase_configuration
+        self.loads = loads
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = analyze_branches(
+                self.catalog,
+                self.phase_configuration,
+                self.loads,
+                cancel_check=self._cancel_event.is_set,
+                progress=lambda current, total: self.progress.emit(current, total),
+            )
+        except InterruptedError:
             self.cancelled.emit()
         except Exception as exc:
             self.failed.emit(str(exc))

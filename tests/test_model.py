@@ -9,6 +9,7 @@ from circuit_viewer.model import (
     CircuitModel,
     FeatureSelection,
     LineNetworkModel,
+    LoadModel,
     StaticPointIndex,
     StaticSegmentIndex,
     SwitchModel,
@@ -159,6 +160,7 @@ class CircuitModelTests(unittest.TestCase):
         )
 
         self.assertIs(network.bars, bars)
+        self.assertEqual(network.phases, ("ABC", "ABC", "ABC"))
         self.assertFalse(network.start_indices.flags.writeable)
         self.assertEqual(network.record(0).start_bar_id, "B1")
         found = set(network.spatial_index.query_rect(Bounds(9.0, 0.0, 21.0, 11.0)))
@@ -205,6 +207,49 @@ class CircuitModelTests(unittest.TestCase):
         self.assertEqual(record.switch_id, "CH1")
         self.assertEqual(record.segment_id, "T2")
         self.assertEqual(switches.index_for_id("CH1"), 0)
+
+    def test_load_model_reuses_bars_and_exposes_immutable_records(self) -> None:
+        bars = CircuitModel(
+            ["B1", "B2"],
+            ["", ""],
+            [0.0, 10.0],
+            [0.0, 5.0],
+            UtmCrs(21, northern=False),
+        )
+        loads = LoadModel(
+            bars,
+            ["L2", "L1"],
+            [1, 1],
+            ["E2", "E1"],
+            ["C2", "C1"],
+            ["20", "10"],
+            ["18", "9"],
+            ["220", "127"],
+            ["ABC", "A"],
+            ["Y", "D"],
+        )
+
+        self.assertIs(loads.bars, bars)
+        self.assertEqual(loads.index_for_id("L1"), 1)
+        self.assertEqual(loads.record(1).bar_id, "B2")
+        self.assertEqual(loads.record(1).secondary_line_voltage, "127")
+        self.assertFalse(loads.bar_indices.flags.writeable)
+        self.assertEqual(loads.spatial_index.nearest(10.0, 5.0, 0.0), 0)
+        self.assertEqual(FeatureSelection("load", 0).kind, "load")
+
+        with self.assertRaisesRegex(ValueError, "duplicado"):
+            LoadModel(
+                bars,
+                ["L1", "L1"],
+                [0, 1],
+                ["", ""],
+                ["", ""],
+                ["", ""],
+                ["", ""],
+                ["", ""],
+                ["", ""],
+                ["", ""],
+            )
 
 
 if __name__ == "__main__":

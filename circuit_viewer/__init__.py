@@ -5,6 +5,12 @@ from .circuit_colors import (
     generate_circuit_palette,
     normalize_hex_color,
 )
+from .branch_analysis import (
+    BranchAnalysisResult,
+    BranchIssue,
+    BranchRecord,
+    analyze_branches,
+)
 from .model import (
     BarRecord,
     CircuitCatalogModel,
@@ -15,6 +21,10 @@ from .model import (
     CircuitVisibilityController,
     FeatureSelection,
     LineNetworkModel,
+    LoadModel,
+    LoadPatternModel,
+    LoadPatternRecord,
+    LoadRecord,
     NetworkTopology,
     SegmentRecord,
     StaticPointIndex,
@@ -23,9 +33,30 @@ from .model import (
     SwitchRecord,
     UtmCrs,
 )
+from .phase_config import (
+    PHASE_COLORS,
+    UNMAPPED_PHASE_COLOR,
+    PhaseClassification,
+    PhaseConfiguration,
+    PhaseConfigurationError,
+    PhaseMappingEntry,
+    default_phase_configuration_path,
+    load_phase_configuration,
+)
+from .load_import import LoadCsvResult, LoadIssue, load_loads_csv
+from .load_pattern_import import (
+    LoadPatternCsvResult,
+    LoadPatternIssue,
+    load_load_patterns_csv,
+)
+from .search import GlobalSearchIndex, SearchQueryResult, SearchResult, normalize_code
 
 __all__ = [
+    "analyze_branches",
     "BarRecord",
+    "BranchAnalysisResult",
+    "BranchIssue",
+    "BranchRecord",
     "CircuitCatalogModel",
     "CircuitDefinition",
     "CircuitMembership",
@@ -35,15 +66,37 @@ __all__ = [
     "contrast_ratio_with_white",
     "FeatureSelection",
     "generate_circuit_palette",
+    "GlobalSearchIndex",
     "LineNetworkModel",
+    "LoadCsvResult",
+    "LoadIssue",
+    "LoadModel",
+    "LoadPatternCsvResult",
+    "LoadPatternIssue",
+    "LoadPatternModel",
+    "LoadPatternRecord",
+    "LoadRecord",
+    "load_load_patterns_csv",
+    "load_loads_csv",
     "NetworkTopology",
     "normalize_hex_color",
+    "normalize_code",
+    "PHASE_COLORS",
+    "PhaseClassification",
+    "PhaseConfiguration",
+    "PhaseConfigurationError",
+    "PhaseMappingEntry",
+    "default_phase_configuration_path",
+    "load_phase_configuration",
+    "SearchQueryResult",
+    "SearchResult",
     "SegmentRecord",
     "StaticPointIndex",
     "StaticSegmentIndex",
     "SwitchModel",
     "SwitchRecord",
     "UtmCrs",
+    "UNMAPPED_PHASE_COLOR",
 ]
 
 __version__ = "0.1.0"
