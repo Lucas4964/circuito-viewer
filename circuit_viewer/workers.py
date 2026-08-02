@@ -6,8 +6,9 @@ import threading
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
+from .circuit_import import load_circuits_csv
 from .csv_import import CsvImportCancelled, load_csv
-from .model import CircuitModel, LineNetworkModel, UtmCrs
+from .model import CircuitModel, LineNetworkModel, SwitchModel, UtmCrs
 from .segment_import import load_segments_csv
 from .switch_import import load_switches_csv
 
@@ -103,6 +104,47 @@ class SwitchImportWorker(QObject):
             result = load_switches_csv(
                 self.path,
                 self.segments,
+                cancel_event=self._cancel_event,
+                progress=lambda rows, current, total: self.progress.emit(
+                    rows, current, total
+                ),
+            )
+        except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class CircuitImportWorker(QObject):
+    progress = pyqtSignal(int, int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        path: str,
+        segments: LineNetworkModel,
+        switches: SwitchModel | None,
+    ) -> None:
+        super().__init__()
+        self.path = path
+        self.segments = segments
+        self.switches = switches
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = load_circuits_csv(
+                self.path,
+                self.segments,
+                self.switches,
                 cancel_event=self._cancel_event,
                 progress=lambda rows, current, total: self.progress.emit(
                     rows, current, total

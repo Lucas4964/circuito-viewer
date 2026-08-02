@@ -3,10 +3,13 @@ from __future__ import annotations
 import os
 import unittest
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt6.QtCore import QPoint, QPointF
+    from PyQt6.QtCore import QPoint, QPointF, Qt
+    from PyQt6.QtGui import QColor, QImage, QPainter
     from PyQt6.QtWidgets import QGraphicsItem
     from PyQt6.QtWidgets import QApplication, QGraphicsScene
 
@@ -15,9 +18,11 @@ try:
         DiagramView,
         ItemVirtualizer,
         LineNetworkItem,
+        NORMAL_SEGMENT_WIDTH_PX,
         SEGMENT_SELECTION_WIDTH_PX,
         SegmentSelectionOverlayItem,
         SWITCH_COLOR,
+        SWITCH_SEGMENT_WIDTH_PX,
         SwitchNetworkItem,
     )
 
@@ -312,6 +317,75 @@ class GraphicsTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_normal_segments_are_three_pixels_and_switches_are_one_pixel(self) -> None:
+        bars = CircuitModel(
+            ["B1", "B2", "B3"],
+            ["", "", ""],
+            [10.0, 50.0, 90.0],
+            [50.0, 50.0, 50.0],
+            UtmCrs(21, northern=False),
+        )
+        network = LineNetworkModel(
+            bars,
+            ["T1", "T2"],
+            ["", ""],
+            ["ABC", "ABC"],
+            [0, 1],
+            [1, 2],
+            ["", ""],
+            ["", ""],
+            ["", ""],
+            [40.0, 40.0],
+        )
+        switches = SwitchModel(
+            network,
+            ["CH1"],
+            [""],
+            ["C1"],
+            [1],
+            [""],
+            ["1"],
+            ["1"],
+            [""],
+            [""],
+            [""],
+        )
+        mask = np.array([True, True], dtype=np.bool_)
+        styles = np.array([0, 0], dtype=np.intp)
+        line_item = LineNetworkItem(network)
+        line_item.set_switch_segment_indices(switches.segment_indices)
+        switch_item = SwitchNetworkItem(switches)
+        line_item.set_circuit_rendering(mask, styles, ("#0066CC",))
+        switch_item.set_circuit_rendering(mask, styles, ("#0066CC",))
+        line_revision = line_item.geometry_revision
+        switch_revision = switch_item.geometry_revision
+
+        line_item.set_circuit_rendering(mask, styles, ("#7A2E8E",))
+        switch_item.set_circuit_rendering(mask, styles, ("#0066CC",))
+        self.assertEqual(line_item.geometry_revision, line_revision)
+        self.assertEqual(switch_item.geometry_revision, switch_revision)
+        self.assertEqual(line_item.category_path_count, 1)
+        self.assertEqual(switch_item.colored_path_count, 0)
+        self.assertEqual(NORMAL_SEGMENT_WIDTH_PX, 3.0)
+        self.assertEqual(SWITCH_SEGMENT_WIDTH_PX, 1.0)
+
+        image = QImage(100, 100, QImage.Format.Format_RGB32)
+        image.fill(Qt.GlobalColor.white)
+        painter = QPainter(image)
+        painter.translate(0.0, 100.0)
+        line_item.paint(painter, None)
+        switch_item.paint(painter, None)
+        painter.end()
+        normal_pixels = [
+            QColor(image.pixel(30, y)).name() for y in range(46, 55)
+        ]
+        switch_pixels = [
+            QColor(image.pixel(70, y)).name() for y in range(46, 55)
+        ]
+        self.assertGreater(normal_pixels.count("#7a2e8e"), 1)
+        self.assertEqual(switch_pixels.count("#ff0000"), 1)
+        self.assertNotIn("#7a2e8e", switch_pixels)
 
 
 if __name__ == "__main__":

@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
+from collections.abc import Callable
 from typing import Iterable, Literal, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
 
+from .circuit_colors import generate_circuit_palette, normalize_hex_color
+
 
 FloatArray = NDArray[np.float64]
 IndexArray = NDArray[np.intp]
+BoolArray = NDArray[np.bool_]
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +115,37 @@ class SwitchRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class CircuitDefinition:
+    """Metadados de um circuito e sua barra de partida."""
+
+    circuit_id: str
+    root_bar_id: str
+    code: str
+    nominal_voltage: str
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitMembership:
+    """Índices associados a um circuito, separados pela origem da associação."""
+
+    bar_indices: IndexArray
+    common_segment_indices: IndexArray
+    switch_segment_indices: IndexArray
+    segment_indices: IndexArray
+
+    def __post_init__(self) -> None:
+        arrays = (
+            self.bar_indices,
+            self.common_segment_indices,
+            self.switch_segment_indices,
+            self.segment_indices,
+        )
+        for values in arrays:
+            if values.dtype != np.dtype(np.intp) or values.ndim != 1:
+                raise ValueError("As associações devem ser vetores de índices.")
+
+
+@dataclass(frozen=True, slots=True)
 class FeatureSelection:
     """Referência leve para um elemento selecionado em um dos modelos."""
 
@@ -183,7 +219,13 @@ class StaticPointIndex:
         mask = (candidate_y >= top) & (candidate_y <= bottom)
         return candidates[mask].astype(np.intp, copy=False)
 
-    def nearest(self, x: float, y: float, tolerance: float) -> int | None:
+    def nearest(
+        self,
+        x: float,
+        y: float,
+        tolerance: float,
+        eligible_mask: BoolArray | Sequence[bool] | None = None,
+    ) -> int | None:
         """Retorna o índice do ponto mais próximo dentro da tolerância."""
 
         if tolerance < 0 or not np.isfinite(tolerance):
@@ -191,6 +233,11 @@ class StaticPointIndex:
         candidates = self.query_rect(
             Bounds(x - tolerance, y - tolerance, x + tolerance, y + tolerance)
         )
+        if eligible_mask is not None:
+            mask = np.asarray(eligible_mask, dtype=np.bool_)
+            if mask.ndim != 1 or mask.size != len(self):
+                raise ValueError("A máscara de pontos deve corresponder ao índice.")
+            candidates = candidates[mask[candidates]]
         if candidates.size == 0:
             return None
 
@@ -297,7 +344,13 @@ class StaticSegmentIndex:
         )
         return candidates[mask].astype(np.intp, copy=False)
 
-    def nearest(self, x: float, y: float, tolerance: float) -> int | None:
+    def nearest(
+        self,
+        x: float,
+        y: float,
+        tolerance: float,
+        eligible_mask: BoolArray | Sequence[bool] | None = None,
+    ) -> int | None:
         """Retorna o segmento mais próximo dentro da tolerância informada.
 
         A caixa de busca reduz os candidatos antes do cálculo vetorizado da
@@ -310,6 +363,11 @@ class StaticSegmentIndex:
         candidates = self.query_rect(
             Bounds(x - tolerance, y - tolerance, x + tolerance, y + tolerance)
         )
+        if eligible_mask is not None:
+            mask = np.asarray(eligible_mask, dtype=np.bool_)
+            if mask.ndim != 1 or mask.size != len(self):
+                raise ValueError("A máscara de trechos deve corresponder ao índice.")
+            candidates = candidates[mask[candidates]]
         if candidates.size == 0:
             return None
 
@@ -701,6 +759,20 @@ class SwitchModel:
     def segment_indices(self) -> IndexArray:
         return self._segment_indices
 
+    @property
+    def circuit_ids(self) -> tuple[str, ...]:
+        return self._circuit_ids
+
+    @property
+    def states(self) -> tuple[str, ...]:
+        return self._states
+
+    @property
+    def record_indices_by_segment(self) -> IndexArray:
+        """Índice do registro de chave por trecho, ou -1 para trecho comum."""
+
+        return self._record_by_segment
+
     def index_for_id(self, switch_id: str) -> int | None:
         return self._by_id.get(switch_id)
 
@@ -732,3 +804,492 @@ class SwitchModel:
         if segment_index is None:
             return None
         return self.record_for_segment(segment_index)
+
+
+def _readonly_indices(values: Iterable[int] | IndexArray) -> IndexArray:
+    result = np.ascontiguousarray(values, dtype=np.intp)
+    if result.ndim != 1:
+        raise ValueError("Os índices devem formar um vetor unidimensional.")
+    result.setflags(write=False)
+    return result
+
+
+class NetworkTopology:
+    """Adjacência CSR e busca elétrica sobre uma rede imutável de trechos."""
+
+    __slots__ = (
+        "segments",
+        "switches",
+        "_offsets",
+        "_incidence_segments",
+        "_incidence_neighbors",
+        "_bar_marks",
+        "_segment_marks",
+        "_generation",
+    )
+
+    def __init__(
+        self,
+        segments: LineNetworkModel,
+        switches: SwitchModel | None = None,
+    ) -> None:
+        if switches is not None and switches.segments is not segments:
+            raise ValueError("As chaves devem pertencer à rede usada na topologia.")
+        self.segments = segments
+        self.switches = switches
+
+        bar_count = len(segments.bars)
+        segment_count = len(segments)
+        starts = segments.start_indices
+        ends = segments.end_indices
+        degrees = np.bincount(
+            np.concatenate((starts, ends)), minlength=bar_count
+        ).astype(np.intp, copy=False)
+        offsets = np.empty(bar_count + 1, dtype=np.intp)
+        offsets[0] = 0
+        np.cumsum(degrees, out=offsets[1:])
+        incidence_segments = np.empty(segment_count * 2, dtype=np.intp)
+        incidence_neighbors = np.empty(segment_count * 2, dtype=np.intp)
+        cursor = offsets[:-1].copy()
+        for segment_index, (start_value, end_value) in enumerate(
+            zip(starts, ends, strict=True)
+        ):
+            start = int(start_value)
+            end = int(end_value)
+            start_position = int(cursor[start])
+            incidence_segments[start_position] = segment_index
+            incidence_neighbors[start_position] = end
+            cursor[start] += 1
+            end_position = int(cursor[end])
+            incidence_segments[end_position] = segment_index
+            incidence_neighbors[end_position] = start
+            cursor[end] += 1
+
+        for values in (offsets, incidence_segments, incidence_neighbors):
+            values.setflags(write=False)
+        self._offsets = offsets
+        self._incidence_segments = incidence_segments
+        self._incidence_neighbors = incidence_neighbors
+        self._bar_marks = np.zeros(bar_count, dtype=np.int64)
+        self._segment_marks = np.zeros(segment_count, dtype=np.int64)
+        self._generation = 0
+
+    def _next_generation(self) -> int:
+        if self._generation >= np.iinfo(np.int64).max - 1:
+            self._bar_marks.fill(0)
+            self._segment_marks.fill(0)
+            self._generation = 0
+        self._generation += 1
+        return self._generation
+
+    def trace(
+        self,
+        circuit_id: str,
+        root_bar_index: int,
+        direct_switch_indices: Iterable[int] | IndexArray = (),
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> CircuitMembership:
+        """Executa BFS, descobrindo barras e somente trechos que não são chaves."""
+
+        if not 0 <= int(root_bar_index) < len(self.segments.bars):
+            raise IndexError(root_bar_index)
+        generation = self._next_generation()
+        root = int(root_bar_index)
+        queue: deque[int] = deque((root,))
+        self._bar_marks[root] = generation
+        bars: list[int] = [root]
+        common_segments: list[int] = []
+        inspected = 0
+
+        switch_by_segment = (
+            None
+            if self.switches is None
+            else self.switches.record_indices_by_segment
+        )
+        while queue:
+            bar_index = queue.popleft()
+            start = int(self._offsets[bar_index])
+            stop = int(self._offsets[bar_index + 1])
+            for position in range(start, stop):
+                inspected += 1
+                if (
+                    cancel_check is not None
+                    and inspected % 4_096 == 0
+                    and cancel_check()
+                ):
+                    raise InterruptedError("Construção da topologia cancelada.")
+                segment_index = int(self._incidence_segments[position])
+                neighbor = int(self._incidence_neighbors[position])
+                switch_record_index = (
+                    -1
+                    if switch_by_segment is None
+                    else int(switch_by_segment[segment_index])
+                )
+                if switch_record_index >= 0:
+                    assert self.switches is not None
+                    traversable = (
+                        self.switches.states[switch_record_index].strip() == "1"
+                        and self.switches.circuit_ids[switch_record_index].strip()
+                        == circuit_id
+                    )
+                    if not traversable:
+                        continue
+                elif self._segment_marks[segment_index] != generation:
+                    self._segment_marks[segment_index] = generation
+                    common_segments.append(segment_index)
+
+                if self._bar_marks[neighbor] != generation:
+                    self._bar_marks[neighbor] = generation
+                    bars.append(neighbor)
+                    queue.append(neighbor)
+
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("Construção da topologia cancelada.")
+        bar_array = _readonly_indices(bars)
+        common_array = _readonly_indices(common_segments)
+        switch_array = _readonly_indices(direct_switch_indices)
+        if common_array.size and switch_array.size:
+            all_segments = _readonly_indices(
+                np.concatenate((common_array, switch_array))
+            )
+        elif common_array.size:
+            all_segments = common_array
+        else:
+            all_segments = switch_array
+        return CircuitMembership(
+            bar_indices=bar_array,
+            common_segment_indices=common_array,
+            switch_segment_indices=switch_array,
+            segment_indices=all_segments,
+        )
+
+
+class CircuitCatalogModel:
+    """Circuitos, associações calculadas e identidade da topologia utilizada."""
+
+    __slots__ = (
+        "segments",
+        "switches",
+        "_definitions",
+        "_memberships",
+        "_by_id",
+        "_segment_circuit_offsets",
+        "_segment_circuit_indices",
+        "_segment_owner_counts",
+        "_overlapping_segment_indices",
+        "topology_warnings",
+        "source_path",
+    )
+
+    def __init__(
+        self,
+        segments: LineNetworkModel,
+        switches: SwitchModel | None,
+        definitions: Iterable[CircuitDefinition],
+        memberships: Iterable[CircuitMembership],
+        *,
+        topology_warnings: Iterable[str] = (),
+        source_path: str | None = None,
+    ) -> None:
+        if switches is not None and switches.segments is not segments:
+            raise ValueError("As chaves devem pertencer aos trechos do catálogo.")
+        definition_values = tuple(definitions)
+        membership_values = tuple(memberships)
+        if not definition_values:
+            raise ValueError("O catálogo deve conter ao menos um circuito.")
+        if len(definition_values) != len(membership_values):
+            raise ValueError("Cada circuito deve possuir uma associação.")
+        by_id: dict[str, int] = {}
+        for index, definition in enumerate(definition_values):
+            if not definition.circuit_id:
+                raise ValueError("CIRC_ID não pode ser vazio.")
+            if definition.circuit_id in by_id:
+                raise ValueError(f"CIRC_ID duplicado: {definition.circuit_id}")
+            if segments.bars.index_for_id(definition.root_bar_id) is None:
+                raise ValueError(
+                    f"Barra inicial inexistente: {definition.root_bar_id}"
+                )
+            by_id[definition.circuit_id] = index
+        self.segments = segments
+        self.switches = switches
+        self._definitions = definition_values
+        self._memberships = membership_values
+        self._by_id = by_id
+        owner_counts = np.zeros(len(segments), dtype=np.intp)
+        for membership in membership_values:
+            if (
+                (membership.segment_indices < 0).any()
+                or (membership.segment_indices >= len(segments)).any()
+            ):
+                raise ValueError("Uma associação referencia trecho inexistente.")
+            owner_counts[membership.segment_indices] += 1
+        owner_offsets = np.empty(len(segments) + 1, dtype=np.intp)
+        owner_offsets[0] = 0
+        np.cumsum(owner_counts, out=owner_offsets[1:])
+        owner_indices = np.empty(int(owner_offsets[-1]), dtype=np.intp)
+        cursor = owner_offsets[:-1].copy()
+        for circuit_index, membership in enumerate(membership_values):
+            segment_values = membership.segment_indices
+            positions = cursor[segment_values]
+            owner_indices[positions] = circuit_index
+            cursor[segment_values] += 1
+        overlapping = np.flatnonzero(owner_counts > 1).astype(np.intp, copy=False)
+        for values in (owner_counts, owner_offsets, owner_indices, overlapping):
+            values.setflags(write=False)
+        self._segment_owner_counts = owner_counts
+        self._segment_circuit_offsets = owner_offsets
+        self._segment_circuit_indices = owner_indices
+        self._overlapping_segment_indices = overlapping
+        self.topology_warnings = tuple(topology_warnings)
+        self.source_path = source_path
+
+    @classmethod
+    def build(
+        cls,
+        segments: LineNetworkModel,
+        switches: SwitchModel | None,
+        definitions: Iterable[CircuitDefinition],
+        *,
+        source_path: str | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> "CircuitCatalogModel":
+        definition_values = tuple(definitions)
+        valid_ids = {definition.circuit_id for definition in definition_values}
+        direct_switches: dict[str, list[int]] = {
+            circuit_id: [] for circuit_id in valid_ids
+        }
+        warnings: list[str] = []
+        if switches is not None:
+            for record_index, segment_value in enumerate(switches.segment_indices):
+                switch_id = switches.switch_ids[record_index]
+                circuit_id = switches.circuit_ids[record_index].strip()
+                state = switches.states[record_index].strip()
+                if state not in {"0", "1"}:
+                    warnings.append(
+                        f"Chave {switch_id}: ESTADO '{state or '<vazio>'}' inválido; "
+                        "a travessia foi bloqueada."
+                    )
+                if circuit_id not in valid_ids:
+                    warnings.append(
+                        f"Chave {switch_id}: CIRC_ID '{circuit_id or '<vazio>'}' "
+                        "não existe no catálogo; a chave ficou sem circuito."
+                    )
+                    continue
+                direct_switches[circuit_id].append(int(segment_value))
+
+        topology = NetworkTopology(segments, switches)
+        memberships: list[CircuitMembership] = []
+        for definition in definition_values:
+            if cancel_check is not None and cancel_check():
+                raise InterruptedError("Construção da topologia cancelada.")
+            root_index = segments.bars.index_for_id(definition.root_bar_id)
+            if root_index is None:
+                raise ValueError(
+                    f"Barra inicial inexistente: {definition.root_bar_id}"
+                )
+            memberships.append(
+                topology.trace(
+                    definition.circuit_id,
+                    root_index,
+                    direct_switches[definition.circuit_id],
+                    cancel_check=cancel_check,
+                )
+            )
+        return cls(
+            segments,
+            switches,
+            definition_values,
+            memberships,
+            topology_warnings=warnings,
+            source_path=source_path,
+        )
+
+    def __len__(self) -> int:
+        return len(self._definitions)
+
+    @property
+    def definitions(self) -> tuple[CircuitDefinition, ...]:
+        return self._definitions
+
+    @property
+    def memberships(self) -> tuple[CircuitMembership, ...]:
+        return self._memberships
+
+    def index_for_id(self, circuit_id: str) -> int | None:
+        return self._by_id.get(circuit_id)
+
+    def definition(self, index: int) -> CircuitDefinition:
+        if not 0 <= int(index) < len(self):
+            raise IndexError(index)
+        return self._definitions[int(index)]
+
+    def membership(self, index: int) -> CircuitMembership:
+        if not 0 <= int(index) < len(self):
+            raise IndexError(index)
+        return self._memberships[int(index)]
+
+    @property
+    def overlapping_segment_indices(self) -> IndexArray:
+        return self._overlapping_segment_indices
+
+    @property
+    def segment_owner_counts(self) -> IndexArray:
+        return self._segment_owner_counts
+
+    def circuit_indices_for_segment(self, segment_index: int) -> IndexArray:
+        if not 0 <= int(segment_index) < len(self.segments):
+            raise IndexError(segment_index)
+        index = int(segment_index)
+        start = int(self._segment_circuit_offsets[index])
+        stop = int(self._segment_circuit_offsets[index + 1])
+        return self._segment_circuit_indices[start:stop]
+
+
+class CircuitVisibilityController:
+    """Estado visual mutável, separado das associações elétricas imutáveis."""
+
+    __slots__ = (
+        "catalog",
+        "_checked",
+        "_colors",
+        "_bar_owner_counts",
+        "_bar_visible_counts",
+        "_segment_owner_counts",
+        "_segment_visible_counts",
+        "_bar_mask",
+        "_segment_mask",
+        "_bar_mask_view",
+        "_segment_mask_view",
+        "_segment_style_indices",
+        "_segment_style_view",
+    )
+
+    def __init__(
+        self,
+        catalog: CircuitCatalogModel,
+        checked: Sequence[bool] | None = None,
+        colors: Sequence[str] | None = None,
+    ) -> None:
+        self.catalog = catalog
+        if checked is None:
+            checked_values = np.ones(len(catalog), dtype=np.bool_)
+        else:
+            checked_values = np.asarray(checked, dtype=np.bool_)
+            if checked_values.ndim != 1 or checked_values.size != len(catalog):
+                raise ValueError("O estado visual deve corresponder aos circuitos.")
+            checked_values = checked_values.copy()
+        self._checked = checked_values
+        if colors is None:
+            self._colors = list(generate_circuit_palette(len(catalog)))
+        else:
+            if len(colors) != len(catalog):
+                raise ValueError("As cores devem corresponder aos circuitos.")
+            self._colors = [normalize_hex_color(value) for value in colors]
+        self._bar_owner_counts = np.zeros(len(catalog.segments.bars), dtype=np.int32)
+        self._segment_owner_counts = catalog.segment_owner_counts.astype(
+            np.int32, copy=True
+        )
+        for membership in catalog.memberships:
+            self._bar_owner_counts[membership.bar_indices] += 1
+        self._bar_visible_counts = np.zeros_like(self._bar_owner_counts)
+        self._segment_visible_counts = np.zeros_like(self._segment_owner_counts)
+        for index, membership in enumerate(catalog.memberships):
+            if self._checked[index]:
+                self._bar_visible_counts[membership.bar_indices] += 1
+                self._segment_visible_counts[membership.segment_indices] += 1
+        self._bar_mask = (self._bar_owner_counts == 0) | (
+            self._bar_visible_counts > 0
+        )
+        self._segment_mask = (self._segment_owner_counts == 0) | (
+            self._segment_visible_counts > 0
+        )
+        self._bar_mask_view = self._bar_mask.view()
+        self._segment_mask_view = self._segment_mask.view()
+        self._bar_mask_view.setflags(write=False)
+        self._segment_mask_view.setflags(write=False)
+        self._segment_style_indices = np.full(len(catalog.segments), -1, dtype=np.intp)
+        for segment_index in range(len(catalog.segments)):
+            owners = catalog.circuit_indices_for_segment(segment_index)
+            if owners.size:
+                self._segment_style_indices[segment_index] = self._first_visible_owner(
+                    owners
+                )
+        self._segment_style_view = self._segment_style_indices.view()
+        self._segment_style_view.setflags(write=False)
+
+    @property
+    def bar_visible_mask(self) -> BoolArray:
+        return self._bar_mask_view
+
+    @property
+    def segment_visible_mask(self) -> BoolArray:
+        return self._segment_mask_view
+
+    @property
+    def checked_states(self) -> tuple[bool, ...]:
+        return tuple(bool(value) for value in self._checked)
+
+    @property
+    def colors(self) -> tuple[str, ...]:
+        return tuple(self._colors)
+
+    @property
+    def segment_style_indices(self) -> IndexArray:
+        """Circuito efetivo por trecho; -1 é padrão e -2 significa oculto."""
+
+        return self._segment_style_view
+
+    def color(self, index: int) -> str:
+        if not 0 <= int(index) < len(self.catalog):
+            raise IndexError(index)
+        return self._colors[int(index)]
+
+    def set_color(self, index: int, color: str) -> bool:
+        if not 0 <= int(index) < len(self.catalog):
+            raise IndexError(index)
+        circuit_index = int(index)
+        normalized = normalize_hex_color(color)
+        if self._colors[circuit_index] == normalized:
+            return False
+        self._colors[circuit_index] = normalized
+        return True
+
+    def _first_visible_owner(self, owners: IndexArray) -> int:
+        for owner in owners:
+            circuit_index = int(owner)
+            if self._checked[circuit_index]:
+                return circuit_index
+        return -2
+
+    def is_visible(self, index: int) -> bool:
+        if not 0 <= int(index) < len(self.catalog):
+            raise IndexError(index)
+        return bool(self._checked[int(index)])
+
+    def set_visible(self, index: int, visible: bool) -> bool:
+        if not 0 <= int(index) < len(self.catalog):
+            raise IndexError(index)
+        circuit_index = int(index)
+        visible = bool(visible)
+        if bool(self._checked[circuit_index]) == visible:
+            return False
+        self._checked[circuit_index] = visible
+        delta = 1 if visible else -1
+        membership = self.catalog.membership(circuit_index)
+        bars = membership.bar_indices
+        segments = membership.segment_indices
+        self._bar_visible_counts[bars] += delta
+        self._segment_visible_counts[segments] += delta
+        self._bar_mask[bars] = (self._bar_owner_counts[bars] == 0) | (
+            self._bar_visible_counts[bars] > 0
+        )
+        self._segment_mask[segments] = (
+            self._segment_owner_counts[segments] == 0
+        ) | (self._segment_visible_counts[segments] > 0)
+        for segment_index in segments:
+            index_value = int(segment_index)
+            self._segment_style_indices[index_value] = self._first_visible_owner(
+                self.catalog.circuit_indices_for_segment(index_value)
+            )
+        return True

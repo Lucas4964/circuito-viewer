@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QThread, Qt
+from PyQt6.QtCore import QThread, QTimer, Qt
 from PyQt6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -29,6 +29,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .circuit_import import CircuitLoadResult
+from .circuits_window import CircuitTableModel, CircuitsWindow
 from .csv_import import CsvLoadResult
 from .graphics import (
     DiagramView,
@@ -37,10 +39,24 @@ from .graphics import (
     SegmentSelectionOverlayItem,
     SwitchNetworkItem,
 )
-from .model import CircuitModel, FeatureSelection, LineNetworkModel, SwitchModel, UtmCrs
+from .model import (
+    CircuitCatalogModel,
+    CircuitModel,
+    CircuitVisibilityController,
+    FeatureSelection,
+    LineNetworkModel,
+    SwitchModel,
+    UtmCrs,
+)
+from .overlap_report import CircuitOverlapReportWindow, OverlapReportTableModel
 from .segment_import import SegmentLoadResult
 from .switch_import import SwitchLoadResult
-from .workers import CsvImportWorker, SegmentImportWorker, SwitchImportWorker
+from .workers import (
+    CircuitImportWorker,
+    CsvImportWorker,
+    SegmentImportWorker,
+    SwitchImportWorker,
+)
 
 
 class UtmImportDialog(QDialog):
@@ -121,6 +137,14 @@ class ImportChoiceDialog(QDialog):
         self.switches_button.clicked.connect(lambda: self._select("switches"))
         layout.addWidget(self.switches_button)
 
+        self.circuits_button = QPushButton("Importar circuitos…")
+        self.circuits_button.setToolTip(
+            "Carregar circuitos e descobrir seus elementos na rede"
+        )
+        self.circuits_button.setEnabled(has_bars and has_segments)
+        self.circuits_button.clicked.connect(lambda: self._select("circuits"))
+        layout.addWidget(self.circuits_button)
+
         if not has_bars:
             dependency = QLabel(
                 "Importe as barras antes de importar os trechos da rede."
@@ -129,7 +153,7 @@ class ImportChoiceDialog(QDialog):
             layout.addWidget(dependency)
         elif not has_segments:
             dependency = QLabel(
-                "Importe os trechos antes de importar as chaves da rede."
+                "Importe os trechos antes de importar as chaves ou os circuitos."
             )
             dependency.setWordWrap(True)
             layout.addWidget(dependency)
@@ -154,10 +178,16 @@ class MainWindow(QMainWindow):
         self._line_item: LineNetworkItem | None = None
         self._switch_model: SwitchModel | None = None
         self._switch_item: SwitchNetworkItem | None = None
+        self._circuit_catalog: CircuitCatalogModel | None = None
+        self._circuit_visibility: CircuitVisibilityController | None = None
         self._selected_feature: FeatureSelection | None = None
         self._import_thread: QThread | None = None
         self._import_worker: (
-            CsvImportWorker | SegmentImportWorker | SwitchImportWorker | None
+            CsvImportWorker
+            | SegmentImportWorker
+            | SwitchImportWorker
+            | CircuitImportWorker
+            | None
         ) = None
         self._progress_dialog: QProgressDialog | None = None
         self._progress_entity = "registros"
@@ -171,6 +201,20 @@ class MainWindow(QMainWindow):
         self.segment_selection_overlay = SegmentSelectionOverlayItem()
         self.scene.addItem(self.segment_selection_overlay)
 
+        self.circuit_table_model = CircuitTableModel(self)
+        self.circuits_window = CircuitsWindow(self.circuit_table_model, self)
+        self.overlap_table_model = OverlapReportTableModel(self)
+        self.overlap_report_window = CircuitOverlapReportWindow(
+            self.overlap_table_model,
+            self,
+        )
+        self._circuit_visibility_timer = QTimer(self)
+        self._circuit_visibility_timer.setSingleShot(True)
+        self._circuit_visibility_timer.setInterval(50)
+        self._circuit_visibility_timer.timeout.connect(
+            self._apply_circuit_visibility
+        )
+
         self._create_actions()
         self._create_menus_and_toolbar()
         self._create_details_dock()
@@ -182,7 +226,9 @@ class MainWindow(QMainWindow):
     def _create_actions(self) -> None:
         self.import_action = QAction("Importar…", self)
         self.import_action.setShortcut(QKeySequence.StandardKey.Open)
-        self.import_action.setToolTip("Importar barras, trechos ou chaves de arquivos CSV")
+        self.import_action.setToolTip(
+            "Importar barras, trechos, chaves ou circuitos de arquivos CSV"
+        )
         self.import_action.triggered.connect(self._choose_import)
 
         self.fit_action = QAction("Enquadrar tudo", self)
@@ -195,6 +241,14 @@ class MainWindow(QMainWindow):
         self.show_bars_action.setChecked(True)
         self.show_bars_action.setEnabled(False)
         self.show_bars_action.toggled.connect(self._set_bars_visible)
+
+        self.circuits_action = QAction("Circuitos…", self)
+        self.circuits_action.setEnabled(False)
+        self.circuits_action.triggered.connect(self._show_circuits_window)
+
+        self.overlaps_action = QAction("Sobreposições…", self)
+        self.overlaps_action.setEnabled(False)
+        self.overlaps_action.triggered.connect(self._show_overlap_report)
 
         self.select_action = QAction("Selecionar", self)
         self.select_action.setCheckable(True)
@@ -228,6 +282,8 @@ class MainWindow(QMainWindow):
 
         view_menu = self.menuBar().addMenu("Visualizar")
         view_menu.addAction(self.show_bars_action)
+        view_menu.addAction(self.circuits_action)
+        view_menu.addAction(self.overlaps_action)
         view_menu.addSeparator()
         view_menu.addAction(self.fit_action)
 
@@ -396,10 +452,12 @@ class MainWindow(QMainWindow):
         self.segment_status = QLabel("Trechos: 0")
         self.active_status = QLabel("Itens ativos: 0")
         self.mode_status = QLabel("Visão geral")
+        self.overlap_status = QLabel("Sobreposições: 0")
         status = self.statusBar()
         status.addWidget(self.coordinate_status, 1)
         status.addPermanentWidget(self.total_status)
         status.addPermanentWidget(self.segment_status)
+        status.addPermanentWidget(self.overlap_status)
         status.addPermanentWidget(self.active_status)
         status.addPermanentWidget(self.mode_status)
 
@@ -408,6 +466,12 @@ class MainWindow(QMainWindow):
         self.view.mouseCoordinateChanged.connect(self._show_coordinates)
         self.virtualizer.countsChanged.connect(self._update_status_counts)
         self.virtualizer.modeChanged.connect(self.mode_status.setText)
+        self.circuit_table_model.visibilityChanged.connect(
+            self._schedule_circuit_visibility_update
+        )
+        self.circuit_table_model.colorChanged.connect(
+            self._schedule_circuit_visibility_update
+        )
 
     def _choose_import(self) -> None:
         if self._import_thread is not None:
@@ -425,6 +489,8 @@ class MainWindow(QMainWindow):
             self._choose_segments_csv()
         elif dialog.selected_kind == "switches":
             self._choose_switches_csv()
+        elif dialog.selected_kind == "circuits":
+            self._choose_circuits_csv()
 
     def _choose_csv(self) -> None:
         if self._import_thread is not None:
@@ -466,6 +532,18 @@ class MainWindow(QMainWindow):
         )
         if path:
             self._start_switch_import(path)
+
+    def _choose_circuits_csv(self) -> None:
+        if self._import_thread is not None or self._line_model is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importar circuitos",
+            "",
+            "Arquivos CSV (*.csv);;Todos os arquivos (*)",
+        )
+        if path:
+            self._start_circuit_import(path)
 
     def _start_import(self, path: str, crs: UtmCrs) -> None:
         thread = QThread(self)
@@ -570,6 +648,51 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
+    def _start_circuit_import(self, path: str) -> None:
+        if self._line_model is None:
+            return
+        thread = QThread(self)
+        worker = CircuitImportWorker(
+            path,
+            self._line_model,
+            self._switch_model,
+        )
+        worker.moveToThread(thread)
+
+        progress = QProgressDialog(
+            "Lendo circuitos e construindo a topologia…",
+            "Cancelar",
+            0,
+            100,
+            self,
+        )
+        progress.setWindowTitle("Importando circuitos")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._import_thread = thread
+        self._import_worker = worker
+        self._progress_dialog = progress
+        self._progress_entity = "circuitos"
+        self.import_action.setEnabled(False)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_import_progress)
+        worker.finished.connect(self._on_circuit_import_finished)
+        worker.failed.connect(self._on_import_failed)
+        worker.cancelled.connect(self._on_import_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(lambda: worker.cancel())
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_import_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
     def _on_import_progress(self, rows: int, current: int, total: int) -> None:
         if self._progress_dialog is None:
             return
@@ -624,9 +747,35 @@ class MainWindow(QMainWindow):
             )
             return
         self._set_switch_model(result.model)
-        self._show_switch_import_report(result)
+        topology_warnings = (
+            ()
+            if self._circuit_catalog is None
+            else self._circuit_catalog.topology_warnings
+        )
+        self._show_switch_import_report(result, topology_warnings)
+
+    def _on_circuit_import_finished(self, result: CircuitLoadResult) -> None:
+        if self._progress_dialog is not None:
+            self._progress_dialog.setValue(100)
+            self._progress_dialog.close()
+        if (
+            self._line_model is None
+            or result.model.segments is not self._line_model
+            or result.model.switches is not self._switch_model
+        ):
+            QMessageBox.critical(
+                self,
+                "Falha na importação",
+                "Os trechos ou as chaves foram alterados durante a importação "
+                "dos circuitos.",
+            )
+            return
+        self._set_circuit_catalog(result.model)
+        self._show_circuits_window()
+        self._show_circuit_import_report(result)
 
     def _set_line_model(self, model: LineNetworkModel | None) -> None:
+        self._set_circuit_catalog(None)
         self._set_switch_model(None)
         if (
             self._selected_feature is not None
@@ -647,13 +796,56 @@ class MainWindow(QMainWindow):
     def _set_switch_model(self, model: SwitchModel | None) -> None:
         if model is not None and model.segments is not self._line_model:
             raise ValueError("As chaves devem referenciar os trechos exibidos.")
+        previous_catalog = self._circuit_catalog
+        previous_checked = (
+            None
+            if self._circuit_visibility is None
+            else self._circuit_visibility.checked_states
+        )
+        previous_colors = (
+            None
+            if self._circuit_visibility is None
+            else self._circuit_visibility.colors
+        )
         if self._switch_item is not None:
             self.scene.removeItem(self._switch_item)
             self._switch_item = None
         self._switch_model = model
+        if self._line_item is not None:
+            self._line_item.set_switch_segment_indices(
+                None if model is None else model.segment_indices
+            )
         if model is not None:
             self._switch_item = SwitchNetworkItem(model)
             self.scene.addItem(self._switch_item)
+        if previous_catalog is not None and self._line_model is not None:
+            rebuilt_catalog = CircuitCatalogModel.build(
+                self._line_model,
+                model,
+                previous_catalog.definitions,
+                source_path=previous_catalog.source_path,
+            )
+            display_by_id = {
+                definition.circuit_id: (previous_checked[index], previous_colors[index])
+                for index, definition in enumerate(previous_catalog.definitions)
+            }
+            rebuilt_checked = tuple(
+                display_by_id[definition.circuit_id][0]
+                for definition in rebuilt_catalog.definitions
+            )
+            rebuilt_colors = tuple(
+                display_by_id[definition.circuit_id][1]
+                for definition in rebuilt_catalog.definitions
+            )
+            self._set_circuit_catalog(
+                rebuilt_catalog,
+                rebuilt_checked,
+                rebuilt_colors,
+            )
+            if rebuilt_catalog.topology_warnings:
+                self.statusBar().showMessage(
+                    "Circuitos recalculados com avisos de topologia.", 5_000
+                )
         if (
             self._selected_feature is not None
             and self._selected_feature.kind == "segment"
@@ -661,6 +853,103 @@ class MainWindow(QMainWindow):
         ):
             self._set_selection(self._selected_feature)
         self.view.viewport().update()
+
+    def _set_circuit_catalog(
+        self,
+        catalog: CircuitCatalogModel | None,
+        checked: tuple[bool, ...] | None = None,
+        colors: tuple[str, ...] | None = None,
+    ) -> None:
+        if catalog is not None:
+            if catalog.segments is not self._line_model:
+                raise ValueError("Os circuitos devem pertencer aos trechos exibidos.")
+            if catalog.switches is not self._switch_model:
+                raise ValueError("Os circuitos devem usar as chaves exibidas.")
+        self._circuit_visibility_timer.stop()
+        self._circuit_catalog = catalog
+        self._circuit_visibility = (
+            None
+            if catalog is None
+            else CircuitVisibilityController(catalog, checked, colors)
+        )
+        self.circuit_table_model.set_source(
+            self._circuit_catalog,
+            self._circuit_visibility,
+        )
+        self.circuits_action.setEnabled(catalog is not None)
+        overlap_count = (
+            0 if catalog is None else int(catalog.overlapping_segment_indices.size)
+        )
+        self.overlap_table_model.set_catalog(catalog)
+        self.overlap_report_window.update_summary(overlap_count)
+        self.overlaps_action.setEnabled(overlap_count > 0)
+        self.overlap_status.setText(f"Sobreposições: {overlap_count:n}")
+        if catalog is None:
+            self.circuits_window.hide()
+        if overlap_count:
+            self._show_overlap_report()
+        else:
+            self.overlap_report_window.hide()
+        self._apply_circuit_visibility()
+
+    def _schedule_circuit_visibility_update(self, *args) -> None:  # noqa: ANN002
+        del args
+        self._circuit_visibility_timer.start()
+
+    def _apply_circuit_visibility(self) -> None:
+        controller = self._circuit_visibility
+        bar_mask = None if controller is None else controller.bar_visible_mask
+        segment_mask = (
+            None if controller is None else controller.segment_visible_mask
+        )
+        segment_styles = (
+            None if controller is None else controller.segment_style_indices
+        )
+        colors = () if controller is None else controller.colors
+        self.view.set_feature_visibility_masks(bar_mask, segment_mask)
+        self.virtualizer.set_visibility_mask(bar_mask)
+        if self._line_item is not None:
+            self._line_item.set_circuit_rendering(
+                segment_mask,
+                segment_styles,
+                colors,
+            )
+        if self._switch_item is not None:
+            self._switch_item.set_circuit_rendering(
+                segment_mask,
+                segment_styles,
+                colors,
+            )
+
+        selection = self._selected_feature
+        if selection is not None and controller is not None:
+            hidden = (
+                selection.kind == "bar"
+                and not bool(controller.bar_visible_mask[selection.index])
+            ) or (
+                selection.kind == "segment"
+                and not bool(controller.segment_visible_mask[selection.index])
+            )
+            if hidden:
+                self._set_selection(None)
+        self.view.viewport().update()
+
+    def _show_circuits_window(self) -> None:
+        if self._circuit_catalog is None:
+            return
+        self.circuits_window.show()
+        self.circuits_window.raise_()
+        self.circuits_window.activateWindow()
+
+    def _show_overlap_report(self) -> None:
+        if (
+            self._circuit_catalog is None
+            or self._circuit_catalog.overlapping_segment_indices.size == 0
+        ):
+            return
+        self.overlap_report_window.show()
+        self.overlap_report_window.raise_()
+        self.overlap_report_window.activateWindow()
 
     def _show_import_report(self, result: CsvLoadResult) -> None:
         if not result.has_warnings:
@@ -719,8 +1008,12 @@ class MainWindow(QMainWindow):
             message.setDetailedText("\n".join(details))
         message.exec()
 
-    def _show_switch_import_report(self, result: SwitchLoadResult) -> None:
-        if not result.has_warnings:
+    def _show_switch_import_report(
+        self,
+        result: SwitchLoadResult,
+        topology_warnings: tuple[str, ...] = (),
+    ) -> None:
+        if not result.has_warnings and not topology_warnings:
             self.statusBar().showMessage(
                 f"{result.valid_rows:n} chaves importadas com sucesso.", 5_000
             )
@@ -735,6 +1028,8 @@ class MainWindow(QMainWindow):
             f"Linhas válidas: {result.valid_rows:n}",
             f"Linhas ignoradas: {result.invalid_rows:n}",
         ]
+        if topology_warnings:
+            lines.append(f"Avisos de topologia: {len(topology_warnings):n}")
         if result.encoding.lower() == "cp1252":
             lines.append("O arquivo não era UTF-8 e foi lido como CP-1252.")
         message.setInformativeText("\n".join(lines))
@@ -743,6 +1038,50 @@ class MainWindow(QMainWindow):
         ]
         if result.omitted_issues:
             details.append(f"… e mais {result.omitted_issues:n} ocorrências.")
+        details.extend(
+            f"Topologia: {warning}" for warning in topology_warnings[:200]
+        )
+        if len(topology_warnings) > 200:
+            details.append(
+                f"… e mais {len(topology_warnings) - 200:n} avisos de topologia."
+            )
+        if details:
+            message.setDetailedText("\n".join(details))
+        message.exec()
+
+    def _show_circuit_import_report(self, result: CircuitLoadResult) -> None:
+        if not result.has_warnings:
+            self.statusBar().showMessage(
+                f"{result.valid_rows:n} circuitos importados com sucesso.", 5_000
+            )
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle("Importação de circuitos concluída com avisos")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText(f"{result.valid_rows:n} circuitos foram importados.")
+        lines = [
+            f"Codificação: {result.encoding}",
+            f"Linhas de dados: {result.total_rows:n}",
+            f"Linhas válidas: {result.valid_rows:n}",
+            f"Linhas ignoradas: {result.invalid_rows:n}",
+            f"Avisos de topologia: {len(result.model.topology_warnings):n}",
+        ]
+        if result.encoding.lower() == "cp1252":
+            lines.append("O arquivo não era UTF-8 e foi lido como CP-1252.")
+        message.setInformativeText("\n".join(lines))
+        details = [
+            f"Linha {issue.line_number}: {issue.reason}" for issue in result.issues
+        ]
+        if result.omitted_issues:
+            details.append(f"… e mais {result.omitted_issues:n} ocorrências no CSV.")
+        topology_warnings = result.model.topology_warnings
+        details.extend(
+            f"Topologia: {warning}" for warning in topology_warnings[:200]
+        )
+        if len(topology_warnings) > 200:
+            details.append(
+                f"… e mais {len(topology_warnings) - 200:n} avisos de topologia."
+            )
         if details:
             message.setDetailedText("\n".join(details))
         message.exec()

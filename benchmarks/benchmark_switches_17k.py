@@ -28,7 +28,7 @@ def create_switches_csv(path: Path) -> None:
         )
         for index in range(SEGMENT_COUNT):
             target.write(
-                f"CH{index};TC;CIR1;T{index};C{index};A;F;N;E{index};FUSIVEL\n"
+                f"CH{index};TC;CIR1;T{index};C{index};0;1;N;E{index};FUSIVEL\n"
             )
 
 

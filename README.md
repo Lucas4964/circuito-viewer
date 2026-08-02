@@ -30,7 +30,7 @@ colunas adicionais são ignoradas. Linhas inválidas são ignoradas e apresentad
 em um relatório; os dados anteriores só são substituídos quando a nova importação
 termina com ao menos uma barra válida.
 
-Use **Arquivo > Importar…** e escolha entre barras, trechos ou chaves. A opção de
+Use **Arquivo > Importar…** e escolha entre barras, trechos, chaves ou circuitos. A opção de
 trechos fica disponível depois que as barras forem carregadas. O arquivo de
 trechos deve conter `TRECHO_ID`, `CODIGO`, `FASES2`, `BARRA1_ID`, `BARRA2_ID`,
 `ARRANJO_ID`, `CABOF_ID`, `CABON_ID` e `COMPR`. A ordem é livre e colunas
@@ -41,7 +41,14 @@ Depois dos trechos, a mesma janela permite **Importar chaves…**. O CSV deve
 conter `CHAVE_ID`, `TIPOCHV_ID`, `CIRC_ID`, `TRECHO_ID`, `CODIGO`, `ESTADO`,
 `ESTADO_NORMAL`, `CORN`, `ELO` e `ELO_TIPO`. Cada registro complementa o trecho
 indicado por `TRECHO_ID`: ele passa a ser desenhado em vermelho e exibe uma
-segunda tabela de propriedades quando selecionado.
+segunda tabela de propriedades quando selecionado. Trechos comuns usam linha
+cosmética de 3 pixels; trechos-chave usam linha vermelha de 1 pixel.
+
+Depois dos trechos, também é possível **Importar circuitos…** usando as colunas
+`CIRC_ID`, `BARRA_ID`, `CODIGO` e `VNOM`. A aplicação executa a busca topológica
+a partir da barra inicial. Trechos-chave são associados diretamente pelo
+`CIRC_ID`: `ESTADO=0` bloqueia a passagem e `ESTADO=1` permite a passagem apenas
+para o mesmo circuito.
 
 ## Controles
 
@@ -51,6 +58,13 @@ segunda tabela de propriedades quando selecionado.
   inspecioná-lo no painel lateral. Barras têm prioridade nos pontos de conexão.
 - **Visualizar > Mostrar barras**: alterna a visibilidade e a seleção das barras
   sem ocultar os trechos ou as chaves.
+- **Visualizar > Circuitos…**: abre a tabela não modal de circuitos. Desmarcar um
+  circuito oculta suas barras, trechos e chaves sem apagar a associação calculada.
+  A coluna **Cor** mostra a cor automática do circuito e abre um seletor ao ser
+  clicada; alterar a cor não recalcula a topologia.
+- **Visualizar > Sobreposições…**: lista os trechos associados a mais de um
+  circuito. O relatório também é aberto automaticamente quando uma sobreposição
+  é encontrada.
 - **Enquadrar tudo** ou tecla `F`: mostra todo o conjunto.
 - `S` e `M`: ativam Selecionar e Mover.
 
@@ -64,11 +78,14 @@ python -m unittest discover -s tests -v
 python benchmarks\benchmark_100k.py --enforce
 python benchmarks\benchmark_segments_17k.py --enforce
 python benchmarks\benchmark_switches_17k.py --enforce
+python benchmarks\benchmark_circuits.py --enforce
 ```
 
 Os benchmarks geram temporariamente 100 mil barras, 17 mil trechos e 17 mil
 chaves, medem a importação/indexação, o desenho agregado em 1920×1080 e a
-latência p95 da seleção geométrica de trechos.
+latência p95 da seleção geométrica de trechos. O benchmark de circuitos também
+mede a geração da paleta, a categorização agregada e a troca de cor sem reconstruir
+a geometria.
 
 ## Organização
 
@@ -76,6 +93,10 @@ latência p95 da seleção geométrica de trechos.
 - `circuit_viewer/csv_import.py`: importação transacional.
 - `circuit_viewer/segment_import.py`: importação e vínculo dos trechos.
 - `circuit_viewer/switch_import.py`: importação e associação das chaves.
+- `circuit_viewer/circuit_import.py`: importação e associação topológica dos circuitos.
+- `circuit_viewer/circuit_colors.py`: paleta contrastante e conversão OKLCH/sRGB.
+- `circuit_viewer/circuits_window.py`: tabela de visibilidade e cores dos circuitos.
+- `circuit_viewer/overlap_report.py`: relatório tabular das sobreposições.
 - `circuit_viewer/graphics.py`: canvas, visão agregada e virtualização.
 - `circuit_viewer/main_window.py`: interface e integração assíncrona.
 

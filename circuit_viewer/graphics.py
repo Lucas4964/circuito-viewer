@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
+import numpy as np
 from PyQt6.QtCore import (
     QLineF,
     QObject,
@@ -36,7 +37,14 @@ from PyQt6.QtWidgets import (
     QGraphicsView,
 )
 
-from .model import Bounds, CircuitModel, FeatureSelection, LineNetworkModel, SwitchModel
+from .model import (
+    BoolArray,
+    Bounds,
+    CircuitModel,
+    FeatureSelection,
+    LineNetworkModel,
+    SwitchModel,
+)
 
 
 POINT_DIAMETER_PX = 5.0
@@ -59,6 +67,8 @@ CANVAS_BACKGROUND = QColor("#f7f7f7")
 LINE_COLOR = QColor("#555555")
 SWITCH_COLOR = QColor("#ff0000")
 SEGMENT_SELECTION_WIDTH_PX = 3.0
+NORMAL_SEGMENT_WIDTH_PX = 3.0
+SWITCH_SEGMENT_WIDTH_PX = 1.0
 
 
 def _scene_point(model: CircuitModel, index: int) -> QPointF:
@@ -77,15 +87,46 @@ def _model_bounds_from_scene(rect: QRectF) -> Bounds:
     )
 
 
+def _visibility_mask(mask: BoolArray | None, size: int, label: str) -> BoolArray:
+    if mask is None:
+        return np.ones(size, dtype=np.bool_)
+    values = np.asarray(mask, dtype=np.bool_)
+    if values.ndim != 1 or values.size != size:
+        raise ValueError(f"A máscara de {label} deve possuir {size:n} valores.")
+    return np.ascontiguousarray(values)
+
+
+def _style_indices(
+    styles: Sequence[int] | None,
+    size: int,
+) -> np.ndarray:
+    if styles is None:
+        return np.full(size, -1, dtype=np.intp)
+    values = np.asarray(styles, dtype=np.intp)
+    if values.ndim != 1 or values.size != size:
+        raise ValueError(f"Os estilos de trechos devem possuir {size:n} valores.")
+    return np.ascontiguousarray(values)
+
+
+def _render_colors(colors: Sequence[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in colors:
+        color = QColor(str(value))
+        if not color.isValid():
+            raise ValueError(f"Cor inválida: {value}")
+        normalized.append(color.name().upper())
+    return tuple(normalized)
+
+
 class BarsOverviewItem(QGraphicsItem):
     """Representação de todas as barras em uma única operação de pintura."""
 
     def __init__(self, model: CircuitModel) -> None:
         super().__init__()
         self._model = model
-        self._points = QPolygonF(
-            [QPointF(float(x), -float(y)) for x, y in zip(model.x, model.y, strict=True)]
-        )
+        self._visibility_mask = np.ones(len(model), dtype=np.bool_)
+        self._points = QPolygonF()
+        self._rebuild_points()
         bounds = model.bounds
         width = max(bounds.width, 1.0)
         height = max(bounds.height, 1.0)
@@ -97,11 +138,33 @@ class BarsOverviewItem(QGraphicsItem):
         )
         self.setZValue(-10.0)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
-        # O conteúdo é imutável. Em pan e repaints subsequentes, o Qt reaproveita
-        # a rasterização em vez de percorrer novamente todos os pontos.
+        # Entre alterações da máscara, o Qt reaproveita a rasterização em pan e
+        # repaints subsequentes sem percorrer novamente todos os pontos.
         self.setCacheMode(
             QGraphicsItem.CacheMode.DeviceCoordinateCache,
             QSize(4_096, 4_096),
+        )
+
+    @property
+    def visible_point_count(self) -> int:
+        return self._points.size()
+
+    def set_visibility_mask(self, mask: BoolArray | None) -> None:
+        values = _visibility_mask(mask, len(self._model), "barras")
+        if np.array_equal(values, self._visibility_mask):
+            return
+        self._visibility_mask = values.copy()
+        self._rebuild_points()
+        self.update()
+
+    def _rebuild_points(self) -> None:
+        indices = np.flatnonzero(self._visibility_mask)
+        model = self._model
+        self._points = QPolygonF(
+            [
+                QPointF(float(model.x[index]), -float(model.y[index]))
+                for index in indices
+            ]
         )
 
     def boundingRect(self) -> QRectF:  # noqa: N802 - API do Qt
@@ -121,27 +184,24 @@ class BarsOverviewItem(QGraphicsItem):
 
 
 class LineNetworkItem(QGraphicsItem):
-    """Camada agregada e imutável de trechos da rede.
+    """Camada agregada e filtrável de trechos da rede.
 
-    Todos os segmentos são compilados uma vez em subcaminhos desconectados de um
-    único ``QPainterPath``. Assim, cada quadro exige somente um ``drawPath``.
+    Os segmentos visíveis são compilados em subcaminhos desconectados de um único
+    ``QPainterPath``. A máscara só recompila o caminho ao mudar a visibilidade;
+    cada quadro continua exigindo somente um ``drawPath``.
     """
 
     def __init__(self, model: LineNetworkModel) -> None:
         super().__init__()
         self._model = model
-        path = QPainterPath()
-        bars = model.bars
-        for start_index, end_index in zip(
-            model.start_indices,
-            model.end_indices,
-            strict=True,
-        ):
-            start = int(start_index)
-            end = int(end_index)
-            path.moveTo(float(bars.x[start]), -float(bars.y[start]))
-            path.lineTo(float(bars.x[end]), -float(bars.y[end]))
-        self._path = path
+        self._visibility_mask = np.ones(len(model), dtype=np.bool_)
+        self._switch_segment_mask = np.zeros(len(model), dtype=np.bool_)
+        self._segment_style_indices = np.full(len(model), -1, dtype=np.intp)
+        self._colors: tuple[str, ...] = ()
+        self._visible_segment_count = len(model)
+        self._paths: dict[int, QPainterPath] = {}
+        self._geometry_revision = 0
+        self._rebuild_paths()
 
         bounds = model.bounds
         width = max(bounds.width, 1.0)
@@ -161,9 +221,98 @@ class LineNetworkItem(QGraphicsItem):
             QSize(4_096, 4_096),
         )
 
+    def _rebuild_paths(self) -> None:
+        paths: dict[int, QPainterPath] = {}
+        bars = self._model.bars
+        indices = np.flatnonzero(
+            self._visibility_mask & ~self._switch_segment_mask
+        )
+        for segment_index in indices:
+            style_index = int(self._segment_style_indices[segment_index])
+            if style_index == -2:
+                continue
+            category = max(style_index, -1)
+            path = paths.setdefault(category, QPainterPath())
+            start = int(self._model.start_indices[segment_index])
+            end = int(self._model.end_indices[segment_index])
+            path.moveTo(float(bars.x[start]), -float(bars.y[start]))
+            path.lineTo(float(bars.x[end]), -float(bars.y[end]))
+        self._paths = paths
+        self._visible_segment_count = sum(
+            1
+            for segment_index in indices
+            if int(self._segment_style_indices[segment_index]) != -2
+        )
+        self._geometry_revision += 1
+
     @property
     def segment_count(self) -> int:
         return len(self._model)
+
+    @property
+    def visible_segment_count(self) -> int:
+        return self._visible_segment_count
+
+    @property
+    def category_path_count(self) -> int:
+        return len(self._paths)
+
+    @property
+    def geometry_revision(self) -> int:
+        return self._geometry_revision
+
+    def set_visibility_mask(self, mask: BoolArray | None) -> None:
+        self.set_circuit_rendering(
+            mask,
+            self._segment_style_indices,
+            self._colors,
+        )
+
+    def set_switch_segment_indices(
+        self,
+        segment_indices: Sequence[int] | None,
+    ) -> None:
+        switch_mask = np.zeros(len(self._model), dtype=np.bool_)
+        if segment_indices is not None:
+            indices = np.asarray(segment_indices, dtype=np.intp)
+            if indices.ndim != 1:
+                raise ValueError("Os índices de chaves devem formar um vetor.")
+            if indices.size and (
+                (indices < 0).any() or (indices >= len(self._model)).any()
+            ):
+                raise IndexError("Uma chave referencia um trecho inexistente.")
+            switch_mask[indices] = True
+        if np.array_equal(switch_mask, self._switch_segment_mask):
+            return
+        self._switch_segment_mask = switch_mask
+        self._rebuild_paths()
+        self.update()
+
+    def set_circuit_rendering(
+        self,
+        mask: BoolArray | None,
+        style_indices: Sequence[int] | None,
+        colors: Sequence[str],
+    ) -> None:
+        visibility = _visibility_mask(mask, len(self._model), "trechos")
+        styles = _style_indices(style_indices, len(self._model))
+        palette = _render_colors(colors)
+        if styles.size:
+            highest_style = int(styles.max(initial=-1))
+            if highest_style >= len(palette):
+                raise ValueError("Um estilo de trecho não possui cor correspondente.")
+        geometry_changed = not np.array_equal(
+            visibility, self._visibility_mask
+        ) or not np.array_equal(styles, self._segment_style_indices)
+        color_changed = palette != self._colors
+        if not geometry_changed and not color_changed:
+            return
+        self._visibility_mask = visibility.copy()
+        self._segment_style_indices = styles.copy()
+        self._colors = palette
+        if geometry_changed:
+            self._rebuild_paths()
+        self.update()
 
     def boundingRect(self) -> QRectF:  # noqa: N802
         return self._bounds
@@ -172,14 +321,16 @@ class LineNetworkItem(QGraphicsItem):
         del option, widget
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        pen = QPen(LINE_COLOR)
-        pen.setWidthF(1.0)
-        pen.setCosmetic(True)
-        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
-        painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(self._path)
+        for category, path in self._paths.items():
+            color = LINE_COLOR if category < 0 else QColor(self._colors[category])
+            pen = QPen(color)
+            pen.setWidthF(NORMAL_SEGMENT_WIDTH_PX)
+            pen.setCosmetic(True)
+            pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+            painter.setPen(pen)
+            painter.drawPath(path)
         painter.restore()
 
 
@@ -189,17 +340,17 @@ class SwitchNetworkItem(QGraphicsItem):
     def __init__(self, model: SwitchModel) -> None:
         super().__init__()
         self._model = model
-        path = QPainterPath()
-        segments = model.segments
-        bars = segments.bars
-        for segment_index in model.segment_indices:
-            index = int(segment_index)
-            start = int(segments.start_indices[index])
-            end = int(segments.end_indices[index])
-            path.moveTo(float(bars.x[start]), -float(bars.y[start]))
-            path.lineTo(float(bars.x[end]), -float(bars.y[end]))
-        self._path = path
-        path_bounds = path.boundingRect()
+        self._segment_visibility_mask = np.ones(len(model.segments), dtype=np.bool_)
+        self._segment_style_indices = np.full(
+            len(model.segments), -1, dtype=np.intp
+        )
+        self._colors: tuple[str, ...] = ()
+        self._visible_switch_count = len(model)
+        self._red_path = QPainterPath()
+        self._colored_paths: dict[int, QPainterPath] = {}
+        self._geometry_revision = 0
+        self._rebuild_paths()
+        path_bounds = self._red_path.boundingRect()
         width = max(path_bounds.width(), 1.0)
         height = max(path_bounds.height(), 1.0)
         padding = max(max(width, height) * 0.001, 1.0)
@@ -212,9 +363,80 @@ class SwitchNetworkItem(QGraphicsItem):
             QSize(4_096, 4_096),
         )
 
+    def _rebuild_paths(self) -> None:
+        red_path = QPainterPath()
+        segments = self._model.segments
+        bars = segments.bars
+        visible_count = 0
+        for segment_index in self._model.segment_indices:
+            index = int(segment_index)
+            style_index = int(self._segment_style_indices[index])
+            if not self._segment_visibility_mask[index] or style_index == -2:
+                continue
+            visible_count += 1
+            start = int(segments.start_indices[index])
+            end = int(segments.end_indices[index])
+            start_x = float(bars.x[start])
+            start_y = -float(bars.y[start])
+            end_x = float(bars.x[end])
+            end_y = -float(bars.y[end])
+            red_path.moveTo(start_x, start_y)
+            red_path.lineTo(end_x, end_y)
+        self._red_path = red_path
+        self._colored_paths = {}
+        self._visible_switch_count = visible_count
+        self._geometry_revision += 1
+
     @property
     def switch_count(self) -> int:
         return len(self._model)
+
+    @property
+    def visible_switch_count(self) -> int:
+        return self._visible_switch_count
+
+    @property
+    def colored_path_count(self) -> int:
+        return len(self._colored_paths)
+
+    @property
+    def geometry_revision(self) -> int:
+        return self._geometry_revision
+
+    def set_visibility_mask(self, segment_mask: BoolArray | None) -> None:
+        self.set_circuit_rendering(
+            segment_mask,
+            self._segment_style_indices,
+            self._colors,
+        )
+
+    def set_circuit_rendering(
+        self,
+        segment_mask: BoolArray | None,
+        style_indices: Sequence[int] | None,
+        colors: Sequence[str],
+    ) -> None:
+        visibility = _visibility_mask(
+            segment_mask, len(self._model.segments), "trechos"
+        )
+        styles = _style_indices(style_indices, len(self._model.segments))
+        palette = _render_colors(colors)
+        if styles.size:
+            highest_style = int(styles.max(initial=-1))
+            if highest_style >= len(palette):
+                raise ValueError("Um estilo de chave não possui cor correspondente.")
+        geometry_changed = not np.array_equal(
+            visibility, self._segment_visibility_mask
+        ) or not np.array_equal(styles, self._segment_style_indices)
+        color_changed = palette != self._colors
+        if not geometry_changed and not color_changed:
+            return
+        self._segment_visibility_mask = visibility.copy()
+        self._segment_style_indices = styles.copy()
+        self._colors = palette
+        if geometry_changed:
+            self._rebuild_paths()
+        self.update()
 
     def boundingRect(self) -> QRectF:  # noqa: N802
         return self._bounds
@@ -223,14 +445,14 @@ class SwitchNetworkItem(QGraphicsItem):
         del option, widget
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         pen = QPen(SWITCH_COLOR)
-        pen.setWidthF(1.0)
+        pen.setWidthF(SWITCH_SEGMENT_WIDTH_PX)
         pen.setCosmetic(True)
         pen.setCapStyle(Qt.PenCapStyle.FlatCap)
         pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
         painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(self._path)
+        painter.drawPath(self._red_path)
         painter.restore()
 
 
@@ -369,6 +591,8 @@ class DiagramView(QGraphicsView):
         super().__init__(scene, parent)
         self._model: CircuitModel | None = None
         self._line_model: LineNetworkModel | None = None
+        self._bar_visibility_mask: BoolArray | None = None
+        self._segment_visibility_mask: BoolArray | None = None
         self._bars_visible = True
         self._interaction_mode = "select"
         self._space_down = False
@@ -410,8 +634,10 @@ class DiagramView(QGraphicsView):
 
     def set_model(self, model: CircuitModel | None) -> None:
         self._model = model
+        self._bar_visibility_mask = None
         if self._line_model is not None and self._line_model.bars is not model:
             self._line_model = None
+            self._segment_visibility_mask = None
         if model is None:
             self.setSceneRect(QRectF(-500.0, -500.0, 1_000.0, 1_000.0))
             return
@@ -427,6 +653,25 @@ class DiagramView(QGraphicsView):
         if model is not None and model.bars is not self._model:
             raise ValueError("Os trechos devem referenciar as barras exibidas na view.")
         self._line_model = model
+        self._segment_visibility_mask = None
+
+    def set_feature_visibility_masks(
+        self,
+        bar_mask: BoolArray | None,
+        segment_mask: BoolArray | None,
+    ) -> None:
+        self._bar_visibility_mask = (
+            None
+            if self._model is None
+            else _visibility_mask(bar_mask, len(self._model), "barras").copy()
+        )
+        self._segment_visibility_mask = (
+            None
+            if self._line_model is None
+            else _visibility_mask(
+                segment_mask, len(self._line_model), "trechos"
+            ).copy()
+        )
 
     def set_bars_visible(self, visible: bool) -> None:
         self._bars_visible = bool(visible)
@@ -536,12 +781,16 @@ class DiagramView(QGraphicsView):
         scale = abs(self.transform().m11())
         tolerance = CLICK_TOLERANCE_PX / max(scale, 1e-12)
         if self._bars_visible:
-            bar_index = self._model.spatial_index.nearest(x, y, tolerance)
+            bar_index = self._model.spatial_index.nearest(
+                x, y, tolerance, self._bar_visibility_mask
+            )
             if bar_index is not None:
                 self.selectionRequested.emit(FeatureSelection("bar", bar_index))
                 return
         if self._line_model is not None:
-            segment_index = self._line_model.spatial_index.nearest(x, y, tolerance)
+            segment_index = self._line_model.spatial_index.nearest(
+                x, y, tolerance, self._segment_visibility_mask
+            )
             if segment_index is not None:
                 self.selectionRequested.emit(FeatureSelection("segment", segment_index))
                 return
@@ -617,6 +866,7 @@ class ItemVirtualizer(QObject):
         self.model: CircuitModel | None = None
         self.overview_item: BarsOverviewItem | None = None
         self._bars_visible = True
+        self._visibility_mask: BoolArray | None = None
         self.selection_overlay = SelectionOverlayItem()
         self.scene.addItem(self.selection_overlay)
 
@@ -660,6 +910,9 @@ class ItemVirtualizer(QObject):
             self.overview_item = None
 
         self.model = model
+        self._visibility_mask = (
+            None if model is None else np.ones(len(model), dtype=np.bool_)
+        )
         self._loaded_rect = None
         self._last_view_rect = None
         self._selected_index = None
@@ -690,6 +943,8 @@ class ItemVirtualizer(QObject):
         margin_y = viewport_rect.height() * VIRTUALIZATION_MARGIN
         loaded_rect = viewport_rect.adjusted(-margin_x, -margin_y, margin_x, margin_y)
         indices = self.model.spatial_index.query_rect(_model_bounds_from_scene(loaded_rect))
+        if self._visibility_mask is not None:
+            indices = indices[self._visibility_mask[indices]]
 
         self._loaded_rect = loaded_rect
         self._last_view_rect = viewport_rect
@@ -817,6 +1072,40 @@ class ItemVirtualizer(QObject):
         self.refresh(force=True)
         self.view.viewport().update()
 
+    def set_visibility_mask(self, mask: BoolArray | None) -> None:
+        if self.model is None:
+            if mask is not None:
+                raise ValueError("Não há modelo de barras para receber a máscara.")
+            self._visibility_mask = None
+            return
+        values = _visibility_mask(mask, len(self.model), "barras")
+        if (
+            self._visibility_mask is not None
+            and np.array_equal(values, self._visibility_mask)
+        ):
+            return
+        self._visibility_mask = values.copy()
+        if self.overview_item is not None:
+            self.overview_item.set_visibility_mask(values)
+        self._refresh_timer.stop()
+        self._batch_timer.stop()
+        self._pending_indices.clear()
+        blocker = QSignalBlocker(self.scene)
+        try:
+            for index in tuple(self._active):
+                if not values[index]:
+                    self._release_item(index)
+        finally:
+            del blocker
+        self._loaded_rect = None
+        self._last_view_rect = None
+        self._sync_selection()
+        self.countsChanged.emit(self.active_count)
+        if self._bars_visible:
+            self.refresh(force=True)
+        else:
+            self.view.viewport().update()
+
     def _sync_selection(self) -> None:
         if (
             not self._bars_visible
@@ -827,6 +1116,12 @@ class ItemVirtualizer(QObject):
             return
         index = self._selected_index
         if not 0 <= index < len(self.model):
+            self.selection_overlay.setVisible(False)
+            return
+        if self._visibility_mask is not None and not self._visibility_mask[index]:
+            active_item = self._active.get(index)
+            if active_item is not None:
+                active_item.setSelected(False)
             self.selection_overlay.setVisible(False)
             return
         active_item = self._active.get(index)
