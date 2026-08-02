@@ -36,7 +36,13 @@ class PhaseConfigurationTests(unittest.TestCase):
         self.assertEqual(UNMAPPED_PHASE_COLOR, "#555555")
         self.assertEqual(
             [(entry.fases2, entry.name, entry.phase_count) for entry in config.entries],
-            [("1", "D", 1), ("2", "E", 1), ("3", "F", 1), ("13", "DEF", 3)],
+            [
+                ("1", "D", 1),
+                ("2", "E", 1),
+                ("3", "F", 1),
+                ("9", "DF", 2),
+                ("13", "DEF", 3),
+            ],
         )
 
     def test_accepts_numeric_values_normalizes_text_and_ignores_extras(self) -> None:
