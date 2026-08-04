@@ -30,6 +30,14 @@ colunas adicionais são ignoradas. Linhas inválidas são ignoradas e apresentad
 em um relatório; os dados anteriores só são substituídos quando a nova importação
 termina com ao menos uma barra válida.
 
+O mesmo diálogo pede a **unidade das coordenadas**. O modelo trabalha em metros
+— a mesma unidade de `COMPR` —, e muitas bases guardam X e Y em decímetros ou
+centímetros. A aplicação lê uma amostra do arquivo, deduz a unidade e já a
+apresenta selecionada; basta confirmar ou escolher outra na lista. Coordenadas
+que continuem fora da faixa UTM válida (easting entre 100.000 e 900.000;
+northing entre 0 e 10.000.000) são aceitas, mas o relatório avisa — nesse caso a
+imagem de satélite não consegue se posicionar corretamente.
+
 Use **Arquivo > Importar…** e escolha entre barras, trechos, cargas, chaves ou
 circuitos. A opção de
 trechos fica disponível depois que as barras forem carregadas. O arquivo de
@@ -94,6 +102,12 @@ para o mesmo circuito.
   substitui cada ramal por uma carga equivalente na sua conexão com o tronco.
   Trechos, barras internas, chaves e cargas agregadas ficam ocultos somente na
   projeção visual; desativar o modo restaura imediatamente a rede original.
+- **Visualizar > Exibir imagem de satélite**: exibe tiles georreferenciados como
+  fundo do canvas. A opção pode ser ligada antes de importar barras e passa a
+  desenhar automaticamente assim que existir uma referência UTM.
+- **Visualizar > Provedor de satélite**: escolhe Esri World Imagery, Google
+  Satélite ou Google Híbrido. Esri é o padrão. Os provedores Google usam
+  endpoints não oficiais e exigem confirmação na primeira utilização da sessão.
 - **Visualizar > Circuitos…**: abre a tabela não modal de circuitos. Desmarcar um
   circuito oculta suas barras, trechos e chaves sem apagar a associação calculada.
   A coluna **Cor** mostra a cor automática do circuito e abre um seletor ao ser
@@ -119,6 +133,27 @@ para o mesmo circuito.
   ramal; duplo clique ou `Enter` também o enquadra no canvas.
 - `S` e `M`: ativam Selecionar e Mover.
 
+## Imagem de satélite
+
+A camada requer conexão com a internet para tiles ainda ausentes do cache. Os
+downloads são assíncronos e não bloqueiam zoom, pan ou seleção. Tiles recebidos
+ficam em um cache LRU de memória e no diretório de cache padrão da aplicação,
+separados por provedor. Falhas de conexão apenas deixam o fundo normal visível.
+
+O nível de detalhe acompanha o zoom da tela. Em ampliações acima da cobertura
+do provedor, o último nível disponível é ampliado; durante a navegação, tiles de
+outros níveis já armazenados são usados temporariamente para evitar áreas
+brancas. A atribuição da fonte permanece fixa no canto inferior direito e a
+legenda de fases continua fixa no canto inferior esquerdo.
+
+O alinhamento depende da zona, do hemisfério **e da unidade** informados ao
+importar as barras. Coordenadas fora da faixa UTM válida fazem a projeção
+saturar: os tiles são posicionados a milhares de quilômetros da rede e o fundo
+parece vazio. Quando isso acontece, a barra de status informa o motivo. A aplicação transforma o CRS do modelo para WGS 84 e suporta zonas dos
+hemisférios norte e sul. O mapa não altera os limites da cena, os dados
+importados, os filtros nem o comportamento de **Enquadrar tudo**. A escolha do
+provedor vale somente para a execução atual; cada inicialização começa com Esri.
+
 ## Configuração de fases
 
 As relações entre `FASES2` e o número de fases ficam em
@@ -131,6 +166,7 @@ inicialização; reinicie a aplicação depois de editá-lo. Cada item deve poss
   {"FASES2": "1", "NOME": "D", "NUMERO_FASES": 1},
   {"FASES2": "2", "NOME": "E", "NUMERO_FASES": 1},
   {"FASES2": "3", "NOME": "F", "NUMERO_FASES": 1},
+  {"FASES2": "9", "NOME": "DF", "NUMERO_FASES": 2},
   {"FASES2": "13", "NOME": "DEF", "NUMERO_FASES": 3}
 ]
 ```
@@ -224,6 +260,12 @@ atualização das máscaras e construção do destaque vetorial.
 
 ## Organização
 
+A documentação técnica completa — arquitetura em camadas, modelo de dados,
+pipeline de renderização, fluxos de importação, concorrência, pontos de extensão
+e decisões de projeto — está em [`ARQUITETURA.md`](ARQUITETURA.md). Este README
+descreve o uso; aquele documento descreve o funcionamento interno e deve ser
+atualizado junto com mudanças relevantes de arquitetura.
+
 - `circuit_viewer/model.py`: modelo lógico e índice espacial.
 - `circuit_viewer/csv_import.py`: importação transacional.
 - `circuit_viewer/segment_import.py`: importação e vínculo dos trechos.
@@ -235,6 +277,7 @@ atualização das máscaras e construção do destaque vetorial.
 - `circuit_viewer/branch_analysis.py`: análise topológica dos ramais.
 - `circuit_viewer/equivalent_network.py`: projeção e agregação das cargas equivalentes.
 - `circuit_viewer/branch_window.py`: tabela, filtro e avisos dos ramais.
+- `circuit_viewer/mapa_tiles.py`: provedores, matemática XYZ, downloads e cache.
 - `circuit_viewer/graphics.py`: canvas, visão agregada e virtualização.
 - `circuit_viewer/main_window.py`: interface e integração assíncrona.
 

@@ -37,7 +37,11 @@ from .branch_window import BranchesWindow, BranchTableModel
 from .equivalent_network import EquivalentNetworkResult
 from .circuit_import import CircuitLoadResult
 from .circuits_window import CircuitTableModel, CircuitsWindow
-from .csv_import import CsvLoadResult
+from .csv_import import (
+    COORDINATE_UNITS,
+    CsvLoadResult,
+    detect_coordinate_scale,
+)
 from .graphics import (
     BranchHighlightOverlayItem,
     DiagramView,
@@ -51,6 +55,14 @@ from .graphics import (
 from .load_import import LoadCsvResult
 from .load_pattern_import import LoadPatternCsvResult
 from .load_pattern_table import LoadPatternTableModel
+from .mapa_tiles import (
+    PROVEDORES,
+    PROVEDOR_ESRI,
+    PROVEDOR_GOOGLE_HIBRIDO,
+    PROVEDOR_GOOGLE_SAT,
+    GerenciadorTiles,
+    Provedor,
+)
 from .model import (
     CircuitCatalogModel,
     CircuitModel,
@@ -89,9 +101,15 @@ from .workers import (
 
 
 class UtmImportDialog(QDialog):
-    """Coleta os metadados UTM ausentes do CSV."""
+    """Coleta os metadados UTM ausentes do CSV e a unidade das coordenadas."""
 
-    def __init__(self, file_name: str, parent=None) -> None:  # noqa: ANN001
+    def __init__(
+        self,
+        file_name: str,
+        parent=None,  # noqa: ANN001
+        *,
+        suggested_scale: float = 1.0,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Sistema de coordenadas UTM")
         self.setModal(True)
@@ -112,6 +130,21 @@ class UtmImportDialog(QDialog):
         self.hemisphere_input.addItem("Norte", True)
         form.addRow("Hemisfério:", self.hemisphere_input)
 
+        self.unit_input = QComboBox()
+        for factor, label in COORDINATE_UNITS:
+            self.unit_input.addItem(label, factor)
+        self.unit_input.setToolTip(
+            "Divisor que converte X e Y do arquivo para metros. O modelo "
+            "trabalha em metros, como o COMPR dos trechos."
+        )
+        form.addRow("Unidade das coordenadas:", self.unit_input)
+
+        # A dedução só devolve fatores de COORDINATE_UNITS, então a entrada
+        # correspondente sempre existe no combo.
+        position = self.unit_input.findData(suggested_scale)
+        if position >= 0:
+            self.unit_input.setCurrentIndex(position)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
@@ -119,6 +152,9 @@ class UtmImportDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+
+    def coordinate_scale(self) -> float:
+        return float(self.unit_input.currentData())
 
     def crs(self) -> UtmCrs:
         return UtmCrs(
@@ -248,6 +284,8 @@ class MainWindow(QMainWindow):
         self._active_bar_count = 0
         self._active_load_count = 0
         self._active_equivalent_load_count = 0
+        self._satellite_provider = PROVEDOR_ESRI
+        self._google_satellite_authorized = False
         self.phase_configuration_path = (
             default_phase_configuration_path()
             if phase_configuration_path is None
@@ -396,6 +434,29 @@ class MainWindow(QMainWindow):
             self._set_phase_coloring_enabled
         )
 
+        self.satellite_action = QAction("Exibir imagem de satélite", self)
+        self.satellite_action.setCheckable(True)
+        self.satellite_action.setChecked(False)
+        self.satellite_action.setToolTip(
+            "Exibir tiles de satélite georreferenciados sob a rede"
+        )
+        self.satellite_action.toggled.connect(self._set_satellite_enabled)
+
+        self.satellite_provider_group = QActionGroup(self)
+        self.satellite_provider_group.setExclusive(True)
+        self.satellite_provider_actions: dict[Provedor, QAction] = {}
+        for provider in PROVEDORES:
+            action = QAction(provider.nome, self)
+            action.setCheckable(True)
+            action.setChecked(provider is self._satellite_provider)
+            action.triggered.connect(
+                lambda _checked=False, selected=provider: (
+                    self._select_satellite_provider(selected)
+                )
+            )
+            self.satellite_provider_group.addAction(action)
+            self.satellite_provider_actions[provider] = action
+
         self.simplified_network_action = QAction(
             "Rede simplificada por ramais",
             self,
@@ -465,6 +526,12 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.show_loads_action)
         view_menu.addAction(self.phase_coloring_action)
         view_menu.addAction(self.simplified_network_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self.satellite_action)
+        provider_menu = view_menu.addMenu("Provedor de satélite")
+        for provider in PROVEDORES:
+            provider_menu.addAction(self.satellite_provider_actions[provider])
+        view_menu.addSeparator()
         view_menu.addAction(self.circuits_action)
         view_menu.addAction(self.overlaps_action)
         view_menu.addSeparator()
@@ -805,6 +872,7 @@ class MainWindow(QMainWindow):
             self._schedule_viewport_overlay_update
         )
         self.view.zoomLimitReached.connect(self._show_zoom_limit_reached)
+        self.view.satelliteUnavailable.connect(self._show_satellite_failure)
         self.virtualizer.countsChanged.connect(self._update_status_counts)
         self.load_virtualizer.countsChanged.connect(
             self._update_load_status_counts
@@ -872,10 +940,19 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        crs_dialog = UtmImportDialog(Path(path).name, self)
+        try:
+            suggested_scale = detect_coordinate_scale(path)
+        except Exception:
+            # A dedução é uma conveniência: se falhar, o diálogo abre em metros.
+            suggested_scale = 1.0
+        crs_dialog = UtmImportDialog(
+            Path(path).name,
+            self,
+            suggested_scale=suggested_scale,
+        )
         if crs_dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self._start_import(path, crs_dialog.crs())
+        self._start_import(path, crs_dialog.crs(), crs_dialog.coordinate_scale())
 
     def _choose_segments_csv(self) -> None:
         if (
@@ -962,9 +1039,9 @@ class MainWindow(QMainWindow):
         if path:
             self._start_circuit_import(path)
 
-    def _start_import(self, path: str, crs: UtmCrs) -> None:
+    def _start_import(self, path: str, crs: UtmCrs, scale: float = 1.0) -> None:
         thread = QThread(self)
-        worker = CsvImportWorker(path, crs)
+        worker = CsvImportWorker(path, crs, scale)
         worker.moveToThread(thread)
 
         progress = QProgressDialog("Lendo barras…", "Cancelar", 0, 100, self)
@@ -2136,6 +2213,12 @@ class MainWindow(QMainWindow):
             f"Linhas válidas: {result.valid_rows:n}",
             f"Linhas ignoradas: {result.invalid_rows:n}",
         ]
+        if result.applied_scale != 1.0:
+            lines.append(
+                f"Coordenadas divididas por {result.applied_scale:n} para metros."
+            )
+        if result.crs_warning is not None:
+            lines.append(result.crs_warning)
         if result.encoding.lower() == "cp1252":
             lines.append("O arquivo não era UTF-8 e foi lido como CP-1252.")
         message.setInformativeText("\n".join(lines))
@@ -2398,6 +2481,92 @@ class MainWindow(QMainWindow):
                 "Modo por fases ativo: todos os trechos foram reconhecidos.",
                 5_000,
             )
+
+    @staticmethod
+    def _is_google_satellite_provider(provider: Provedor) -> bool:
+        return provider in (PROVEDOR_GOOGLE_SAT, PROVEDOR_GOOGLE_HIBRIDO)
+
+    def _authorize_google_satellite(self) -> bool:
+        if self._google_satellite_authorized:
+            return True
+        answer = QMessageBox.warning(
+            self,
+            "Provedor Google não oficial",
+            "Este provedor utiliza um endpoint de tiles Google não oficial. "
+            "O uso pode não ser adequado para distribuição comercial e deve "
+            "respeitar os termos do provedor.\n\n"
+            "Deseja autorizar os provedores Google durante esta sessão?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self._google_satellite_authorized = True
+        return True
+
+    def _select_satellite_provider(self, provider: Provedor) -> None:
+        previous = self._satellite_provider
+        if provider is previous:
+            return
+        if (
+            self._is_google_satellite_provider(provider)
+            and not self._authorize_google_satellite()
+        ):
+            self.satellite_provider_actions[previous].setChecked(True)
+            return
+        self._satellite_provider = provider
+        if self.satellite_action.isChecked():
+            self._create_satellite_manager(provider)
+        self.statusBar().showMessage(
+            f"Provedor de satélite: {provider.nome}.", 4_000
+        )
+
+    def _create_satellite_manager(self, provider: Provedor) -> None:
+        manager = GerenciadorTiles(provider, parent=self.view)
+        manager.tile_pronto.connect(self.view.viewport().update)
+        manager.falha_tiles.connect(self._show_satellite_download_failure)
+        self.view.set_tile_manager(manager)
+
+    def _show_satellite_download_failure(self, reason: str) -> None:
+        self._show_satellite_failure(
+            f"não foi possível baixar os tiles ({reason}); verifique a conexão"
+        )
+
+    def _show_satellite_failure(self, reason: str) -> None:
+        self.statusBar().showMessage(
+            f"Imagem de satélite indisponível: {reason}.",
+            8_000,
+        )
+
+    def _set_satellite_enabled(self, enabled: bool) -> None:
+        if enabled:
+            if (
+                self._is_google_satellite_provider(self._satellite_provider)
+                and not self._authorize_google_satellite()
+            ):
+                blocker = QSignalBlocker(self.satellite_action)
+                self.satellite_action.setChecked(False)
+                del blocker
+                return
+            manager = self.view.tile_manager
+            if (
+                manager is None
+                or manager.provedor is not self._satellite_provider
+            ):
+                self._create_satellite_manager(self._satellite_provider)
+        if not enabled:
+            message = "Imagem de satélite desativada."
+        elif self._model is None:
+            # Sem barras não há zona/hemisfério UTM para georreferenciar os
+            # tiles; a camada só passa a desenhar depois da importação.
+            message = (
+                "Imagem de satélite ativada; o fundo aparecerá após importar "
+                "as barras (referência UTM)."
+            )
+        else:
+            message = "Imagem de satélite ativada."
+        self.view.set_satellite_enabled(enabled)
+        self.statusBar().showMessage(message, 4_000)
 
     def _position_phase_legend(self) -> None:
         if not self.phase_legend.isVisible():
@@ -2788,4 +2957,5 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.search_palette.shutdown()
+        self.view.shutdown_satellite()
         super().closeEvent(event)

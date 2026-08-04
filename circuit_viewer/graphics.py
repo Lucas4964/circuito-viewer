@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import traceback
 from collections.abc import Iterable, Sequence
 
 import numpy as np
@@ -11,6 +12,7 @@ from PyQt6.QtCore import (
     QObject,
     QPoint,
     QPointF,
+    QRect,
     QRectF,
     QSignalBlocker,
     QSize,
@@ -21,11 +23,13 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QColor,
     QBrush,
+    QFont,
     QMouseEvent,
     QPainter,
     QPainterPath,
     QPen,
     QPolygonF,
+    QTransform,
     QWheelEvent,
 )
 from PyQt6.QtWidgets import (
@@ -47,6 +51,19 @@ from .model import (
     SwitchModel,
 )
 from .equivalent_network import EquivalentNetworkModel
+from .mapa_tiles import (
+    GerenciadorTiles,
+    cantos_lonlat_da_faixa,
+    lonlat_para_tile,
+    nivel_zoom,
+    sub_rect_no_pai,
+    tile_pai,
+)
+
+try:
+    from pyproj import Transformer
+except ModuleNotFoundError:  # pragma: no cover - dependência obrigatória do pacote
+    Transformer = None  # type: ignore[assignment]
 
 
 LoadRenderModel = LoadModel | EquivalentNetworkModel
@@ -968,6 +985,7 @@ class DiagramView(QGraphicsView):
     zoomLimitReached = pyqtSignal()
     selectionRequested = pyqtSignal(object)
     mouseCoordinateChanged = pyqtSignal(float, float)
+    satelliteUnavailable = pyqtSignal(str)
 
     def __init__(self, scene: QGraphicsScene, parent=None) -> None:  # noqa: ANN001
         super().__init__(scene, parent)
@@ -987,6 +1005,21 @@ class DiagramView(QGraphicsView):
         self._press_pos = QPoint()
         self._pan_moved = False
         self._zoom_limit_notified = False
+        self._satellite_enabled = False
+        self._satellite_opacity = 1.0
+        self._tile_manager: GerenciadorTiles | None = None
+        self._satellite_last_frame: tuple[int, int, int, int, int] | None = None
+        self._satellite_attribution_rect: QRect | None = None
+        self._satellite_failure_notified = False
+        self._model_to_geographic = None
+        self._geographic_to_model = None
+        self._transformer_epsg: int | None = None
+        self._satellite_prefetch_timer = QTimer(self)
+        self._satellite_prefetch_timer.setSingleShot(True)
+        self._satellite_prefetch_timer.setInterval(250)
+        self._satellite_prefetch_timer.timeout.connect(
+            self._prefetch_neighboring_tiles
+        )
 
         # Os pontos comuns são rasterizados sem suavização. O destaque amarelo
         # habilita antialiasing localmente no seu próprio paint().
@@ -1006,6 +1039,101 @@ class DiagramView(QGraphicsView):
         self.setBackgroundBrush(QBrush(CANVAS_BACKGROUND))
         self.setFrameShape(QFrame.Shape.NoFrame)
         self._apply_cursor()
+
+    @property
+    def satellite_enabled(self) -> bool:
+        return self._satellite_enabled
+
+    @property
+    def tile_manager(self) -> GerenciadorTiles | None:
+        return self._tile_manager
+
+    def set_satellite_enabled(self, enabled: bool) -> None:
+        self._satellite_enabled = bool(enabled)
+        if not self._satellite_enabled:
+            self._satellite_prefetch_timer.stop()
+            self._satellite_last_frame = None
+        self.viewport().update()
+
+    def set_tile_manager(self, manager: GerenciadorTiles | None) -> None:
+        if manager is self._tile_manager:
+            return
+        previous = self._tile_manager
+        self._tile_manager = manager
+        self._satellite_last_frame = None
+        self._satellite_prefetch_timer.stop()
+        if previous is not None:
+            previous.fechar()
+            previous.deleteLater()
+        self.viewport().update()
+
+    def shutdown_satellite(self) -> None:
+        """Interrompe downloads e solta o cache de memória da camada."""
+
+        self._satellite_enabled = False
+        self.set_tile_manager(None)
+
+    def _reset_geographic_transformers(self) -> None:
+        self._model_to_geographic = None
+        self._geographic_to_model = None
+        self._transformer_epsg = None
+        self._satellite_failure_notified = False
+
+    def _notify_satellite_failure(self, reason: str) -> None:
+        """Denuncia UMA vez por modelo que o fundo não pôde ser posicionado.
+
+        Sem isso, uma projeção saturada (coordenadas fora da faixa UTM) ou uma
+        exceção no desenho viravam apenas um fundo branco silencioso.
+        """
+
+        if self._satellite_failure_notified:
+            return
+        self._satellite_failure_notified = True
+        self.satelliteUnavailable.emit(reason)
+
+    def _ensure_geographic_transformers(self) -> bool:
+        model = self._model
+        if model is None:
+            return False
+        epsg = model.crs.epsg
+        if self._transformer_epsg == epsg:
+            return True
+        if Transformer is None:
+            return False
+        self._model_to_geographic = Transformer.from_crs(
+            f"EPSG:{epsg}", "EPSG:4326", always_xy=True
+        )
+        self._geographic_to_model = Transformer.from_crs(
+            "EPSG:4326", f"EPSG:{epsg}", always_xy=True
+        )
+        self._transformer_epsg = epsg
+        return True
+
+    def _scene_to_lonlat(self, x: float, y: float) -> tuple[float, float] | None:
+        if not self._ensure_geographic_transformers():
+            return None
+        lon, lat = self._model_to_geographic.transform(float(x), -float(y))
+        if not math.isfinite(lon) or not math.isfinite(lat):
+            return None
+        return float(lon), float(lat)
+
+    def _lonlat_to_scene(self, lon: float, lat: float) -> QPointF | None:
+        batch = self._lonlat_to_scene_batch((lon,), (lat,))
+        if batch is None:
+            return None
+        return QPointF(batch[0][0], batch[1][0])
+
+    def _lonlat_to_scene_batch(
+        self,
+        longitudes: Iterable[float],
+        latitudes: Iterable[float],
+    ) -> tuple[list[float], list[float]] | None:
+        if not self._ensure_geographic_transformers():
+            return None
+        xs, ys = self._geographic_to_model.transform(
+            list(longitudes), list(latitudes)
+        )
+        return [float(x) for x in xs], [-float(y) for y in ys]
 
     @property
     def model(self) -> CircuitModel | None:
@@ -1044,6 +1172,9 @@ class DiagramView(QGraphicsView):
 
     def set_model(self, model: CircuitModel | None) -> None:
         self._model = model
+        self._reset_geographic_transformers()
+        self._satellite_last_frame = None
+        self._satellite_prefetch_timer.stop()
         self._bar_visibility_mask = None
         if self._line_model is not None and self._line_model.bars is not model:
             self._line_model = None
@@ -1057,6 +1188,7 @@ class DiagramView(QGraphicsView):
             self._equivalent_load_model = None
         if model is None:
             self.setSceneRect(QRectF(-500.0, -500.0, 1_000.0, 1_000.0))
+            self.viewport().update()
             return
         bounds = model.bounds
         width = max(bounds.width, 100.0)
@@ -1065,6 +1197,7 @@ class DiagramView(QGraphicsView):
         margin_x = max(width, 500.0)
         margin_y = max(height, 500.0)
         self.setSceneRect(content.adjusted(-margin_x, -margin_y, margin_x, margin_y))
+        self.viewport().update()
 
     def set_line_model(self, model: LineNetworkModel | None) -> None:
         if model is not None and model.bars is not self._model:
@@ -1439,6 +1572,306 @@ class DiagramView(QGraphicsView):
                 self.selectionRequested.emit(FeatureSelection("segment", segment_index))
                 return
         self.selectionRequested.emit(None)
+
+    def drawBackground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
+        super().drawBackground(painter, rect)
+        if self._satellite_enabled:
+            self._draw_satellite(painter, rect)
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001, N802
+        super().paintEvent(event)
+        if self._satellite_enabled and self._tile_manager is not None:
+            self._draw_satellite_attribution()
+        else:
+            self._satellite_attribution_rect = None
+
+    def _draw_satellite_attribution(self) -> None:
+        manager = self._tile_manager
+        if manager is None:
+            return
+        text = manager.provedor.atribuicao
+        painter = QPainter(self.viewport())
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            font = QFont("Arial", 8)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            viewport = self.viewport().rect()
+            width = metrics.horizontalAdvance(text) + 12
+            height = metrics.height() + 6
+            x = viewport.width() - width - 6
+            y = viewport.height() - height - 6
+            self._satellite_attribution_rect = QRect(x, y, width, height)
+            painter.fillRect(x, y, width, height, QColor(0, 0, 0, 140))
+            painter.setPen(QColor("#f0f0f0"))
+            painter.drawText(x + 6, y + metrics.ascent() + 3, text)
+        finally:
+            painter.end()
+
+    def _draw_satellite(self, painter: QPainter, rect: QRectF) -> None:
+        manager = self._tile_manager
+        if manager is None or self._model is None:
+            return
+        try:
+            corners = (
+                self._scene_to_lonlat(rect.left(), rect.top()),
+                self._scene_to_lonlat(rect.right(), rect.top()),
+                self._scene_to_lonlat(rect.left(), rect.bottom()),
+                self._scene_to_lonlat(rect.right(), rect.bottom()),
+            )
+            if any(corner is None for corner in corners):
+                self._notify_satellite_failure(
+                    "não foi possível projetar a área visível para coordenadas "
+                    "geográficas; confira a zona UTM e a unidade das coordenadas"
+                )
+                return
+            values = [corner for corner in corners if corner is not None]
+            longitudes = [corner[0] for corner in values]
+            latitudes = [corner[1] for corner in values]
+            lon_min, lon_max = min(longitudes), max(longitudes)
+            lat_min, lat_max = min(latitudes), max(latitudes)
+            lat_middle = (lat_min + lat_max) / 2.0
+
+            zoom = abs(self.transform().m11())
+            pixels_per_meter = zoom * self.devicePixelRatioF()
+            level = nivel_zoom(
+                pixels_per_meter,
+                lat_middle,
+                z_max=manager.provedor.zoom_max,
+            )
+            x0, y0 = lonlat_para_tile(lon_min, lat_max, level)
+            x1, y1 = lonlat_para_tile(lon_max, lat_min, level)
+            x_start, x_end = min(x0, x1), max(x0, x1)
+            y_start, y_end = min(y0, y1), max(y0, y1)
+            nx = x_end - x_start + 1
+            ny = y_end - y_start + 1
+            if nx * ny > 400:
+                return
+
+            keys = [
+                (level, x, y)
+                for x in range(x_start, x_end + 1)
+                for y in range(y_start, y_end + 1)
+            ]
+            center = (
+                level,
+                (x_start + x_end) // 2,
+                (y_start + y_end) // 2,
+            )
+            manager.definir_interesse(keys, center)
+            self._satellite_last_frame = (
+                level,
+                x_start,
+                x_end,
+                y_start,
+                y_end,
+            )
+            self._satellite_prefetch_timer.start()
+
+            grid_lons, grid_lats = cantos_lonlat_da_faixa(
+                x_start, y_start, nx, ny, level
+            )
+            batch = self._lonlat_to_scene_batch(grid_lons, grid_lats)
+            if batch is None:
+                return
+            grid_x, grid_y = batch
+
+            def grid_point(ix: int, iy: int) -> tuple[float, float]:
+                position = iy * (nx + 1) + ix
+                return grid_x[position], grid_y[position]
+
+            painter.save()
+            try:
+                painter.setOpacity(self._satellite_opacity)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+                native_size = manager.provedor.tam_tile
+                for ix in range(nx):
+                    for iy in range(ny):
+                        x, y = x_start + ix, y_start + iy
+                        top_left = grid_point(ix, iy)
+                        top_right = grid_point(ix + 1, iy)
+                        bottom_right = grid_point(ix + 1, iy + 1)
+                        bottom_left = grid_point(ix, iy + 1)
+                        if not all(
+                            math.isfinite(value)
+                            for point in (
+                                top_left,
+                                top_right,
+                                bottom_right,
+                                bottom_left,
+                            )
+                            for value in point
+                        ):
+                            continue
+                        quad = QPolygonF(
+                            [
+                                QPointF(*top_left),
+                                QPointF(*top_right),
+                                QPointF(*bottom_right),
+                                QPointF(*bottom_left),
+                            ]
+                        )
+                        pixmap = manager.tile(level, x, y)
+                        if pixmap is not None and not pixmap.isNull():
+                            scene_width = math.hypot(
+                                top_right[0] - top_left[0],
+                                top_right[1] - top_left[1],
+                            )
+                            painter.setRenderHint(
+                                QPainter.RenderHint.SmoothPixmapTransform,
+                                abs(scene_width * zoom - native_size) > 2.0,
+                            )
+                            self._draw_pixmap_in_quad(
+                                painter,
+                                pixmap,
+                                QRectF(pixmap.rect()),
+                                quad,
+                            )
+                            continue
+                        painter.setRenderHint(
+                            QPainter.RenderHint.SmoothPixmapTransform, False
+                        )
+                        self._draw_fallback_tile(
+                            painter, manager, quad, level, x, y
+                        )
+            finally:
+                painter.restore()
+        except Exception as exc:
+            # Uma indisponibilidade do fundo nunca deve interromper a rede, mas
+            # também não pode passar despercebida.
+            traceback.print_exc()
+            self._notify_satellite_failure(f"falha ao desenhar o fundo: {exc}")
+
+    @staticmethod
+    def _draw_pixmap_in_quad(
+        painter: QPainter,
+        pixmap,
+        source: QRectF,
+        quad: QPolygonF,
+    ) -> bool:
+        origin = QPolygonF(
+            [
+                QPointF(source.left(), source.top()),
+                QPointF(source.right(), source.top()),
+                QPointF(source.right(), source.bottom()),
+                QPointF(source.left(), source.bottom()),
+            ]
+        )
+        transform = QTransform()
+        if not QTransform.quadToQuad(origin, quad, transform):
+            return False
+        painter.save()
+        try:
+            painter.setTransform(transform, True)
+            painter.drawPixmap(source.topLeft(), pixmap, source)
+        finally:
+            painter.restore()
+        return True
+
+    @staticmethod
+    def _sub_quad(
+        quad: QPolygonF,
+        x_fraction: float,
+        y_fraction: float,
+        size_fraction: float,
+    ) -> QPolygonF:
+        top_left, top_right, bottom_right, bottom_left = (
+            quad[0],
+            quad[1],
+            quad[2],
+            quad[3],
+        )
+
+        def point(u: float, v: float) -> QPointF:
+            top_x = top_left.x() + (top_right.x() - top_left.x()) * u
+            top_y = top_left.y() + (top_right.y() - top_left.y()) * u
+            bottom_x = bottom_left.x() + (bottom_right.x() - bottom_left.x()) * u
+            bottom_y = bottom_left.y() + (bottom_right.y() - bottom_left.y()) * u
+            return QPointF(
+                top_x + (bottom_x - top_x) * v,
+                top_y + (bottom_y - top_y) * v,
+            )
+
+        return QPolygonF(
+            [
+                point(x_fraction, y_fraction),
+                point(x_fraction + size_fraction, y_fraction),
+                point(
+                    x_fraction + size_fraction,
+                    y_fraction + size_fraction,
+                ),
+                point(x_fraction, y_fraction + size_fraction),
+            ]
+        )
+
+    @classmethod
+    def _draw_fallback_tile(
+        cls,
+        painter: QPainter,
+        manager: GerenciadorTiles,
+        quad: QPolygonF,
+        level: int,
+        x: int,
+        y: int,
+    ) -> bool:
+        for levels in (1, 2):
+            parent_level = level - levels
+            if parent_level < 0:
+                break
+            parent_x, parent_y, _ = tile_pai(x, y, level, levels)
+            parent = manager.tile_do_cache(parent_level, parent_x, parent_y)
+            if parent is None or parent.isNull():
+                continue
+            fx, fy, fraction = sub_rect_no_pai(
+                x, y, level, parent_level
+            )
+            width, height = parent.width(), parent.height()
+            source = QRectF(
+                fx * width,
+                fy * height,
+                fraction * width,
+                fraction * height,
+            )
+            return cls._draw_pixmap_in_quad(painter, parent, source, quad)
+
+        painted = False
+        for ix in (0, 1):
+            for iy in (0, 1):
+                child = manager.tile_do_cache(
+                    level + 1,
+                    x * 2 + ix,
+                    y * 2 + iy,
+                )
+                if child is None or child.isNull():
+                    continue
+                child_quad = cls._sub_quad(quad, ix * 0.5, iy * 0.5, 0.5)
+                if cls._draw_pixmap_in_quad(
+                    painter, child, QRectF(child.rect()), child_quad
+                ):
+                    painted = True
+        return painted
+
+    def _prefetch_neighboring_tiles(self) -> None:
+        manager = self._tile_manager
+        frame = self._satellite_last_frame
+        if manager is None or frame is None or not self._satellite_enabled:
+            return
+        level, x_start, x_end, y_start, y_end = frame
+        width = x_end - x_start + 1
+        height = y_end - y_start + 1
+        if width * height > 100:
+            return
+        tile_count = 1 << level
+        keys: list[tuple[int, int, int]] = []
+        for x_offset in (-width, 0, width):
+            for y_offset in (-height, 0, height):
+                if x_offset == 0 and y_offset == 0:
+                    continue
+                for x in range(x_start + x_offset, x_end + x_offset + 1):
+                    for y in range(y_start + y_offset, y_end + y_offset + 1):
+                        if 0 <= x < tile_count and 0 <= y < tile_count:
+                            keys.append((level, x, y))
+        manager.prefetch(keys)
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
         delta = event.angleDelta().y()

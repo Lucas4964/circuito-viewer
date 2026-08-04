@@ -32,10 +32,11 @@ class CsvImportWorker(QObject):
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, path: str, crs: UtmCrs) -> None:
+    def __init__(self, path: str, crs: UtmCrs, scale: float = 1.0) -> None:
         super().__init__()
         self.path = path
         self.crs = crs
+        self.scale = float(scale)
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -53,6 +54,7 @@ class CsvImportWorker(QObject):
                 progress=lambda rows, current, total: self.progress.emit(
                     rows, current, total
                 ),
+                scale=self.scale,
             )
         except CsvImportCancelled:
             self.cancelled.emit()

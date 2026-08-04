@@ -8,12 +8,16 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PyQt6.QtCore import Qt
     from PyQt6.QtGui import QPalette
-    from PyQt6.QtWidgets import QApplication, QDialog, QToolBar
+    from PyQt6.QtWidgets import QApplication, QDialog, QFormLayout, QToolBar
 
     from circuit_viewer.csv_import import CsvLoadResult
     from circuit_viewer.load_import import LoadCsvResult
     from circuit_viewer.load_pattern_import import LoadPatternCsvResult
-    from circuit_viewer.main_window import ImportChoiceDialog, MainWindow
+    from circuit_viewer.main_window import (
+        ImportChoiceDialog,
+        MainWindow,
+        UtmImportDialog,
+    )
     from circuit_viewer.segment_import import SegmentLoadResult
     from circuit_viewer.switch_import import SwitchLoadResult
 
@@ -518,6 +522,53 @@ class MainWindowSelectionTests(unittest.TestCase):
             ),
             1,
         )
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class UtmImportDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_suggested_unit_is_preselected(self) -> None:
+        dialog = UtmImportDialog("barras.csv", suggested_scale=10.0)
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertEqual(dialog.unit_input.currentText(), "Decímetros")
+        self.assertEqual(dialog.coordinate_scale(), 10.0)
+
+    def test_dialog_exposes_only_crs_and_unit(self) -> None:
+        dialog = UtmImportDialog("barras.csv", suggested_scale=10.0)
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertFalse(hasattr(dialog, "custom_scale_input"))
+        self.assertFalse(hasattr(dialog, "range_label"))
+        layout = dialog.layout()
+        captions = [
+            layout.itemAt(row, QFormLayout.ItemRole.LabelRole).widget().text()
+            for row in range(layout.rowCount())
+            if layout.itemAt(row, QFormLayout.ItemRole.LabelRole) is not None
+        ]
+        self.assertEqual(
+            captions,
+            ["Arquivo:", "Zona UTM:", "Hemisfério:", "Unidade das coordenadas:"],
+        )
+
+    def test_defaults_to_metres_without_a_suggestion(self) -> None:
+        dialog = UtmImportDialog("barras.csv")
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertEqual(dialog.coordinate_scale(), 1.0)
+        self.assertEqual(dialog.crs(), UtmCrs(21, northern=False))
+
+    def test_unknown_factor_falls_back_to_metres(self) -> None:
+        # Fator fora de COORDINATE_UNITS não deve deixar o combo em estado
+        # inválido; o relatório de importação é quem avisa sobre o envelope UTM.
+        dialog = UtmImportDialog("barras.csv", suggested_scale=2.5)
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertEqual(dialog.coordinate_scale(), 1.0)
+        self.assertEqual(dialog.unit_input.currentText(), "Metros")
 
 
 if __name__ == "__main__":
