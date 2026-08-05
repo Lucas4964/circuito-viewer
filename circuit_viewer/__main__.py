@@ -12,6 +12,7 @@ def _exception_hook(exc_type, exc_value, exc_traceback) -> None:  # noqa: ANN001
 
 def main() -> int:
     try:
+        from PyQt6.QtCore import QSettings
         from PyQt6.QtWidgets import QApplication
     except ModuleNotFoundError as exc:
         raise SystemExit(
@@ -20,11 +21,14 @@ def main() -> int:
         ) from exc
 
     from .main_window import MainWindow
+    from .theme import apply_theme, load_theme_preference
 
     sys.excepthook = _exception_hook
     app = QApplication(sys.argv)
     app.setApplicationName("Visualizador de Circuitos Elétricos")
     app.setOrganizationName("Circuit Viewer")
+    # Antes da janela: aplicar depois faria a interface piscar no tema anterior.
+    apply_theme(app, load_theme_preference(QSettings()))
     window = MainWindow()
     window.showMaximized()
     return app.exec()

@@ -35,13 +35,22 @@ class PhaseConfigurationTests(unittest.TestCase):
         self.assertEqual(PHASE_COLORS, ("#0000FF", "#00FF00", "#FF0000"))
         self.assertEqual(UNMAPPED_PHASE_COLOR, "#555555")
         self.assertEqual(
-            [(entry.fases2, entry.name, entry.phase_count) for entry in config.entries],
             [
-                ("1", "D", 1),
-                ("2", "E", 1),
-                ("3", "F", 1),
-                ("9", "DF", 2),
-                ("13", "DEF", 3),
+                (entry.fases2, entry.name, entry.phase_count, entry.dss)
+                for entry in config.entries
+            ],
+            [
+                ("1", "D", 1, "1"),
+                ("2", "E", 1, "2"),
+                ("3", "F", 1, "3"),
+                ("4", "DN", 1, "1.0"),
+                ("5", "EN", 1, "2.0"),
+                ("6", "FN", 1, "3.0"),
+                ("7", "DE", 2, "1.2"),
+                ("8", "EF", 2, "2.3"),
+                ("9", "FD", 2, "3.1"),
+                ("13", "DEF", 3, "1.2.3"),
+                ("14", "DEFN", 3, "1.2.3.0"),
             ],
         )
 
@@ -52,6 +61,7 @@ class PhaseConfigurationTests(unittest.TestCase):
                     "FASES2": 1.0,
                     "NOME": " D ",
                     "NUMERO_FASES": 1,
+                    "DSS": " 1.2.3 ",
                     "EXTRA": "ignorado",
                 },
                 {"FASES2": " Ab ", "NUMERO_FASES": 2},
@@ -62,9 +72,21 @@ class PhaseConfigurationTests(unittest.TestCase):
 
         self.assertEqual(config.entries[0].fases2, "1")
         self.assertEqual(config.entries[0].name, "D")
+        self.assertEqual(config.entries[0].dss, "1.2.3")
         self.assertEqual(config.entries[1].fases2, "ab")
+        # DSS é opcional: arquivos que não o informam continuam válidos.
+        self.assertIsNone(config.entries[1].dss)
         with self.assertRaises(TypeError):
             config.phase_count_by_value["novo"] = 1  # type: ignore[index]
+
+    def test_dss_is_optional_and_backward_compatible(self) -> None:
+        path = self.write_json(
+            [{"FASES2": "1", "NOME": "D", "NUMERO_FASES": 1}]
+        )
+
+        config = load_phase_configuration(path)
+
+        self.assertIsNone(config.entries[0].dss)
 
     def test_classifies_once_and_reports_distinct_unmapped_values(self) -> None:
         config = load_phase_configuration(
@@ -118,6 +140,10 @@ class PhaseConfigurationTests(unittest.TestCase):
             (
                 [{"FASES2": "1", "NUMERO_FASES": 1, "NOME": 123}],
                 "NOME deve ser texto",
+            ),
+            (
+                [{"FASES2": "1", "NUMERO_FASES": 1, "DSS": 123}],
+                "DSS deve ser texto",
             ),
         )
         for payload, message in invalid_payloads:

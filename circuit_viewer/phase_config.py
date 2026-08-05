@@ -27,6 +27,7 @@ class PhaseMappingEntry:
     fases2: str
     name: str | None
     phase_count: int
+    dss: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +181,12 @@ def load_phase_configuration(path: str | Path | None = None) -> PhaseConfigurati
                 f"Relação {row_number}: NOME deve ser texto quando informado."
             )
         name = None if raw_name is None else raw_name.strip() or None
+        raw_dss = raw_entry.get("DSS")
+        if raw_dss is not None and not isinstance(raw_dss, str):
+            raise PhaseConfigurationError(
+                f"Relação {row_number}: DSS deve ser texto quando informado."
+            )
+        dss = None if raw_dss is None else raw_dss.strip() or None
         seen[fases2] = row_number
-        entries.append(PhaseMappingEntry(fases2, name, phase_count))
+        entries.append(PhaseMappingEntry(fases2, name, phase_count, dss))
     return PhaseConfiguration(tuple(entries))

@@ -130,6 +130,26 @@ class LoadRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class CableRecord:
+    """Atributos de um cabo do catálogo referenciado pelos trechos."""
+
+    cable_id: str
+    cable_type: str
+    code: str
+    iadm: str
+    gmr: str
+    r: str
+    x: str
+    qcap: str
+    r0: str
+    x0: str
+    r1: str
+    x1: str
+    name: str
+    external_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class LoadPatternRecord:
     """Valores complementares de uma carga em um patamar NPAT."""
 
@@ -646,6 +666,10 @@ class LoadModel:
         return self._sadm_values
 
     @property
+    def phases(self) -> tuple[str, ...]:
+        return self._phases
+
+    @property
     def spatial_index(self) -> StaticPointIndex:
         return self._spatial_index
 
@@ -666,6 +690,147 @@ class LoadModel:
             phases=self._phases[index],
             connection_type=self._connection_types[index],
         )
+
+
+class CableModel:
+    """Catálogo de cabos, sem geometria e sem dependência de outros modelos.
+
+    Os trechos referenciam cabos por `CABOF_ID`/`CABON_ID` apenas como texto, de
+    modo que o catálogo é uma raiz independente: importá-lo não invalida nada e
+    nenhuma outra importação o invalida.
+    """
+
+    __slots__ = (
+        "_cable_ids",
+        "_cable_types",
+        "_codes",
+        "_iadm_values",
+        "_gmr_values",
+        "_r_values",
+        "_x_values",
+        "_qcap_values",
+        "_r0_values",
+        "_x0_values",
+        "_r1_values",
+        "_x1_values",
+        "_names",
+        "_external_ids",
+        "_by_id",
+        "source_path",
+    )
+
+    def __init__(
+        self,
+        cable_ids: Iterable[str],
+        cable_types: Iterable[str],
+        codes: Iterable[str],
+        iadm_values: Iterable[str],
+        gmr_values: Iterable[str],
+        r_values: Iterable[str],
+        x_values: Iterable[str],
+        qcap_values: Iterable[str],
+        r0_values: Iterable[str],
+        x0_values: Iterable[str],
+        r1_values: Iterable[str],
+        x1_values: Iterable[str],
+        names: Iterable[str],
+        external_ids: Iterable[str],
+        *,
+        source_path: str | None = None,
+    ) -> None:
+        ids = tuple(str(value) for value in cable_ids)
+        text_columns = tuple(
+            tuple(str(value) for value in values)
+            for values in (
+                cable_types,
+                codes,
+                iadm_values,
+                gmr_values,
+                r_values,
+                x_values,
+                qcap_values,
+                r0_values,
+                x0_values,
+                r1_values,
+                x1_values,
+                names,
+                external_ids,
+            )
+        )
+        size = len(ids)
+        if size == 0:
+            raise ValueError("O modelo deve conter ao menos um cabo.")
+        if any(len(values) != size for values in text_columns):
+            raise ValueError("Todos os campos do cabo devem possuir o mesmo tamanho.")
+
+        by_id: dict[str, int] = {}
+        for index, cable_id in enumerate(ids):
+            if not cable_id:
+                raise ValueError("CABO_ID não pode ser vazio.")
+            if cable_id in by_id:
+                raise ValueError(f"CABO_ID duplicado no modelo: {cable_id}")
+            by_id[cable_id] = index
+
+        self._cable_ids = ids
+        (
+            self._cable_types,
+            self._codes,
+            self._iadm_values,
+            self._gmr_values,
+            self._r_values,
+            self._x_values,
+            self._qcap_values,
+            self._r0_values,
+            self._x0_values,
+            self._r1_values,
+            self._x1_values,
+            self._names,
+            self._external_ids,
+        ) = text_columns
+        self._by_id = by_id
+        self.source_path = source_path
+
+    def __len__(self) -> int:
+        return len(self._cable_ids)
+
+    @property
+    def cable_ids(self) -> tuple[str, ...]:
+        return self._cable_ids
+
+    @property
+    def codes(self) -> tuple[str, ...]:
+        return self._codes
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return self._names
+
+    def index_for_id(self, cable_id: str) -> int | None:
+        return self._by_id.get(cable_id)
+
+    def record(self, index: int) -> CableRecord:
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        return CableRecord(
+            cable_id=self._cable_ids[index],
+            cable_type=self._cable_types[index],
+            code=self._codes[index],
+            iadm=self._iadm_values[index],
+            gmr=self._gmr_values[index],
+            r=self._r_values[index],
+            x=self._x_values[index],
+            qcap=self._qcap_values[index],
+            r0=self._r0_values[index],
+            x0=self._x0_values[index],
+            r1=self._r1_values[index],
+            x1=self._x1_values[index],
+            name=self._names[index],
+            external_id=self._external_ids[index],
+        )
+
+    def record_for_id(self, cable_id: str) -> CableRecord | None:
+        index = self.index_for_id(cable_id)
+        return None if index is None else self.record(index)
 
 
 class LoadPatternModel:

@@ -74,7 +74,9 @@ CIRCUITO_VIEWER/
 │   ├── load_import.py         # importação de cargas
 │   ├── load_pattern_import.py # importação de patamares (NPAT 0–3)
 │   ├── circuit_import.py      # importação de circuitos + build da topologia
+│   ├── cable_import.py        # importação do catálogo de cabos (sem dependência)
 │   │
+│   ├── opendss_export.py      # geração dos .dss de rede e de cargas
 │   ├── branch_analysis.py     # análise topológica de ramais
 │   ├── equivalent_network.py  # projeção simplificada / cargas equivalentes
 │   ├── search.py              # índice de busca global (sem Qt)
@@ -85,12 +87,15 @@ CIRCUITO_VIEWER/
 │   ├── main_window.py         # orquestração da UI e do estado da aplicação
 │   ├── circuits_window.py     # tabela de circuitos (visibilidade + cor)
 │   ├── branch_window.py       # tabela de ramais (filtro, ordenação, avisos)
+│   ├── cables_window.py       # tabela do catálogo de cabos
+│   ├── opendss_export_dialog.py  # seleção dos circuitos a exportar
 │   ├── overlap_report.py      # relatório de trechos sobrepostos
 │   ├── search_palette.py      # janela de busca não modal
 │   ├── load_pattern_table.py  # tabela de patamares no painel lateral
-│   └── phase_legend.py        # legenda flutuante do modo por fases
+│   ├── phase_legend.py        # legenda flutuante do modo por fases
+│   └── theme.py               # tema claro/escuro escolhido manualmente
 │
-├── tests/                     # 21 arquivos de teste (unittest + pytest-qt)
+├── tests/                     # 26 arquivos de teste (unittest + pytest-qt)
 ├── benchmarks/                # 8 benchmarks com modo --enforce
 ├── README.md                  # documentação de uso
 ├── ARQUITETURA.md             # este documento
@@ -116,7 +121,8 @@ secundárias sem cuidados com afinidade de objetos Qt.
 ┌─────────────────────────────────────────────────────────────────┐
 │ CAMADA DE APRESENTAÇÃO (PyQt6 Widgets)                          │
 │ main_window · circuits_window · branch_window · overlap_report  │
-│ search_palette · load_pattern_table · phase_legend              │
+│ cables_window · search_palette · load_pattern_table             │
+│ phase_legend · theme                                            │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ sinais/slots
 ┌───────────────────────────┴─────────────────────────────────────┐
@@ -175,6 +181,7 @@ completo, ou levantam exceção; nunca mutam estado externo.
 | `load_import.py` | Carga | `CircuitModel` | `CARGA_ID, BARRA_ID, EXTERN_ID, CODIGO, SNOM, SADM, VLINHASEC, FASES2, TIPO_LIG` |
 | `load_pattern_import.py` | Patamar | `LoadModel` | `CARGA_ID, NPAT, PD, PE, PF, QD, QE, QF` |
 | `circuit_import.py` | Circuito | `LineNetworkModel` + `SwitchModel?` | `CIRC_ID, BARRA_ID, CODIGO, VNOM` |
+| `cable_import.py` | Cabo | — (catálogo raiz) | `CABO_ID, TIPO, CODIGO, IADM, GMR, R, X, QCAP, R0, X0, R1, X1, NOME, EXTERN_ID` |
 
 `csv_import.py` também exporta as exceções compartilhadas `CsvImportError`
 (fatal) e `CsvImportCancelled` (interrupção do usuário), reutilizadas por todos
@@ -185,6 +192,7 @@ os demais importadores.
 | Módulo | Entrada | Saída |
 |---|---|---|
 | `branch_analysis.py` | `CircuitCatalogModel`, `PhaseConfiguration`, `LoadModel?` | `BranchAnalysisResult` (ramais + diagnósticos) |
+| `opendss_export.py` | `CircuitCatalogModel`, `CableModel`, `PhaseConfiguration`, índices dos circuitos, `LoadModel?` + `LoadPatternModel?` | `OpenDssExportBundle` (textos de `trechos.dss`, `chaves.dss`, `cargasmonofasicas.dss` e `cargasbifasicas.dss` + diagnósticos) |
 | `equivalent_network.py` | `BranchAnalysisResult`, `LoadModel?`, `LoadPatternModel?` | `EquivalentNetworkResult` (cargas equivalentes + máscaras) |
 
 ### Gráfico e UI
@@ -197,9 +205,12 @@ os demais importadores.
 | `circuits_window.py` | `QAbstractTableModel` fino sobre `CircuitVisibilityController` + delegate de cor |
 | `branch_window.py` | Tabela de ramais com `QSortFilterProxyModel` (ordenação por `UserRole`, filtro por circuito) |
 | `overlap_report.py` | Tabela derivada de `overlapping_segment_indices` |
+| `cables_window.py` | Tabela do catálogo de cabos (ordenação numérica por `UserRole`) + rótulos `cable_summary`/`cable_tooltip` reutilizados no painel de trechos |
+| `opendss_export_dialog.py` | Lista de circuitos com caixas de seleção; devolve os índices escolhidos para a exportação |
 | `search_palette.py` | Diálogo não modal; roda indexação e consultas em `QThreadPool` com tokens de cancelamento |
 | `load_pattern_table.py` | Modelo somente leitura de exatamente 4 linhas (NPAT 0–3) |
 | `phase_legend.py` | `QFrame` filho do viewport, transparente a mouse, reposicionado a cada mudança de viewport |
+| `theme.py` | Paletas claras/escuras fixas, leitura e gravação da preferência em `QSettings` e aplicação do tema à aplicação inteira |
 
 ---
 
@@ -267,6 +278,7 @@ central de consistência transacional entre threads.
 | `SwitchRecord` | `switch_id, switch_type_id, circuit_id, segment_id, code, state, normal_state, corn, elo, elo_type` |
 | `LoadRecord` | `load_id, bar_id, external_id, code, snom, sadm, secondary_line_voltage, phases, connection_type` |
 | `LoadPatternRecord` | `load_id, npat ∈ {0,1,2,3}, pd, pe, pf, qd, qe, qf` |
+| `CableRecord` | `cable_id, cable_type, code, iadm, gmr, r, x, qcap, r0, x0, r1, x1, name, external_id` (todos `str`) |
 | `CircuitDefinition` | `circuit_id, root_bar_id, code, nominal_voltage` |
 | `CircuitMembership` | `bar_indices, common_segment_indices, switch_segment_indices, segment_indices` |
 | `FeatureSelection` | `kind ∈ {bar, segment, load, equivalent_load}`, `index` |
@@ -303,6 +315,13 @@ cargas sem duplicar geometria.
 `tuple[tuple[LoadPatternRecord,...] | None]` com um slot por carga, alinhado com
 os índices de `LoadModel`. Grupos são obrigatoriamente completos (NPAT 0,1,2,3
 ordenados) ou `None`; grupos parciais são descartados no importador.
+
+**`CableModel`** — único modelo **sem NumPy e sem geometria**: só tuplas de texto
+e `_by_id`. É um catálogo raiz, fora do grafo de dependências entre entidades —
+os trechos guardam `CABOF_ID`/`CABON_ID` como texto e nunca exigem que o cabo
+exista. Por isso `_set_cable_model` não dispara cascata alguma, e nenhuma outra
+importação o invalida. Também fica fora do índice de busca global: sem geometria,
+não haveria o que enquadrar ao ativar um resultado.
 
 ### `NetworkTopology` — adjacência CSR
 
@@ -391,7 +410,8 @@ donos — é isso que resolve a cor de um trecho sobreposto.
 
 O `ImportChoiceDialog` habilita cada botão conforme o estado:
 `segments/loads` exigem barras; `switches/circuits` exigem trechos;
-`load_patterns` exige cargas.
+`load_patterns` exige cargas. `cables` é um catálogo isolado — o botão nunca
+fica desabilitado e não aparece no diagrama acima.
 
 ### Pipeline comum de cada importador
 
@@ -496,7 +516,8 @@ python -m circuit_viewer
   └─ __main__.main()
        ├─ importa PyQt6 (erro amigável se ausente)
        ├─ instala sys.excepthook (traceback no console, sem matar a app)
-       ├─ QApplication(sys.argv)
+       ├─ QApplication(sys.argv) + applicationName/organizationName
+       ├─ apply_theme(app, load_theme_preference(QSettings()))
        ├─ MainWindow()
        │    ├─ carrega fases2.json → PhaseConfiguration ou registra erro
        │    ├─ QGraphicsScene com ItemIndexMethod.NoIndex
@@ -833,6 +854,15 @@ handler de limpeza e `thread.deleteLater`.
 `_branch_thread`, `_equivalent_thread`) e cada entrada de menu verifica os três
 antes de iniciar — nunca há duas operações pesadas simultâneas.
 
+**A exportação OpenDSS (`_export_thread`) é a exceção deliberada.** Ela não
+entra nessa verificação mútua porque não produz estado compartilhado: o worker
+guarda referências próprias aos modelos, que são imutáveis, e o arquivo sai como
+um retrato consistente do estado no início da exportação — a mesma semântica de
+snapshot da seção anterior, sem precisar de revalidação na chegada, já que o
+resultado vai para disco e não para a aplicação. O único acoplamento é o
+inverso: `_sync_export_availability()` desabilita o menu enquanto uma importação
+ou outra exportação estiver correndo.
+
 ### Cancelamento cooperativo
 
 Dois protocolos coexistem:
@@ -957,6 +987,179 @@ correto para circuitos sobrepostos.
 O modelo expõe `bars`, `bar_indices`, `load_ids`, `spatial_index` e `record()`,
 ou seja, é **duck-type compatível com `LoadModel`** — por isso o mesmo
 `LoadVirtualizer` renderiza as duas camadas sem código condicional.
+
+### 12.3 Exportação OpenDSS (`opendss_export.py`)
+
+**Objetivo:** gerar `trechos.dss` (uma `Line` por trecho comum), `chaves.dss`
+(uma `Line ... Switch=Yes` por trecho-chave), `cargasmonofasicas.dss` (uma
+`Load` + um `LoadShape` por carga) e `cargasbifasicas.dss` (duas `Load` + dois
+`LoadShape` por carga) para os circuitos selecionados no diálogo.
+`build_export()` monta os quatro em sequência e devolve um
+`OpenDssExportBundle`; a pasta escolhida na UI recebe todos os arquivos.
+
+Os dois resultados de carga do bundle são **opcionais e andam juntos**. Cargas e
+patamares não entram nas precondições do menu — exigi-los desabilitaria também a
+exportação da rede, que não depende deles. Sem os dois modelos (ou com patamares
+de outra importação, detectados pela regra de identidade) nenhum arquivo de
+carga é gerado e `files` volta a ter dois elementos; havendo os dois modelos,
+saem os quatro arquivos, mesmo que um dos de carga fique só com o cabeçalho —
+assim a lista de arquivos gerados não depende do conteúdo do CSV, e a
+confirmação de substituição na UI pode ser montada antes de exportar.
+
+`OpenDssLoadExportResult` é compartilhado pelos dois builders de carga. Nele,
+`exported_count` conta **cargas de origem**, não linhas `Load`: uma bifásica
+rende duas `Load` e ainda assim soma 1, para o relatório falar a mesma língua do
+CSV importado. `skipped_other_phase_count` conta as cargas de outra contagem de
+fases, que pertencem ao outro arquivo (ou a uma etapa futura, no caso das
+trifásicas).
+
+O filtro de chaves **não é implementado aqui**: os dois arquivos consomem as
+duas metades que o `trace()` já separa — `membership.common_segment_indices`
+(trechos comuns) e `membership.switch_segment_indices` (trechos-chave).
+Reaproveitar essa separação evita uma segunda definição de "trecho é chave"
+divergindo da usada na topologia.
+
+Regras de conversão, todas amarradas ao `units=km` emitido em cada linha:
+
+| Propriedade | Origem | Conversão |
+|---|---|---|
+| nome da `Line` | `CODIGO` do trecho | saneado; `TRECHO_ID` como fallback |
+| `Bus1`/`Bus2` | **`CODIGO`** das barras + `DSS` do `FASES2` | saneado; `BARRA_ID` como fallback |
+| `Phases` | `NUMERO_FASES` do `fases2.json` | — |
+| `R1/X1/R0/X0` | colunas homônimas do cabo de `CABOF_ID` | Ω/km, direto |
+| `C1`/`C0` | `QCAP` do cabo + `VNOM` do circuito | `C = Q/(2πf·V_f²)`, `V_f = VNOM/√3` |
+| `Length` | `COMPR` | metros → km |
+
+**A tensão da conversão de `C1` é a de fase, não a de linha.** `C1` é a
+capacitância shunt entre fase e neutro; como `VNOM` é tensão de linha, a
+implementação divide explicitamente por `√3` em vez de embutir o fator 3, para o
+código continuar legível como a física que representa. Premissa documentada:
+`QCAP` em kvar por km **e por fase**.
+
+**Saneamento de nomes é obrigatório, não cosmético:** no OpenDSS o ponto separa
+nós de barra (`bus.1.2.3`) e o espaço separa propriedades, então um `CODIGO` com
+ponto, espaço ou acento geraria um arquivo inválido. `sanitize_dss_name()`
+reduz por `unicodedata` NFKD para ASCII e troca o resto por `_`. Nomes repetidos
+são descartados com diagnóstico — duas `Line` homônimas fariam o OpenDSS
+redefinir a primeira silenciosamente.
+
+Trecho pertencente a dois circuitos selecionados sai **uma vez só**: o primeiro
+circuito selecionado que o contém é o dono e define a `VNOM` usada em `C1`;
+divergência de `VNOM` entre donos vira aviso sem descartar o trecho.
+
+#### Chaves (`chaves.dss`)
+
+| Propriedade | Origem |
+|---|---|
+| nome da `Line` | **`CODIGO` da chave** (não o do trecho); `CHAVE_ID` como fallback |
+| `Bus1`/`Bus2` + sufixo de nós | mesmas regras dos trechos, lidas do trecho onde a chave está |
+| `Phases` | `NUMERO_FASES` do `FASES2` do trecho |
+| `Switch=Yes` | sempre a **última** propriedade |
+| `Open Line.<nome> 1` | emitido no fim do arquivo quando `ESTADO != "1"` |
+
+**`Switch=Yes` é a última propriedade por obrigação, não por estilo.** O
+`DSSHelp` documenta o efeito colateral: ele redefine `r1`, `x1`, `r0`, `x0`,
+`c1`, `c0` e `length=0.001`. Emitir qualquer parâmetro elétrico depois dele o
+apagaria — por isso a chave não recebe `R1`, `Length` nem `units`.
+
+`Open` é comando executivo e exige o elemento já definido, então todas as
+definições vêm antes de todos os `Open` no mesmo arquivo. O critério de abertura
+é `ESTADO`, com a mesma regra do `trace()`: só `"1"` é fechada.
+
+**Namespace `Line.*` compartilhado.** Os dois arquivos criam objetos no mesmo
+espaço de nomes do OpenDSS, e como o nome do trecho vem do `CODIGO` do trecho
+enquanto o da chave vem do `CODIGO` da chave, eles podem coincidir. Por isso
+`build_export()` passa `line_result.used_names` como `reserved_names` para
+`build_switch_export()`: sem isso, a segunda definição sobrescreveria a primeira
+em silêncio. As cargas ficam fora dessa reserva: `Load.*` e `LoadShape.*` são
+espaços de nomes distintos de `Line.*`.
+
+#### Cargas monofásicas (`cargasmonofasicas.dss`)
+
+| Propriedade | Origem |
+|---|---|
+| nome da `Load` | `CODIGO` da carga; `CARGA_ID` como fallback |
+| `phases` | `NUMERO_FASES` do `FASES2` da carga (sempre `1` aqui) |
+| `bus1` | **`CODIGO`** da barra da carga + `DSS` do `FASES2` |
+| `conn` | fixo em `wye` |
+| `kV` | `VNOM` do circuito dono **dividida por `√3`** |
+| `kW`/`kvar` | fixos em `1` |
+| `daily` | `PERFIL-<nome da carga>` |
+| `class` | fixo em `1`; marcador manual de carga monofásica |
+| `mult`/`qmult` do `LoadShape` | `PD`/`QD`, `PE`/`QE` ou `PF`/`QF` por `NPAT` 0–3 |
+
+**Só monofásicas, mas seis valores de `FASES2`.** O `fases2.json` mapeia com
+`NUMERO_FASES=1` tanto `D`/`E`/`F` quanto `DN`/`EN`/`FN` (fase com neutro
+explícito). A coluna de patamar é escolhida pela **primeira letra do `NOME`**, e
+o `DSS` já carrega o nó de neutro quando existe — daí `bus.1` para `FASES2=1` e
+`bus.1.0` para `FASES2=4`. Cargas de outra contagem de fases entram em
+`skipped_other_phase_count` **sem diagnóstico**: são esperadas, ao contrário de
+um `FASES2` sem relação no JSON, que é aviso real.
+
+**`kW=1 kvar=1` com a potência no `LoadShape`.** É o idioma do OpenDSS para
+carga variável: o `mult`/`qmult` multiplica a potência nominal, então fixar a
+nominal em 1 faz o perfil carregar os valores absolutos de cada patamar. Os
+`LoadShape` são emitidos **antes** de todas as `Load` porque o `daily` referencia
+um objeto que precisa já existir — mesma disciplina de ordenação dos comandos
+`Open` em `chaves.dss`, e o motivo de o corpo ser montado em duas seções.
+
+**A carga chega ao circuito pela barra.** `CircuitMembership` associa barras e
+trechos, nunca cargas. `_bar_owners()` resolve, em uma passada, o dono de cada
+barra dos circuitos selecionados com a mesma regra dos trechos sobrepostos — o
+primeiro circuito selecionado vence e define a `VNOM` — e guarda à parte as
+barras de `VNOM` divergente, para o aviso só sair quando uma carga de fato usar
+aquela barra. Sem isso, uma barra compartilhada sem carga alguma geraria ruído.
+
+**Seis casas decimais nos patamares.** `_format_pattern` usa `.6f` em vez do
+`.6g` do resto do módulo: os valores de origem têm precisão excessiva e o
+arquivo ficaria ilegível com a notação científica que o `%g` escolhe para
+magnitudes pequenas.
+
+**`class=1` é só um rótulo manual.** Não tem efeito elétrico no OpenDSS — existe
+apenas para o usuário identificar visualmente, ao abrir o arquivo, que aquela
+`Load` é monofásica. Por isso vem por último na linha, depois de `daily`. As
+bifásicas usam `class=2`.
+
+#### Cargas bifásicas (`cargasbifasicas.dss`)
+
+**Duas `Load` monofásicas, não uma bifásica.** É a diferença de modelagem que
+justifica o arquivo separado: uma única `Load` de `phases=2` distribuiria a
+potência igualmente entre as duas fases, apagando exatamente o desequilíbrio que
+os patamares por fase (`PD`/`PE`/`PF`) descrevem. Cada carga vira
+`<CODIGO>-<FASE>` com `phases=1` e seu próprio `LoadShape`, lendo só o par de
+colunas daquela fase.
+
+**O terminal de cada letra vem da entrada monofásica, não da bifásica.**
+`_terminals_by_phase_letter()` indexa as entradas de `NUMERO_FASES=1` pela
+primeira letra do `NOME` e guarda o **primeiro nó** do `DSS` — o primeiro nó,
+para tolerar tanto `D` (`"1"`) quanto `DN` (`"1.0"`). Usar o `DSS` da entrada
+bifásica seria a escolha óbvia e está errada: ele lista os nós em ordem
+crescente, não na ordem das letras do `NOME`. `FD` tem `DSS "1.3"`, então parear
+posicionalmente daria `F`→`1` e `D`→`3`, invertendo as duas fases. A ordem de
+**emissão**, essa sim, segue as letras do `NOME`.
+
+**`_two_phase_letters()` filtra por letra, não por posição.** Extrai de `NOME`
+todos os caracteres em `{D, E, F}` e exige exatamente dois distintos, o que
+aceita um eventual `DEN` (fase + fase + neutro) sem tratamento especial e recusa
+qualquer `NOME` que não descreva duas fases.
+
+**A carga sai inteira ou não sai.** As duas fases são inteiramente resolvidas —
+os 8 valores parseados, os dois nomes checados contra `reserved_names` e contra
+o `used_names` local — **antes** de qualquer linha ser emitida. Meia carga
+bifásica no arquivo subestimaria a demanda em silêncio, que é o pior modo de
+falha possível para um estudo de fluxo de potência.
+
+**Namespace `Load.*` compartilhado.** Os dois arquivos de carga criam objetos no
+mesmo espaço de nomes, e o nome de fase de uma bifásica (`CG-D`) pode coincidir
+com o nome de uma monofásica. `build_export()` passa
+`single_phase_result.used_names` como `reserved_names` — a mesma disciplina que
+protege `chaves.dss` contra nomes de `trechos.dss`, e o motivo de o builder
+monofásico rodar primeiro.
+
+**Zero é valor válido.** Toda a validação numérica usa
+`parse_number(...) is None`, nunca teste de verdade: uma fase sem consumo tem
+patamar `0`, que precisa ser exportado; só vazio e não numérico invalidam. Há
+teste de regressão nos dois arquivos de carga.
 
 ---
 
@@ -1193,6 +1396,20 @@ aplicação. Erro no arquivo desabilita **apenas** os modos que dependem dele
 áureo e contraste mínimo 3:1 com branco: circuitos adjacentes ficam
 distinguíveis mesmo em quantidade alta.
 
+**Tema explícito com Fusion + paleta fixa.** O tema é escolha do usuário, nunca
+inferência do sistema operacional. O estilo nativo (`windows11`) ignora a paleta
+da aplicação e segue o SO, então `apply_theme` troca o estilo para `Fusion`, que
+a honra. As duas paletas de `theme.py` têm valores fixos de propósito: a partir
+do Qt 6.8 o `standardPalette()` do Fusion passou a acompanhar o esquema de cores
+do sistema, o que reintroduziria a inferência que se quer evitar. O
+`setColorScheme()` (Qt ≥ 6.8, chamada guardada por `hasattr` porque o
+`pyproject.toml` admite PyQt6 6.7) fixa também a barra de título nativa. Como as
+folhas de estilo dos widgets sempre usaram `palette(mid)`/`palette(window)` em
+vez de cores literais, nenhuma delas precisou mudar — só um ciclo de
+`unpolish`/`polish` para reavaliá-las. **O canvas fica fora do tema**: as cores
+de `graphics.py` e a paleta OKLCH garantem contraste com fundo branco
+(`MIN_WHITE_CONTRAST`), então o diagrama permanece claro nos dois temas.
+
 **Chaves como trechos, não como entidades geométricas próprias.** Chaves
 existem fisicamente sobre um trecho; modelá-las como decoração do trecho
 (`_record_by_segment`) evita uma quarta camada geométrica e dá lookup O(1) no
@@ -1273,10 +1490,12 @@ exigem consentimento devem passar por `_authorize_*` como os do Google.
 
 ### Persistir sessão
 
-Hoje nada é persistido (cores, filtros e provedor valem só para a execução
-atual). Um ponto natural seria serializar `CircuitVisibilityController.colors` e
-`checked_states` indexados por `circuit_id`, reaproveitando o mesmo mecanismo de
-remapeamento já usado em `_set_switch_model`.
+O tema é a única preferência persistida (`QSettings`, chave
+`appearance/theme`); cores, filtros e provedor de satélite valem só para a
+execução atual. Um ponto natural seria serializar
+`CircuitVisibilityController.colors` e `checked_states` indexados por
+`circuit_id` no mesmo `QSettings` injetado em `MainWindow`, reaproveitando o
+mecanismo de remapeamento já usado em `_set_switch_model`.
 
 ### Exportar dados
 
@@ -1288,17 +1507,18 @@ sem tocar no núcleo.
 
 ## 18. Testes e benchmarks
 
-### Testes (`tests/`, 21 arquivos)
+### Testes (`tests/`, 26 arquivos)
 
 | Arquivo | Foco |
 |---|---|
 | `test_model.py` | entidades, índices espaciais, topologia |
-| `test_csv_import.py` · `test_segment_import.py` · `test_switch_import.py` · `test_load_import.py` · `test_load_pattern_import.py` · `test_circuit_import.py` | importadores e casos de erro |
+| `test_csv_import.py` · `test_segment_import.py` · `test_switch_import.py` · `test_load_import.py` · `test_load_pattern_import.py` · `test_circuit_import.py` · `test_cable_import.py` | importadores e casos de erro |
 | `test_phase_config.py` | validação do `fases2.json` |
 | `test_circuit_colors.py` | paleta e contraste |
 | `test_branch_analysis.py` · `test_equivalent_network.py` | análises topológicas |
+| `test_opendss_export.py` | linhas de trecho, de chave e das cargas mono e bifásicas, conversão de `C1` e do `kV` pela tensão de fase, ordem `New`/`Open` e `LoadShape`/`Load`, terminal por letra, colunas de patamar por fase, patamar zerado, descarte integral da bifásica, reserva de nomes entre os arquivos, arredondamento, saneamento e diagnósticos |
 | `test_search.py` | índice de busca (sem Qt) |
-| `test_graphics.py` · `test_main_window.py` · `test_branches_ui.py` · `test_circuits_ui.py` · `test_phase_ui.py` · `test_search_ui.py` · `test_map_tiles.py` · `test_satellite_ui.py` | camadas Qt (exigem PyQt6) |
+| `test_graphics.py` · `test_main_window.py` · `test_branches_ui.py` · `test_circuits_ui.py` · `test_phase_ui.py` · `test_search_ui.py` · `test_map_tiles.py` · `test_satellite_ui.py` · `test_theme_ui.py` · `test_cables_ui.py` · `test_opendss_export_ui.py` | camadas Qt (exigem PyQt6) |
 
 Os testes do núcleo usam apenas a biblioteca padrão e NumPy; os gráficos rodam
 quando PyQt6 está disponível.

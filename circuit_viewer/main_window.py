@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QSignalBlocker, QThread, QTimer, Qt
+from PyQt6.QtCore import QSettings, QSignalBlocker, QThread, QTimer, Qt
 from PyQt6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -34,6 +35,13 @@ from PyQt6.QtWidgets import (
 
 from .branch_analysis import BranchAnalysisResult, BranchRecord
 from .branch_window import BranchesWindow, BranchTableModel
+from .cable_import import CableCsvResult
+from .cables_window import (
+    CablesWindow,
+    CableTableModel,
+    cable_summary,
+    cable_tooltip,
+)
 from .equivalent_network import EquivalentNetworkResult
 from .circuit_import import CircuitLoadResult
 from .circuits_window import CircuitTableModel, CircuitsWindow
@@ -64,6 +72,7 @@ from .mapa_tiles import (
     Provedor,
 )
 from .model import (
+    CableModel,
     CircuitCatalogModel,
     CircuitModel,
     CircuitVisibilityController,
@@ -74,6 +83,14 @@ from .model import (
     SwitchModel,
     UtmCrs,
 )
+from .opendss_export import (
+    LINES_FILENAME,
+    SINGLE_PHASE_LOADS_FILENAME,
+    SWITCHES_FILENAME,
+    TWO_PHASE_LOADS_FILENAME,
+    OpenDssExportBundle,
+)
+from .opendss_export_dialog import OpenDssExportDialog
 from .overlap_report import CircuitOverlapReportWindow, OverlapReportTableModel
 from .phase_config import (
     PHASE_COLORS,
@@ -88,12 +105,21 @@ from .search import GlobalSearchIndex, SearchResult
 from .search_palette import SearchPalette
 from .segment_import import SegmentLoadResult
 from .switch_import import SwitchLoadResult
+from .theme import (
+    THEME_LABELS,
+    AppTheme,
+    apply_theme,
+    load_theme_preference,
+    save_theme_preference,
+)
 from .workers import (
     BranchAnalysisWorker,
+    CableImportWorker,
     CircuitImportWorker,
     CsvImportWorker,
     LoadImportWorker,
     LoadPatternImportWorker,
+    OpenDssExportWorker,
     SegmentImportWorker,
     SwitchImportWorker,
     EquivalentNetworkWorker,
@@ -230,6 +256,15 @@ class ImportChoiceDialog(QDialog):
         self.circuits_button.clicked.connect(lambda: self._select("circuits"))
         layout.addWidget(self.circuits_button)
 
+        # O catálogo de cabos é uma raiz independente: não depende de barras nem
+        # de trechos, então o botão nunca fica desabilitado.
+        self.cables_button = QPushButton("Importar cabos…")
+        self.cables_button.setToolTip(
+            "Carregar o catálogo de cabos consultado em Tabelas > Cabos…"
+        )
+        self.cables_button.clicked.connect(lambda: self._select("cables"))
+        layout.addWidget(self.cables_button)
+
         if not has_bars:
             dependency = QLabel(
                 "Importe as barras antes de importar trechos ou cargas."
@@ -259,10 +294,19 @@ class ImportChoiceDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, phase_configuration_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        phase_configuration_path: str | Path | None = None,
+        settings: QSettings | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("Visualizador de Circuitos Elétricos")
         self.resize(1280, 800)
+
+        # O tema já foi aplicado pelo ponto de entrada; aqui a preferência serve
+        # apenas para marcar a ação correta do menu.
+        self._settings = QSettings() if settings is None else settings
+        self._theme = load_theme_preference(self._settings)
 
         self._model: CircuitModel | None = None
         self._line_model: LineNetworkModel | None = None
@@ -271,6 +315,7 @@ class MainWindow(QMainWindow):
         self._load_pattern_model: LoadPatternModel | None = None
         self._switch_model: SwitchModel | None = None
         self._switch_item: SwitchNetworkItem | None = None
+        self._cable_model: CableModel | None = None
         self._circuit_catalog: CircuitCatalogModel | None = None
         self._circuit_visibility: CircuitVisibilityController | None = None
         self._branch_analysis_result: BranchAnalysisResult | None = None
@@ -325,6 +370,11 @@ class MainWindow(QMainWindow):
         self._equivalent_progress_dialog: QProgressDialog | None = None
         self._equivalent_snapshot: tuple[object, ...] | None = None
         self._close_after_equivalent_build = False
+        self._export_thread: QThread | None = None
+        self._export_worker: OpenDssExportWorker | None = None
+        self._export_progress_dialog: QProgressDialog | None = None
+        self._export_directory: Path | None = None
+        self._close_after_export = False
 
         self.scene = QGraphicsScene(self)
         self.scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
@@ -371,6 +421,8 @@ class MainWindow(QMainWindow):
         )
         self.branch_table_model = BranchTableModel(self)
         self.branches_window = BranchesWindow(self.branch_table_model, self)
+        self.cable_table_model = CableTableModel(self)
+        self.cables_window = CablesWindow(self.cable_table_model, self)
         self._circuit_visibility_timer = QTimer(self)
         self._circuit_visibility_timer.setSingleShot(True)
         self._circuit_visibility_timer.setInterval(50)
@@ -385,6 +437,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._set_selection(None)
         self._update_status_counts(0)
+        self._sync_export_availability()
         if self._phase_configuration_error is not None:
             QTimer.singleShot(0, self._show_phase_configuration_error)
 
@@ -457,6 +510,23 @@ class MainWindow(QMainWindow):
             self.satellite_provider_group.addAction(action)
             self.satellite_provider_actions[provider] = action
 
+        self.theme_group = QActionGroup(self)
+        self.theme_group.setExclusive(True)
+        self.theme_actions: dict[AppTheme, QAction] = {}
+        for theme, label in THEME_LABELS.items():
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(theme is self._theme)
+            action.setToolTip(
+                "Definir manualmente a aparência da interface, "
+                "independentemente do tema do sistema operacional"
+            )
+            action.triggered.connect(
+                lambda _checked=False, selected=theme: self._set_theme(selected)
+            )
+            self.theme_group.addAction(action)
+            self.theme_actions[theme] = action
+
         self.simplified_network_action = QAction(
             "Rede simplificada por ramais",
             self,
@@ -481,6 +551,20 @@ class MainWindow(QMainWindow):
         self.overlaps_action = QAction("Sobreposições…", self)
         self.overlaps_action.setEnabled(False)
         self.overlaps_action.triggered.connect(self._show_overlap_report)
+
+        self.cables_action = QAction("Cabos…", self)
+        self.cables_action.setToolTip(
+            "Consultar o catálogo de cabos importado"
+        )
+        self.cables_action.triggered.connect(self._show_cables_window)
+
+        self.opendss_export_action = QAction("OpenDSS…", self)
+        self.opendss_export_action.setEnabled(False)
+        self.opendss_export_action.setToolTip(
+            "Exportar trechos, chaves e cargas mono e bifásicas como elementos "
+            "do OpenDSS"
+        )
+        self.opendss_export_action.triggered.connect(self._export_opendss)
 
         self.branches_action = QAction("Ramais…", self)
         self.branches_action.setEnabled(False)
@@ -531,11 +615,20 @@ class MainWindow(QMainWindow):
         provider_menu = view_menu.addMenu("Provedor de satélite")
         for provider in PROVEDORES:
             provider_menu.addAction(self.satellite_provider_actions[provider])
+        theme_menu = view_menu.addMenu("Tema")
+        for theme in THEME_LABELS:
+            theme_menu.addAction(self.theme_actions[theme])
         view_menu.addSeparator()
         view_menu.addAction(self.circuits_action)
         view_menu.addAction(self.overlaps_action)
         view_menu.addSeparator()
         view_menu.addAction(self.fit_action)
+
+        self.tables_menu = self.menuBar().addMenu("Tabelas")
+        self.tables_menu.addAction(self.cables_action)
+
+        self.export_menu = self.menuBar().addMenu("Exportar")
+        self.export_menu.addAction(self.opendss_export_action)
 
         self.tools_menu = self.menuBar().addMenu("Ferramentas")
         self.tools_menu.addAction(self.branches_action)
@@ -585,7 +678,16 @@ class MainWindow(QMainWindow):
                 "padding: 4px 6px;"
             )
 
-        def create_table(fields: tuple[tuple[str, str], ...], parent: QWidget):
+        def create_table(
+            fields: tuple[tuple[str, str], ...],
+            parent: QWidget,
+            *,
+            with_companion: bool = False,
+        ):
+            # A terceira coluna existe para valores derivados de outro catálogo
+            # (hoje, o cabo de CABOF_ID/CABON_ID). Os rótulos nascem ocultos e o
+            # QGridLayout colapsa a coluna, então sem dados complementares a
+            # tabela fica idêntica à de duas colunas.
             table = QWidget(parent)
             table.setObjectName("details_table")
             grid = QGridLayout(table)
@@ -594,8 +696,11 @@ class MainWindow(QMainWindow):
             grid.setVerticalSpacing(0)
             grid.setColumnStretch(0, 0)
             grid.setColumnStretch(1, 1)
+            if with_companion:
+                grid.setColumnStretch(2, 1)
             labels: dict[str, QLabel] = {}
             caption_labels: dict[str, QLabel] = {}
+            companion_labels: dict[str, QLabel] = {}
             for row, (key, caption) in enumerate(fields):
                 caption_value = QLabel(caption)
                 caption_value.setProperty("detailCell", True)
@@ -614,12 +719,25 @@ class MainWindow(QMainWindow):
                 labels[key] = value
                 grid.addWidget(caption_value, row, 0)
                 grid.addWidget(value, row, 1)
-            return table, labels, caption_labels, grid
+                if not with_companion:
+                    continue
+                companion = QLabel("—")
+                companion.setProperty("detailCell", True)
+                companion.setProperty("detailColumn", "companion")
+                companion.setStyleSheet(cell_style(row, 2))
+                companion.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextSelectableByMouse
+                )
+                companion.setWordWrap(True)
+                companion.setVisible(False)
+                grid.addWidget(companion, row, 2)
+                companion_labels[key] = companion
+            return table, labels, caption_labels, grid, companion_labels
 
         def create_table_page(fields: tuple[tuple[str, str], ...]):
             page = QWidget(self.details_stack)
             page_layout = QVBoxLayout(page)
-            table, labels, caption_labels, grid = create_table(fields, page)
+            table, labels, caption_labels, grid, _ = create_table(fields, page)
             page_layout.addWidget(table)
             page_layout.addStretch(1)
             return page, table, labels, caption_labels, grid
@@ -668,7 +786,12 @@ class MainWindow(QMainWindow):
             self.load_detail_labels,
             self.load_caption_labels,
             self.load_details_grid,
-        ) = create_table(load_fields, self.load_details_body)
+            self.load_companion_labels,
+        ) = create_table(
+            load_fields,
+            self.load_details_body,
+            with_companion=True,
+        )
         load_layout.addWidget(self.load_details_table)
 
         self.load_patterns_section = QWidget(self.load_details_body)
@@ -745,6 +868,7 @@ class MainWindow(QMainWindow):
             self.equivalent_detail_labels,
             self.equivalent_caption_labels,
             self.equivalent_details_grid,
+            _,
         ) = create_table(equivalent_fields, self.equivalent_details_body)
         equivalent_layout.addWidget(self.equivalent_details_table)
 
@@ -810,7 +934,12 @@ class MainWindow(QMainWindow):
             self.segment_detail_labels,
             self.segment_caption_labels,
             self.segment_details_grid,
-        ) = create_table(segment_fields, self.segment_details_body)
+            self.segment_companion_labels,
+        ) = create_table(
+            segment_fields,
+            self.segment_details_body,
+            with_companion=True,
+        )
         segment_layout.addWidget(self.segment_details_table)
 
         switch_fields = (
@@ -835,6 +964,7 @@ class MainWindow(QMainWindow):
             self.switch_detail_labels,
             self.switch_caption_labels,
             self.switch_details_grid,
+            _,
         ) = create_table(switch_fields, self.switch_details_section)
         switch_layout.addWidget(self.switch_details_table)
         self.switch_details_section.setVisible(False)
@@ -895,6 +1025,7 @@ class MainWindow(QMainWindow):
             self._clear_branch_highlight
         )
         self.branches_window.closed.connect(self._clear_branch_highlight)
+        self.cables_window.importRequested.connect(self._choose_cables_csv)
 
     def _choose_import(self) -> None:
         if (
@@ -923,6 +1054,8 @@ class MainWindow(QMainWindow):
             self._choose_switches_csv()
         elif dialog.selected_kind == "circuits":
             self._choose_circuits_csv()
+        elif dialog.selected_kind == "cables":
+            self._choose_cables_csv()
 
     def _choose_csv(self) -> None:
         if (
@@ -987,6 +1120,22 @@ class MainWindow(QMainWindow):
         )
         if path:
             self._start_switch_import(path)
+
+    def _choose_cables_csv(self) -> None:
+        if (
+            self._import_thread is not None
+            or self._branch_thread is not None
+            or self._equivalent_thread is not None
+        ):
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importar cabos",
+            "",
+            "Arquivos CSV (*.csv);;Todos os arquivos (*)",
+        )
+        if path:
+            self._start_cable_import(path)
 
     def _choose_loads_csv(self) -> None:
         if (
@@ -1134,6 +1283,40 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_import_progress)
         worker.finished.connect(self._on_switch_import_finished)
+        worker.failed.connect(self._on_import_failed)
+        worker.cancelled.connect(self._on_import_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(lambda: worker.cancel())
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_import_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _start_cable_import(self, path: str) -> None:
+        thread = QThread(self)
+        worker = CableImportWorker(path)
+        worker.moveToThread(thread)
+
+        progress = QProgressDialog("Lendo cabos…", "Cancelar", 0, 100, self)
+        progress.setWindowTitle("Importando cabos")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._import_thread = thread
+        self._import_worker = worker
+        self._progress_dialog = progress
+        self._progress_entity = "cabos"
+        self.import_action.setEnabled(False)
+        self.branches_action.setEnabled(False)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_import_progress)
+        worker.finished.connect(self._on_cable_import_finished)
         worker.failed.connect(self._on_import_failed)
         worker.cancelled.connect(self._on_import_cancelled)
         worker.finished.connect(thread.quit)
@@ -1298,6 +1481,7 @@ class MainWindow(QMainWindow):
         self.total_status.setText(f"Barras: {len(result.model):n}")
         self.show_bars_action.setEnabled(True)
         self.fit_action.setEnabled(True)
+        self._sync_export_availability()
         self._fit_all()
         self._show_import_report(result)
 
@@ -1345,6 +1529,14 @@ class MainWindow(QMainWindow):
             return
         self._set_load_pattern_model(result.model)
         self._show_load_pattern_import_report(result)
+
+    def _on_cable_import_finished(self, result: CableCsvResult) -> None:
+        if self._progress_dialog is not None:
+            self._progress_dialog.setValue(100)
+            self._progress_dialog.close()
+        # Catálogo raiz: não há modelo-pai cuja identidade precise ser validada.
+        self._set_cable_model(result.model)
+        self._show_cable_import_report(result)
 
     def _on_switch_import_finished(self, result: SwitchLoadResult) -> None:
         if self._progress_dialog is not None:
@@ -1423,6 +1615,7 @@ class MainWindow(QMainWindow):
             self.scene.addItem(self._line_item)
         self.segment_status.setText(f"Trechos: {len(model) if model is not None else 0:n}")
         self._apply_circuit_visibility()
+        self._sync_export_availability()
         self.view.viewport().update()
 
     def _set_load_model(self, model: LoadModel | None) -> None:
@@ -1471,6 +1664,24 @@ class MainWindow(QMainWindow):
             self.load_patterns_section.setVisible(False)
         if rebuild_equivalent and self._import_thread is None:
             self._start_equivalent_build()
+
+    def _set_cable_model(self, model: CableModel | None) -> None:
+        """Instala o catálogo de cabos.
+
+        Não há cascata de invalidação: cabos são raiz e ninguém deriva deles —
+        os trechos apenas exibem o cabo correspondente quando ele existe.
+        """
+
+        self._cable_model = model
+        self.cable_table_model.set_catalog(model)
+        self.cables_window.refresh()
+        self._sync_export_availability()
+        selection = self._selected_feature
+        if selection is not None and selection.kind == "segment":
+            self._set_selection(
+                selection,
+                reveal_hidden=self._search_focus_active,
+            )
 
     def _set_switch_model(self, model: SwitchModel | None) -> None:
         self._invalidate_branch_analysis()
@@ -1538,6 +1749,7 @@ class MainWindow(QMainWindow):
         ):
             self._set_selection(self._selected_feature)
         self._apply_circuit_visibility()
+        self._sync_export_availability()
         self.view.viewport().update()
 
     def _set_circuit_catalog(
@@ -1583,6 +1795,7 @@ class MainWindow(QMainWindow):
         else:
             self.overlap_report_window.hide()
         self._sync_branches_availability()
+        self._sync_export_availability()
         self._apply_circuit_visibility()
 
     def _schedule_circuit_visibility_update(self, *args) -> None:  # noqa: ANN002
@@ -1702,6 +1915,13 @@ class MainWindow(QMainWindow):
         self.overlap_report_window.raise_()
         self.overlap_report_window.activateWindow()
 
+    def _show_cables_window(self) -> None:
+        # Sempre disponível: sem catálogo, a janela oferece a importação.
+        self.cables_window.refresh()
+        self.cables_window.show()
+        self.cables_window.raise_()
+        self.cables_window.activateWindow()
+
     def _sync_branches_availability(self) -> None:
         available = (
             self._circuit_catalog is not None
@@ -1713,6 +1933,265 @@ class MainWindow(QMainWindow):
         )
         self.branches_action.setEnabled(available)
         self.simplified_network_action.setEnabled(available)
+
+    def _sync_export_availability(self) -> None:
+        """Só exporta com tudo que trechos.dss consome carregado."""
+
+        self.opendss_export_action.setEnabled(
+            self._model is not None
+            and self._line_model is not None
+            and self._switch_model is not None
+            and self._circuit_catalog is not None
+            and self._cable_model is not None
+            and self._phase_configuration is not None
+            and self._import_thread is None
+            and self._export_thread is None
+        )
+
+    def _exportable_loads(self) -> tuple[LoadModel, LoadPatternModel] | None:
+        """Cargas e patamares aptos a gerar os arquivos de carga.
+
+        Os dois são necessários: sem os quatro NPAT não há ``LoadShape`` para o
+        ``daily`` das cargas apontar. A identidade garante que os patamares
+        pertencem às cargas exibidas.
+        """
+
+        loads = self._load_model
+        patterns = self._load_pattern_model
+        if loads is None or patterns is None or patterns.loads is not loads:
+            return None
+        return loads, patterns
+
+    def _expected_export_filenames(self) -> tuple[str, ...]:
+        """Arquivos que a exportação vai gravar no estado atual.
+
+        Sem cargas e patamares os arquivos de carga não são gerados, então eles
+        também não podem aparecer na confirmação de substituição.
+        """
+
+        names = [LINES_FILENAME, SWITCHES_FILENAME]
+        if self._exportable_loads() is not None:
+            names.append(SINGLE_PHASE_LOADS_FILENAME)
+            names.append(TWO_PHASE_LOADS_FILENAME)
+        return tuple(names)
+
+    def _export_opendss(self) -> None:
+        catalog = self._circuit_catalog
+        cables = self._cable_model
+        configuration = self._phase_configuration
+        if (
+            catalog is None
+            or cables is None
+            or configuration is None
+            or self._export_thread is not None
+        ):
+            return
+        dialog = OpenDssExportDialog(catalog, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        circuit_indices = dialog.selected_circuit_indices()
+        if not circuit_indices:
+            return
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Escolher a pasta de destino da exportação",
+        )
+        if not directory:
+            return
+        # A pasta é escolhida uma vez só e recebe todos os arquivos gerados.
+        destination = Path(directory)
+        existing = [
+            name
+            for name in self._expected_export_filenames()
+            if (destination / name).exists()
+        ]
+        if existing:
+            answer = QMessageBox.question(
+                self,
+                "Substituir arquivos",
+                f"Já existem em {destination}: {', '.join(existing)}.\n"
+                "Deseja substituí-los?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._start_opendss_export(destination, circuit_indices)
+
+    def _start_opendss_export(
+        self,
+        destination: Path,
+        circuit_indices: tuple[int, ...],
+    ) -> None:
+        catalog = self._circuit_catalog
+        cables = self._cable_model
+        configuration = self._phase_configuration
+        if catalog is None or cables is None or configuration is None:
+            return
+        exportable_loads = self._exportable_loads()
+        thread = QThread(self)
+        # Os modelos são imutáveis: o worker guarda as próprias referências e o
+        # arquivo sai como um retrato consistente do estado atual, mesmo que uma
+        # importação substitua os modelos enquanto a exportação corre.
+        worker = OpenDssExportWorker(
+            catalog,
+            cables,
+            configuration,
+            circuit_indices,
+            *(exportable_loads or ()),
+        )
+        worker.moveToThread(thread)
+
+        progress = QProgressDialog(
+            "Gerando os arquivos .dss…",
+            "Cancelar",
+            0,
+            100,
+            self,
+        )
+        progress.setWindowTitle("Exportando para OpenDSS")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._export_thread = thread
+        self._export_worker = worker
+        self._export_progress_dialog = progress
+        self._export_directory = destination
+        self._sync_export_availability()
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_export_progress)
+        worker.finished.connect(self._on_opendss_export_finished)
+        worker.failed.connect(self._on_export_failed)
+        worker.cancelled.connect(self._on_export_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(lambda: worker.cancel())
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_export_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_export_progress(self, current: int, total: int) -> None:
+        if self._export_progress_dialog is None:
+            return
+        if total <= 0:
+            self._export_progress_dialog.setRange(0, 0)
+            return
+        self._export_progress_dialog.setRange(0, total)
+        self._export_progress_dialog.setValue(min(current, total))
+        self._export_progress_dialog.setLabelText(
+            f"Gerando os arquivos .dss… ({current:n}/{total:n})"
+        )
+
+    def _close_export_progress(self) -> None:
+        if self._export_progress_dialog is not None:
+            self._export_progress_dialog.close()
+
+    def _on_opendss_export_finished(self, result: OpenDssExportBundle) -> None:
+        self._close_export_progress()
+        destination = self._export_directory
+        if destination is None:
+            return
+        for filename, text in result.files:
+            target = destination / filename
+            try:
+                target.write_text(text, encoding="utf-8")
+            except OSError as exc:
+                QMessageBox.critical(
+                    self,
+                    "Falha na exportação",
+                    f"Não foi possível gravar {target}: {exc.strerror or exc}",
+                )
+                return
+        self._show_opendss_export_report(result, destination)
+
+    def _on_export_failed(self, reason: str) -> None:
+        self._close_export_progress()
+        QMessageBox.critical(self, "Falha na exportação", reason)
+
+    def _on_export_cancelled(self) -> None:
+        self._close_export_progress()
+        self.statusBar().showMessage(
+            "Exportação cancelada; nenhum arquivo foi gravado.",
+            5_000,
+        )
+
+    def _on_export_thread_finished(self) -> None:
+        self._export_thread = None
+        self._export_worker = None
+        self._export_progress_dialog = None
+        self._export_directory = None
+        self._sync_export_availability()
+        if self._close_after_export:
+            self._close_after_export = False
+            self.close()
+
+    def _show_opendss_export_report(
+        self,
+        result: OpenDssExportBundle,
+        destination: Path,
+    ) -> None:
+        summary = (
+            f"{result.lines.exported_count:n} trechos e "
+            f"{result.switches.exported_count:n} chaves"
+        )
+        if result.single_phase_loads is not None:
+            summary += (
+                f", {result.single_phase_loads.exported_count:n} cargas "
+                "monofásicas"
+            )
+        if result.two_phase_loads is not None:
+            summary += (
+                f" e {result.two_phase_loads.exported_count:n} cargas bifásicas"
+            )
+        if not result.has_warnings:
+            self.statusBar().showMessage(
+                f"{summary} exportados para {destination}.",
+                5_000,
+            )
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle("Exportação concluída com avisos")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText(f"{summary} foram exportados.")
+        lines = [
+            f"Pasta: {destination}",
+            f"{LINES_FILENAME}: {result.lines.exported_count:n} trechos, "
+            f"{result.lines.discarded_count:n} descartados",
+            f"{SWITCHES_FILENAME}: {result.switches.exported_count:n} chaves "
+            f"({result.switches.open_count:n} abertas), "
+            f"{result.switches.discarded_count:n} descartadas",
+        ]
+        for filename, caption, load_result in (
+            (
+                SINGLE_PHASE_LOADS_FILENAME,
+                "monofásicas",
+                result.single_phase_loads,
+            ),
+            (TWO_PHASE_LOADS_FILENAME, "bifásicas", result.two_phase_loads),
+        ):
+            if load_result is None:
+                continue
+            lines.append(
+                f"{filename}: {load_result.exported_count:n} cargas {caption} "
+                f"({load_result.skipped_other_phase_count:n} de outras fases "
+                f"ignoradas), "
+                f"{load_result.discarded_count:n} descartadas"
+            )
+        message.setInformativeText("\n".join(lines))
+        details = [
+            f"{issue.segment_id}: {issue.reason}" for issue in result.issues
+        ]
+        if result.omitted_issues:
+            details.append(f"… e mais {result.omitted_issues:n} ocorrências.")
+        if details:
+            message.setDetailedText("\n".join(details))
+        message.exec()
 
     def _sync_load_layout(self) -> None:
         equivalent_model = (
@@ -2363,6 +2842,37 @@ class MainWindow(QMainWindow):
             message.setDetailedText("\n".join(details))
         message.exec()
 
+    def _show_cable_import_report(self, result: CableCsvResult) -> None:
+        if not result.has_warnings:
+            message = f"{result.valid_rows:n} cabos importados com sucesso."
+            if result.ignored_type_rows:
+                message += f" {result.ignored_type_rows:n} ignorados por TIPO ≠ 1."
+            self.statusBar().showMessage(message, 5_000)
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle("Importação de cabos concluída com avisos")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText(f"{result.valid_rows:n} cabos foram importados.")
+        lines = [
+            f"Codificação: {result.encoding}",
+            f"Linhas de dados: {result.total_rows:n}",
+            f"Linhas válidas: {result.valid_rows:n}",
+            f"Linhas ignoradas: {result.invalid_rows:n}",
+        ]
+        if result.ignored_type_rows:
+            lines.append(f"Ignorados por TIPO ≠ 1: {result.ignored_type_rows:n}")
+        if result.encoding.lower() == "cp1252":
+            lines.append("O arquivo não era UTF-8 e foi lido como CP-1252.")
+        message.setInformativeText("\n".join(lines))
+        details = [
+            f"Linha {issue.line_number}: {issue.reason}" for issue in result.issues
+        ]
+        if result.omitted_issues:
+            details.append(f"… e mais {result.omitted_issues:n} ocorrências.")
+        if details:
+            message.setDetailedText("\n".join(details))
+        message.exec()
+
     def _show_circuit_import_report(self, result: CircuitLoadResult) -> None:
         if not result.has_warnings:
             self.statusBar().showMessage(
@@ -2416,6 +2926,7 @@ class MainWindow(QMainWindow):
         self._progress_dialog = None
         self.import_action.setEnabled(True)
         self._sync_branches_availability()
+        self._sync_export_availability()
         if (
             self._pending_simplified_activation
             and self._branch_analysis_result is not None
@@ -2519,6 +3030,23 @@ class MainWindow(QMainWindow):
             self._create_satellite_manager(provider)
         self.statusBar().showMessage(
             f"Provedor de satélite: {provider.nome}.", 4_000
+        )
+
+    def _set_theme(self, theme: AppTheme) -> None:
+        """Aplica e memoriza o tema escolhido manualmente pelo usuário."""
+
+        if theme is self._theme:
+            return
+        self._theme = theme
+        save_theme_preference(self._settings, theme)
+        action = self.theme_actions.get(theme)
+        if action is not None and not action.isChecked():
+            action.setChecked(True)
+        app = QApplication.instance()
+        if app is not None:
+            apply_theme(app, theme)
+        self.statusBar().showMessage(
+            f"Tema {THEME_LABELS[theme].lower()} aplicado.", 4_000
         )
 
     def _create_satellite_manager(self, provider: Provedor) -> None:
@@ -2788,6 +3316,7 @@ class MainWindow(QMainWindow):
             }
             for key, value in values.items():
                 self.load_detail_labels[key].setText(value or "—")
+            self._sync_load_companion_columns(selection.index, record)
             pattern_records = (
                 ()
                 if self._load_pattern_model is None
@@ -2879,6 +3408,7 @@ class MainWindow(QMainWindow):
         }
         for key, value in values.items():
             self.segment_detail_labels[key].setText(value or "—")
+        self._sync_segment_cable_columns(record, selection.index)
 
         switch_record = (
             None
@@ -2908,6 +3438,94 @@ class MainWindow(QMainWindow):
         self.details_dock.setWindowTitle("Trecho selecionado")
         self.details_stack.setCurrentWidget(self.segment_details_page)
         self.segment_details_page.verticalScrollBar().setValue(0)
+
+    def _phase_entry(self, value: str):  # noqa: ANN201
+        """Resolve um FASES2 na configuração atual, ou ``None``."""
+
+        configuration = self._phase_configuration
+        if configuration is None:
+            return None
+        key = str(value).strip().casefold()
+        return next(
+            (entry for entry in configuration.entries if entry.fases2 == key),
+            None,
+        )
+
+    def _apply_phase_companion(self, label: QLabel, value: str) -> None:
+        """Escreve o NOME do FASES2 e o número de fases no tooltip."""
+
+        entry = self._phase_entry(value)
+        if entry is None:
+            label.setText("—")
+            label.setToolTip("")
+            return
+        label.setText(entry.name or "—")
+        label.setToolTip(f"NUMERO_FASES: {entry.phase_count}")
+
+    def _sync_segment_cable_columns(self, record, segment_index: int) -> None:  # noqa: ANN001
+        """Preenche a coluna à direita de FASES2, BARRA1_ID/BARRA2_ID e CABOF_ID/CABON_ID.
+
+        BARRA1_ID/BARRA2_ID sempre mostram o código da barra correspondente,
+        pois ele está sempre disponível a partir do modelo de trechos — igual
+        ao painel de cargas. FASES2 e os cabos continuam dependendo da
+        configuração de fases e do catálogo de cabos.
+        """
+
+        catalog = self._cable_model
+        visible = catalog is not None or self._phase_configuration is not None
+        cable_ids = {
+            "phase_cable_id": record.phase_cable_id,
+            "neutral_cable_id": record.neutral_cable_id,
+        }
+        start_index = int(self._line_model.start_indices[segment_index])
+        end_index = int(self._line_model.end_indices[segment_index])
+        bar_codes = {
+            "start_bar_id": self._line_model.bars.codes[start_index],
+            "end_bar_id": self._line_model.bars.codes[end_index],
+        }
+        for key, label in self.segment_companion_labels.items():
+            if key == "phases":
+                self._apply_phase_companion(label, record.phases)
+                label.setVisible(visible)
+                continue
+            if key in bar_codes:
+                label.setText(bar_codes[key] or "—")
+                label.setToolTip("")
+                label.setVisible(True)
+                continue
+            cable_id = cable_ids.get(key)
+            if catalog is None or cable_id is None:
+                label.setText("—")
+                label.setToolTip("")
+            else:
+                cable = catalog.record_for_id(cable_id) if cable_id else None
+                label.setText("—" if cable is None else cable_summary(cable))
+                label.setToolTip("" if cable is None else cable_tooltip(cable))
+            label.setVisible(visible)
+
+    def _sync_load_companion_columns(self, load_index: int, record) -> None:  # noqa: ANN001
+        """Preenche a coluna à direita de BARRA_ID e de FASES2.
+
+        A coluna fica sempre visível nesta página: o código da barra existe
+        sempre que há cargas, ao contrário do painel de trechos, que depende do
+        catálogo de cabos.
+        """
+
+        model = self._load_model
+        bar_code = ""
+        if model is not None and 0 <= load_index < len(model):
+            bar_index = int(model.bar_indices[load_index])
+            bar_code = model.bars.codes[bar_index]
+        for key, label in self.load_companion_labels.items():
+            if key == "phases":
+                self._apply_phase_companion(label, record.phases)
+            elif key == "bar_id":
+                label.setText(bar_code or "—")
+                label.setToolTip("")
+            else:
+                label.setText("—")
+                label.setToolTip("")
+            label.setVisible(True)
 
     def _show_coordinates(self, x: float, y: float) -> None:
         self.coordinate_status.setText(f"X: {x:.3f}   Y: {y:.3f}")
@@ -2954,6 +3572,12 @@ class MainWindow(QMainWindow):
             if self._equivalent_worker is not None:
                 self._equivalent_worker.cancel()
             self._close_after_equivalent_build = True
+            event.ignore()
+            return
+        if self._export_thread is not None and self._export_thread.isRunning():
+            if self._export_worker is not None:
+                self._export_worker.cancel()
+            self._close_after_export = True
             event.ignore()
             return
         self.search_palette.shutdown()

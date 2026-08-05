@@ -7,12 +7,14 @@ import threading
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from .branch_analysis import BranchAnalysisResult, analyze_branches
+from .cable_import import load_cables_csv
 from .circuit_import import load_circuits_csv
 from .csv_import import CsvImportCancelled, load_csv
 from .load_import import load_loads_csv
 from .load_pattern_import import load_load_patterns_csv
 from .equivalent_network import build_equivalent_network
 from .model import (
+    CableModel,
     CircuitCatalogModel,
     CircuitModel,
     LineNetworkModel,
@@ -21,6 +23,7 @@ from .model import (
     SwitchModel,
     UtmCrs,
 )
+from .opendss_export import build_export
 from .phase_config import PhaseConfiguration
 from .segment_import import load_segments_csv
 from .switch_import import load_switches_csv
@@ -200,6 +203,38 @@ class SwitchImportWorker(QObject):
             self.finished.emit(result)
 
 
+class CableImportWorker(QObject):
+    progress = pyqtSignal(int, int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self.path = path
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = load_cables_csv(
+                self.path,
+                cancel_event=self._cancel_event,
+                progress=lambda rows, current, total: self.progress.emit(
+                    rows, current, total
+                ),
+            )
+        except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
 class CircuitImportWorker(QObject):
     progress = pyqtSignal(int, int, int)
     finished = pyqtSignal(object)
@@ -234,6 +269,54 @@ class CircuitImportWorker(QObject):
                 ),
             )
         except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class OpenDssExportWorker(QObject):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        catalog: CircuitCatalogModel,
+        cables: CableModel,
+        phase_configuration: PhaseConfiguration,
+        circuit_indices: tuple[int, ...],
+        loads: LoadModel | None = None,
+        patterns: LoadPatternModel | None = None,
+    ) -> None:
+        super().__init__()
+        self.catalog = catalog
+        self.cables = cables
+        self.phase_configuration = phase_configuration
+        self.circuit_indices = tuple(circuit_indices)
+        self.loads = loads
+        self.patterns = patterns
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = build_export(
+                self.catalog,
+                self.cables,
+                self.phase_configuration,
+                self.circuit_indices,
+                loads=self.loads,
+                patterns=self.patterns,
+                cancel_check=self._cancel_event.is_set,
+                progress=lambda current, total: self.progress.emit(current, total),
+            )
+        except InterruptedError:
             self.cancelled.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
