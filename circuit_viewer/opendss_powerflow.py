@@ -36,6 +36,7 @@ diagnóstico, em vez de atribuir a corrente de um trecho ao outro.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -45,6 +46,7 @@ from .model import (
     CircuitCatalogModel,
     LoadModel,
     LoadPatternModel,
+    RegulatorModel,
 )
 from .opendss_engine import DssEngine
 from .opendss_export import (
@@ -74,6 +76,17 @@ _STEP_MODE_COMMANDS = (
     "Set time=(0, 0)",
 )
 
+# Pares fase-fase da tensão de linha, na ordem em que o painel os apresenta:
+# VDE, VEF, VFD. Os números são os nós DSS das fases D, E e F.
+LINE_VOLTAGE_PAIRS: tuple[tuple[int, int], ...] = ((1, 2), (2, 3), (3, 1))
+
+# Operador de rotação das componentes simétricas: 1∠120°.
+_ALPHA = complex(math.cos(math.radians(120.0)), math.sin(math.radians(120.0)))
+_ALPHA_SQUARED = _ALPHA * _ALPHA
+
+# A base pu do OpenDSS é a tensão de fase da barra; a de linha é √3 maior.
+LINE_VOLTAGE_PU_BASE = math.sqrt(3.0)
+
 
 @dataclass(frozen=True, slots=True)
 class PowerFlowIssue:
@@ -95,11 +108,16 @@ class SegmentCurrents:
     para calcular o carregamento percentual. Vem do trecho mesmo quando ele
     carrega uma chave: ``Switch=Yes`` apaga os parâmetros elétricos da ``Line``,
     mas o condutor físico daquele ponto continua sendo o do ``CABOF_ID``.
+
+    ``angles`` acompanha ``magnitudes`` e traz o ângulo do fasor em graus, no
+    mesmo referencial do OpenDSS (a fonte em 0°). Vem de graça: o
+    ``currents_mag_ang`` lido para o módulo já intercala os dois.
     """
 
     nodes: tuple[int, ...]
     magnitudes: tuple[tuple[float, ...], ...]
     ampacity: float | None = None
+    angles: tuple[tuple[float, ...], ...] = ()
 
     @property
     def peak(self) -> float:
@@ -109,25 +127,79 @@ class SegmentCurrents:
 
 
 @dataclass(frozen=True, slots=True)
+class SegmentPowers:
+    """Potências de um trecho no **terminal 1**, por patamar e por nó.
+
+    ``active`` em kW e ``reactive`` em kvar, alinhados com ``nodes`` como as
+    correntes. A **convenção de sinal do OpenDSS é preservada**: positivo é
+    potência entrando pelo terminal 1, negativo é saindo. É o sinal que diz o
+    sentido do fluxo, então nada aqui usa valor absoluto.
+
+    ``active_losses``/``reactive_losses`` são do elemento inteiro, um valor por
+    patamar — o OpenDSS as devolve somadas, não por fase.
+    """
+
+    nodes: tuple[int, ...]
+    active: tuple[tuple[float, ...], ...]
+    reactive: tuple[tuple[float, ...], ...]
+    active_losses: tuple[float, ...] = ()
+    reactive_losses: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RegulatorTap:
+    """Tap resolvido de uma unidade monofásica do regulador.
+
+    ``tap`` é a relação em pu do enrolamento 2, e ``minimum``/``maximum`` são os
+    limites do transformador. ``at_limit`` é o que interessa na prática: um
+    regulador encostado no fim do curso **parou de regular**, e sem isso a
+    interface mostraria um número que parece normal.
+    """
+
+    phase: str
+    tap: float
+    minimum: float
+    maximum: float
+
+    @property
+    def at_limit(self) -> bool:
+        span = self.maximum - self.minimum
+        if span <= 0.0:
+            return False
+        tolerance = span * 1e-6
+        return (
+            self.tap <= self.minimum + tolerance
+            or self.tap >= self.maximum - tolerance
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class BarVoltages:
     """Tensões de uma barra, por patamar e por nó.
 
     ``magnitudes`` em volts e ``per_unit`` na base da barra; os dois vetores têm
     a mesma forma de ``nodes``, porque saem alinhados do mesmo ``AllNodeNames``.
+
+    ``angles`` é o ângulo do fasor fase-neutro em graus, no referencial do
+    OpenDSS (a fonte em 0°). É o que permite compor a tensão de linha, que é uma
+    subtração de fasores e não de módulos.
     """
 
     nodes: tuple[int, ...]
     magnitudes: tuple[tuple[float, ...], ...]
     per_unit: tuple[tuple[float, ...], ...]
+    angles: tuple[tuple[float, ...], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class PowerFlowResult:
     """Resultado de uma execução, pronto para ser associado à tela.
 
-    Os cinco modelos de entrada viajam no resultado para a interface poder
+    Os seis modelos de entrada viajam no resultado para a interface poder
     revalidá-los por identidade na chegada, como as demais análises fazem: uma
-    reimportação durante a execução torna o resultado obsoleto.
+    reimportação durante a execução torna o resultado obsoleto. Os reguladores
+    entram nessa lista desde que passaram a ser exportados: eles mudam a tensão
+    resolvida, então trocá-los invalida o resultado como qualquer outra fonte.
     """
 
     catalog: CircuitCatalogModel
@@ -136,7 +208,12 @@ class PowerFlowResult:
     loads: LoadModel | None
     patterns: LoadPatternModel | None
     step_count: int
+    regulators: RegulatorModel | None = None
     segment_currents: Mapping[int, SegmentCurrents] = field(default_factory=dict)
+    segment_powers: Mapping[int, SegmentPowers] = field(default_factory=dict)
+    regulator_taps: Mapping[int, tuple[RegulatorTap, ...]] = field(
+        default_factory=dict
+    )
     bar_voltages: Mapping[int, BarVoltages] = field(default_factory=dict)
     solved_circuits: tuple[str, ...] = ()
     skipped_circuits: tuple[str, ...] = ()
@@ -262,6 +339,181 @@ def _ampacity(cables: CableModel, cable_id: str) -> float | None:
     return value if value is not None and value > 0.0 else None
 
 
+def line_voltages(
+    nodes: Sequence[int],
+    magnitudes: Sequence[Sequence[float]],
+    angles: Sequence[Sequence[float]],
+) -> tuple[
+    tuple[tuple[int, int], ...],
+    tuple[tuple[float, ...], ...],
+    tuple[tuple[float, ...], ...],
+]:
+    """Tensões fase-fase a partir dos fasores fase-neutro da barra.
+
+    ``VDE = VD − VE`` é subtração de **fasores**: com os módulos apenas, o
+    resultado estaria errado sempre que as fases não estivessem alinhadas — que
+    é o caso normal. Daí esta função exigir os ângulos.
+
+    Devolve ``(pares, módulos, ângulos)``, com um par por coluna. Só entra o par
+    cujas **duas** fases existem na barra, então uma barra bifásica sai com uma
+    coluna em vez de duas colunas de traço, e uma monofásica sai vazia.
+
+    Público e no núcleo porque é física, não apresentação: o painel só exibe o
+    que sai daqui.
+    """
+
+    position_by_node = {int(node): index for index, node in enumerate(nodes)}
+    pairs = tuple(
+        pair
+        for pair in LINE_VOLTAGE_PAIRS
+        if pair[0] in position_by_node and pair[1] in position_by_node
+    )
+    if not pairs:
+        return (), (), ()
+
+    rows: list[tuple[float, ...]] = []
+    angle_rows: list[tuple[float, ...]] = []
+    for magnitude_row, angle_row in zip(magnitudes, angles, strict=True):
+        values: list[float] = []
+        row_angles: list[float] = []
+        for first, second in pairs:
+            head = _phasor(magnitude_row, angle_row, position_by_node[first])
+            tail = _phasor(magnitude_row, angle_row, position_by_node[second])
+            difference = head - tail
+            values.append(abs(difference))
+            row_angles.append(math.degrees(_phase_of(difference)))
+        rows.append(tuple(values))
+        angle_rows.append(tuple(row_angles))
+    return pairs, tuple(rows), tuple(angle_rows)
+
+
+def voltage_unbalance(
+    nodes: Sequence[int],
+    magnitudes: Sequence[Sequence[float]],
+    angles: Sequence[Sequence[float]],
+) -> tuple[float, ...]:
+    """Fator de desequilíbrio de tensão, em %, por patamar.
+
+    Definição do PRODIST Módulo 8: ``FD% = |V₋| / |V₊| × 100``, a razão entre as
+    componentes de sequência negativa e positiva. Exige as três fases — com
+    menos de três não há sistema trifásico a desequilibrar, e a função devolve
+    vazio.
+
+    Com os fasores em mãos esta é a definição exata, e não a aproximação por
+    desvio máximo em torno da média, que ignora o ângulo.
+    """
+
+    position_by_node = {int(node): index for index, node in enumerate(nodes)}
+    if any(node not in position_by_node for node in (1, 2, 3)):
+        return ()
+
+    values: list[float] = []
+    for magnitude_row, angle_row in zip(magnitudes, angles, strict=True):
+        phases = tuple(
+            _phasor(magnitude_row, angle_row, position_by_node[node])
+            for node in (1, 2, 3)
+        )
+        positive = (
+            phases[0] + _ALPHA * phases[1] + _ALPHA_SQUARED * phases[2]
+        ) / 3.0
+        negative = (
+            phases[0] + _ALPHA_SQUARED * phases[1] + _ALPHA * phases[2]
+        ) / 3.0
+        values.append(
+            0.0 if abs(positive) == 0.0 else abs(negative) / abs(positive) * 100.0
+        )
+    return tuple(values)
+
+
+def apparent_power(
+    active: Sequence[Sequence[float]],
+    reactive: Sequence[Sequence[float]],
+) -> tuple[tuple[tuple[float, ...], ...], tuple[tuple[float, ...], ...]]:
+    """Módulo e ângulo de ``S = P + jQ`` por fase, em kVA e graus."""
+
+    magnitudes: list[tuple[float, ...]] = []
+    angles: list[tuple[float, ...]] = []
+    for active_row, reactive_row in zip(active, reactive, strict=True):
+        magnitudes.append(
+            tuple(
+                math.hypot(p, q)
+                for p, q in zip(active_row, reactive_row, strict=True)
+            )
+        )
+        angles.append(
+            tuple(
+                math.degrees(math.atan2(q, p))
+                for p, q in zip(active_row, reactive_row, strict=True)
+            )
+        )
+    return tuple(magnitudes), tuple(angles)
+
+
+def three_phase_power(
+    active: Sequence[Sequence[float]],
+    reactive: Sequence[Sequence[float]],
+) -> tuple[tuple[float, ...], ...]:
+    """Totais do elemento por patamar: ``(P₃ᵩ, Q₃ᵩ, |S₃ᵩ|, θ₃ᵩ)``.
+
+    A soma é das potências **complexas** das fases, e o sinal de cada parcela é
+    preservado: ele diz se o elemento recebe ou fornece pelo terminal 1.
+    """
+
+    rows: list[tuple[float, ...]] = []
+    for active_row, reactive_row in zip(active, reactive, strict=True):
+        total_active = math.fsum(active_row)
+        total_reactive = math.fsum(reactive_row)
+        rows.append(
+            (
+                total_active,
+                total_reactive,
+                math.hypot(total_active, total_reactive),
+                math.degrees(math.atan2(total_reactive, total_active)),
+            )
+        )
+    return tuple(rows)
+
+
+def power_factor(
+    active: Sequence[Sequence[float]],
+    reactive: Sequence[Sequence[float]],
+) -> tuple[tuple[float, ...], ...]:
+    """``cos θ`` por fase mais o do total, por patamar.
+
+    Sai **com sinal**, herdado de ``P``: negativo indica potência saindo pelo
+    terminal 1. Potência nula não tem fator definido e vira ``0``.
+    """
+
+    rows: list[tuple[float, ...]] = []
+    for active_row, reactive_row in zip(active, reactive, strict=True):
+        values = [
+            0.0 if math.hypot(p, q) == 0.0 else p / math.hypot(p, q)
+            for p, q in zip(active_row, reactive_row, strict=True)
+        ]
+        total_active = math.fsum(active_row)
+        total_apparent = math.hypot(total_active, math.fsum(reactive_row))
+        values.append(
+            0.0 if total_apparent == 0.0 else total_active / total_apparent
+        )
+        rows.append(tuple(values))
+    return tuple(rows)
+
+
+def _phasor(
+    magnitudes: Sequence[float],
+    angles: Sequence[float],
+    position: int,
+) -> complex:
+    return complex(
+        magnitudes[position] * math.cos(math.radians(angles[position])),
+        magnitudes[position] * math.sin(math.radians(angles[position])),
+    )
+
+
+def _phase_of(value: complex) -> float:
+    return math.atan2(value.imag, value.real)
+
+
 def _write_circuit_files(workspace: Path, circuit_index: int, definition, bundle) -> Path:  # noqa: ANN001
     """Grava o bundle numa subpasta própria e devolve o caminho do master.
 
@@ -286,6 +538,7 @@ def _harvest_bus_voltages(
     nodes: dict[int, list[int]],
     magnitudes: dict[int, list[float]],
     per_unit: dict[int, list[float]],
+    angles: dict[int, list[float]],
     report: _PowerFlowReport,
     circuit_id: str,
     *,
@@ -293,13 +546,23 @@ def _harvest_bus_voltages(
 ) -> None:
     """Distribui ``AllBusVMag``/``AllBusVMagPu`` pelas barras da aplicação.
 
-    Os três vetores do OpenDSS são paralelos e cobrem o sistema inteiro, então
-    uma leitura por passo resolve todas as barras — não há laço por elemento.
+    Os vetores do OpenDSS são paralelos e cobrem o sistema inteiro, então uma
+    leitura por passo resolve todas as barras — não há laço por elemento.
+
+    ``AllBusVolts`` entra pelo ângulo: não existe um ``AllBusVMagAngle`` no
+    ``py_dss_interface``, e é dele que sai o fasor de que a tensão de linha
+    precisa. Ele traz **dois** doubles por nó (parte real e imaginária), daí a
+    conferência de tamanho ser contra o dobro.
     """
 
     values = engine.circuit.buses_vmag
     pu_values = engine.circuit.buses_vmag_pu
-    if len(values) != len(node_names) or len(pu_values) != len(node_names):
+    volts = engine.circuit.buses_volts
+    if (
+        len(values) != len(node_names)
+        or len(pu_values) != len(node_names)
+        or len(volts) != 2 * len(node_names)
+    ):
         report.add(
             circuit_id,
             "o OpenDSS devolveu tensões em quantidade diferente da lista de "
@@ -322,6 +585,11 @@ def _harvest_bus_voltages(
             nodes.setdefault(bar_index, []).append(node)
         magnitudes.setdefault(bar_index, []).append(float(values[position]))
         per_unit.setdefault(bar_index, []).append(float(pu_values[position]))
+        real = float(volts[2 * position])
+        imaginary = float(volts[2 * position + 1])
+        angles.setdefault(bar_index, []).append(
+            math.degrees(math.atan2(imaginary, real))
+        )
 
 
 def _harvest_line_currents(
@@ -329,12 +597,22 @@ def _harvest_line_currents(
     segment_by_line_name: Mapping[str, int],
     nodes: dict[int, tuple[int, ...]],
     magnitudes: dict[int, list[float]],
+    angles: dict[int, list[float]],
+    active: dict[int, list[float]],
+    reactive: dict[int, list[float]],
+    active_losses: dict[int, list[float]],
+    reactive_losses: dict[int, list[float]],
     cancel_check: Callable[[], bool] | None,
 ) -> None:
-    """Percorre as ``Line`` do circuito lendo a corrente do terminal 1.
+    """Percorre as ``Line`` do circuito lendo corrente e potência do terminal 1.
 
     Chaves também são ``Line`` no modelo exportado, então elas vêm de graça
     neste mesmo laço.
+
+    ``powers`` tem o mesmo layout do ``currents_mag_ang`` — dois doubles por
+    condutor, terminais em sequência —, só que o par é ``(kW, kvar)`` em vez de
+    módulo e ângulo. Por isso as duas leituras andam juntas: mesmo recorte de
+    terminal, mesmo filtro de nó, mesma indexação.
     """
 
     processed = 0
@@ -354,25 +632,106 @@ def _harvest_line_currents(
             order = engine.cktelement.node_order
             # currents_mag_ang intercala módulo e ângulo por condutor, com os
             # terminais em sequência; o terminal 1 são os primeiros condutores.
+            powers = engine.cktelement.powers
             row: list[float] = []
+            angle_row: list[float] = []
+            active_row: list[float] = []
+            reactive_row: list[float] = []
             terminal_nodes: list[int] = []
             for position in range(min(conductors, len(order))):
                 node = int(order[position])
                 if node <= 0:
                     continue
                 magnitude_at = 2 * position
-                if magnitude_at >= len(readings):
+                # O ângulo é o segundo double do par; ler os dois juntos mantém
+                # módulo e fase do mesmo condutor sempre alinhados.
+                if magnitude_at + 1 >= len(readings):
                     break
                 terminal_nodes.append(node)
                 row.append(float(readings[magnitude_at]))
+                angle_row.append(float(readings[magnitude_at + 1]))
+                # Sinal preservado: positivo entra pelo terminal 1.
+                if magnitude_at + 1 < len(powers):
+                    active_row.append(float(powers[magnitude_at]))
+                    reactive_row.append(float(powers[magnitude_at + 1]))
             if row:
                 known = nodes.get(segment_index)
+                complete = len(active_row) == len(row)
+                # As perdas vêm do elemento inteiro, não por condutor — e em
+                # **watts**, ao contrário de ``powers``, que vem em kW. Medido
+                # contra 3·R·I² de um trecho conhecido: a razão deu exatamente
+                # 1000. Sem esta divisão a coluna erraria por três ordens de
+                # grandeza sem nada denunciar.
+                losses = engine.cktelement.losses
+                loss_active = (
+                    float(losses[0]) / 1_000.0 if len(losses) > 1 else 0.0
+                )
+                loss_reactive = (
+                    float(losses[1]) / 1_000.0 if len(losses) > 1 else 0.0
+                )
                 if known is None:
                     nodes[segment_index] = tuple(terminal_nodes)
                     magnitudes[segment_index] = list(row)
+                    angles[segment_index] = list(angle_row)
+                    if complete:
+                        active[segment_index] = list(active_row)
+                        reactive[segment_index] = list(reactive_row)
+                        active_losses[segment_index] = [loss_active]
+                        reactive_losses[segment_index] = [loss_reactive]
                 elif known == tuple(terminal_nodes):
                     magnitudes[segment_index].extend(row)
+                    angles[segment_index].extend(angle_row)
+                    if complete and segment_index in active:
+                        active[segment_index].extend(active_row)
+                        reactive[segment_index].extend(reactive_row)
+                        active_losses[segment_index].append(loss_active)
+                        reactive_losses[segment_index].append(loss_reactive)
         has_line = bool(engine.lines.next())
+
+
+def _regulator_unit_index(bundle) -> dict[str, tuple[int, str]]:  # noqa: ANN001
+    """``nome do Transformer`` minúsculo → ``(índice do trecho, fase)``."""
+
+    regulators = getattr(bundle, "regulators", None)
+    if regulators is None:
+        return {}
+    return {
+        name.casefold(): (segment_index, phase)
+        for name, segment_index, phase in regulators.exported_units
+    }
+
+
+def _harvest_regulator_taps(
+    engine: DssEngine,
+    unit_by_name: Mapping[str, tuple[int, str]],
+    taps: dict[int, list[RegulatorTap]],
+) -> None:
+    """Percorre os ``Transformer`` lendo o tap do enrolamento 2.
+
+    Os reguladores nunca aparecem no laço de ``lines``: no modelo exportado eles
+    são ``Transformer``. O vínculo nome→trecho vem do índice reverso do
+    exportador, como o das linhas — nunca de uma segunda implementação das
+    regras de nome.
+    """
+
+    if not unit_by_name:
+        return
+    has_transformer = bool(engine.transformers.first())
+    while has_transformer:
+        found = unit_by_name.get(engine.transformers.name.casefold())
+        if found is not None:
+            segment_index, phase = found
+            # Enrolamento 2 é o regulado, o mesmo que o RegControl monitora.
+            engine.transformers.wdg = 2
+            taps.setdefault(segment_index, []).append(
+                RegulatorTap(
+                    phase=phase,
+                    tap=float(engine.transformers.tap),
+                    minimum=float(engine.transformers.min_tap),
+                    maximum=float(engine.transformers.max_tap),
+                )
+            )
+        has_transformer = bool(engine.transformers.next())
 
 
 def run_power_flow(
@@ -385,6 +744,7 @@ def run_power_flow(
     workspace: Path,
     loads: LoadModel | None = None,
     patterns: LoadPatternModel | None = None,
+    regulators: RegulatorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
     step_count: int = LOAD_PATTERN_COUNT,
     cancel_check: Callable[[], bool] | None = None,
@@ -409,6 +769,8 @@ def run_power_flow(
     selected = _selected_indices(catalog, circuit_indices)
     report = _PowerFlowReport()
     segment_currents: dict[int, SegmentCurrents] = {}
+    segment_powers: dict[int, SegmentPowers] = {}
+    regulator_taps: dict[int, tuple[RegulatorTap, ...]] = {}
     bar_voltages: dict[int, BarVoltages] = {}
     solved: list[str] = []
     skipped: list[str] = []
@@ -427,6 +789,7 @@ def run_power_flow(
             (circuit_index,),
             loads=loads,
             patterns=patterns,
+            regulators=regulators,
             load_settings=load_settings,
             cancel_check=cancel_check,
         )
@@ -465,8 +828,14 @@ def run_power_flow(
         circuit_nodes: dict[int, list[int]] = {}
         circuit_magnitudes: dict[int, list[float]] = {}
         circuit_per_unit: dict[int, list[float]] = {}
+        circuit_angles: dict[int, list[float]] = {}
         line_nodes: dict[int, tuple[int, ...]] = {}
         line_magnitudes: dict[int, list[float]] = {}
+        line_angles: dict[int, list[float]] = {}
+        line_active: dict[int, list[float]] = {}
+        line_reactive: dict[int, list[float]] = {}
+        line_active_losses: dict[int, list[float]] = {}
+        line_reactive_losses: dict[int, list[float]] = {}
 
         for step in range(step_count):
             if cancel_check is not None and cancel_check():
@@ -481,6 +850,7 @@ def run_power_flow(
                 circuit_nodes,
                 circuit_magnitudes,
                 circuit_per_unit,
+                circuit_angles,
                 report,
                 definition.circuit_id,
                 first_step=step == 0,
@@ -490,11 +860,27 @@ def run_power_flow(
                 segment_by_line_name,
                 line_nodes,
                 line_magnitudes,
+                line_angles,
+                line_active,
+                line_reactive,
+                line_active_losses,
+                line_reactive_losses,
                 cancel_check,
             )
             completed += 1
             if progress is not None:
                 progress(min(completed, total), total)
+
+        # Um tap por circuito, depois do último passo: é o estado com que o
+        # alimentador terminou de ser resolvido.
+        circuit_taps: dict[int, list[RegulatorTap]] = {}
+        _harvest_regulator_taps(
+            engine,
+            _regulator_unit_index(bundle),
+            circuit_taps,
+        )
+        for segment_index, units in circuit_taps.items():
+            regulator_taps.setdefault(segment_index, tuple(units))
 
         _merge_circuit_results(
             catalog,
@@ -503,10 +889,17 @@ def run_power_flow(
             circuit_nodes,
             circuit_magnitudes,
             circuit_per_unit,
+            circuit_angles,
             line_nodes,
             line_magnitudes,
+            line_angles,
+            line_active,
+            line_reactive,
+            line_active_losses,
+            line_reactive_losses,
             bar_voltages,
             segment_currents,
+            segment_powers,
             report,
         )
         solved.append(definition.circuit_id)
@@ -517,8 +910,11 @@ def run_power_flow(
         phase_configuration=phase_configuration,
         loads=loads,
         patterns=patterns,
+        regulators=regulators,
         step_count=step_count,
         segment_currents=segment_currents,
+        segment_powers=segment_powers,
+        regulator_taps=regulator_taps,
         bar_voltages=bar_voltages,
         solved_circuits=tuple(solved),
         skipped_circuits=tuple(skipped),
@@ -546,10 +942,17 @@ def _merge_circuit_results(
     circuit_nodes: Mapping[int, Sequence[int]],
     circuit_magnitudes: Mapping[int, Sequence[float]],
     circuit_per_unit: Mapping[int, Sequence[float]],
+    circuit_angles: Mapping[int, Sequence[float]],
     line_nodes: Mapping[int, tuple[int, ...]],
     line_magnitudes: Mapping[int, Sequence[float]],
+    line_angles: Mapping[int, Sequence[float]],
+    line_active: Mapping[int, Sequence[float]],
+    line_reactive: Mapping[int, Sequence[float]],
+    line_active_losses: Mapping[int, Sequence[float]],
+    line_reactive_losses: Mapping[int, Sequence[float]],
     bar_voltages: dict[int, BarVoltages],
     segment_currents: dict[int, SegmentCurrents],
+    segment_powers: dict[int, SegmentPowers],
     report: _PowerFlowReport,
 ) -> None:
     """Converte os acumuladores do circuito em dataclasses e mescla no total.
@@ -567,7 +970,8 @@ def _merge_circuit_results(
         width = len(nodes)
         magnitudes = _rows(circuit_magnitudes.get(bar_index, ()), width, step_count)
         per_unit = _rows(circuit_per_unit.get(bar_index, ()), width, step_count)
-        if magnitudes is None or per_unit is None:
+        bar_angles = _rows(circuit_angles.get(bar_index, ()), width, step_count)
+        if magnitudes is None or per_unit is None or bar_angles is None:
             report.add(
                 bars.bar_ids[bar_index],
                 "as tensões lidas não completaram todos os patamares; a barra "
@@ -578,13 +982,15 @@ def _merge_circuit_results(
             nodes=tuple(nodes),
             magnitudes=magnitudes,
             per_unit=per_unit,
+            angles=bar_angles,
         )
 
     for segment_index, nodes in line_nodes.items():
         if segment_index in segment_currents:
             continue
         magnitudes = _rows(line_magnitudes.get(segment_index, ()), len(nodes), step_count)
-        if magnitudes is None:
+        segment_angles = _rows(line_angles.get(segment_index, ()), len(nodes), step_count)
+        if magnitudes is None or segment_angles is None:
             report.add(
                 segments.segment_ids[segment_index],
                 "as correntes lidas não completaram todos os patamares; o "
@@ -594,8 +1000,27 @@ def _merge_circuit_results(
         segment_currents[segment_index] = SegmentCurrents(
             nodes=nodes,
             magnitudes=magnitudes,
+            angles=segment_angles,
             ampacity=_ampacity(
                 cables,
                 segments.record(segment_index).phase_cable_id,
             ),
+        )
+        # A potência é opcional: um motor que não a forneça deixa o trecho com
+        # corrente e sem potência, em vez de perder os dois resultados.
+        active = _rows(line_active.get(segment_index, ()), len(nodes), step_count)
+        reactive = _rows(line_reactive.get(segment_index, ()), len(nodes), step_count)
+        if active is None or reactive is None:
+            continue
+        losses_active = tuple(line_active_losses.get(segment_index, ()))
+        losses_reactive = tuple(line_reactive_losses.get(segment_index, ()))
+        if len(losses_active) != step_count or len(losses_reactive) != step_count:
+            losses_active = ()
+            losses_reactive = ()
+        segment_powers[segment_index] = SegmentPowers(
+            nodes=nodes,
+            active=active,
+            reactive=reactive,
+            active_losses=losses_active,
+            reactive_losses=losses_reactive,
         )

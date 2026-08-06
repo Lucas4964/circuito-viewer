@@ -347,9 +347,17 @@ class BranchesUiTests(unittest.TestCase):
         self.assertIs(window._equivalent_network_result.model.source_patterns, patterns)
         window._set_selection(FeatureSelection("equivalent_load", 0))
         self.assertEqual(window.equivalent_pattern_table_model.rowCount(), 4)
+        # Exibição arredondada em 4 casas; o valor somado continua inteiro.
         self.assertEqual(
             window.equivalent_pattern_table_model.data(
                 window.equivalent_pattern_table_model.index(0, 2)
+            ),
+            "3.0000",
+        )
+        self.assertEqual(
+            window.equivalent_pattern_table_model.data(
+                window.equivalent_pattern_table_model.index(0, 2),
+                Qt.ItemDataRole.ToolTipRole,
             ),
             "3",
         )

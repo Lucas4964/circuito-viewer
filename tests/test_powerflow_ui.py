@@ -8,8 +8,10 @@ combobox.
 
 from __future__ import annotations
 
+import math
 import os
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -41,6 +43,11 @@ try:
         PowerFlowIssue,
         PowerFlowResult,
         SegmentCurrents,
+        SegmentPowers,
+    )
+    from circuit_viewer.phase_config import (
+        PhaseConfiguration,
+        PhaseMappingEntry,
     )
     from circuit_viewer.segment_import import SegmentLoadResult
     from circuit_viewer.switch_import import SwitchLoadResult
@@ -201,6 +208,27 @@ class PowerFlowUiTests(unittest.TestCase):
                         (13.0, 23.0, 33.0),
                     ),
                     ampacity=ampacity,
+                    angles=(
+                        (0.0, -120.0, 120.0),
+                        (1.0, -119.0, 121.0),
+                        (2.0, -118.0, 122.0),
+                        (3.0, -117.0, 123.0),
+                    ),
+                )
+            },
+            segment_powers={
+                0: SegmentPowers(
+                    nodes=(1, 2, 3),
+                    active=tuple(
+                        (100.0 + step, 110.0 + step, 120.0 + step)
+                        for step in range(4)
+                    ),
+                    reactive=tuple(
+                        (30.0 + step, 33.0 + step, 36.0 + step)
+                        for step in range(4)
+                    ),
+                    active_losses=(2.0, 2.1, 2.2, 2.3),
+                    reactive_losses=(6.0, 6.1, 6.2, 6.3),
                 )
             },
             bar_voltages={
@@ -217,6 +245,12 @@ class PowerFlowUiTests(unittest.TestCase):
                         (0.997, 0.996),
                         (0.995, 0.994),
                         (0.993, 0.992),
+                    ),
+                    angles=(
+                        (0.0, -120.0),
+                        (1.0, -119.0),
+                        (2.0, -118.0),
+                        (3.0, -117.0),
                     ),
                 )
             },
@@ -303,10 +337,13 @@ class PowerFlowUiTests(unittest.TestCase):
         self.assertTrue(window.segment_power_flow_section.isVisible())
         model = window.segment_power_flow_model
         self.assertEqual(model.rowCount(), 4)
-        # Uma coluna de NPAT mais uma por fase.
-        self.assertEqual(model.columnCount(), 4)
-        self.assertEqual(model.nodes, (1, 2, 3))
-        self.assertEqual(model.rows[0], (10.0, 20.0, 30.0))
+        # NPAT + três módulos + três ângulos.
+        self.assertEqual(model.columnCount(), 7)
+        self.assertEqual(
+            model.labels,
+            ("Fase D", "Fase E", "Fase F", "θD", "θE", "θF"),
+        )
+        self.assertEqual(model.rows[0], (10.0, 20.0, 30.0, 0.0, -120.0, 120.0))
 
     def test_segment_combobox_switches_to_loading(self) -> None:
         window = self._window()
@@ -365,8 +402,8 @@ class PowerFlowUiTests(unittest.TestCase):
 
         self.assertTrue(window.bar_power_flow_section.isVisible())
         model = window.bar_power_flow_model
-        self.assertEqual(model.nodes, (1, 2))
-        self.assertEqual(model.rows[0], (7_960.0, 7_950.0))
+        self.assertEqual(model.labels, ("Fase D", "Fase E", "θD", "θE"))
+        self.assertEqual(model.rows[0], (7_960.0, 7_950.0, 0.0, -120.0))
 
         combo = window.bar_power_flow_combo
         combo.setCurrentIndex(
@@ -376,7 +413,245 @@ class PowerFlowUiTests(unittest.TestCase):
                 if combo.itemData(row) == "per_unit"
             )
         )
+        # O pu não traz ângulo: seria o mesmo da tensão de fase.
+        self.assertEqual(window.bar_power_flow_model.labels, ("Fase D", "Fase E"))
         self.assertEqual(window.bar_power_flow_model.rows[0], (0.999, 0.998))
+
+    def _select_quantity(self, combo, key: str) -> None:  # noqa: ANN001
+        combo.setCurrentIndex(
+            next(
+                row
+                for row in range(combo.count())
+                if combo.itemData(row) == key
+            )
+        )
+
+    def test_quantities_use_the_project_phase_names(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._install_result(window, self._result(window))
+
+        captions = [
+            window.bar_power_flow_combo.itemText(row)
+            for row in range(window.bar_power_flow_combo.count())
+        ]
+
+        self.assertEqual(
+            captions,
+            [
+                "Tensão de fase (V)",
+                "Tensão de linha (V)",
+                "Tensão de fase (pu)",
+                "Tensão de linha (pu)",
+                "Desequilíbrio de tensão (%)",
+            ],
+        )
+
+    def test_phase_letters_come_from_the_configuration(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._install_result(window, self._result(window))
+        # Configuração invertida: o nó 1 passa a ser a fase E e o nó 2, a D.
+        # Se os rótulos fossem literais, nada mudaria aqui.
+        window._phase_configuration = PhaseConfiguration(
+            (
+                PhaseMappingEntry("1", "E", 1, "1"),
+                PhaseMappingEntry("2", "D", 1, "2"),
+                PhaseMappingEntry("13", "DEF", 3, "1.2.3"),
+            )
+        )
+
+        window._set_selection(FeatureSelection("bar", 0))
+
+        self.assertEqual(
+            window.bar_power_flow_model.labels,
+            ("Fase E", "Fase D", "θE", "θD"),
+        )
+
+    def test_unmapped_node_falls_back_to_its_number(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._install_result(window, self._result(window))
+        window._phase_configuration = None
+
+        window._set_selection(FeatureSelection("bar", 0))
+
+        self.assertEqual(
+            window.bar_power_flow_model.labels,
+            ("Fase 1", "Fase 2", "θ1", "θ2"),
+        )
+
+    def test_bar_panel_shows_the_line_voltage(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._install_result(window, self._result(window))
+        window._set_selection(FeatureSelection("bar", 0))
+
+        self._select_quantity(window.bar_power_flow_combo, "line_voltage")
+
+        model = window.bar_power_flow_model
+        # A barra da fixture tem só as fases D e E, então sai um par só.
+        self.assertEqual(model.labels, ("VDE", "θDE"))
+        # 7960 ∠0° menos 7950 ∠-120° = 13778,47 ∠29,98°. A diferença de
+        # módulos daria 10 V: é o que separa subtrair fasor de subtrair módulo.
+        self.assertAlmostEqual(model.rows[0][0], 13_778.465081, places=4)
+        self.assertAlmostEqual(model.rows[0][1], 29.979208, places=4)
+
+    def test_line_voltage_is_disabled_on_a_single_phase_bar(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        result = self._result(window)
+        single = BarVoltages(
+            nodes=(1,),
+            magnitudes=((7_960.0,),) * 4,
+            per_unit=((0.999,),) * 4,
+            angles=((0.0,),) * 4,
+        )
+        self._install_result(
+            window,
+            replace(result, bar_voltages={0: single}),
+        )
+
+        window._set_selection(FeatureSelection("bar", 0))
+
+        combo = window.bar_power_flow_combo
+        row = next(
+            index
+            for index in range(combo.count())
+            if combo.itemData(index) == "line_voltage"
+        )
+        self.assertFalse(combo.model().item(row).isEnabled())
+
+        self._select_quantity(combo, "line_voltage")
+        self.assertEqual(window.bar_power_flow_model.labels, ())
+        self.assertIn("uma fase só", window.bar_power_flow_note.text())
+
+    def test_segment_loading_has_no_angle_columns(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._install_result(window, self._result(window))
+        window._set_selection(FeatureSelection("segment", 0))
+
+        self._select_quantity(window.segment_power_flow_combo, "loading")
+
+        # Carregamento é razão de módulos: não há fasor a mostrar.
+        self.assertEqual(
+            window.segment_power_flow_model.labels,
+            ("Fase D", "Fase E", "Fase F"),
+        )
+
+    def test_bar_shows_line_voltage_in_per_unit(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._install_result(window, self._result(window))
+        window._set_selection(FeatureSelection("bar", 0))
+
+        self._select_quantity(window.bar_power_flow_combo, "line_per_unit")
+
+        model = window.bar_power_flow_model
+        self.assertEqual(model.labels, ("VDE",))
+        # A pu de fase da fixture é ~0,999/0,998 defasadas de 120°: a de linha
+        # renormaliza por √3 e fica na mesma ordem de grandeza, não em √3.
+        self.assertAlmostEqual(model.rows[0][0], 0.99850, places=4)
+
+    def test_bar_shows_the_voltage_unbalance(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        result = self._result(window)
+        balanced = BarVoltages(
+            nodes=(1, 2, 3),
+            magnitudes=((7_960.0, 7_960.0, 7_960.0),) * 4,
+            per_unit=((1.0, 1.0, 1.0),) * 4,
+            angles=((0.0, -120.0, 120.0),) * 4,
+        )
+        self._install_result(window, replace(result, bar_voltages={0: balanced}))
+        window._set_selection(FeatureSelection("bar", 0))
+
+        self._select_quantity(window.bar_power_flow_combo, "unbalance")
+
+        self.assertEqual(window.bar_power_flow_model.labels, ("FD (%)",))
+        self.assertAlmostEqual(window.bar_power_flow_model.rows[0][0], 0.0)
+
+    def test_unbalance_is_disabled_without_three_phases(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        # A fixture padrão tem uma barra de dois nós.
+        self._install_result(window, self._result(window))
+        window._set_selection(FeatureSelection("bar", 0))
+
+        combo = window.bar_power_flow_combo
+        row = next(
+            index
+            for index in range(combo.count())
+            if combo.itemData(index) == "unbalance"
+        )
+        self.assertFalse(combo.model().item(row).isEnabled())
+
+    def test_segment_shows_active_and_reactive_power(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._install_result(window, self._result(window))
+        window._set_selection(FeatureSelection("segment", 0))
+
+        self._select_quantity(window.segment_power_flow_combo, "active_power")
+        model = window.segment_power_flow_model
+        self.assertEqual(model.labels, ("Fase D", "Fase E", "Fase F"))
+        self.assertEqual(model.rows[0], (100.0, 110.0, 120.0))
+
+        self._select_quantity(window.segment_power_flow_combo, "reactive_power")
+        self.assertEqual(
+            window.segment_power_flow_model.rows[0], (30.0, 33.0, 36.0)
+        )
+
+    def test_segment_shows_apparent_power_with_its_angle(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._install_result(window, self._result(window))
+        window._set_selection(FeatureSelection("segment", 0))
+
+        self._select_quantity(window.segment_power_flow_combo, "apparent_power")
+
+        model = window.segment_power_flow_model
+        self.assertEqual(
+            model.labels, ("Fase D", "Fase E", "Fase F", "θD", "θE", "θF")
+        )
+        self.assertAlmostEqual(model.rows[0][0], math.hypot(100.0, 30.0))
+        self.assertAlmostEqual(
+            model.rows[0][3], math.degrees(math.atan2(30.0, 100.0))
+        )
+
+    def test_segment_shows_the_three_phase_totals(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._install_result(window, self._result(window))
+        window._set_selection(FeatureSelection("segment", 0))
+
+        self._select_quantity(
+            window.segment_power_flow_combo, "three_phase_power"
+        )
+
+        model = window.segment_power_flow_model
+        self.assertEqual(model.labels, ("P (kW)", "Q (kvar)", "S (kVA)", "θS"))
+        active, reactive, apparent, _ = model.rows[0]
+        self.assertAlmostEqual(active, 330.0)
+        self.assertAlmostEqual(reactive, 99.0)
+        self.assertAlmostEqual(apparent, math.hypot(330.0, 99.0))
+
+    def test_segment_shows_power_factor_and_losses(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._install_result(window, self._result(window))
+        window._set_selection(FeatureSelection("segment", 0))
+
+        self._select_quantity(window.segment_power_flow_combo, "power_factor")
+        model = window.segment_power_flow_model
+        self.assertEqual(model.labels, ("Fase D", "Fase E", "Fase F", "3φ"))
+        self.assertAlmostEqual(model.rows[0][0], 100.0 / math.hypot(100.0, 30.0))
+
+        self._select_quantity(window.segment_power_flow_combo, "losses")
+        model = window.segment_power_flow_model
+        self.assertEqual(model.labels, ("ΔP (kW)", "ΔQ (kvar)"))
+        self.assertEqual(model.rows[0], (2.0, 6.0))
 
     def test_selecting_another_kind_hides_both_sections(self) -> None:
         window = self._window()

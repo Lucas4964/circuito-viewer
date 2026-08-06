@@ -516,8 +516,10 @@ na topologia.
 segundo registro do mesmo trecho é descartado com diagnóstico. **Todos os campos
 permanecem texto**, inclusive `SNOM`, `NPASSOS` e `TAP`: é a regra do projeto
 para dados que só são exibidos, a mesma que mantém `SNOM`/`SADM` das cargas como
-texto. Sem consumidor numérico — a exportação OpenDSS não os usa — converter
-agora seria inventar uma política de arredondamento sem ninguém para aplicá-la;
+texto. `VNOM` e `SNOM` ganharam um consumidor numérico com a exportação (seção
+12.3), mas a conversão acontece **lá**, com o `parse_number()` do exportador;
+converter na importação seria inventar uma política de arredondamento sem
+ninguém para aplicá-la aos demais campos;
 e como texto, zeros à esquerda e vírgula decimal chegam ao painel exatamente como
 estão no arquivo de origem.
 
@@ -617,6 +619,7 @@ repaint do viewport
   ├─ drawBackground → _draw_satellite (se habilitado)
   ├─ itens da cena por Z:
   │     -20 LineNetworkItem · -15 SwitchNetworkItem
+  │     -12 RegulatorNetworkItem
   │     -11 LoadsOverviewItem · -10 BarsOverviewItem
   │      10 BarraItem ·  20 LoadItem
   │      90 SegmentSelectionOverlay · 95 BranchHighlightOverlay
@@ -656,6 +659,7 @@ Durante a materialização o agregado permanece visível e só é ocultado após
 | `LoadsOverviewItem` | −11 | idem, `SquareCap`, diâmetro 7 px |
 | `LineNetworkItem` | −20 | `dict[categoria → QPainterPath]` com subcaminhos desconectados; 1 `drawPath` por cor |
 | `SwitchNetworkItem` | −15 | `_red_path` único no modo circuito; `_colored_paths` por categoria no modo fases |
+| `RegulatorNetworkItem` | −12 | pontos médios pré-calculados; um `drawEllipse` por regulador, raio derivado da escala do painter |
 
 Todos usam `DeviceCoordinateCache(4096×4096)`: entre mudanças de máscara, o Qt
 reaproveita a rasterização em pan e repaints, sem repercorrer os pontos.
@@ -664,6 +668,16 @@ O agrupamento por categoria em `LineNetworkItem` é a chave da performance com
 cores: em vez de um `QPen` por trecho, há um `QPainterPath` por cor e uma troca
 de pen por categoria. O caminho só é recompilado quando **a máscara ou os
 estilos** mudam (`geometry_changed`); mudar apenas cores dispara só `update()`.
+
+`RegulatorNetworkItem` é o primeiro símbolo desenhado **sobre** um trecho, e não
+como o trecho. Ele obedece à mesma regra de item único: um anel por regulador
+dentro de um `paint()` só, nunca um `QGraphicsItem` por símbolo. O raio precisa
+ser fixo em pixels, e `ItemIgnoresTransformations` — usado por `BarraItem` e
+`LoadItem` — **não serve aqui**, porque é uma flag por item e forçaria a
+materialização de um item por regulador. A saída é derivar o raio da escala do
+próprio painter (`worldTransform().m11()`), o mesmo idioma que o hit-test já usa
+para converter `CLICK_TOLERANCE_PX`. O anel não tem cor por circuito nem por
+fase: ele só some junto com o trecho que o hospeda.
 
 ### Sistema de coordenadas
 
@@ -1050,8 +1064,9 @@ ou seja, é **duck-type compatível com `LoadModel`** — por isso o mesmo
 ### 12.3 Exportação OpenDSS (`opendss_export.py`)
 
 **Objetivo:** gerar `trechos.dss` (uma `Line` por trecho comum), `chaves.dss`
-(uma `Line ... Switch=Yes` por trecho-chave) e um arquivo de cargas por contagem
-de fases — `cargasmonofasicas.dss`, `cargasbifasicas.dss` e
+(uma `Line ... Switch=Yes` por trecho-chave), `reguladores.dss` (três
+`Transformer` + três `RegControl` por regulador trifásico) e um arquivo de cargas
+por contagem de fases — `cargasmonofasicas.dss`, `cargasbifasicas.dss` e
 `cargastrifasicas.dss`, com `N` `Load` + `N` `LoadShape` por carga — mais o par
 `<CODIGO>_Master.dss` e `<CODIGO>_Buscoords.csv`, que cria o circuito, chama os
 demais e resolve. `build_export()` monta tudo em sequência e devolve um
@@ -1072,14 +1087,59 @@ rende três `Load` e ainda assim soma 1, para o relatório falar a mesma língua
 CSV importado. `skipped_other_phase_count` conta as cargas de outra contagem de
 fases, que pertencem a outro arquivo.
 
-**Reguladores de tensão não são exportados.** O `RegulatorModel` existe e é
-exibido no painel, mas nenhum arquivo o menciona: no OpenDSS um regulador é um
-`Transformer` mais um `RegControl`, e a modelagem exige parâmetros que o CSV de
-origem não traz — tensão de referência, banda, relação de PT, compensação de
-linha. Emitir algo com valores arbitrados faria o estudo parecer considerar a
-regulação sem de fato considerá-la, que é pior do que ignorá-la de forma
-declarada. Consequência prática: **o fluxo de potência resolve a rede como se não
-houvesse reguladores**, e a queda de tensão calculada é a da rede sem regulação.
+#### Reguladores (`reguladores.dss`)
+
+Um regulador trifásico vira **três transformadores monofásicos**, um por fase,
+cada um com o seu `RegControl`. As unidades monofásicas dividem a grandeza
+trifásica do CSV: `kV = VNOM/√3` — a mesma `phase_voltage_kv()` do `C1` dos
+trechos e do `kV` das cargas — e `kVA = SNOM/3`.
+
+A modelagem que faltava está fixada em constantes do módulo: transformador quase
+ideal (`XHL` e `%LoadLoss` de 0,01 %), TP de 115 V, `vreg = 115/√3` e banda de
+2 % de `vreg`. A relação de PT é `VNOM×1000/115`, e a simplificação é exata: o
+√3 do primário e o do secundário se cancelam, de modo que o controle lê
+exatamente `vreg` quando a barra está na tensão nominal — isto é, regula em
+1,0000 pu.
+
+**O regulador ocupa o lugar do trecho.** Os transformadores ligam as duas barras
+do trecho, exatamente como a `Line ... Switch=Yes` da chave faz, e é por isso que
+o trecho **não** pode sair também em `trechos.dss`: duas ligações entre as mesmas
+barras poriam a linha em paralelo com o regulador, e a linha curto-circuitaria a
+injeção de tensão. Quem cumpre isso é `replaced_segments`, devolvido por
+`build_regulator_export()` e recebido por `build_line_export()` como
+`skip_segments`. Por isso os reguladores são construídos **antes** dos trechos.
+
+O trecho só é omitido quando o regulador foi **de fato emitido**. Um regulador
+descartado mantém a linha dele: apagá-la removeria um ramo inteiro da rede em
+silêncio, que é um erro muito pior do que um regulador a menos.
+
+**Só trecho trifásico**, por ora: o recorte é `entry.phase_count == 3`, e as
+letras vêm de `_phase_letters(entry.name, 3)`, que absorve o neutro de `DEFN`.
+O nó de cada fase sai de `_terminals_by_phase_letter()` — `D`→1, `E`→2, `F`→3 no
+`fases2.json` distribuído.
+
+**`VNOM` é conferida contra a do circuito.** A coluna não declara unidade e o
+projeto já viu os dois formatos (`13800` e `13,8`); tratada como kV, uma tensão
+em volts geraria `kVs` e `ptratio` absurdos que o OpenDSS aceitaria sem reclamar.
+Divergência acima de `REGULATOR_VOLTAGE_TOLERANCE` descarta o regulador com
+diagnóstico. Substituir um trecho longo também vira aviso — sem descarte —,
+porque o transformador não tem comprimento e a impedância daquele trecho sai do
+modelo.
+
+**O tap volta do fluxo de potência.** Os reguladores são `Transformer` no modelo
+exportado, então o laço de `lines` nunca os alcança: há um laço próprio sobre
+`engine.transformers`, casado pelo índice reverso `exported_units` que o
+exportador devolve — mesma disciplina do `exported_segments`, nunca uma segunda
+implementação das regras de nome. O painel mostra o tap de cada fase e **avisa
+quando ele está no fim do curso**: um regulador saturado parou de regular, e sem
+esse aviso a interface exibiria uma posição de aparência normal enquanto a tensão
+a jusante despenca.
+
+**Consequência no fluxo de potência:** o trecho substituído deixa de ter corrente
+no painel. `_harvest_line_currents()` itera `engine.lines`, e um `Transformer`
+nunca aparece ali — o que é correto, já que naquele ponto não há mais linha.
+`FAIXA`, `NPASSOS` e `TAP` do CSV continuam sem consumidor: a faixa de regulação
+é a padrão do `Transformer` do OpenDSS (±10 %, 32 passos).
 
 O filtro de chaves **não é implementado aqui**: os dois arquivos consomem as
 duas metades que o `trace()` já separa — `membership.common_segment_indices`
@@ -1415,12 +1475,63 @@ sem ela, porque o núcleo é exercitado com um motor falso.
 #### Apresentação no painel lateral
 
 As páginas de barra e de trecho ganharam uma seção de resultados com um
-`QComboBox` de grandeza e uma tabela de quatro linhas (`power_flow_table.py`):
-**Corrente por fase (A)** e **Carregamento (%)** no trecho, **Tensão por nó (V)**
-e **Tensão (pu)** na barra. O combobox existe para não empilhar quatro tabelas
-num painel que já é denso; a chave da grandeza viaja no `UserRole` do item, e não
-na posição. Sem `IADM` numérico no cabo, o item de carregamento fica desabilitado
-e uma nota explica o motivo — em vez de uma coluna de traços sem explicação.
+`QComboBox` de grandeza e uma tabela de quatro linhas (`power_flow_table.py`).
+No trecho: **Corrente por fase (A)**, **Carregamento (%)**, **Potência ativa
+(kW)**, **Potência reativa (kvar)**, **Potência aparente (kVA)**, **Potência
+trifásica**, **Fator de potência** e **Perdas**. Na barra: **Tensão de fase
+(V)**, **Tensão de linha (V)**, **Tensão de fase (pu)**, **Tensão de linha
+(pu)** e **Desequilíbrio de tensão (%)**. O combobox existe para não empilhar
+uma tabela por grandeza num painel que já é denso; a chave da grandeza viaja no
+`UserRole` do item, e não na posição.
+
+**As potências são as do terminal 1, com o sinal do OpenDSS intacto** — positivo
+entra pelo terminal, negativo sai. É o sinal que informa o sentido do fluxo, e
+por isso nada no caminho usa valor absoluto. Os totais trifásicos somam as
+potências **complexas** das fases (`P₃ᵩ = ΣPᶠ`, `Q₃ᵩ = ΣQᶠ`), e o módulo e o
+ângulo saem de `√(P²+Q²)` e `atan2(Q, P)`.
+
+**Uma armadilha de unidade, medida e não suposta:** `cktelement.powers` devolve
+kW e kvar, mas `cktelement.losses` devolve **watts**. A conferência foi contra
+`3·R·I²` de um trecho conhecido — a razão deu exatamente 1000. Sem a divisão a
+coluna de perdas erraria por três ordens de grandeza sem nada denunciar.
+
+**O desequilíbrio segue o PRODIST Módulo 8:** `FD% = |V₋|/|V₊| × 100`, por
+componentes simétricas. Como os fasores completos já estão colhidos, essa é a
+definição exata, e não a aproximação por desvio máximo em torno da média. Exige
+as três fases; com menos, a grandeza é desabilitada.
+
+**A pu de linha reusa a de fase.** A base pu do OpenDSS é fase-neutro, e a de
+linha é `√3` maior — então a mesma `line_voltages()` roda sobre `per_unit` e o
+resultado é dividido por `√3`. Nenhuma leitura nova do motor. Sem `IADM` numérico no cabo, o item de
+carregamento fica desabilitado e uma nota explica o motivo — em vez de uma coluna
+de traços sem explicação. A tensão de linha segue a mesma disciplina numa barra
+monofásica, onde não existe par de fases.
+
+**Módulo e ângulo dividem a tabela.** As grandezas que são fasores acrescentam
+uma coluna de ângulo por fase (`Fase D` … `θD` …), em graus e no referencial do
+OpenDSS — a fonte em 0°. O `pu` fica de fora porque o ângulo dele é o mesmo da
+tensão de fase, e o carregamento porque é razão de módulos. Como módulo e ângulo
+não têm a mesma precisão útil, `set_values()` aceita **casas decimais por
+coluna**.
+
+**A tensão de linha é subtração de fasores, feita em `line_voltages()`** —
+função pública do núcleo, testável headless, e não do painel: `VDE = VD − VE`
+com os dois em forma retangular. Compor a partir dos módulos daria errado sempre
+que as fases não estivessem alinhadas, que é o caso normal; num sistema
+equilibrado o resultado correto é `√3` da tensão de fase, adiantado de 30°. É
+por isso que `BarVoltages` ganhou `angles`: o ângulo não é enfeite, é insumo. Ele
+vem de `AllBusVolts` (dois doubles por nó, parte real e imaginária), porque não
+existe um `AllBusVMagAngle` na interface. O ângulo da corrente sempre esteve
+disponível — `currents_mag_ang` intercala módulo e ângulo, e o segundo era
+descartado.
+
+**Os rótulos `D`/`E`/`F` saem do `fases2.json`**, via
+`phase_letters_by_node()` — o inverso do `_terminals_by_phase_letter()` que a
+exportação usa para os `Bus1`/`Bus2`. Fixar `{1: "D", 2: "E", 3: "F"}` no painel
+criaria uma segunda verdade que divergiria em silêncio de uma configuração
+customizada. Nó sem letra, ou `fases2.json` inválido, cai em `Fase <n>`. Por isso
+o modelo da tabela recebe **rótulos prontos** em vez de números de nó: nem toda
+coluna é um nó — `VDE` é um par e `θD` é um ângulo.
 
 A seção nasce invisível e só aparece quando o elemento selecionado tem resultado.
 Qualquer reimportação chama `_invalidate_power_flow()` e a esconde: o resultado
@@ -1859,6 +1970,8 @@ de ramais (análise → agregação → máscaras → destaque vetorial).
 | `NORMAL_SEGMENT_WIDTH_PX` | 3.0 | espessura do trecho comum |
 | `SWITCH_SEGMENT_WIDTH_PX` | 1.0 | espessura do trecho-chave |
 | `LOAD_WIDTH/HEIGHT_PX` | 12.0 / 8.0 | símbolo da carga |
+| `REGULATOR_DIAMETER_PX` | 9.0 | anel do regulador, no meio do trecho |
+| `REGULATOR_RING_WIDTH_PX` | 2.0 | espessura do anel |
 
 Outros tetos: `MAX_REPORTED_ISSUES = 200` (importadores),
 `MAX_BRANCH_ISSUES = 500`, `MAX_EQUIVALENT_ISSUES = 500`,

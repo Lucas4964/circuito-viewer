@@ -89,16 +89,24 @@ decimal chegam ao painel exatamente como estão no arquivo.
 Ao selecionar um trecho com regulador, o painel lateral exibe a tabela **Dados do
 regulador**, abaixo da tabela de chave quando as duas existirem. Os reguladores
 também entram na busca global: procurar pelo `REGU_ID` ou pelo `CODIGO` enquadra
-o trecho e rola o painel até a seção. A importação **não** altera símbolos no
-mapa, filtros de circuito nem a topologia — reguladores não interrompem nem
-energizam nada, então importá-los não invalida ramais, rede simplificada ou um
-resultado de fluxo de potência já calculado.
+o trecho e rola o painel até a seção.
 
-> **Ainda não exportados.** Os reguladores não entram nos arquivos `.dss` nem no
-> fluxo de potência: no OpenDSS eles seriam um `Transformer` mais um `RegControl`,
-> cuja modelagem exige parâmetros que o CSV não traz (tensão de referência, banda,
-> relação de PT, compensação de linha). Na prática, **o fluxo de potência resolve
-> a rede como se não houvesse regulação**.
+No diagrama, cada trecho com regulador ganha um **anel laranja no seu ponto
+médio** — é como se localiza o equipamento na rede sem precisar clicar trecho a
+trecho. O anel tem tamanho fixo em pixels, então continua legível em qualquer
+zoom, e desaparece junto com o trecho quando o circuito é filtrado.
+
+A importação não altera filtros de circuito nem a topologia: reguladores não
+interrompem nem energizam nada, então importá-los não invalida ramais nem rede
+simplificada. Um resultado de fluxo de potência já calculado, esse **é**
+descartado: reguladores mudam a tensão resolvida.
+
+> **Exportados quando o trecho é trifásico.** Cada regulador vira três
+> transformadores monofásicos e três `RegControl` em `reguladores.dss`, e o
+> trecho onde ele está deixa de sair como `Line` — veja
+> [Exportação para OpenDSS](#exportação-para-opendss). Reguladores em trecho
+> não trifásico ainda não são exportados; eles aparecem na lista de ocorrências
+> e o trecho segue como linha comum.
 
 Depois dos trechos, também é possível **Importar circuitos…** usando as colunas
 `CIRC_ID`, `BARRA_ID`, `CODIGO` e `VNOM`. A aplicação executa a busca topológica
@@ -245,7 +253,8 @@ filtros de visibilidade dos circuitos continuam sendo respeitados.
 
 ## Exportação para OpenDSS
 
-**Exportar > OpenDSS…** gera `trechos.dss`, `chaves.dss` e, quando houver cargas
+**Exportar > OpenDSS…** gera `trechos.dss`, `chaves.dss`, `reguladores.dss`
+(quando houver regulador exportável) e, quando houver cargas
 e patamares importados, um arquivo de cargas por contagem de fases:
 `cargasmonofasicas.dss`, `cargasbifasicas.dss` e `cargastrifasicas.dss`. Por
 cima deles saem `<CODIGO>_Master.dss` e `<CODIGO>_Buscoords.csv`, o arquivo
@@ -333,6 +342,51 @@ verificados em conjunto: uma chave cujo nome coincida com o de um trecho já
 exportado é descartada e reportada, em vez de sobrescrever a definição anterior
 silenciosamente. As cargas ficam fora dessa verificação por viverem em `Load.*`,
 um namespace separado.
+
+### reguladores.dss
+
+Um regulador trifásico vira **três transformadores monofásicos**, um por fase,
+cada um com o seu `RegControl`. Para um regulador de 34,5 kV e 333 kVA nas fases
+`D`, `E` e `F`, entre as barras `BARRA1` e `BARRA2`:
+
+```
+New Transformer.REG-X-D phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA1.1.0, BARRA2.1.0] conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]
+New Transformer.REG-X-E phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA1.2.0, BARRA2.2.0] conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]
+New Transformer.REG-X-F phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA1.3.0, BARRA2.3.0] conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]
+
+New RegControl.CTRL-X-D transformer=REG-X-D winding=2 vreg=66.3953 band=1.32791 ptratio=300
+New RegControl.CTRL-X-E transformer=REG-X-E winding=2 vreg=66.3953 band=1.32791 ptratio=300
+New RegControl.CTRL-X-F transformer=REG-X-F winding=2 vreg=66.3953 band=1.32791 ptratio=300
+```
+
+- **Nome** — `REG-<CODIGO>-<FASE>` e `CTRL-<CODIGO>-<FASE>`, com o `CODIGO` do
+  regulador saneado; vazio cai no `REGU_ID`, com aviso.
+- **Fase → nó** — `D`→1, `E`→2, `F`→3, lido das entradas monofásicas do
+  `fases2.json`. O `.0` fecha o neutro do enrolamento em estrela.
+- **`kVs`** — `VNOM/√3`, a tensão de fase, porque cada unidade é monofásica
+  entre fase e neutro. **`kVAs`** — `SNOM/3`.
+- **`vreg`/`band`/`ptratio`** — TP de 115 V: `vreg = 115/√3`, banda de 2 % de
+  `vreg` e `ptratio = VNOM×1000/115`. Os √3 do primário e do secundário se
+  cancelam, então o controle regula a barra em **1,0000 pu**.
+- **`XHL` e `%LoadLoss` de 0,01 %** — transformador quase ideal: o regulador
+  injeta tensão em série, não impedância.
+- Todas as definições de `Transformer` vêm **antes** de todos os `RegControl`,
+  porque cada controle referencia o seu transformador pelo nome.
+
+**O trecho onde o regulador está deixa de sair em `trechos.dss`** — o regulador
+ocupa o lugar dele, como a chave faz. Ligar os transformadores às mesmas duas
+barras *e* manter a linha os deixaria em paralelo, e a linha curto-circuitaria a
+injeção de tensão. Consequência: aquele trecho não tem corrente no painel de
+fluxo de potência, e a impedância dele sai do modelo — se for longo, um aviso
+avisa.
+
+Não são exportados, com o motivo na lista de ocorrências: reguladores em trecho
+**não trifásico** (por ora), sem `VNOM`/`SNOM` numéricos positivos, em trecho que
+já representa uma chave, ou com `VNOM` incompatível com a do circuito — esta
+última pega a troca de unidade (volts em vez de kV), que geraria um modelo aceito
+pelo OpenDSS e completamente errado. Em todos esses casos **o trecho continua
+saindo como linha comum**. `FAIXA`, `NPASSOS` e `TAP` ainda não são usados: a
+faixa de regulação é a padrão do OpenDSS (±10 %, 32 passos).
 
 ### Arquivos de carga
 
@@ -572,8 +626,23 @@ de quatro linhas — uma por patamar — e uma coluna por fase:
 
 | Elemento | Grandezas no seletor |
 |---|---|
-| Trecho | **Corrente por fase (A)** — módulo no terminal de montante; **Carregamento (%)** — a corrente sobre o `IADM` do cabo de `CABOF_ID` |
-| Barra | **Tensão por nó (V)**; **Tensão (pu)** na base da barra |
+| Trecho | **Corrente por fase (A)**; **Carregamento (%)** — a corrente sobre o `IADM` do cabo de `CABOF_ID`; **Potência ativa (kW)**; **Potência reativa (kvar)**; **Potência aparente (kVA)** com ângulo; **Potência trifásica** — `P`, `Q`, `S` e `θS` totais; **Fator de potência** por fase e trifásico; **Perdas** do elemento |
+| Barra | **Tensão de fase (V)** — fase-neutro; **Tensão de linha (V)** — `VDE`, `VEF`, `VFD`; **Tensão de fase (pu)**; **Tensão de linha (pu)**; **Desequilíbrio de tensão (%)** |
+
+As colunas são nomeadas pelas fases do projeto — **Fase D**, **Fase E**,
+**Fase F** —, lidas do `fases2.json`: uma configuração que numere as fases de
+outro jeito muda os rótulos junto.
+
+**Ângulo dos fasores.** A tensão de fase, a tensão de linha e a corrente trazem,
+ao lado dos módulos, uma coluna de ângulo por fase (`θD`, `θE`, `θF`; `θDE`,
+`θEF`, `θFD`), em graus e no mesmo referencial do OpenDSS — a fonte em 0°. O
+**pu** não repete o ângulo, que é o mesmo da tensão de fase, e o **carregamento**
+não tem ângulo por ser uma razão de módulos.
+
+A tensão de linha é a subtração dos **fasores** de duas fases, não a diferença
+dos módulos: num sistema equilibrado ela dá `√3` vezes a tensão de fase,
+adiantada de 30°. Numa barra monofásica não existe par de fases, então a grandeza
+fica desabilitada com o motivo na nota.
 
 Chaves aparecem como trechos comuns nesta leitura: no modelo exportado elas são
 `Line` como as demais, e o `IADM` usado no carregamento é o do cabo do trecho
@@ -581,9 +650,12 @@ onde a chave está.
 
 A seção só aparece quando aquele elemento tem resultado. Quando o cabo não tem
 `IADM` numérico, a opção de carregamento fica desabilitada e uma nota explica o
-motivo. Qualquer reimportação (trechos, chaves, circuitos, cabos, cargas ou
-patamares) descarta o resultado e esconde a seção — número velho não sobrevive a
-uma troca de dado.
+motivo. Qualquer reimportação (trechos, chaves, circuitos, cabos, cargas,
+patamares ou reguladores) descarta o resultado e esconde a seção — número velho
+não sobrevive a uma troca de dado.
+
+O trecho substituído por um regulador **não** tem corrente aqui: naquele ponto o
+modelo tem um `Transformer`, não uma `Line`.
 
 ### Avisos
 

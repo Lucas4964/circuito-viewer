@@ -20,6 +20,7 @@ from .model import (
     LineNetworkModel,
     LoadModel,
     LoadPatternModel,
+    RegulatorModel,
     SwitchModel,
     UtmCrs,
 )
@@ -328,6 +329,7 @@ class OpenDssExportWorker(QObject):
         circuit_indices: tuple[int, ...],
         loads: LoadModel | None = None,
         patterns: LoadPatternModel | None = None,
+        regulators: RegulatorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
     ) -> None:
         super().__init__()
@@ -337,6 +339,7 @@ class OpenDssExportWorker(QObject):
         self.circuit_indices = tuple(circuit_indices)
         self.loads = loads
         self.patterns = patterns
+        self.regulators = regulators
         self.load_settings = load_settings
         self._cancel_event = threading.Event()
 
@@ -353,6 +356,7 @@ class OpenDssExportWorker(QObject):
                 self.circuit_indices,
                 loads=self.loads,
                 patterns=self.patterns,
+                regulators=self.regulators,
                 load_settings=self.load_settings,
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
@@ -387,6 +391,7 @@ class PowerFlowWorker(QObject):
         circuit_indices: tuple[int, ...],
         loads: LoadModel | None = None,
         patterns: LoadPatternModel | None = None,
+        regulators: RegulatorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
     ) -> None:
         super().__init__()
@@ -396,6 +401,7 @@ class PowerFlowWorker(QObject):
         self.circuit_indices = tuple(circuit_indices)
         self.loads = loads
         self.patterns = patterns
+        self.regulators = regulators
         self.load_settings = load_settings
         self._cancel_event = threading.Event()
 
@@ -417,6 +423,7 @@ class PowerFlowWorker(QObject):
                     workspace=workspace,
                     loads=self.loads,
                     patterns=self.patterns,
+                    regulators=self.regulators,
                     load_settings=self.load_settings,
                     cancel_check=self._cancel_event.is_set,
                     progress=lambda current, total: self.progress.emit(

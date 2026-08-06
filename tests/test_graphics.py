@@ -24,6 +24,9 @@ try:
         LoadItem,
         LoadVirtualizer,
         NORMAL_SEGMENT_WIDTH_PX,
+        REGULATOR_COLOR,
+        REGULATOR_DIAMETER_PX,
+        RegulatorNetworkItem,
         SEGMENT_SELECTION_WIDTH_PX,
         SegmentSelectionOverlayItem,
         SWITCH_COLOR,
@@ -40,6 +43,7 @@ from circuit_viewer.model import (
     FeatureSelection,
     LineNetworkModel,
     LoadModel,
+    RegulatorModel,
     SwitchModel,
     UtmCrs,
 )
@@ -379,6 +383,142 @@ class GraphicsTests(unittest.TestCase):
         self.assertAlmostEqual(center.x(), 0.0, delta=1.0)
         self.assertAlmostEqual(center.y(), 0.0, delta=1.0)
         self.assertLessEqual(abs(view.transform().m11()), 4.0)
+
+    # ------------------------------------------------- anel do regulador
+
+    def _regulator_canvas(self):  # noqa: ANN202
+        """Dois trechos horizontais; só o primeiro tem regulador."""
+
+        bars = CircuitModel(
+            ["B0", "B1", "B2"],
+            ["A", "B", "C"],
+            [0.0, 100.0, 200.0],
+            [0.0, 0.0, 0.0],
+            UtmCrs(21, northern=False),
+        )
+        network = LineNetworkModel(
+            bars,
+            ["T0", "T1"],
+            ["TR-0", "TR-1"],
+            ["13", "13"],
+            [0, 1],
+            [1, 2],
+            ["", ""],
+            ["CB1", "CB1"],
+            ["", ""],
+            [100.0, 100.0],
+        )
+        regulators = RegulatorModel(
+            network,
+            ["RG1"],
+            [0],
+            [""],
+            ["X"],
+            ["Y"],
+            ["333"],
+            ["10"],
+            ["32"],
+            ["0"],
+            ["100"],
+            ["13,8"],
+        )
+        return network, regulators
+
+    def _paint_regulator(self, item, width: int = 220):  # noqa: ANN001, ANN202
+        image = QImage(width, 100, QImage.Format.Format_RGB32)
+        image.fill(Qt.GlobalColor.white)
+        painter = QPainter(image)
+        painter.translate(0.0, 50.0)
+        item.paint(painter, None)
+        painter.end()
+        return image
+
+    def test_regulator_ring_marks_only_the_segment_that_has_one(self) -> None:
+        _, regulators = self._regulator_canvas()
+        item = RegulatorNetworkItem(regulators)
+
+        self.assertEqual(item.regulator_count, 1)
+        self.assertEqual(item.visible_regulator_count, 1)
+        image = self._paint_regulator(item)
+        target = REGULATOR_COLOR.name()
+        # x=50 é o meio do trecho 0; x=150 o do trecho 1, sem regulador.
+        with_regulator = [
+            QColor(image.pixel(50, y)).name() for y in range(35, 66)
+        ]
+        without = [QColor(image.pixel(150, y)).name() for y in range(35, 66)]
+        self.assertGreaterEqual(with_regulator.count(target), 2)
+        self.assertEqual(without.count(target), 0)
+
+    def test_regulator_ring_is_hollow(self) -> None:
+        _, regulators = self._regulator_canvas()
+
+        image = self._paint_regulator(RegulatorNetworkItem(regulators))
+
+        # O centro precisa continuar mostrando o que está por baixo.
+        self.assertEqual(QColor(image.pixel(50, 50)).name(), "#ffffff")
+
+    def test_regulator_ring_is_one_cached_item_above_the_lines(self) -> None:
+        _, regulators = self._regulator_canvas()
+        item = RegulatorNetworkItem(regulators)
+
+        self.assertEqual(
+            item.cacheMode(), QGraphicsItem.CacheMode.DeviceCoordinateCache
+        )
+        # Acima de trechos (-20) e chaves (-15), abaixo das barras.
+        self.assertGreater(item.zValue(), -15.0)
+        self.assertLess(item.zValue(), 0.0)
+        self.assertFalse(
+            item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+        )
+
+    def test_hidden_segment_hides_its_regulator_ring(self) -> None:
+        _, regulators = self._regulator_canvas()
+        item = RegulatorNetworkItem(regulators)
+        revision = item.geometry_revision
+
+        item.set_visibility_mask(np.array([False, True], dtype=np.bool_))
+
+        self.assertEqual(item.visible_regulator_count, 0)
+        self.assertGreater(item.geometry_revision, revision)
+        image = self._paint_regulator(item)
+        self.assertEqual(
+            [QColor(image.pixel(50, y)).name() for y in range(35, 66)].count(
+                REGULATOR_COLOR.name()
+            ),
+            0,
+        )
+
+    def test_same_mask_does_not_recompile_the_geometry(self) -> None:
+        _, regulators = self._regulator_canvas()
+        item = RegulatorNetworkItem(regulators)
+        revision = item.geometry_revision
+
+        item.set_visibility_mask(np.ones(2, dtype=np.bool_))
+
+        self.assertEqual(item.geometry_revision, revision)
+
+    def test_regulator_ring_keeps_its_pixel_size_across_zoom(self) -> None:
+        _, regulators = self._regulator_canvas()
+        item = RegulatorNetworkItem(regulators)
+
+        def ring_pixels(scale: float) -> int:
+            image = QImage(220, 100, QImage.Format.Format_RGB32)
+            image.fill(Qt.GlobalColor.white)
+            painter = QPainter(image)
+            painter.translate(0.0, 50.0)
+            painter.scale(scale, scale)
+            item.paint(painter, None)
+            painter.end()
+            target = REGULATOR_COLOR.name()
+            return sum(
+                QColor(image.pixel(x, y)).name() == target
+                for x in range(220)
+                for y in range(100)
+            )
+
+        # O anel é medido em pixels de tela: dobrar o zoom não pode engordá-lo.
+        self.assertEqual(REGULATOR_DIAMETER_PX, 9.0)
+        self.assertAlmostEqual(ring_pixels(1.0), ring_pixels(2.0), delta=6)
 
     def test_branch_highlight_is_one_yellow_cosmetic_path_and_can_be_focused(self) -> None:
         bars = CircuitModel(

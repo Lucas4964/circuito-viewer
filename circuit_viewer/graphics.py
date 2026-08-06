@@ -48,6 +48,7 @@ from .model import (
     FeatureSelection,
     LineNetworkModel,
     LoadModel,
+    RegulatorModel,
     SwitchModel,
 )
 from .equivalent_network import EquivalentNetworkModel
@@ -92,6 +93,13 @@ SELECTED_OUTLINE = QColor("#7a5a00")
 CANVAS_BACKGROUND = QColor("#f7f7f7")
 LINE_COLOR = QColor("#555555")
 SWITCH_COLOR = QColor("#ff0000")
+# Laranja: contrasta com o cinza do canvas, com o vermelho da chave, com o
+# amarelo da seleção e com as três cores de fase.
+REGULATOR_COLOR = QColor("#ff8800")
+# Anel do regulador, no ponto médio do trecho. 9 px de diâmetro fica entre o
+# ponto de barra (5) e o retângulo de carga (12x8): visível sem destoar.
+REGULATOR_DIAMETER_PX = 9.0
+REGULATOR_RING_WIDTH_PX = 2.0
 SEGMENT_SELECTION_WIDTH_PX = 3.0
 NORMAL_SEGMENT_WIDTH_PX = 3.0
 SWITCH_SEGMENT_WIDTH_PX = 1.0
@@ -678,6 +686,110 @@ class SwitchNetworkItem(QGraphicsItem):
             pen.setColor(color)
             painter.setPen(pen)
             painter.drawPath(path)
+        painter.restore()
+
+
+class RegulatorNetworkItem(QGraphicsItem):
+    """Anel no ponto médio de cada trecho que tem regulador.
+
+    Um único item para todos os anéis, como o resto da camada agregada: com 100
+    mil trechos, um item por símbolo seria inviável. Os pontos médios são
+    recompilados só quando a máscara de visibilidade muda.
+
+    O raio é fixo **em pixels**, derivado da escala do próprio ``painter``. O
+    ``ItemIgnoresTransformations`` que os símbolos materializados usam não serve
+    aqui: é uma flag por item, e forçaria um item por regulador.
+    """
+
+    def __init__(self, model: RegulatorModel) -> None:
+        super().__init__()
+        self._model = model
+        self._segment_visibility_mask = np.ones(
+            len(model.segments), dtype=np.bool_
+        )
+        self._centers: list[QPointF] = []
+        self._geometry_revision = 0
+        self._rebuild_centers()
+
+        bounds = model.segments.bars.bounds
+        width = max(bounds.width, 1.0)
+        height = max(bounds.height, 1.0)
+        padding = max(max(width, height) * 0.001, 1.0)
+        self._bounds = QRectF(
+            bounds.left, -bounds.bottom, width, height
+        ).adjusted(-padding, -padding, padding, padding)
+        self.setZValue(-12.0)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self.setCacheMode(
+            QGraphicsItem.CacheMode.DeviceCoordinateCache,
+            QSize(4_096, 4_096),
+        )
+
+    def _rebuild_centers(self) -> None:
+        segments = self._model.segments
+        bars = segments.bars
+        centers: list[QPointF] = []
+        for segment_index in self._model.segment_indices:
+            index = int(segment_index)
+            if not self._segment_visibility_mask[index]:
+                continue
+            start = int(segments.start_indices[index])
+            end = int(segments.end_indices[index])
+            # A inversão de Y é a mesma do resto da cena; o sinal negativo nunca
+            # sai daqui.
+            centers.append(
+                QPointF(
+                    (float(bars.x[start]) + float(bars.x[end])) / 2.0,
+                    -(float(bars.y[start]) + float(bars.y[end])) / 2.0,
+                )
+            )
+        self._centers = centers
+        self._geometry_revision += 1
+
+    @property
+    def regulator_count(self) -> int:
+        return len(self._model)
+
+    @property
+    def visible_regulator_count(self) -> int:
+        return len(self._centers)
+
+    @property
+    def geometry_revision(self) -> int:
+        return self._geometry_revision
+
+    def set_visibility_mask(self, segment_mask: BoolArray | None) -> None:
+        visibility = _visibility_mask(
+            segment_mask, len(self._model.segments), "trechos"
+        )
+        if np.array_equal(visibility, self._segment_visibility_mask):
+            return
+        self._segment_visibility_mask = visibility.copy()
+        self._rebuild_centers()
+        self.update()
+
+    def boundingRect(self) -> QRectF:  # noqa: N802
+        return self._bounds
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
+        del option, widget
+        if not self._centers:
+            return
+        # O raio sai em unidades de cena para acompanhar a transformação do
+        # painter, mas medindo sempre os mesmos pixels na tela — mesmo idioma do
+        # hit-test, que converte CLICK_TOLERANCE_PX pela escala corrente.
+        scale = abs(painter.worldTransform().m11())
+        radius = REGULATOR_DIAMETER_PX / 2.0 / max(scale, 1e-12)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(REGULATOR_COLOR)
+        pen.setWidthF(REGULATOR_RING_WIDTH_PX)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for center in self._centers:
+            painter.drawEllipse(center, radius, radius)
         painter.restore()
 
 

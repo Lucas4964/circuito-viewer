@@ -12,6 +12,7 @@ from circuit_viewer.model import (
     LoadModel,
     LoadPatternModel,
     LoadPatternRecord,
+    RegulatorModel,
     SwitchModel,
     UtmCrs,
 )
@@ -19,6 +20,7 @@ from circuit_viewer.opendss_export import (
     FREQUENCY_HZ,
     LINES_FILENAME,
     MAX_REPORTED_ISSUES,
+    REGULATORS_FILENAME,
     SINGLE_PHASE_LOADS_FILENAME,
     SWITCHES_FILENAME,
     THREE_PHASE_LOADS_FILENAME,
@@ -27,6 +29,7 @@ from circuit_viewer.opendss_export import (
     build_line_export,
     build_load_export,
     build_master_export,
+    build_regulator_export,
     build_switch_export,
     bus_namer,
     master_filenames,
@@ -169,6 +172,46 @@ def make_switches(
         [""] * size,
         [""] * size,
     )
+
+
+def make_regulators(
+    network: LineNetworkModel,
+    *,
+    segment_indices: tuple[int, ...] = (0,),
+    codes: tuple[str, ...] = ("X",),
+    vnom_values: tuple[str, ...] = ("34,5",),
+    snom_values: tuple[str, ...] = ("333",),
+    regulator_ids: tuple[str, ...] = ("RG1",),
+) -> RegulatorModel:
+    """Um regulador no trecho 0, com os valores do exemplo da especificação."""
+
+    size = len(segment_indices)
+    return RegulatorModel(
+        network,
+        list(regulator_ids),
+        list(segment_indices),
+        [""] * size,
+        list(codes),
+        ["Y"] * size,
+        list(snom_values),
+        ["10"] * size,
+        ["32"] * size,
+        ["0"] * size,
+        ["100"] * size,
+        list(vnom_values),
+    )
+
+
+def transformer_entries(text: str) -> list[str]:
+    return [
+        line for line in data_lines(text) if line.startswith("New Transformer.")
+    ]
+
+
+def control_entries(text: str) -> list[str]:
+    return [
+        line for line in data_lines(text) if line.startswith("New RegControl.")
+    ]
 
 
 def make_loads(
@@ -712,6 +755,259 @@ class SwitchExportTests(unittest.TestCase):
                 [0],
                 cancel_check=lambda: True,
             )
+
+
+class RegulatorExportTests(unittest.TestCase):
+    """Um regulador trifásico vira três monofásicos e ocupa o lugar do trecho."""
+
+    def _network(self, **overrides):  # noqa: ANN003, ANN202
+        overrides.setdefault("lengths", (5.0, 400.0))
+        return make_network(make_bars(), **overrides)
+
+    def _export(self, network=None, regulators=None, voltage="34,5", **kwargs):  # noqa: ANN001, ANN003, ANN202
+        network = self._network() if network is None else network
+        catalog = make_catalog(network, voltage=voltage, **kwargs)
+        model = make_regulators(network) if regulators is None else regulators
+        return build_regulator_export(catalog, model, PHASES, [0])
+
+    def test_three_single_phase_transformers_follow_the_specification(self) -> None:
+        result = self._export()
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertEqual(result.discarded_count, 0)
+        self.assertEqual(result.issues, ())
+        self.assertEqual(
+            transformer_entries(result.text),
+            [
+                "New Transformer.REG-X-D phases=1 windings=2 XHL=0.01 "
+                "%LoadLoss=0.01 Buses=[BARRA_A.1.0, BARRA_B.1.0] "
+                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]",
+                "New Transformer.REG-X-E phases=1 windings=2 XHL=0.01 "
+                "%LoadLoss=0.01 Buses=[BARRA_A.2.0, BARRA_B.2.0] "
+                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]",
+                "New Transformer.REG-X-F phases=1 windings=2 XHL=0.01 "
+                "%LoadLoss=0.01 Buses=[BARRA_A.3.0, BARRA_B.3.0] "
+                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]",
+            ],
+        )
+
+    def test_each_transformer_gets_its_own_control(self) -> None:
+        result = self._export()
+
+        self.assertEqual(
+            control_entries(result.text),
+            [
+                "New RegControl.CTRL-X-D transformer=REG-X-D winding=2 "
+                "vreg=66.3953 band=1.32791 ptratio=300",
+                "New RegControl.CTRL-X-E transformer=REG-X-E winding=2 "
+                "vreg=66.3953 band=1.32791 ptratio=300",
+                "New RegControl.CTRL-X-F transformer=REG-X-F winding=2 "
+                "vreg=66.3953 band=1.32791 ptratio=300",
+            ],
+        )
+
+    def test_every_control_comes_after_every_transformer(self) -> None:
+        # O RegControl referencia o transformador pelo nome, então nenhuma
+        # definição de controle pode preceder a do seu transformador.
+        kinds = [line.split(".", 1)[0] for line in data_lines(self._export().text)]
+
+        self.assertEqual(kinds, ["New Transformer"] * 3 + ["New RegControl"] * 3)
+
+    def test_the_regulated_segment_stops_being_a_line(self) -> None:
+        network = self._network()
+        catalog = make_catalog(network, voltage="34,5")
+        regulators = make_regulators(network)
+
+        exported = build_regulator_export(catalog, regulators, PHASES, [0])
+        lines = build_line_export(
+            catalog,
+            make_cables(),
+            PHASES,
+            [0],
+            skip_segments=exported.replaced_segments,
+        )
+
+        self.assertEqual(exported.replaced_segments, frozenset({0}))
+        # TR-1 é o trecho 0: ele virou regulador e não pode sair também como
+        # Line, senão ficaria em paralelo com os transformadores.
+        self.assertEqual(lines.exported_segments, (("TR-2", 1),))
+        self.assertNotIn("New Line.TR-1 ", lines.text)
+
+    def test_a_discarded_regulator_keeps_the_line_of_its_segment(self) -> None:
+        network = self._network(phases=("7", "13"))
+        catalog = make_catalog(network, voltage="34,5")
+
+        exported = build_regulator_export(
+            catalog, make_regulators(network), PHASES, [0]
+        )
+        lines = build_line_export(
+            catalog,
+            make_cables(),
+            PHASES,
+            [0],
+            skip_segments=exported.replaced_segments,
+        )
+
+        # Sem regulador emitido não há substituição: apagar a linha aqui
+        # removeria um ramo inteiro da rede em silêncio.
+        self.assertEqual(exported.exported_count, 0)
+        self.assertEqual(exported.replaced_segments, frozenset())
+        self.assertIn("New Line.TR-1 ", lines.text)
+
+    def test_only_three_phase_segments_are_exported(self) -> None:
+        result = self._export(network=self._network(phases=("7", "13")))
+
+        self.assertEqual(result.exported_count, 0)
+        self.assertEqual(result.discarded_count, 1)
+        self.assertTrue(
+            any("não é trifásica" in issue.reason for issue in result.issues),
+            result.issues,
+        )
+
+    def test_voltage_in_volts_is_refused_against_the_circuit_vnom(self) -> None:
+        network = self._network()
+        result = self._export(
+            network=network,
+            regulators=make_regulators(network, vnom_values=("34500",)),
+        )
+
+        self.assertEqual(result.exported_count, 0)
+        self.assertEqual(result.discarded_count, 1)
+        self.assertTrue(
+            any("confira se a unidade é kV" in issue.reason for issue in result.issues),
+            result.issues,
+        )
+
+    def test_non_numeric_vnom_and_snom_are_discarded(self) -> None:
+        network = self._network()
+        for field, regulators in (
+            ("VNOM", make_regulators(network, vnom_values=("",))),
+            ("SNOM", make_regulators(network, snom_values=("zero",))),
+        ):
+            with self.subTest(field=field):
+                result = self._export(network=network, regulators=regulators)
+
+                self.assertEqual(result.exported_count, 0)
+                self.assertEqual(result.discarded_count, 1)
+                self.assertTrue(
+                    any(field in issue.reason for issue in result.issues),
+                    result.issues,
+                )
+
+    def test_empty_code_falls_back_to_the_regulator_id(self) -> None:
+        network = self._network()
+        result = self._export(
+            network=network,
+            regulators=make_regulators(network, codes=("",)),
+        )
+
+        self.assertEqual(result.exported_count, 1)
+        # Aviso, não descarte: o regulador saiu, só com outro nome.
+        self.assertEqual(result.discarded_count, 0)
+        self.assertTrue(
+            transformer_entries(result.text)[0].startswith(
+                "New Transformer.REG-RG1-D "
+            ),
+            result.text,
+        )
+
+    def test_replacing_a_long_segment_warns_without_discarding(self) -> None:
+        result = self._export(network=self._network(lengths=(250.0, 400.0)))
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertEqual(result.discarded_count, 0)
+        self.assertTrue(
+            any("impedância dele saiu do modelo" in i.reason for i in result.issues),
+            result.issues,
+        )
+
+    def test_a_switch_segment_refuses_the_regulator(self) -> None:
+        network = self._network()
+        switches = make_switches(network, segment_indices=(0,))
+        result = self._export(network=network, switches=switches)
+
+        self.assertEqual(result.exported_count, 0)
+        self.assertEqual(result.discarded_count, 1)
+        self.assertTrue(
+            any("já representa a chave" in issue.reason for issue in result.issues),
+            result.issues,
+        )
+
+    def test_homonym_regulators_are_discarded(self) -> None:
+        network = self._network()
+        result = self._export(
+            network=network,
+            regulators=make_regulators(
+                network,
+                segment_indices=(0, 1),
+                regulator_ids=("RG1", "RG2"),
+                codes=("X", "X"),
+                vnom_values=("34,5", "34,5"),
+                snom_values=("333", "333"),
+            ),
+        )
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertEqual(result.discarded_count, 1)
+        self.assertTrue(
+            any("já usado pelo regulador RG1" in i.reason for i in result.issues),
+            result.issues,
+        )
+
+
+class RegulatorBundleTests(unittest.TestCase):
+    """O arquivo de reguladores só existe quando há regulador exportado."""
+
+    def _bundle(self, **overrides):  # noqa: ANN003, ANN202
+        network = make_network(make_bars(), lengths=(5.0, 400.0), **overrides)
+        catalog = make_catalog(network, voltage="34,5")
+        return build_export(
+            catalog,
+            make_cables(),
+            PHASES,
+            [0],
+            regulators=make_regulators(network),
+        )
+
+    def test_bundle_adds_the_file_and_the_master_redirect(self) -> None:
+        bundle = self._bundle()
+
+        self.assertEqual(
+            [name for name, _ in bundle.element_files],
+            [LINES_FILENAME, SWITCHES_FILENAME, REGULATORS_FILENAME],
+        )
+        self.assertIn(f"Redirect {REGULATORS_FILENAME}", bundle.master.text)
+
+    def test_an_export_without_regulators_is_unchanged(self) -> None:
+        network = make_network(make_bars())
+        catalog = make_catalog(network)
+        cables = make_cables()
+
+        without = build_export(catalog, cables, PHASES, [0])
+        explicit_none = build_export(catalog, cables, PHASES, [0], regulators=None)
+
+        self.assertEqual(
+            [name for name, _ in without.element_files],
+            [LINES_FILENAME, SWITCHES_FILENAME],
+        )
+        self.assertEqual(without.files, explicit_none.files)
+        self.assertNotIn(REGULATORS_FILENAME, without.master.text)
+
+    def test_a_fully_discarded_regulator_model_writes_no_file(self) -> None:
+        # Modelo presente, nenhum regulador exportável: o arquivo não sai, e o
+        # master de quem não tem regulador continua idêntico.
+        bundle = self._bundle(phases=("7", "13"))
+
+        self.assertEqual(bundle.regulators.exported_count, 0)
+        self.assertEqual(
+            [name for name, _ in bundle.element_files],
+            [LINES_FILENAME, SWITCHES_FILENAME],
+        )
+        self.assertTrue(bundle.has_warnings)
+        self.assertTrue(
+            any("não é trifásica" in issue.reason for issue in bundle.issues),
+            bundle.issues,
+        )
 
 
 class ExportedSegmentIndexTests(unittest.TestCase):

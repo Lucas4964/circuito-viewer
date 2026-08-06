@@ -8,7 +8,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PyQt6.QtCore import Qt
     from PyQt6.QtGui import QPalette
-    from PyQt6.QtWidgets import QApplication, QDialog, QFormLayout, QToolBar
+    from PyQt6.QtWidgets import (
+        QApplication,
+        QDialog,
+        QFormLayout,
+        QHeaderView,
+        QTableView,
+        QToolBar,
+    )
 
     from circuit_viewer.csv_import import CsvLoadResult
     from circuit_viewer.load_import import LoadCsvResult
@@ -422,6 +429,26 @@ class MainWindowSelectionTests(unittest.TestCase):
         window._set_load_model(loads)
         self.assertIsNone(window._load_pattern_model)
         self.assertFalse(window.load_patterns_section.isVisible())
+
+    def test_detail_tables_allow_column_resizing(self) -> None:
+        window, _, _ = self._make_window()
+        self.addCleanup(window.close)
+
+        tables = (
+            window.load_patterns_table,
+            window.equivalent_patterns_table,
+            window.findChild(QTableView, "bar_power_flow_quantity_table"),
+            window.findChild(QTableView, "segment_power_flow_quantity_table"),
+        )
+        for table in tables:
+            self.assertIsNotNone(table)
+            header = table.horizontalHeader()
+            with self.subTest(table=table.objectName() or "patterns"):
+                for column in range(header.count()):
+                    self.assertEqual(
+                        header.sectionResizeMode(column),
+                        QHeaderView.ResizeMode.Interactive,
+                    )
 
     def test_switch_table_is_conditional_and_reimport_preserves_selection(self) -> None:
         window, _, network = self._make_window()

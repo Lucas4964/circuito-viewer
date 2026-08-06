@@ -7,6 +7,7 @@ e como os vetores devolvidos viram resultado associado a trecho e barra.
 
 from __future__ import annotations
 
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,7 +27,13 @@ from circuit_viewer.model import (
 from circuit_viewer.opendss_export import LINES_FILENAME, build_export
 from circuit_viewer.opendss_powerflow import (
     PowerFlowIssue,
+    RegulatorTap,
+    apparent_power,
+    line_voltages,
+    power_factor,
     run_power_flow,
+    three_phase_power,
+    voltage_unbalance,
 )
 from circuit_viewer.opendss_settings import OpenDssLoadSettings
 from circuit_viewer.phase_config import PhaseConfiguration, PhaseMappingEntry
@@ -168,8 +175,65 @@ class FakeCktElement:
                     # provar de qual circuito veio o resultado guardado.
                     + 10_000.0 * (self._owner.compiles - 1)
                 )
-                values.extend([magnitude + 1_000.0 * terminal, 0.0])
+                angle = self._owner.line_current_angles[self._line][position]
+                values.extend([magnitude + 1_000.0 * terminal, angle])
         return values
+
+    @property
+    def powers(self) -> list[float]:
+        """Pares (kW, kvar) por condutor, terminais em sequência.
+
+        Mesmo layout do ``currents_mag_ang``, e o terminal 2 leva o sinal
+        trocado — como num elemento real, onde o que entra por um terminal sai
+        pelo outro. Assim um teste prova que só o terminal 1 é guardado.
+        """
+
+        nodes = self._owner.line_nodes[self._line]
+        base = self._owner.line_powers[self._line]
+        values: list[float] = []
+        for terminal in range(2):
+            sign = 1.0 if terminal == 0 else -1.0
+            for active, reactive in base[: len(nodes)]:
+                shift = 10.0 * (self._owner.step - 1)
+                values.extend([sign * (active + shift), sign * reactive])
+        return values
+
+    @property
+    def losses(self) -> list[float]:
+        return list(self._owner.line_losses[self._line])
+
+
+class FakeTransformers:
+    """Itera Transformer no protocolo first()/next(), como o OpenDSS."""
+
+    def __init__(self, owner: FakeEngine) -> None:
+        self._owner = owner
+        self._position = -1
+        self.wdg = 1
+
+    def first(self) -> int:
+        self._position = 0
+        return 1 if self._owner.transformer_taps else 0
+
+    def next(self) -> int:
+        self._position += 1
+        return 1 if self._position < len(self._owner.transformer_taps) else 0
+
+    @property
+    def name(self) -> str:
+        return list(self._owner.transformer_taps)[self._position]
+
+    @property
+    def tap(self) -> float:
+        return self._owner.transformer_taps[self.name]
+
+    @property
+    def min_tap(self) -> float:
+        return self._owner.transformer_tap_limits[0]
+
+    @property
+    def max_tap(self) -> float:
+        return self._owner.transformer_tap_limits[1]
 
 
 class FakeCircuit:
@@ -193,6 +257,25 @@ class FakeCircuit:
             value / 7_967.0 for value in self.buses_vmag
         ]
 
+    @property
+    def buses_volts(self) -> list[float]:
+        """Dois doubles por nó — parte real e imaginária, como o AllBusVolts.
+
+        Deriva do próprio ``buses_vmag`` para módulo lido e módulo do fasor
+        nunca discordarem, e usa o ângulo declarado no motor.
+        """
+
+        angles = self._owner.node_angles
+        values: list[float] = []
+        for position, magnitude in enumerate(self.buses_vmag):
+            # Cíclico: os testes que encurtam a lista de nós continuam
+            # exercitando o guarda de tamanho do colhedor, e não este falso.
+            radians = math.radians(angles[position % len(angles)])
+            values.extend(
+                [magnitude * math.cos(radians), magnitude * math.sin(radians)]
+            )
+        return values
+
 
 class FakeEngine:
     """Motor falso: guarda os comandos e devolve grandezas previsíveis.
@@ -208,6 +291,10 @@ class FakeEngine:
         line_names: tuple[str, ...] = ("tr-1", "tr-2"),
         line_nodes: dict[str, tuple[int, ...]] | None = None,
         line_currents: dict[str, tuple[float, ...]] | None = None,
+        line_powers: dict[str, tuple[tuple[float, float], ...]] | None = None,
+        line_losses: dict[str, tuple[float, float]] | None = None,
+        transformer_taps: dict[str, float] | None = None,
+        transformer_tap_limits: tuple[float, float] = (0.9, 1.1),
         node_names: tuple[str, ...] = (
             "barra_a.1",
             "barra_a.2",
@@ -215,6 +302,8 @@ class FakeEngine:
             "barra_b.1",
         ),
         node_voltages: tuple[float, ...] = (7_960.0, 7_950.0, 7_940.0, 7_900.0),
+        node_angles: tuple[float, ...] = (0.0, -120.0, 120.0, 0.0),
+        line_current_angles: dict[str, tuple[float, ...]] | None = None,
         diverging_steps: frozenset[int] = frozenset(),
     ) -> None:
         self.commands: list[str] = []
@@ -228,11 +317,27 @@ class FakeEngine:
         self.line_currents = line_currents or {
             name: (10.0, 20.0, 30.0) for name in line_names
         }
+        self.line_powers = line_powers or {
+            name: ((100.0, 30.0), (110.0, 33.0), (120.0, 36.0))
+            for name in line_names
+        }
+        # Em **watts**, como o OpenDSS de verdade devolve — ao contrário de
+        # ``powers``, que vem em kW. Medido contra 3·R·I² num trecho conhecido.
+        self.line_losses = line_losses or {
+            name: (1_500.0, 4_500.0) for name in line_names
+        }
         self.node_names = node_names
         self.node_voltages = node_voltages
+        self.node_angles = node_angles
+        self.line_current_angles = line_current_angles or {
+            name: (0.0, -120.0, 120.0) for name in line_names
+        }
         self.diverging_steps = diverging_steps
+        self.transformer_taps = transformer_taps or {}
+        self.transformer_tap_limits = transformer_tap_limits
         self.circuit = FakeCircuit(self)
         self.lines = FakeLines(self)
+        self.transformers = FakeTransformers(self)
         self.cktelement = FakeCktElement(self)
         self.solution = FakeSolution(self)
 
@@ -764,6 +869,226 @@ class LoadSettingsTests(unittest.TestCase):
         self.assertLess(
             max(i for i, line in enumerate(lines) if line.startswith("BatchEdit")),
             lines.index("Solve"),
+        )
+
+
+class LineVoltageTests(unittest.TestCase):
+    """A tensão de linha é subtração de fasores, não de módulos."""
+
+    def test_balanced_system_gives_root_three_at_thirty_degrees(self) -> None:
+        pairs, magnitudes, angles = line_voltages(
+            (1, 2, 3),
+            ((1.0, 1.0, 1.0),),
+            ((0.0, -120.0, 120.0),),
+        )
+
+        self.assertEqual(pairs, ((1, 2), (2, 3), (3, 1)))
+        for value in magnitudes[0]:
+            self.assertAlmostEqual(value, math.sqrt(3.0))
+        # VDE adianta 30°, VEF atrasa 90° e VFD adianta 150°: o resultado
+        # clássico do triângulo de tensões.
+        self.assertAlmostEqual(angles[0][0], 30.0)
+        self.assertAlmostEqual(angles[0][1], -90.0)
+        self.assertAlmostEqual(angles[0][2], 150.0)
+
+    def test_magnitudes_alone_would_be_wrong(self) -> None:
+        # Duas fases de mesmo módulo dão diferença de módulos zero, mas a
+        # tensão entre elas é √3 vezes a de fase. É a prova de que compor o
+        # fasor não é preciosismo.
+        _, magnitudes, _ = line_voltages(
+            (1, 2),
+            ((7_960.0, 7_960.0),),
+            ((0.0, -120.0),),
+        )
+
+        self.assertAlmostEqual(magnitudes[0][0], 7_960.0 * math.sqrt(3.0))
+
+    def test_only_pairs_with_both_phases_are_emitted(self) -> None:
+        pairs, magnitudes, angles = line_voltages(
+            (1, 2),
+            ((1.0, 1.0),),
+            ((0.0, -120.0),),
+        )
+
+        self.assertEqual(pairs, ((1, 2),))
+        self.assertEqual(len(magnitudes[0]), 1)
+        self.assertEqual(len(angles[0]), 1)
+
+    def test_single_phase_bar_has_no_line_voltage(self) -> None:
+        self.assertEqual(
+            line_voltages((1,), ((1.0,),), ((0.0,),)),
+            ((), (), ()),
+        )
+
+    def test_every_patamar_is_converted(self) -> None:
+        _, magnitudes, _ = line_voltages(
+            (1, 2, 3),
+            tuple((1.0 + step, 1.0 + step, 1.0 + step) for step in range(4)),
+            tuple((0.0, -120.0, 120.0) for _ in range(4)),
+        )
+
+        self.assertEqual(len(magnitudes), 4)
+        self.assertAlmostEqual(magnitudes[3][0], 4.0 * math.sqrt(3.0))
+
+    def test_angles_reach_the_result(self) -> None:
+        engine = FakeEngine()
+        with tempfile.TemporaryDirectory() as directory:
+            result = run_power_flow(
+                engine,
+                make_catalog(make_network(make_bars())),
+                make_cables(),
+                PHASES,
+                [0],
+                workspace=Path(directory),
+            )
+
+        # O motor falso declara 0/-120/+120 nos três nós da barra A. A tensão
+        # passa por retangular e volta, então compara com tolerância.
+        for read, expected in zip(
+            result.bar_voltages[0].angles[0], (0.0, -120.0, 120.0), strict=True
+        ):
+            self.assertAlmostEqual(read, expected)
+        # A corrente vem direto do currents_mag_ang, sem conversão nenhuma.
+        self.assertEqual(
+            result.segment_currents[0].angles[0], (0.0, -120.0, 120.0)
+        )
+
+
+class VoltageUnbalanceTests(unittest.TestCase):
+    """FD% do PRODIST: razão entre sequência negativa e positiva."""
+
+    def test_balanced_system_has_no_unbalance(self) -> None:
+        values = voltage_unbalance(
+            (1, 2, 3), ((1.0, 1.0, 1.0),), ((0.0, -120.0, 120.0),)
+        )
+
+        self.assertEqual(len(values), 1)
+        self.assertAlmostEqual(values[0], 0.0)
+
+    def test_one_low_phase_gives_the_closed_form(self) -> None:
+        # Va=0,9 e Vb=Vc=1,0: V₊=2,9/3 e V₋=−0,1/3, então FD = 0,1/2,9.
+        values = voltage_unbalance(
+            (1, 2, 3), ((0.9, 1.0, 1.0),), ((0.0, -120.0, 120.0),)
+        )
+
+        self.assertAlmostEqual(values[0], 0.1 / 2.9 * 100.0, places=6)
+
+    def test_fewer_than_three_phases_is_undefined(self) -> None:
+        self.assertEqual(
+            voltage_unbalance((1, 2), ((1.0, 1.0),), ((0.0, -120.0),)),
+            (),
+        )
+
+
+class PowerMathTests(unittest.TestCase):
+    """As grandezas derivadas de P e Q, com o sinal do OpenDSS intacto."""
+
+    def test_apparent_power_is_the_hypotenuse_and_its_angle(self) -> None:
+        magnitudes, angles = apparent_power(((100.0, 0.0),), ((0.0, 50.0),))
+
+        self.assertAlmostEqual(magnitudes[0][0], 100.0)
+        self.assertAlmostEqual(angles[0][0], 0.0)
+        # Só reativo: 90° de defasagem.
+        self.assertAlmostEqual(magnitudes[0][1], 50.0)
+        self.assertAlmostEqual(angles[0][1], 90.0)
+
+    def test_three_phase_power_sums_the_complex_phases(self) -> None:
+        rows = three_phase_power(
+            ((100.0, 110.0, 120.0),), ((30.0, 33.0, 36.0),)
+        )
+
+        active, reactive, apparent, angle = rows[0]
+        self.assertAlmostEqual(active, 330.0)
+        self.assertAlmostEqual(reactive, 99.0)
+        self.assertAlmostEqual(apparent, math.hypot(330.0, 99.0))
+        self.assertAlmostEqual(angle, math.degrees(math.atan2(99.0, 330.0)))
+
+    def test_reverse_flow_keeps_its_sign(self) -> None:
+        # É o sinal que diz se o elemento recebe ou fornece pelo terminal 1;
+        # perder isso apagaria o sentido do fluxo.
+        rows = three_phase_power(((-100.0, -100.0, -100.0),), ((-30.0,) * 3,))
+        active, reactive, apparent, _ = rows[0]
+
+        self.assertAlmostEqual(active, -300.0)
+        self.assertAlmostEqual(reactive, -90.0)
+        self.assertGreater(apparent, 0.0)
+        self.assertLess(power_factor(((-100.0,),), ((-30.0,),))[0][0], 0.0)
+
+    def test_power_factor_appends_the_three_phase_total(self) -> None:
+        rows = power_factor(((100.0, 100.0, 100.0),), ((0.0, 0.0, 0.0),))
+
+        # Três fases mais o total.
+        self.assertEqual(len(rows[0]), 4)
+        for value in rows[0]:
+            self.assertAlmostEqual(value, 1.0)
+
+    def test_zero_power_has_no_factor(self) -> None:
+        self.assertEqual(power_factor(((0.0,),), ((0.0,),))[0][0], 0.0)
+
+
+class SegmentPowerHarvestTests(unittest.TestCase):
+    """Potência e perdas chegam ao trecho, só do terminal 1."""
+
+    def _run(self, engine: FakeEngine):  # noqa: ANN202
+        with tempfile.TemporaryDirectory() as directory:
+            return run_power_flow(
+                engine,
+                make_catalog(make_network(make_bars())),
+                make_cables(),
+                PHASES,
+                [0],
+                workspace=Path(directory),
+            )
+
+    def test_powers_land_on_the_segment(self) -> None:
+        result = self._run(FakeEngine())
+
+        powers = result.segment_powers[0]
+        self.assertEqual(powers.nodes, (1, 2, 3))
+        self.assertEqual(powers.active[0], (100.0, 110.0, 120.0))
+        self.assertEqual(powers.reactive[0], (30.0, 33.0, 36.0))
+
+    def test_only_the_first_terminal_is_kept(self) -> None:
+        # O motor falso inverte o sinal no terminal 2; nada disso pode aparecer.
+        result = self._run(FakeEngine())
+
+        self.assertTrue(all(value > 0 for value in result.segment_powers[0].active[0]))
+
+    def test_each_patamar_is_harvested_separately(self) -> None:
+        result = self._run(FakeEngine())
+
+        # O falso soma 10 kW por passo.
+        self.assertEqual(
+            [row[0] for row in result.segment_powers[0].active],
+            [100.0, 110.0, 120.0, 130.0],
+        )
+
+    def test_losses_arrive_per_patamar(self) -> None:
+        result = self._run(FakeEngine())
+
+        powers = result.segment_powers[0]
+        # O falso devolve 1500 W; o colhedor converte para kW.
+        self.assertEqual(powers.active_losses, (1.5,) * 4)
+        self.assertEqual(powers.reactive_losses, (4.5,) * 4)
+
+
+class RegulatorTapTests(unittest.TestCase):
+    """O tap volta do Transformer e denuncia o fim de curso."""
+
+    def _tap(self, value: float) -> RegulatorTap:
+        return RegulatorTap(phase="D", tap=value, minimum=0.9, maximum=1.1)
+
+    def test_tap_inside_the_range_is_not_at_limit(self) -> None:
+        self.assertFalse(self._tap(1.0437).at_limit)
+
+    def test_tap_on_either_end_is_at_limit(self) -> None:
+        self.assertTrue(self._tap(1.1).at_limit)
+        self.assertTrue(self._tap(0.9).at_limit)
+
+    def test_degenerate_range_is_never_at_limit(self) -> None:
+        # Sem curso não há o que esgotar; evita alarme falso.
+        self.assertFalse(
+            RegulatorTap(phase="D", tap=1.0, minimum=1.0, maximum=1.0).at_limit
         )
 
 

@@ -35,6 +35,7 @@ from .model import (
     CircuitCatalogModel,
     LoadModel,
     LoadPatternModel,
+    RegulatorModel,
 )
 from .phase_config import PhaseConfiguration
 
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
 FREQUENCY_HZ = 60.0
 LINES_FILENAME = "trechos.dss"
 SWITCHES_FILENAME = "chaves.dss"
+REGULATORS_FILENAME = "reguladores.dss"
 SINGLE_PHASE_LOADS_FILENAME = "cargasmonofasicas.dss"
 TWO_PHASE_LOADS_FILENAME = "cargasbifasicas.dss"
 THREE_PHASE_LOADS_FILENAME = "cargastrifasicas.dss"
@@ -77,6 +79,28 @@ _PATTERN_COLUMNS_BY_PHASE = {
     "E": ("pe", "qe"),
     "F": ("pf", "qf"),
 }
+
+# --- Regulador de tensão -----------------------------------------------------
+# Um regulador trifásico vira três transformadores monofásicos, um por fase, e
+# cada um ganha o seu RegControl. Os valores abaixo são a modelagem adotada; o
+# CSV traz apenas VNOM e SNOM.
+REGULATOR_NAME_PREFIX = "REG-"
+REGULATOR_CONTROL_NAME_PREFIX = "CTRL-"
+# Transformador quase ideal: o regulador injeta tensão em série, não impedância.
+REGULATOR_XHL_PERCENT = 0.01
+REGULATOR_LOAD_LOSS_PERCENT = 0.01
+# Transformador de potencial: 115 V entre fases no secundário, como o primário,
+# de modo que ``ptratio`` fica VNOM*1000/115 — o √3 dos dois lados se cancela.
+REGULATOR_PT_SECONDARY_V = 115.0
+# Banda de 2 % em torno de vreg, folgada o bastante para um passo de tap.
+REGULATOR_BAND_FRACTION = 0.02
+# O regulador ocupa o lugar do trecho, então a impedância dele sai do modelo.
+# Acima deste comprimento isso deixa de ser desprezível e vira aviso.
+REGULATOR_SEGMENT_LENGTH_WARNING_M = 10.0
+# VNOM do regulador e do circuito são a mesma tensão de linha, em kV. Uma
+# divergência maior que esta denuncia unidade trocada (volts em vez de kV),
+# que passaria despercebida por gerar um modelo aceito e absurdo.
+REGULATOR_VOLTAGE_TOLERANCE = 0.10
 
 _INVALID_NAME_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 _NUMBER_PATTERN = re.compile(
@@ -125,6 +149,38 @@ class OpenDssSwitchExportResult:
     used_names: frozenset[str] = frozenset()
     # Mesmo índice reverso dos trechos; aqui o nome vem do CODIGO da chave.
     exported_segments: tuple[tuple[str, int], ...] = ()
+
+    @property
+    def has_warnings(self) -> bool:
+        return self.discarded_count > 0 or bool(self.issues)
+
+
+@dataclass(frozen=True, slots=True)
+class OpenDssRegulatorExportResult:
+    """Resultado de ``reguladores.dss``.
+
+    ``exported_count`` conta reguladores, não elementos: cada um vira três
+    ``Transformer`` mais três ``RegControl``.
+
+    ``replaced_segments`` são os trechos que **deixaram de ser** ``Line``, e é o
+    que :func:`build_line_export` recebe para não emitir uma linha em paralelo
+    com o regulador. Só entra aqui o trecho cujo regulador foi de fato emitido:
+    um regulador descartado precisa manter a linha dele, senão a exportação
+    apagaria um ramo da rede em silêncio.
+    """
+
+    text: str
+    exported_count: int
+    discarded_count: int
+    issues: tuple[OpenDssExportIssue, ...]
+    omitted_issues: int
+    used_names: frozenset[str] = frozenset()
+    replaced_segments: frozenset[int] = frozenset()
+    # Índice reverso ``nome do Transformer`` → (trecho, letra da fase), na ordem
+    # de emissão. Mesma razão do ``exported_segments`` dos trechos: só o
+    # exportador conhece as regras que produziram cada nome, e o fluxo de
+    # potência precisa devolver o tap ao regulador certo.
+    exported_units: tuple[tuple[str, int, str], ...] = ()
 
     @property
     def has_warnings(self) -> bool:
@@ -184,10 +240,15 @@ class OpenDssExportBundle:
     Os três resultados de carga são opcionais e andam juntos: sem cargas e
     patamares importados nenhum dos arquivos de carga é gerado, e a exportação
     segue produzindo apenas os dois arquivos de rede.
+
+    ``regulators`` é opcional pela mesma razão, e some do ``element_files``
+    quando nenhum regulador foi exportado: uma exportação sem reguladores
+    continua gerando exatamente os mesmos arquivos de sempre.
     """
 
     lines: OpenDssLineExportResult
     switches: OpenDssSwitchExportResult
+    regulators: OpenDssRegulatorExportResult | None = None
     single_phase_loads: OpenDssLoadExportResult | None = None
     two_phase_loads: OpenDssLoadExportResult | None = None
     three_phase_loads: OpenDssLoadExportResult | None = None
@@ -215,11 +276,21 @@ class OpenDssExportBundle:
 
     @property
     def element_files(self) -> tuple[tuple[str, str], ...]:
-        """Arquivos de elementos, na ordem em que o master os chama."""
+        """Arquivos de elementos, na ordem em que o master os chama.
 
+        ``reguladores.dss`` só entra quando há regulador exportado: um arquivo
+        vazio mudaria o master de exportações que não têm reguladores.
+        """
+
+        regulators = self.regulators
         return (
             (LINES_FILENAME, self.lines.text),
             (SWITCHES_FILENAME, self.switches.text),
+            *(
+                ()
+                if regulators is None or not regulators.exported_count
+                else ((REGULATORS_FILENAME, regulators.text),)
+            ),
             *(
                 (_LOAD_FILES[count][0], result.text)
                 for count, result in self.loads_by_phase_count
@@ -242,6 +313,7 @@ class OpenDssExportBundle:
         return (
             *self.lines.issues,
             *self.switches.issues,
+            *(() if self.regulators is None else self.regulators.issues),
             *(issue for result in self._load_results for issue in result.issues),
             *(() if self.master is None else self.master.issues),
         )
@@ -249,12 +321,14 @@ class OpenDssExportBundle:
     @property
     def omitted_issues(self) -> int:
         total = self.lines.omitted_issues + self.switches.omitted_issues
+        total += 0 if self.regulators is None else self.regulators.omitted_issues
         total += sum(result.omitted_issues for result in self._load_results)
         return total + (0 if self.master is None else self.master.omitted_issues)
 
     @property
     def discarded_count(self) -> int:
         total = self.lines.discarded_count + self.switches.discarded_count
+        total += 0 if self.regulators is None else self.regulators.discarded_count
         total += sum(result.discarded_count for result in self._load_results)
         return total + (
             0 if self.master is None else self.master.discarded_count
@@ -265,6 +339,7 @@ class OpenDssExportBundle:
         return (
             self.lines.has_warnings
             or self.switches.has_warnings
+            or (self.regulators is not None and self.regulators.has_warnings)
             or any(result.has_warnings for result in self._load_results)
             or (self.master is not None and self.master.has_warnings)
         )
@@ -425,6 +500,27 @@ def _terminals_by_phase_letter(
     return terminals
 
 
+def phase_letters_by_node(
+    configuration: PhaseConfiguration,
+) -> dict[int, str]:
+    """Letra da fase de cada nó DSS — o inverso de :func:`_terminals_by_phase_letter`.
+
+    Público porque o painel de fluxo de potência rotula as colunas por fase e
+    precisa da mesma correspondência que os ``Bus1``/``Bus2`` usam. Derivar do
+    ``fases2.json`` em vez de fixar ``{1: "D", 2: "E", 3: "F"}`` evita uma
+    segunda verdade que divergiria em silêncio de uma configuração customizada.
+    """
+
+    letters: dict[int, str] = {}
+    for letter, node in _terminals_by_phase_letter(configuration).items():
+        try:
+            index = int(node)
+        except ValueError:
+            continue
+        letters.setdefault(index, letter)
+    return letters
+
+
 def _phase_letters(name: str | None, expected: int) -> tuple[str, ...] | None:
     """As fases de um NOME, na ordem em que aparecem.
 
@@ -478,6 +574,7 @@ def build_line_export(
     phase_configuration: PhaseConfiguration,
     circuit_indices: Sequence[int] | Iterable[int],
     *,
+    skip_segments: frozenset[int] = frozenset(),
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssLineExportResult:
@@ -485,6 +582,12 @@ def build_line_export(
 
     Percorre apenas ``common_segment_indices`` de cada associação: a busca
     topológica já separa ali os trechos que **não** representam chaves.
+
+    ``skip_segments`` são os trechos já representados por outro elemento — hoje,
+    os substituídos por um regulador (``replaced_segments`` de
+    :func:`build_regulator_export`). Sair também como ``Line`` poria a linha em
+    paralelo com o regulador. A omissão é silenciosa de propósito: quem
+    substituiu o trecho já relatou a substituição.
     """
 
     selected = _selected_indices(catalog, circuit_indices)
@@ -522,6 +625,8 @@ def build_line_export(
                 progress(processed, total)
 
             segment_index = int(raw_index)
+            if segment_index in skip_segments:
+                continue
             segment_id = segments.segment_ids[segment_index]
             previous = owner_voltage.get(segment_index)
             if previous is not None:
@@ -818,6 +923,272 @@ def build_switch_export(
         omitted_issues=report.omitted,
         used_names=frozenset(used_names),
         exported_segments=tuple(exported_segments),
+    )
+
+
+def build_regulator_export(
+    catalog: CircuitCatalogModel,
+    regulators: RegulatorModel,
+    phase_configuration: PhaseConfiguration,
+    circuit_indices: Sequence[int] | Iterable[int],
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    progress: ProgressCallback | None = None,
+) -> OpenDssRegulatorExportResult:
+    """Gera o conteúdo de ``reguladores.dss`` para os circuitos selecionados.
+
+    Um regulador trifásico vira **três** transformadores monofásicos, um por
+    fase, cada um com o seu ``RegControl``. As unidades monofásicas dividem a
+    grandeza trifásica: ``kV = VNOM/√3`` (a mesma
+    :func:`phase_voltage_kv` do ``C1`` dos trechos e do ``kV`` das cargas) e
+    ``kVA = SNOM/3``.
+
+    **O regulador ocupa o lugar do trecho.** Os transformadores ligam as duas
+    barras do trecho, exatamente como a chave de :func:`build_switch_export`
+    faz, e é por isso que o trecho não pode sair também como ``Line``: duas
+    ligações entre as mesmas barras poriam a linha em paralelo com o regulador,
+    curto-circuitando a injeção de tensão. Quem cumpre isso é
+    ``replaced_segments``, consumido por :func:`build_line_export`.
+
+    Só reguladores em trecho **trifásico** são exportados; os demais viram
+    ocorrência e mantêm a linha do trecho.
+    """
+
+    selected = _selected_indices(catalog, circuit_indices)
+    segments = catalog.segments
+    entries_by_value = _entries_by_value(phase_configuration)
+    terminals = _terminals_by_phase_letter(phase_configuration)
+    report = _ExportReport()
+    bus_name = bus_namer(catalog)
+    by_segment = regulators.record_indices_by_segment
+
+    total = sum(
+        int(catalog.membership(index).common_segment_indices.size)
+        + int(catalog.membership(index).switch_segment_indices.size)
+        for index in selected
+    )
+    processed = 0
+    transformers: list[str] = []
+    controls: list[str] = []
+    exported_units: list[tuple[str, int, str]] = []
+    used_names: dict[str, str] = {}
+    replaced_segments: set[int] = set()
+    seen_segments: set[int] = set()
+    exported_count = 0
+
+    for circuit_index in selected:
+        definition = catalog.definition(circuit_index)
+        membership = catalog.membership(circuit_index)
+        circuit_voltage = parse_number(definition.nominal_voltage)
+        if circuit_voltage is not None and circuit_voltage <= 0.0:
+            circuit_voltage = None
+
+        # Os trechos-chave entram só para o regulador que porventura esteja num
+        # deles ser relatado: chave e regulador disputam a mesma Line, e um
+        # regulador sumindo em silêncio é o que este laço evita.
+        for raw_index in membership.switch_segment_indices:
+            segment_index = int(raw_index)
+            processed += 1
+            if segment_index in seen_segments:
+                continue
+            record_index = int(by_segment[segment_index])
+            if record_index < 0:
+                continue
+            seen_segments.add(segment_index)
+            report.add(
+                segments.segment_ids[segment_index],
+                f"trecho já representa a chave do circuito "
+                f"{definition.circuit_id}; o regulador "
+                f"{regulators.record(record_index).regulator_id} não foi "
+                "exportado",
+            )
+
+        for raw_index in membership.common_segment_indices:
+            if cancel_check is not None and processed % 4_096 == 0 and cancel_check():
+                raise InterruptedError("Exportação cancelada.")
+            processed += 1
+            if progress is not None and processed % 1_000 == 0:
+                progress(processed, total)
+
+            segment_index = int(raw_index)
+            if segment_index in seen_segments:
+                continue
+            record_index = int(by_segment[segment_index])
+            if record_index < 0:
+                continue
+            seen_segments.add(segment_index)
+            segment_id = segments.segment_ids[segment_index]
+            regulator = regulators.record(record_index)
+
+            segment = segments.record(segment_index)
+            entry = entries_by_value.get(segment.phases.strip().casefold())
+            if entry is None:
+                report.add(
+                    segment_id,
+                    f"FASES2 '{segment.phases.strip() or '<vazio>'}' sem relação "
+                    "em fases2.json; o regulador não foi exportado",
+                )
+                continue
+            if entry.phase_count != 3:
+                report.add(
+                    segment_id,
+                    f"FASES2 '{entry.fases2}' não é trifásica; só reguladores "
+                    "em trecho trifásico são exportados",
+                )
+                continue
+            letters = _phase_letters(entry.name, 3)
+            if letters is None:
+                report.add(
+                    segment_id,
+                    f"FASES2 '{entry.fases2}' com NOME "
+                    f"'{(entry.name or '').strip() or '<vazio>'}' não resolve "
+                    "três fases distintas entre D, E e F",
+                )
+                continue
+            missing = next(
+                (letter for letter in letters if letter not in terminals),
+                None,
+            )
+            if missing is not None:
+                report.add(
+                    segment_id,
+                    f"fase '{missing}' sem terminal DSS: nenhuma entrada "
+                    "monofásica de fases2.json a define",
+                )
+                continue
+
+            voltage = parse_number(regulator.vnom)
+            if voltage is None or voltage <= 0.0:
+                report.add(
+                    segment_id,
+                    f"regulador {regulator.regulator_id} sem VNOM numérica "
+                    f"positiva ({regulator.vnom.strip() or '<vazio>'})",
+                )
+                continue
+            power = parse_number(regulator.snom)
+            if power is None or power <= 0.0:
+                report.add(
+                    segment_id,
+                    f"regulador {regulator.regulator_id} sem SNOM numérica "
+                    f"positiva ({regulator.snom.strip() or '<vazio>'})",
+                )
+                continue
+            # VNOM do regulador e do circuito são a mesma tensão de linha em kV.
+            # Divergir muito quase sempre é unidade trocada, e o modelo
+            # resultante seria aceito pelo OpenDSS e completamente errado.
+            if circuit_voltage is not None and abs(
+                voltage - circuit_voltage
+            ) > REGULATOR_VOLTAGE_TOLERANCE * circuit_voltage:
+                report.add(
+                    segment_id,
+                    f"VNOM '{regulator.vnom.strip()}' do regulador "
+                    f"{regulator.regulator_id} incompatível com a VNOM "
+                    f"{definition.nominal_voltage.strip()} do circuito "
+                    f"{definition.circuit_id}; confira se a unidade é kV",
+                )
+                continue
+
+            name = sanitize_dss_name(regulator.code)
+            if not name:
+                name = sanitize_dss_name(regulator.regulator_id)
+                report.add(
+                    segment_id,
+                    "CODIGO do regulador vazio ou sem caracteres válidos; o "
+                    "nome dos transformadores usou o REGU_ID",
+                    discarded=False,
+                )
+            if name in used_names:
+                report.add(
+                    segment_id,
+                    f"nome '{name}' já usado pelo regulador {used_names[name]}",
+                )
+                continue
+
+            phase_kv = _format(phase_voltage_kv(voltage))
+            phase_kva = _format(power / 3.0)
+            vreg = REGULATOR_PT_SECONDARY_V / math.sqrt(3.0)
+            band = vreg * REGULATOR_BAND_FRACTION
+            ptratio = voltage * 1_000.0 / REGULATOR_PT_SECONDARY_V
+            bus1 = bus_name(int(segments.start_indices[segment_index]))
+            bus2 = bus_name(int(segments.end_indices[segment_index]))
+
+            for letter in letters:
+                node = terminals[letter]
+                unit = f"{REGULATOR_NAME_PREFIX}{name}-{letter}"
+                transformers.append(
+                    f"New Transformer.{unit}"
+                    " phases=1 windings=2"
+                    f" XHL={_format(REGULATOR_XHL_PERCENT)}"
+                    f" %LoadLoss={_format(REGULATOR_LOAD_LOSS_PERCENT)}"
+                    f" Buses=[{bus1}.{node}.0, {bus2}.{node}.0]"
+                    " conns=[wye, wye]"
+                    f" kVs=[{phase_kv}, {phase_kv}]"
+                    f" kVAs=[{phase_kva}, {phase_kva}]"
+                )
+                controls.append(
+                    f"New RegControl."
+                    f"{REGULATOR_CONTROL_NAME_PREFIX}{name}-{letter}"
+                    f" transformer={unit}"
+                    " winding=2"
+                    f" vreg={_format(vreg)}"
+                    f" band={_format(band)}"
+                    f" ptratio={_format(ptratio)}"
+                )
+                exported_units.append((unit, segment_index, letter))
+
+            used_names[name] = regulator.regulator_id
+            replaced_segments.add(segment_index)
+            exported_count += 1
+
+            # O transformador não tem comprimento: a impedância do trecho que
+            # ele substitui desaparece do modelo.
+            length = segment.length
+            if length is not None and length > REGULATOR_SEGMENT_LENGTH_WARNING_M:
+                report.add(
+                    segment_id,
+                    f"trecho de {_format(length)} m substituído pelo regulador "
+                    f"{regulator.regulator_id}; a impedância dele saiu do "
+                    "modelo",
+                    discarded=False,
+                )
+
+    if cancel_check is not None and cancel_check():
+        raise InterruptedError("Exportação cancelada.")
+    if progress is not None:
+        progress(total, total)
+
+    header = (
+        "! Reguladores exportados pelo Visualizador de Circuitos Eletricos",
+        "! Um regulador trifasico = tres transformadores monofasicos + tres "
+        "RegControl",
+        "! kV = VNOM/raiz(3) e kVA = SNOM/3; o trecho regulado nao sai em "
+        f"{LINES_FILENAME}",
+        "! Circuitos: "
+        + ", ".join(
+            sanitize_dss_name(catalog.definition(index).circuit_id)
+            for index in selected
+        ),
+        "",
+    )
+    # Todo RegControl referencia o seu Transformer pelo nome, então todas as
+    # definições de transformador vêm antes de todos os controles.
+    body = (
+        *transformers,
+        *(("",) if transformers and controls else ()),
+        *controls,
+    )
+    text = "\n".join((*header, *body))
+    if body:
+        text += "\n"
+    return OpenDssRegulatorExportResult(
+        text=text,
+        exported_count=exported_count,
+        discarded_count=report.discarded,
+        issues=tuple(report.issues),
+        omitted_issues=report.omitted,
+        used_names=frozenset(used_names),
+        replaced_segments=frozenset(replaced_segments),
+        exported_units=tuple(exported_units),
     )
 
 
@@ -1316,6 +1687,7 @@ def build_export(
     *,
     loads: LoadModel | None = None,
     patterns: LoadPatternModel | None = None,
+    regulators: RegulatorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
@@ -1339,14 +1711,36 @@ def build_export(
     comando que edita zero objetos num arquivo sem cargas só confundiria quem o
     lesse. A divisão de responsabilidade é essa: ``build_master_export`` emite o
     que recebe, e é aqui que se decide se faz sentido.
+
+    Os reguladores são construídos **antes** dos trechos porque cada regulador
+    exportado toma o lugar da ``Line`` do seu trecho, e só depois de tentar
+    exportá-los se sabe quais trechos não devem sair — um regulador descartado
+    mantém a linha dele.
     """
 
     selected = _selected_indices(catalog, circuit_indices)
+    regulator_result = (
+        None
+        if regulators is None
+        else build_regulator_export(
+            catalog,
+            regulators,
+            phase_configuration,
+            selected,
+            cancel_check=cancel_check,
+            progress=progress,
+        )
+    )
     line_result = build_line_export(
         catalog,
         cables,
         phase_configuration,
         selected,
+        skip_segments=(
+            frozenset()
+            if regulator_result is None
+            else regulator_result.replaced_segments
+        ),
         cancel_check=cancel_check,
         progress=progress,
     )
@@ -1380,6 +1774,7 @@ def build_export(
     bundle = OpenDssExportBundle(
         lines=line_result,
         switches=switch_result,
+        regulators=regulator_result,
         single_phase_loads=load_results.get(1),
         two_phase_loads=load_results.get(2),
         three_phase_loads=load_results.get(3),
@@ -1395,6 +1790,7 @@ def build_export(
     return OpenDssExportBundle(
         lines=line_result,
         switches=switch_result,
+        regulators=regulator_result,
         single_phase_loads=load_results.get(1),
         two_phase_loads=load_results.get(2),
         three_phase_loads=load_results.get(3),

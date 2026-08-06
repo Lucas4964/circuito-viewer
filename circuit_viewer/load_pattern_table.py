@@ -2,7 +2,39 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt
+
+from .opendss_export import parse_number
+
+# Arredondamento **só de exibição**: o valor guardado no registro continua
+# intacto, e o tooltip devolve a precisão cheia para conferência.
+DISPLAY_DECIMALS = 4
+
+# CARGA_ID e NPAT são identificadores, não grandezas — nunca são formatados.
+_FIRST_VALUE_COLUMN = 2
+
+
+def _display_text(value: object) -> str:
+    """Formata uma grandeza de patamar com casas decimais fixas.
+
+    O modelo atende dois registros diferentes: os patamares importados guardam
+    o texto cru do CSV (que pode vir com vírgula decimal, ou nem ser número), e
+    os patamares equivalentes guardam ``Decimal`` somado em precisão alta. Só o
+    que for reconhecido como número é arredondado; o resto aparece como está,
+    porque esconder um valor que o usuário digitou seria pior que exibi-lo.
+    """
+
+    if isinstance(value, Decimal):
+        return f"{value:.{DISPLAY_DECIMALS}f}"
+    # ``parse_number`` é a regra única de separador decimal do projeto; duplicá-la
+    # aqui abriria espaço para a tabela e a exportação discordarem.
+    number = parse_number(value) if isinstance(value, str) else None
+    if number is None:
+        return str(value)
+    return f"{number:.{DISPLAY_DECIMALS}f}"
+
 
 class LoadPatternTableModel(QAbstractTableModel):
     HEADERS = ("CARGA_ID", "NPAT", "PD", "PE", "PF", "QD", "QE", "QF")
@@ -51,7 +83,14 @@ class LoadPatternTableModel(QAbstractTableModel):
             Qt.ItemDataRole.DisplayRole,
             Qt.ItemDataRole.ToolTipRole,
         }:
-            return "—" if value is None or value == "" else str(value)
+            if value is None or value == "":
+                return "—"
+            if (
+                role == Qt.ItemDataRole.DisplayRole
+                and index.column() >= _FIRST_VALUE_COLUMN
+            ):
+                return _display_text(value)
+            return str(value)
         if role == Qt.ItemDataRole.TextAlignmentRole:
             horizontal = (
                 Qt.AlignmentFlag.AlignLeft

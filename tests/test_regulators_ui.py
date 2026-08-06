@@ -263,10 +263,12 @@ class RegulatorUiTests(unittest.TestCase):
         self.assertIsNone(window._regulator_model)
         self.assertFalse(window.regulator_details_section.isVisible())
 
-    def test_importing_regulators_does_not_invalidate_anything(self) -> None:
+    def test_importing_regulators_invalidates_only_the_power_flow(self) -> None:
         window = self._window()
         self._load_network(window)
-        # Reguladores não entram na topologia: nada que dependa dela é tocado.
+        # Reguladores seguem fora da topologia, então o que depende dela não é
+        # tocado. Mas eles são exportados e regulam a tensão: um resultado de
+        # fluxo calculado com outro conjunto deixa de valer.
         marker = object()
         window._branch_analysis_result = marker
         window._power_flow_result = marker
@@ -274,7 +276,7 @@ class RegulatorUiTests(unittest.TestCase):
         self._load_regulators(window)
 
         self.assertIs(window._branch_analysis_result, marker)
-        self.assertIs(window._power_flow_result, marker)
+        self.assertIsNone(window._power_flow_result)
 
     # ------------------------------------------------------------------ busca
 

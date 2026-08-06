@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Sequence
 
 from PyQt6.QtCore import QSettings, QSignalBlocker, QThread, QTimer, Qt
 from PyQt6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
@@ -18,7 +19,6 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGraphicsScene,
     QGridLayout,
-    QHeaderView,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -57,6 +57,7 @@ from .graphics import (
     LineNetworkItem,
     LoadVirtualizer,
     load_layout_offsets_for_models,
+    RegulatorNetworkItem,
     SegmentSelectionOverlayItem,
     SwitchNetworkItem,
 )
@@ -86,16 +87,27 @@ from .model import (
 )
 from .opendss_export import (
     LINES_FILENAME,
+    REGULATORS_FILENAME,
     SINGLE_PHASE_LOADS_FILENAME,
     SWITCHES_FILENAME,
     THREE_PHASE_LOADS_FILENAME,
     TWO_PHASE_LOADS_FILENAME,
     OpenDssExportBundle,
     master_filenames,
+    phase_letters_by_node,
 )
 from .opendss_export_dialog import OpenDssExportDialog
 from .opendss_engine import power_flow_import_error
-from .opendss_powerflow import PowerFlowResult
+from .opendss_powerflow import (
+    LINE_VOLTAGE_PU_BASE,
+    PowerFlowResult,
+    SegmentPowers,
+    apparent_power,
+    line_voltages,
+    power_factor,
+    three_phase_power,
+    voltage_unbalance,
+)
 from .opendss_settings import OpenDssLoadSettings
 from .opendss_settings_dialog import (
     OpenDssSettingsDialog,
@@ -118,6 +130,7 @@ from .search import GlobalSearchIndex, SearchResult
 from .search_palette import SearchPalette
 from .segment_import import SegmentLoadResult
 from .switch_import import SwitchLoadResult
+from .table_columns import enable_interactive_columns
 from .theme import (
     THEME_LABELS,
     AppTheme,
@@ -150,16 +163,46 @@ _LOAD_EXPORT_FILES: tuple[tuple[int, str, str], ...] = (
 )
 
 # Grandezas do fluxo de potência oferecidas em cada página de detalhes, como
-# (chave, rótulo, casas decimais). Duas grandezas por página em vez de duas
-# tabelas: o painel já é denso, e o combobox troca a leitura sem empilhar mais
+# (chave, rótulo, casas decimais, tem fasor). Uma tabela por página em vez de
+# várias: o painel já é denso, e o combobox troca a leitura sem empilhar mais
 # uma tabela de quatro linhas.
-_SEGMENT_QUANTITIES: tuple[tuple[str, str, int], ...] = (
-    ("current", "Corrente por fase (A)", 2),
-    ("loading", "Carregamento (%)", 1),
+#
+# "tem fasor" acrescenta as colunas de ângulo ao lado dos módulos. O pu fica de
+# fora de propósito: o ângulo dele é o mesmo da tensão de fase, só o módulo muda
+# de escala, então repeti-lo seria ruído. O carregamento é uma razão de módulos
+# e não tem fase alguma.
+_SEGMENT_QUANTITIES: tuple[tuple[str, str, int, bool], ...] = (
+    ("current", "Corrente por fase (A)", 2, True),
+    ("loading", "Carregamento (%)", 1, False),
+    ("active_power", "Potência ativa (kW)", 2, False),
+    ("reactive_power", "Potência reativa (kvar)", 2, False),
+    ("apparent_power", "Potência aparente (kVA)", 2, True),
+    ("three_phase_power", "Potência trifásica", 2, False),
+    ("power_factor", "Fator de potência", 4, False),
+    ("losses", "Perdas", 3, False),
 )
-_BAR_QUANTITIES: tuple[tuple[str, str, int], ...] = (
-    ("voltage", "Tensão por nó (V)", 1),
-    ("per_unit", "Tensão (pu)", 4),
+# "voltage" precisa continuar em primeiro: é o padrão do combobox e o recuo de
+# _quantity_of quando a chave ainda não foi escolhida.
+_BAR_QUANTITIES: tuple[tuple[str, str, int, bool], ...] = (
+    ("voltage", "Tensão de fase (V)", 1, True),
+    ("line_voltage", "Tensão de linha (V)", 1, True),
+    ("per_unit", "Tensão de fase (pu)", 4, False),
+    ("line_per_unit", "Tensão de linha (pu)", 4, False),
+    ("unbalance", "Desequilíbrio de tensão (%)", 2, False),
+)
+# Casas decimais das colunas de ângulo; um décimo de grau é resolução de sobra
+# para ler um fasor.
+_ANGLE_DECIMALS = 1
+# Grandezas que saem de SegmentPowers, e não de SegmentCurrents.
+_POWER_QUANTITY_KEYS = frozenset(
+    {
+        "active_power",
+        "reactive_power",
+        "apparent_power",
+        "three_phase_power",
+        "power_factor",
+        "losses",
+    }
 )
 
 
@@ -364,6 +407,7 @@ class MainWindow(QMainWindow):
         self._switch_model: SwitchModel | None = None
         self._switch_item: SwitchNetworkItem | None = None
         self._regulator_model: RegulatorModel | None = None
+        self._regulator_item: RegulatorNetworkItem | None = None
         self._cable_model: CableModel | None = None
         self._circuit_catalog: CircuitCatalogModel | None = None
         self._circuit_visibility: CircuitVisibilityController | None = None
@@ -434,6 +478,7 @@ class MainWindow(QMainWindow):
         # Grandezas do elemento selecionado, guardadas para o combobox poder
         # trocar a leitura sem reconsultar o resultado.
         self._segment_power_flow_currents = None
+        self._segment_power_flow_powers = None
         self._bar_power_flow_voltages = None
 
         self.scene = QGraphicsScene(self)
@@ -851,7 +896,7 @@ class MainWindow(QMainWindow):
 
             combo = QComboBox(section)
             combo.setObjectName(object_name)
-            for key, caption, _ in quantities:
+            for key, caption, *_ in quantities:
                 combo.addItem(caption, key)
             layout.addWidget(combo)
 
@@ -874,10 +919,7 @@ class MainWindow(QMainWindow):
             )
             table.verticalHeader().hide()
             table.verticalHeader().setDefaultSectionSize(28)
-            table.horizontalHeader().setSectionResizeMode(
-                QHeaderView.ResizeMode.ResizeToContents
-            )
-            table.horizontalHeader().setStretchLastSection(False)
+            enable_interactive_columns(table)
             table.setStyleSheet("QTableView { gridline-color: palette(mid); }")
             # Quatro patamares sempre; altura fixa evita a barra de rolagem
             # vertical dentro de uma tabela que nunca cresce.
@@ -993,10 +1035,7 @@ class MainWindow(QMainWindow):
         )
         self.load_patterns_table.verticalHeader().hide()
         self.load_patterns_table.verticalHeader().setDefaultSectionSize(28)
-        self.load_patterns_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.load_patterns_table.horizontalHeader().setStretchLastSection(False)
+        enable_interactive_columns(self.load_patterns_table)
         self.load_patterns_table.setStyleSheet(
             "QTableView { gridline-color: palette(mid); }"
         )
@@ -1074,9 +1113,7 @@ class MainWindow(QMainWindow):
         )
         self.equivalent_patterns_table.verticalHeader().hide()
         self.equivalent_patterns_table.verticalHeader().setDefaultSectionSize(28)
-        self.equivalent_patterns_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
+        enable_interactive_columns(self.equivalent_patterns_table)
         self.equivalent_patterns_table.setFixedHeight(table_height)
         equivalent_pattern_layout.addWidget(self.equivalent_patterns_table)
         self.equivalent_patterns_section.setVisible(False)
@@ -1170,6 +1207,12 @@ class MainWindow(QMainWindow):
             _,
         ) = create_table(regulator_fields, self.regulator_details_section)
         regulator_layout.addWidget(self.regulator_details_table)
+        # Tap resolvido pelo fluxo de potência; só aparece quando há resultado.
+        self.regulator_tap_label = QLabel("")
+        self.regulator_tap_label.setObjectName("regulator_tap")
+        self.regulator_tap_label.setWordWrap(True)
+        self.regulator_tap_label.setVisible(False)
+        regulator_layout.addWidget(self.regulator_tap_label)
         self.regulator_details_section.setVisible(False)
         segment_layout.addWidget(self.regulator_details_section)
 
@@ -2054,15 +2097,24 @@ class MainWindow(QMainWindow):
     def _set_regulator_model(self, model: RegulatorModel | None) -> None:
         """Instala os reguladores do trecho selecionável.
 
-        Setter sem cascata, ao contrário do de chaves: reguladores não
-        interrompem nem energizam nada, então não entram na topologia, não
-        reconstroem o catálogo de circuitos e não invalidam ramais, rede
-        simplificada nem fluxo de potência. O que muda é o painel e a busca.
+        Cascata mínima: reguladores continuam fora da topologia — não
+        interrompem nem energizam nada, então não reconstroem o catálogo de
+        circuitos e não invalidam ramais nem rede simplificada. Mas eles **são
+        exportados** e regulam a tensão, então um resultado de fluxo de potência
+        calculado com outro conjunto de reguladores deixa de valer.
         """
 
         if model is not None and model.segments is not self._line_model:
             raise ValueError("Os reguladores devem referenciar os trechos exibidos.")
+        if model is not self._regulator_model:
+            self._invalidate_power_flow()
+        if self._regulator_item is not None:
+            self.scene.removeItem(self._regulator_item)
+            self._regulator_item = None
         self._regulator_model = model
+        if model is not None:
+            self._regulator_item = RegulatorNetworkItem(model)
+            self.scene.addItem(self._regulator_item)
         self.search_index.set_regulators(model, build_fields=False)
         self.search_palette.schedule_field_index("regulator", model)
         self._sync_search_availability()
@@ -2074,6 +2126,11 @@ class MainWindow(QMainWindow):
             )
         elif model is None:
             self.regulator_details_section.setVisible(False)
+        # O anel entra na cena agora, então precisa da máscara de circuitos e de
+        # um repaint — nenhum dos dois existia enquanto reguladores não eram
+        # desenhados.
+        self._apply_circuit_visibility()
+        self.view.viewport().update()
 
     def _set_circuit_catalog(
         self,
@@ -2194,6 +2251,10 @@ class MainWindow(QMainWindow):
                     segment_styles,
                     colors,
                 )
+        if self._regulator_item is not None:
+            # O anel não tem cor por circuito nem por fase: só some junto com o
+            # trecho que o hospeda.
+            self._regulator_item.set_visibility_mask(segment_mask)
         self.phase_legend.setVisible(phase_mode and self._line_item is not None)
         if self.phase_legend.isVisible():
             self._position_phase_legend()
@@ -2319,6 +2380,7 @@ class MainWindow(QMainWindow):
         self._power_flow_snapshot = None
         self._power_flow_result = None
         self._segment_power_flow_currents = None
+        self._segment_power_flow_powers = None
         self._bar_power_flow_voltages = None
         self.segment_power_flow_model.clear()
         self.bar_power_flow_model.clear()
@@ -2353,6 +2415,12 @@ class MainWindow(QMainWindow):
         """
 
         names = [LINES_FILENAME, SWITCHES_FILENAME]
+        # Aproximação deliberada: só a exportação sabe quantos reguladores são
+        # de fato exportáveis, e um modelo cujos reguladores fossem todos
+        # descartados não geraria o arquivo. Perguntar por um arquivo que não
+        # será tocado é inofensivo; deixar de perguntar por um que será, não.
+        if self._regulator_model is not None:
+            names.append(REGULATORS_FILENAME)
         if self._exportable_loads() is not None:
             names.extend(filename for _, filename, _ in _LOAD_EXPORT_FILES)
         catalog = self._circuit_catalog
@@ -2420,13 +2488,16 @@ class MainWindow(QMainWindow):
         # Os modelos são imutáveis: o worker guarda as próprias referências e o
         # arquivo sai como um retrato consistente do estado atual, mesmo que uma
         # importação substitua os modelos enquanto a exportação corre.
+        loads, patterns = exportable_loads or (None, None)
         worker = OpenDssExportWorker(
             catalog,
             cables,
             configuration,
             circuit_indices,
-            *(exportable_loads or (None, None)),
-            self._opendss_load_settings,
+            loads=loads,
+            patterns=patterns,
+            regulators=self._regulator_model,
+            load_settings=self._opendss_load_settings,
         )
         worker.moveToThread(thread)
 
@@ -2525,9 +2596,15 @@ class MainWindow(QMainWindow):
         destination: Path,
     ) -> None:
         captions = {count: caption for count, _, caption in _LOAD_EXPORT_FILES}
+        regulators = result.regulators
         parts = [
             f"{result.lines.exported_count:n} trechos",
             f"{result.switches.exported_count:n} chaves",
+            *(
+                ()
+                if regulators is None or not regulators.exported_count
+                else (f"{regulators.exported_count:n} reguladores",)
+            ),
             *(
                 f"{load_result.exported_count:n} cargas {captions[count]}"
                 for count, load_result in result.loads_by_phase_count
@@ -2563,6 +2640,16 @@ class MainWindow(QMainWindow):
             f"{SWITCHES_FILENAME}: {result.switches.exported_count:n} chaves "
             f"({result.switches.open_count:n} abertas), "
             f"{result.switches.discarded_count:n} descartadas",
+            *(
+                ()
+                if regulators is None
+                else (
+                    f"{REGULATORS_FILENAME}: "
+                    f"{regulators.exported_count:n} reguladores "
+                    f"({regulators.exported_count * 3:n} transformadores), "
+                    f"{regulators.discarded_count:n} descartados",
+                )
+            ),
         ]
         filenames = {count: filename for count, filename, _ in _LOAD_EXPORT_FILES}
         for count, load_result in result.loads_by_phase_count:
@@ -2640,9 +2727,10 @@ class MainWindow(QMainWindow):
             cables,
             configuration,
             circuit_indices,
-            loads,
-            patterns,
-            self._opendss_load_settings,
+            loads=loads,
+            patterns=patterns,
+            regulators=self._regulator_model,
+            load_settings=self._opendss_load_settings,
         )
         worker.moveToThread(thread)
 
@@ -4158,6 +4246,7 @@ class MainWindow(QMainWindow):
             }
             for key, value in regulator_values.items():
                 self.regulator_detail_labels[key].setText(value or "—")
+            self._apply_regulator_tap(selection.index)
             self.regulator_details_section.setVisible(True)
 
         self._sync_segment_power_flow_section(selection.index)
@@ -4254,8 +4343,8 @@ class MainWindow(QMainWindow):
             label.setVisible(True)
 
     @staticmethod
-    def _quantity_of(combo: QComboBox, quantities) -> tuple[str, int]:  # noqa: ANN001
-        """Chave e casas decimais da grandeza escolhida no combobox.
+    def _quantity_of(combo: QComboBox, quantities) -> tuple[str, int, bool]:  # noqa: ANN001
+        """Chave, casas decimais e presença de fasor da grandeza escolhida.
 
         A chave viaja no ``UserRole`` para o painel não depender da posição do
         item, e o ``next`` com padrão cobre o combobox ainda vazio.
@@ -4263,8 +4352,98 @@ class MainWindow(QMainWindow):
 
         key = combo.currentData()
         return next(
-            ((name, decimals) for name, _, decimals in quantities if name == key),
-            (quantities[0][0], quantities[0][2]),
+            (
+                (name, decimals, phasor)
+                for name, _, decimals, phasor in quantities
+                if name == key
+            ),
+            (quantities[0][0], quantities[0][2], quantities[0][3]),
+        )
+
+    def _apply_regulator_tap(self, segment_index: int) -> None:
+        """Escreve o tap resolvido do regulador daquele trecho, se houver.
+
+        O aviso de fim de curso é o motivo de a linha existir: um regulador que
+        esgotou o tap **parou de regular**, e sem dizê-lo o painel mostraria uma
+        posição de aparência normal.
+        """
+
+        result = self._power_flow_result
+        taps = () if result is None else result.regulator_taps.get(segment_index, ())
+        if not taps:
+            self.regulator_tap_label.setVisible(False)
+            self.regulator_tap_label.setText("")
+            return
+        parts = ", ".join(f"{tap.phase}: {tap.tap:.4f}" for tap in taps)
+        saturated = [tap.phase for tap in taps if tap.at_limit]
+        text = f"Tap resolvido — {parts}"
+        if saturated:
+            text += (
+                f". Fase(s) {', '.join(saturated)} no fim do curso: "
+                "o regulador não consegue corrigir mais."
+            )
+        self.regulator_tap_label.setText(text)
+        self.regulator_tap_label.setVisible(True)
+
+    def _phase_letter_of_node(self, node: int) -> str | None:
+        """Letra da fase de um nó DSS, segundo o ``fases2.json`` carregado."""
+
+        configuration = self._phase_configuration
+        if configuration is None:
+            return None
+        return phase_letters_by_node(configuration).get(int(node))
+
+    def _node_labels(self, nodes: Sequence[int]) -> tuple[str, ...]:
+        """Rótulo de cada coluna de fase, com o número do nó como reserva."""
+
+        return tuple(
+            f"Fase {self._phase_letter_of_node(node) or node}" for node in nodes
+        )
+
+    def _pair_labels(self, pairs: Sequence[tuple[int, int]]) -> tuple[str, ...]:
+        """Rótulo de cada coluna fase-fase, no formato ``VDE``."""
+
+        return tuple(
+            "V"
+            + (self._phase_letter_of_node(first) or str(first))
+            + (self._phase_letter_of_node(second) or str(second))
+            for first, second in pairs
+        )
+
+    @staticmethod
+    def _angle_labels(labels: Sequence[str]) -> tuple[str, ...]:
+        """Rótulo do ângulo a partir do rótulo do módulo: ``Fase D`` → ``θD``."""
+
+        return tuple(
+            "θ" + label.removeprefix("Fase ").removeprefix("V")
+            for label in labels
+        )
+
+    def _with_angles(
+        self,
+        labels: Sequence[str],
+        magnitudes: Sequence[Sequence[float | None]],
+        angles: Sequence[Sequence[float]],
+        decimals: int,
+    ) -> tuple[tuple[str, ...], tuple[tuple[float | None, ...], ...], tuple[int, ...]]:
+        """Junta módulo e ângulo na mesma tabela, lado a lado.
+
+        Sem ângulo colhido — resultado de uma execução anterior à colheita de
+        fasores — a tabela volta a ser só de módulos, em vez de exibir colunas
+        de traço.
+        """
+
+        columns = tuple(labels)
+        if not angles or len(angles) != len(magnitudes):
+            return columns, tuple(tuple(row) for row in magnitudes), (decimals,) * len(columns)
+        rows = tuple(
+            (*magnitude_row, *angle_row)
+            for magnitude_row, angle_row in zip(magnitudes, angles, strict=True)
+        )
+        return (
+            (*columns, *self._angle_labels(columns)),
+            rows,
+            (decimals,) * len(columns) + (_ANGLE_DECIMALS,) * len(columns),
         )
 
     def _set_combo_item_enabled(
@@ -4292,6 +4471,9 @@ class MainWindow(QMainWindow):
             else result.segment_currents.get(segment_index)
         )
         self._segment_power_flow_currents = currents
+        self._segment_power_flow_powers = (
+            None if result is None else result.segment_powers.get(segment_index)
+        )
         if currents is None:
             self.segment_power_flow_model.clear()
             self.segment_power_flow_note.setVisible(False)
@@ -4304,17 +4486,93 @@ class MainWindow(QMainWindow):
             "loading",
             currents.ampacity is not None,
         )
+        powers = self._segment_power_flow_powers
+        for key in _POWER_QUANTITY_KEYS:
+            self._set_combo_item_enabled(
+                self.segment_power_flow_combo,
+                key,
+                powers is not None
+                and (key != "losses" or bool(powers.active_losses)),
+            )
         self.segment_power_flow_section.setVisible(True)
         self._refresh_segment_power_flow_values()
+
+    def _show_segment_power(
+        self,
+        key: str,
+        powers: SegmentPowers,
+        decimals: int,
+        with_phasor: bool,
+    ) -> None:
+        """Monta a tabela de uma das grandezas de potência do trecho.
+
+        Todas nascem de ``P`` e ``Q`` do terminal 1 e **preservam o sinal do
+        OpenDSS**: positivo entra pelo terminal, negativo sai. É o sinal que diz
+        o sentido do fluxo.
+        """
+
+        phases = self._node_labels(powers.nodes)
+        if key == "active_power":
+            self.segment_power_flow_model.set_values(
+                phases, powers.active, decimals=decimals
+            )
+            return
+        if key == "reactive_power":
+            self.segment_power_flow_model.set_values(
+                phases, powers.reactive, decimals=decimals
+            )
+            return
+        if key == "apparent_power":
+            magnitudes, angles = apparent_power(powers.active, powers.reactive)
+            labels, rows, places = self._with_angles(
+                phases, magnitudes, angles if with_phasor else (), decimals
+            )
+            self.segment_power_flow_model.set_values(
+                labels, rows, decimals=places
+            )
+            return
+        if key == "three_phase_power":
+            self.segment_power_flow_model.set_values(
+                ("P (kW)", "Q (kvar)", "S (kVA)", "θS"),
+                three_phase_power(powers.active, powers.reactive),
+                decimals=(decimals, decimals, decimals, _ANGLE_DECIMALS),
+            )
+            return
+        if key == "power_factor":
+            self.segment_power_flow_model.set_values(
+                (*phases, "3φ"),
+                power_factor(powers.active, powers.reactive),
+                decimals=decimals,
+            )
+            return
+        # Perdas: o OpenDSS as devolve somadas no elemento, não por fase.
+        rows = tuple(
+            (active, reactive)
+            for active, reactive in zip(
+                powers.active_losses, powers.reactive_losses, strict=True
+            )
+        )
+        self.segment_power_flow_model.set_values(
+            ("ΔP (kW)", "ΔQ (kvar)"), rows, decimals=decimals
+        )
 
     def _refresh_segment_power_flow_values(self) -> None:
         currents = self._segment_power_flow_currents
         if currents is None:
             return
-        key, decimals = self._quantity_of(
+        key, decimals, with_phasor = self._quantity_of(
             self.segment_power_flow_combo,
             _SEGMENT_QUANTITIES,
         )
+        labels = self._node_labels(currents.nodes)
+        powers = self._segment_power_flow_powers
+        if key in _POWER_QUANTITY_KEYS:
+            self.segment_power_flow_note.setVisible(False)
+            if powers is None:
+                self.segment_power_flow_model.set_values((), ())
+                return
+            self._show_segment_power(key, powers, decimals, with_phasor)
+            return
         if key == "loading":
             ampacity = currents.ampacity
             rows = tuple(
@@ -4331,13 +4589,20 @@ class MainWindow(QMainWindow):
                 else f"Base: IADM de {ampacity:n} A."
             )
             self.segment_power_flow_note.setVisible(True)
+            places: int | tuple[int, ...] = decimals
         else:
             rows = currents.magnitudes
             self.segment_power_flow_note.setVisible(False)
+            labels, rows, places = self._with_angles(
+                labels,
+                rows,
+                currents.angles if with_phasor else (),
+                decimals,
+            )
         self.segment_power_flow_model.set_values(
-            currents.nodes,
+            labels,
             rows,
-            decimals=decimals,
+            decimals=places,
         )
 
     def _sync_bar_power_flow_section(self, bar_index: int) -> None:
@@ -4350,8 +4615,30 @@ class MainWindow(QMainWindow):
         self._bar_power_flow_voltages = voltages
         if voltages is None:
             self.bar_power_flow_model.clear()
+            self.bar_power_flow_note.setVisible(False)
             self.bar_power_flow_section.setVisible(False)
             return
+        # Barra monofásica não tem par de fases, e o desequilíbrio exige as
+        # três; as grandezas ficam desabilitadas em vez de abrir uma tabela
+        # vazia, como o "Carregamento" já faz.
+        pairs, _, _ = line_voltages(
+            voltages.nodes,
+            voltages.magnitudes,
+            voltages.angles,
+        )
+        for key in ("line_voltage", "line_per_unit"):
+            self._set_combo_item_enabled(
+                self.bar_power_flow_combo, key, bool(pairs)
+            )
+        self._set_combo_item_enabled(
+            self.bar_power_flow_combo,
+            "unbalance",
+            bool(
+                voltage_unbalance(
+                    voltages.nodes, voltages.magnitudes, voltages.angles
+                )
+            ),
+        )
         self.bar_power_flow_section.setVisible(True)
         self._refresh_bar_power_flow_values()
 
@@ -4359,15 +4646,69 @@ class MainWindow(QMainWindow):
         voltages = self._bar_power_flow_voltages
         if voltages is None:
             return
-        key, decimals = self._quantity_of(
+        key, decimals, with_phasor = self._quantity_of(
             self.bar_power_flow_combo,
             _BAR_QUANTITIES,
         )
-        rows = voltages.per_unit if key == "per_unit" else voltages.magnitudes
+        # Cadeia explícita por grandeza: um else que engolisse a chave
+        # desconhecida faria a tensão de linha exibir a de fase em silêncio.
+        note = ""
+        if key == "per_unit":
+            labels = self._node_labels(voltages.nodes)
+            rows: tuple[tuple[float | None, ...], ...] = voltages.per_unit
+            places: int | tuple[int, ...] = decimals
+        elif key == "unbalance":
+            values = voltage_unbalance(
+                voltages.nodes,
+                voltages.magnitudes,
+                voltages.angles,
+            )
+            if not values:
+                note = (
+                    "O desequilíbrio exige as três fases; esta barra não as "
+                    "tem."
+                )
+            labels = ("FD (%)",) if values else ()
+            rows = tuple((value,) for value in values)
+            places = decimals
+        elif key in {"line_voltage", "line_per_unit"}:
+            per_unit = key == "line_per_unit"
+            pairs, magnitudes, angles = line_voltages(
+                voltages.nodes,
+                voltages.per_unit if per_unit else voltages.magnitudes,
+                voltages.angles,
+            )
+            if per_unit:
+                # A pu do OpenDSS é na base de fase; a de linha é √3 maior, e é
+                # essa renormalização que faz o nominal dar 1,0.
+                magnitudes = tuple(
+                    tuple(value / LINE_VOLTAGE_PU_BASE for value in row)
+                    for row in magnitudes
+                )
+            if not pairs:
+                note = (
+                    "A barra tem uma fase só, então não há tensão entre fases "
+                    "para calcular."
+                )
+            labels, rows, places = self._with_angles(
+                self._pair_labels(pairs),
+                magnitudes,
+                angles if with_phasor else (),
+                decimals,
+            )
+        else:
+            labels, rows, places = self._with_angles(
+                self._node_labels(voltages.nodes),
+                voltages.magnitudes,
+                voltages.angles if with_phasor else (),
+                decimals,
+            )
+        self.bar_power_flow_note.setText(note)
+        self.bar_power_flow_note.setVisible(bool(note))
         self.bar_power_flow_model.set_values(
-            voltages.nodes,
+            labels,
             rows,
-            decimals=decimals,
+            decimals=places,
         )
 
     def _show_coordinates(self, x: float, y: float) -> None:

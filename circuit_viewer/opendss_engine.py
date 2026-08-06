@@ -62,6 +62,9 @@ class DssEngine(Protocol):
     lines: Any
     cktelement: Any
     solution: Any
+    # Os reguladores são Transformer no modelo exportado, e o tap resolvido só
+    # sai por esta coleção — o laço de ``lines`` nunca os alcança.
+    transformers: Any
 
     def text(self, command: str) -> str:
         """Envia um comando à interface de texto do OpenDSS."""

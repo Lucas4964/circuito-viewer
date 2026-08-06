@@ -32,11 +32,13 @@ try:
         LoadModel,
         LoadPatternModel,
         LoadPatternRecord,
+        RegulatorModel,
         SwitchModel,
         UtmCrs,
     )
     from circuit_viewer.opendss_export import (
         LINES_FILENAME,
+        REGULATORS_FILENAME,
         SINGLE_PHASE_LOADS_FILENAME,
         SWITCHES_FILENAME,
         THREE_PHASE_LOADS_FILENAME,
@@ -44,6 +46,7 @@ try:
         build_export,
     )
     from circuit_viewer.opendss_export_dialog import OpenDssExportDialog
+    from circuit_viewer.regulator_import import RegulatorLoadResult
     from circuit_viewer.segment_import import SegmentLoadResult
     from circuit_viewer.switch_import import SwitchLoadResult
 
@@ -257,6 +260,61 @@ class OpenDssExportUiTests(unittest.TestCase):
         self.assertEqual(
             dialog.circuit_list.item(0).checkState(), Qt.CheckState.Unchecked
         )
+
+    def _load_regulators(self, window: MainWindow) -> RegulatorModel:
+        """Um regulador no trecho 0, na tensão do circuito da fixture."""
+
+        model = RegulatorModel(
+            window._line_model,
+            ["RG1"],
+            [0],
+            [""],
+            ["X"],
+            ["Y"],
+            ["333"],
+            ["10"],
+            ["32"],
+            ["0"],
+            ["100"],
+            ["13,8"],
+        )
+        window._on_regulator_import_finished(
+            RegulatorLoadResult(model, "utf-8-sig", 1, 1, 0, (), 0)
+        )
+        self.app.processEvents()
+        return model
+
+    def test_export_includes_the_regulators_of_the_window(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._load_regulators(window)
+
+        with patch.object(
+            OpenDssExportDialog, "exec", accept_dialog
+        ), patch(
+            "circuit_viewer.main_window.QFileDialog.getExistingDirectory",
+            return_value=str(self.destination),
+        ), patch(
+            "circuit_viewer.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ), patch.object(QMessageBox, "exec", return_value=0):
+            # O trecho da fixture tem 250 m: substituí-lo pelo regulador
+            # descarta a impedância dele e o relatório sai com aviso, modal.
+            window.opendss_export_action.trigger()
+            self._wait_for_export(window)
+
+        target = self.destination / REGULATORS_FILENAME
+        self.assertTrue(target.is_file())
+        emitted = target.read_text(encoding="utf-8")
+        self.assertIn("New Transformer.REG-X-D ", emitted)
+        self.assertIn("New RegControl.CTRL-X-F ", emitted)
+        # O trecho regulado saiu do arquivo de trechos: ele virou o regulador.
+        # Nesta fixture o outro trecho carrega a chave, então trechos.dss fica
+        # sem nenhuma Line — e a chave continua intacta no arquivo dela.
+        lines = (self.destination / LINES_FILENAME).read_text(encoding="utf-8")
+        self.assertNotIn("New Line.", lines)
+        switches = (self.destination / SWITCHES_FILENAME).read_text(encoding="utf-8")
+        self.assertIn("New Line.CHV-1 ", switches)
 
     def test_export_writes_every_file_in_the_chosen_folder(self) -> None:
         window = self._window()
