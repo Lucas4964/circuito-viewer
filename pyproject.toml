@@ -19,6 +19,11 @@ test = [
     "pytest>=8,<10",
     "pytest-qt>=4.4,<5",
 ]
+# O motor do OpenDSS é opcional: sem ele a aplicação roda inteira, apenas com o
+# botão "Executar Fluxo de Potência" desabilitado e o motivo na dica.
+opendss = [
+    "py-dss-interface>=2.3,<3",
+]
 
 [project.scripts]
 circuit-viewer = "circuit_viewer.__main__:main"

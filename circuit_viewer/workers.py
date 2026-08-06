@@ -23,8 +23,12 @@ from .model import (
     SwitchModel,
     UtmCrs,
 )
+from .opendss_engine import acquire_engine, ascii_workspace
 from .opendss_export import build_export
+from .opendss_powerflow import run_power_flow
+from .opendss_settings import OpenDssLoadSettings
 from .phase_config import PhaseConfiguration
+from .regulator_import import load_regulators_csv
 from .segment_import import load_segments_csv
 from .switch_import import load_switches_csv
 
@@ -203,6 +207,40 @@ class SwitchImportWorker(QObject):
             self.finished.emit(result)
 
 
+class RegulatorImportWorker(QObject):
+    progress = pyqtSignal(int, int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, path: str, segments: LineNetworkModel) -> None:
+        super().__init__()
+        self.path = path
+        self.segments = segments
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = load_regulators_csv(
+                self.path,
+                self.segments,
+                cancel_event=self._cancel_event,
+                progress=lambda rows, current, total: self.progress.emit(
+                    rows, current, total
+                ),
+            )
+        except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
 class CableImportWorker(QObject):
     progress = pyqtSignal(int, int, int)
     finished = pyqtSignal(object)
@@ -290,6 +328,7 @@ class OpenDssExportWorker(QObject):
         circuit_indices: tuple[int, ...],
         loads: LoadModel | None = None,
         patterns: LoadPatternModel | None = None,
+        load_settings: OpenDssLoadSettings | None = None,
     ) -> None:
         super().__init__()
         self.catalog = catalog
@@ -298,6 +337,7 @@ class OpenDssExportWorker(QObject):
         self.circuit_indices = tuple(circuit_indices)
         self.loads = loads
         self.patterns = patterns
+        self.load_settings = load_settings
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -313,6 +353,7 @@ class OpenDssExportWorker(QObject):
                 self.circuit_indices,
                 loads=self.loads,
                 patterns=self.patterns,
+                load_settings=self.load_settings,
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
             )
@@ -320,6 +361,72 @@ class OpenDssExportWorker(QObject):
             self.cancelled.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class PowerFlowWorker(QObject):
+    """Gera o modelo OpenDSS de cada circuito, resolve e devolve as grandezas.
+
+    Segue o mesmo contrato dos demais workers, com uma diferença obrigatória: o
+    ``except`` cobre ``BaseException``. A biblioteca do OpenDSS chama ``exit()``
+    quando a DLL não inicia, e ``SystemExit`` não deriva de ``Exception`` —
+    escaparia daqui e derrubaria a thread sem mensagem alguma para o usuário.
+    """
+
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        catalog: CircuitCatalogModel,
+        cables: CableModel,
+        phase_configuration: PhaseConfiguration,
+        circuit_indices: tuple[int, ...],
+        loads: LoadModel | None = None,
+        patterns: LoadPatternModel | None = None,
+        load_settings: OpenDssLoadSettings | None = None,
+    ) -> None:
+        super().__init__()
+        self.catalog = catalog
+        self.cables = cables
+        self.phase_configuration = phase_configuration
+        self.circuit_indices = tuple(circuit_indices)
+        self.loads = loads
+        self.patterns = patterns
+        self.load_settings = load_settings
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            # A pasta de trabalho é descartada ao sair: os .dss aqui são meio, e
+            # não produto — quem quer os arquivos usa a exportação.
+            with ascii_workspace() as workspace, acquire_engine() as engine:
+                result = run_power_flow(
+                    engine,
+                    self.catalog,
+                    self.cables,
+                    self.phase_configuration,
+                    self.circuit_indices,
+                    workspace=workspace,
+                    loads=self.loads,
+                    patterns=self.patterns,
+                    load_settings=self.load_settings,
+                    cancel_check=self._cancel_event.is_set,
+                    progress=lambda current, total: self.progress.emit(
+                        current, total
+                    ),
+                )
+        except InterruptedError:
+            self.cancelled.emit()
+        except BaseException as exc:  # noqa: BLE001 — inclui o exit() da DLL
+            self.failed.emit(str(exc) or type(exc).__name__)
         else:
             self.finished.emit(result)
 

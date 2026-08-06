@@ -27,7 +27,7 @@ NumPy 2.x, pyproj 3.5+.
 9. [Seleção, interação e navegação](#9-seleção-interação-e-navegação)
 10. [Estruturas de dados e finalidades](#10-estruturas-de-dados-e-finalidades)
 11. [Concorrência e ciclo de vida das threads](#11-concorrência-e-ciclo-de-vida-das-threads)
-12. [Subsistemas analíticos](#12-subsistemas-analíticos)
+12. [Subsistemas analíticos](#12-subsistemas-analíticos) (ramais · rede simplificada · exportação OpenDSS · fluxo de potência)
 13. [Camada de satélite](#13-camada-de-satélite)
 14. [Busca global](#14-busca-global)
 15. [Dependências](#15-dependências)
@@ -43,8 +43,9 @@ Aplicação desktop PyQt6 para importar, visualizar e analisar redes elétricas 
 distribuição georreferenciadas em coordenadas UTM. O usuário importa até seis
 arquivos CSV encadeados (barras → trechos → chaves/cargas → patamares →
 circuitos), navega em um canvas com fundo de satélite opcional, inspeciona
-atributos, filtra por circuito e executa análises topológicas (ramais e rede
-simplificada por cargas equivalentes).
+atributos, filtra por circuito, executa análises topológicas (ramais e rede
+simplificada por cargas equivalentes) e resolve o fluxo de potência dos
+circuitos visíveis sem sair da aplicação.
 
 O projeto foi dimensionado para escala industrial: os benchmarks cobrem
 100 mil barras, 100 mil trechos, 100 mil cargas e 400 mil registros de patamares.
@@ -71,12 +72,16 @@ CIRCUITO_VIEWER/
 │   ├── csv_import.py          # importação de barras (+ exceções compartilhadas)
 │   ├── segment_import.py      # importação de trechos
 │   ├── switch_import.py       # importação de chaves
+│   ├── regulator_import.py    # importação de reguladores de tensão
 │   ├── load_import.py         # importação de cargas
 │   ├── load_pattern_import.py # importação de patamares (NPAT 0–3)
 │   ├── circuit_import.py      # importação de circuitos + build da topologia
 │   ├── cable_import.py        # importação do catálogo de cabos (sem dependência)
 │   │
 │   ├── opendss_export.py      # geração dos .dss de rede e de cargas
+│   ├── opendss_settings.py    # parâmetros globais das cargas (Vminpu/Vmaxpu)
+│   ├── opendss_engine.py      # único acesso ao py_dss_interface (opcional)
+│   ├── opendss_powerflow.py   # execução do fluxo e associação dos resultados
 │   ├── branch_analysis.py     # análise topológica de ramais
 │   ├── equivalent_network.py  # projeção simplificada / cargas equivalentes
 │   ├── search.py              # índice de busca global (sem Qt)
@@ -89,13 +94,15 @@ CIRCUITO_VIEWER/
 │   ├── branch_window.py       # tabela de ramais (filtro, ordenação, avisos)
 │   ├── cables_window.py       # tabela do catálogo de cabos
 │   ├── opendss_export_dialog.py  # seleção dos circuitos a exportar
+│   ├── opendss_settings_dialog.py # Configurações → OpenDSS… + QSettings
 │   ├── overlap_report.py      # relatório de trechos sobrepostos
 │   ├── search_palette.py      # janela de busca não modal
 │   ├── load_pattern_table.py  # tabela de patamares no painel lateral
+│   ├── power_flow_table.py    # tabela de grandezas do fluxo no painel lateral
 │   ├── phase_legend.py        # legenda flutuante do modo por fases
 │   └── theme.py               # tema claro/escuro escolhido manualmente
 │
-├── tests/                     # 26 arquivos de teste (unittest + pytest-qt)
+├── tests/                     # 32 arquivos de teste (unittest + pytest-qt)
 ├── benchmarks/                # 8 benchmarks com modo --enforce
 ├── README.md                  # documentação de uso
 ├── ARQUITETURA.md             # este documento
@@ -140,10 +147,18 @@ secundárias sem cuidados com afinidade de objetos Qt.
 ┌───────────────────────────┴─────────────────────────────────────┐
 │ NÚCLEO LÓGICO — SEM QT                                          │
 │ model.py · *_import.py · branch_analysis · equivalent_network   │
+│ opendss_export · opendss_settings · opendss_powerflow           │
+│ opendss_engine                                                  │
 │ search · phase_config · circuit_colors                          │
 │ (matemática de tiles em mapa_tiles também é pura)               │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+Uma segunda regra, análoga, vale para a dependência opcional do OpenDSS: **só
+`opendss_engine.py` importa `py_dss_interface`**, e mesmo ali o import é tardio.
+`opendss_powerflow.py` recebe o motor por parâmetro, o que o mantém testável
+headless com um motor falso e faz a aplicação inteira funcionar sem a biblioteca
+instalada — apenas com o botão de fluxo de potência desabilitado.
 
 Exceções conhecidas e deliberadas:
 
@@ -178,6 +193,7 @@ completo, ou levantam exceção; nunca mutam estado externo.
 | `csv_import.py` | Barra | — (só do `UtmCrs`) | `BARRA_ID, CODIGO, X, Y` |
 | `segment_import.py` | Trecho | `CircuitModel` | `TRECHO_ID, CODIGO, FASES2, BARRA1_ID, BARRA2_ID, ARRANJO_ID, CABOF_ID, CABON_ID, COMPR` |
 | `switch_import.py` | Chave | `LineNetworkModel` | `CHAVE_ID, TIPOCHV_ID, CIRC_ID, TRECHO_ID, CODIGO, ESTADO, ESTADO_NORMAL, CORN, ELO, ELO_TIPO` |
+| `regulator_import.py` | Regulador de tensão | `LineNetworkModel` | `REGU_ID, TRECHO_ID, EXTERN_ID, CODIGO, LIGACAO, SNOM, FAIXA, NPASSOS, TAP, INOM, VNOM` |
 | `load_import.py` | Carga | `CircuitModel` | `CARGA_ID, BARRA_ID, EXTERN_ID, CODIGO, SNOM, SADM, VLINHASEC, FASES2, TIPO_LIG` |
 | `load_pattern_import.py` | Patamar | `LoadModel` | `CARGA_ID, NPAT, PD, PE, PF, QD, QE, QF` |
 | `circuit_import.py` | Circuito | `LineNetworkModel` + `SwitchModel?` | `CIRC_ID, BARRA_ID, CODIGO, VNOM` |
@@ -192,7 +208,8 @@ os demais importadores.
 | Módulo | Entrada | Saída |
 |---|---|---|
 | `branch_analysis.py` | `CircuitCatalogModel`, `PhaseConfiguration`, `LoadModel?` | `BranchAnalysisResult` (ramais + diagnósticos) |
-| `opendss_export.py` | `CircuitCatalogModel`, `CableModel`, `PhaseConfiguration`, índices dos circuitos, `LoadModel?` + `LoadPatternModel?` | `OpenDssExportBundle` (textos de `trechos.dss`, `chaves.dss`, `cargasmonofasicas.dss` e `cargasbifasicas.dss` + diagnósticos) |
+| `opendss_export.py` | `CircuitCatalogModel`, `CableModel`, `PhaseConfiguration`, índices dos circuitos, `LoadModel?` + `LoadPatternModel?` | `OpenDssExportBundle` (textos de `trechos.dss`, `chaves.dss`, dos três arquivos de carga, do master e das coordenadas + diagnósticos) |
+| `opendss_powerflow.py` | motor OpenDSS injetado + as mesmas entradas da exportação + pasta de trabalho | `PowerFlowResult` (correntes por trecho e tensões por barra, um retrato por patamar + diagnósticos) |
 | `equivalent_network.py` | `BranchAnalysisResult`, `LoadModel?`, `LoadPatternModel?` | `EquivalentNetworkResult` (cargas equivalentes + máscaras) |
 
 ### Gráfico e UI
@@ -200,15 +217,19 @@ os demais importadores.
 | Módulo | Responsabilidade |
 |---|---|
 | `graphics.py` | Toda a pintura, virtualização, hit-test geométrico, zoom/pan, desenho do fundo de satélite |
-| `workers.py` | 8 workers `QObject` que apenas encapsulam funções puras e emitem `progress/finished/failed/cancelled` |
+| `opendss_settings.py` | Valor imutável dos parâmetros globais das cargas (`Vminpu`/`Vmaxpu`), com a invariante que o OpenDSS não impõe e a tradução para os comandos `BatchEdit` |
+| `opendss_engine.py` | Contenção dos efeitos globais do `py_dss_interface`: singleton com trava, diretório corrente preservado, `SystemExit` capturado, pasta temporária ASCII |
+| `workers.py` | 9 workers `QObject` que apenas encapsulam funções puras e emitem `progress/finished/failed/cancelled` |
 | `main_window.py` | Dono de todo o estado da aplicação; coordena importações, invalidações em cascata, máscaras efetivas, painel de detalhes e menus |
 | `circuits_window.py` | `QAbstractTableModel` fino sobre `CircuitVisibilityController` + delegate de cor |
 | `branch_window.py` | Tabela de ramais com `QSortFilterProxyModel` (ordenação por `UserRole`, filtro por circuito) |
 | `overlap_report.py` | Tabela derivada de `overlapping_segment_indices` |
 | `cables_window.py` | Tabela do catálogo de cabos (ordenação numérica por `UserRole`) + rótulos `cable_summary`/`cable_tooltip` reutilizados no painel de trechos |
-| `opendss_export_dialog.py` | Lista de circuitos com caixas de seleção; devolve os índices escolhidos para a exportação |
+| `opendss_export_dialog.py` | Lista de circuitos com caixas de seleção **mutuamente exclusivas**; devolve o índice escolhido para a exportação |
+| `opendss_settings_dialog.py` | Diálogo dos parâmetros globais **e** a persistência em `QSettings` — que mora aqui, e não no núcleo, porque `QSettings` é Qt (mesma divisão de `theme.py`) |
 | `search_palette.py` | Diálogo não modal; roda indexação e consultas em `QThreadPool` com tokens de cancelamento |
 | `load_pattern_table.py` | Modelo somente leitura de exatamente 4 linhas (NPAT 0–3) |
+| `power_flow_table.py` | Modelo somente leitura da matriz `[patamar][nó]`; não sabe qual grandeza exibe, recebe a matriz já escolhida pelo combobox |
 | `phase_legend.py` | `QFrame` filho do viewport, transparente a mouse, reposicionado a cada mudança de viewport |
 | `theme.py` | Paletas claras/escuras fixas, leitura e gravação da preferência em `QSettings` e aplicação do tema à aplicação inteira |
 
@@ -250,7 +271,19 @@ os demais importadores.
                 ┌──────────────────────────────┐
                 │ CircuitVisibilityController  │ (estado visual mutável)
                 └──────────────────────────────┘
+
+    ┌─────────────────┐
+    │ RegulatorModel  │ (1 regulador por trecho) ──► LineNetworkModel
+    └─────────────────┘   folha: ninguém deriva dele
 ```
+
+**`RegulatorModel` está fora da coluna do meio de propósito.** Ele se pendura em
+`LineNetworkModel` pelo `TRECHO_ID`, com o mesmo vínculo 1:1 do `SwitchModel` —
+mas, ao contrário das chaves, **não alimenta a topologia**. Reguladores não
+interrompem nem energizam nada, então `NetworkTopology.trace()` e
+`CircuitCatalogModel` não os consultam, e importá-los não invalida análise
+alguma. É a diferença que faz `_set_regulator_model()` ser um setter simples,
+enquanto `_set_switch_model()` reconstrói o catálogo inteiro.
 
 ### Regra de identidade
 
@@ -401,17 +434,24 @@ donos — é isso que resolve a cor de um trecho sobreposto.
                  │                                        │
                  ▼                                        ▼
             Trechos                                    Cargas
-             │    │                                       │
-             ▼    ▼                                       ▼
-        Chaves   Circuitos                            Patamares
+          │   │    │                                       │
+          ▼   ▼    ▼                                       ▼
+ Reguladores Chaves Circuitos                          Patamares
                   ▲
                   └─ usa Chaves (opcional) para a topologia energizada
 ```
 
 O `ImportChoiceDialog` habilita cada botão conforme o estado:
-`segments/loads` exigem barras; `switches/circuits` exigem trechos;
+`segments/loads` exigem barras; `switches/regulators/circuits` exigem trechos;
 `load_patterns` exige cargas. `cables` é um catálogo isolado — o botão nunca
 fica desabilitado e não aparece no diagrama acima.
+
+**Reguladores são a única importação sem cascata.** Todas as demais invalidam
+algo: trechos derrubam chaves, circuitos e ramais; chaves reconstroem o catálogo;
+patamares refazem a rede equivalente. Reguladores não, porque nada deriva deles —
+a seta no diagrama aponta só para dentro. `_set_regulator_model()` instala o
+modelo, atualiza a busca e reaplica a seleção; e a única cascata que os atinge é
+a inversa, `_set_line_model()` zerando-os quando os trechos mudam.
 
 ### Pipeline comum de cada importador
 
@@ -471,6 +511,15 @@ vazio.
 **Chaves** — resolve `TRECHO_ID` para índice; rejeita `TRECHO_ID` já usado por
 outra chave (invariante 1:1). `ESTADO` é preservado como texto e só interpretado
 na topologia.
+
+**Reguladores** — mesma resolução de `TRECHO_ID` e a mesma invariante 1:1; o
+segundo registro do mesmo trecho é descartado com diagnóstico. **Todos os campos
+permanecem texto**, inclusive `SNOM`, `NPASSOS` e `TAP`: é a regra do projeto
+para dados que só são exibidos, a mesma que mantém `SNOM`/`SADM` das cargas como
+texto. Sem consumidor numérico — a exportação OpenDSS não os usa — converter
+agora seria inventar uma política de arredondamento sem ninguém para aplicá-la;
+e como texto, zeros à esquerda e vírgula decimal chegam ao painel exatamente como
+estão no arquivo de origem.
 
 **Cargas** — resolve `BARRA_ID`; todos os demais campos permanecem texto
 (inclusive `SNOM`/`SADM`, convertidos para `Decimal` só na agregação
@@ -850,9 +899,19 @@ O worker é `moveToThread(thread)`; `thread.started` → `worker.run`; os três
 sinais terminais → `thread.quit`; `thread.finished` → `worker.deleteLater`,
 handler de limpeza e `thread.deleteLater`.
 
-`MainWindow` mantém três slots exclusivos de execução (`_import_thread`,
-`_branch_thread`, `_equivalent_thread`) e cada entrada de menu verifica os três
-antes de iniciar — nunca há duas operações pesadas simultâneas.
+`MainWindow` mantém quatro slots exclusivos de execução (`_import_thread`,
+`_branch_thread`, `_equivalent_thread`, `_power_flow_thread`) e cada entrada de
+menu verifica os quatro antes de iniciar — nunca há duas operações pesadas
+simultâneas.
+
+**O fluxo de potência entra nessa exclusão, e a exportação não.** A diferença é
+o destino do resultado: a exportação escreve em disco e pode conviver com
+qualquer outra operação, enquanto o fluxo devolve grandezas para o estado da
+aplicação e por isso precisa dos mesmos modelos do começo ao fim. Há ainda um
+motivo físico: a DLL do OpenDSS é global ao processo, então duas execuções
+simultâneas compartilhariam o mesmo circuito nativo — `opendss_engine` fecha
+essa porta com uma trava própria, e a exclusão de threads evita que o usuário
+sequer chegue lá.
 
 **A exportação OpenDSS (`_export_thread`) é a exceção deliberada.** Ela não
 entra nessa verificação mútua porque não produz estado compartilhado: o worker
@@ -991,27 +1050,36 @@ ou seja, é **duck-type compatível com `LoadModel`** — por isso o mesmo
 ### 12.3 Exportação OpenDSS (`opendss_export.py`)
 
 **Objetivo:** gerar `trechos.dss` (uma `Line` por trecho comum), `chaves.dss`
-(uma `Line ... Switch=Yes` por trecho-chave), `cargasmonofasicas.dss` (uma
-`Load` + um `LoadShape` por carga) e `cargasbifasicas.dss` (duas `Load` + dois
-`LoadShape` por carga) para os circuitos selecionados no diálogo.
-`build_export()` monta os quatro em sequência e devolve um
-`OpenDssExportBundle`; a pasta escolhida na UI recebe todos os arquivos.
+(uma `Line ... Switch=Yes` por trecho-chave) e um arquivo de cargas por contagem
+de fases — `cargasmonofasicas.dss`, `cargasbifasicas.dss` e
+`cargastrifasicas.dss`, com `N` `Load` + `N` `LoadShape` por carga — mais o par
+`<CODIGO>_Master.dss` e `<CODIGO>_Buscoords.csv`, que cria o circuito, chama os
+demais e resolve. `build_export()` monta tudo em sequência e devolve um
+`OpenDssExportBundle`; a pasta escolhida na UI recebe todos.
 
-Os dois resultados de carga do bundle são **opcionais e andam juntos**. Cargas e
+Os três resultados de carga do bundle são **opcionais e andam juntos**. Cargas e
 patamares não entram nas precondições do menu — exigi-los desabilitaria também a
 exportação da rede, que não depende deles. Sem os dois modelos (ou com patamares
 de outra importação, detectados pela regra de identidade) nenhum arquivo de
 carga é gerado e `files` volta a ter dois elementos; havendo os dois modelos,
-saem os quatro arquivos, mesmo que um dos de carga fique só com o cabeçalho —
+saem os cinco arquivos, mesmo que algum dos de carga fique só com o cabeçalho —
 assim a lista de arquivos gerados não depende do conteúdo do CSV, e a
 confirmação de substituição na UI pode ser montada antes de exportar.
 
-`OpenDssLoadExportResult` é compartilhado pelos dois builders de carga. Nele,
-`exported_count` conta **cargas de origem**, não linhas `Load`: uma bifásica
-rende duas `Load` e ainda assim soma 1, para o relatório falar a mesma língua do
+`OpenDssLoadExportResult` é compartilhado pelos três arquivos de carga. Nele,
+`exported_count` conta **cargas de origem**, não linhas `Load`: uma trifásica
+rende três `Load` e ainda assim soma 1, para o relatório falar a mesma língua do
 CSV importado. `skipped_other_phase_count` conta as cargas de outra contagem de
-fases, que pertencem ao outro arquivo (ou a uma etapa futura, no caso das
-trifásicas).
+fases, que pertencem a outro arquivo.
+
+**Reguladores de tensão não são exportados.** O `RegulatorModel` existe e é
+exibido no painel, mas nenhum arquivo o menciona: no OpenDSS um regulador é um
+`Transformer` mais um `RegControl`, e a modelagem exige parâmetros que o CSV de
+origem não traz — tensão de referência, banda, relação de PT, compensação de
+linha. Emitir algo com valores arbitrados faria o estudo parecer considerar a
+regulação sem de fato considerá-la, que é pior do que ignorá-la de forma
+declarada. Consequência prática: **o fluxo de potência resolve a rede como se não
+houvesse reguladores**, e a queda de tensão calculada é a da rede sem regulação.
 
 O filtro de chaves **não é implementado aqui**: os dois arquivos consomem as
 duas metades que o `trace()` já separa — `membership.common_segment_indices`
@@ -1074,34 +1142,62 @@ enquanto o da chave vem do `CODIGO` da chave, eles podem coincidir. Por isso
 em silêncio. As cargas ficam fora dessa reserva: `Load.*` e `LoadShape.*` são
 espaços de nomes distintos de `Line.*`.
 
-#### Cargas monofásicas (`cargasmonofasicas.dss`)
+#### Cargas, um arquivo por contagem de fases
 
 | Propriedade | Origem |
 |---|---|
-| nome da `Load` | `CODIGO` da carga; `CARGA_ID` como fallback |
-| `phases` | `NUMERO_FASES` do `FASES2` da carga (sempre `1` aqui) |
-| `bus1` | **`CODIGO`** da barra da carga + `DSS` do `FASES2` |
+| nome da `Load` | `<CODIGO>-<N>F-<FASE>`; `CARGA_ID` como fallback do `CODIGO` |
+| `phases` | sempre `1` — a carga multifásica é decomposta, não declarada |
+| `bus1` | **`CODIGO`** da barra + nó da fase (ver abaixo) |
 | `conn` | fixo em `wye` |
 | `kV` | `VNOM` do circuito dono **dividida por `√3`** |
 | `kW`/`kvar` | fixos em `1` |
-| `daily` | `PERFIL-<nome da carga>` |
-| `class` | fixo em `1`; marcador manual de carga monofásica |
+| `daily` | `PERFIL-<nome da Load>` |
+| `class` | a contagem de fases: `1`, `2` ou `3` |
 | `mult`/`qmult` do `LoadShape` | `PD`/`QD`, `PE`/`QE` ou `PF`/`QF` por `NPAT` 0–3 |
 
-**Só monofásicas, mas seis valores de `FASES2`.** O `fases2.json` mapeia com
-`NUMERO_FASES=1` tanto `D`/`E`/`F` quanto `DN`/`EN`/`FN` (fase com neutro
-explícito). A coluna de patamar é escolhida pela **primeira letra do `NOME`**, e
-o `DSS` já carrega o nó de neutro quando existe — daí `bus.1` para `FASES2=1` e
-`bus.1.0` para `FASES2=4`. Cargas de outra contagem de fases entram em
-`skipped_other_phase_count` **sem diagnóstico**: são esperadas, ao contrário de
-um `FASES2` sem relação no JSON, que é aviso real.
+**Um builder só, parameterizado por `phase_count`.** `build_load_export()` é
+chamado três vezes por `build_export()`, uma por entrada de `_LOAD_FILES`. As
+três saídas diferem apenas em quantas fases o `NOME` precisa resolver, no
+`class` emitido e no arquivo de destino — separá-las em funções distintas
+significaria manter três cópias em sincronia.
+
+**N `Load` monofásicas, não uma multifásica.** É a decisão que dá forma ao
+módulo: uma única `Load` de `phases=2` ou `3` distribuiria a potência
+igualmente entre as fases, apagando exatamente o desequilíbrio que os patamares
+por fase (`PD`/`PE`/`PF`) descrevem. A monofásica segue a mesma forma com uma
+fase só, por uniformidade.
+
+**A nomenclatura carrega a contagem de fases.** `<CODIGO>-<N>F-<FASE>` deixa o
+arquivo legível sem consultar o `fases2.json` e, de quebra, torna impossível que
+duas cargas de contagens diferentes colidam de nome, mesmo com o mesmo `CODIGO`.
+`build_export()` ainda encadeia `reserved_names` entre os três builders: o
+namespace `Load.*` do OpenDSS é de fato compartilhado, e a unicidade atual é
+propriedade emergente do esquema de nomes, não invariante imposta — se o esquema
+mudar, a reserva continua protegendo contra a sobrescrita silenciosa.
+
+**`_phase_letters()` filtra por letra, não por posição.** Extrai de `NOME` todos
+os caracteres em `{D, E, F}` e exige exatamente `phase_count` distintos. Isso
+absorve o neutro sem tratamento especial — `DN` → `D`, `DEFN` → `D`, `E`, `F` —
+e recusa qualquer `NOME` que não descreva a contagem esperada.
+
+**O nó da fase tem duas origens, e a diferença é deliberada**
+(`_phase_nodes()`). Nas **multifásicas** ele vem do `DSS` da entrada
+**monofásica** daquela letra, indexado por `_terminals_by_phase_letter()`. Usar
+o `DSS` da entrada multifásica seria a escolha óbvia e está errada: ele lista os
+nós em ordem crescente, não na ordem das letras do `NOME`. `FD` tem `DSS "1.3"`,
+então parear posicionalmente daria `F`→`1` e `D`→`3`, invertendo as fases. Nas
+**monofásicas** o `DSS` da própria entrada é usado inteiro, o que preserva o nó
+de neutro explícito de `DN`/`EN`/`FN` (`bus.1.0`) — e é por isso que só elas
+exigem esse campo preenchido.
 
 **`kW=1 kvar=1` com a potência no `LoadShape`.** É o idioma do OpenDSS para
 carga variável: o `mult`/`qmult` multiplica a potência nominal, então fixar a
 nominal em 1 faz o perfil carregar os valores absolutos de cada patamar. Os
-`LoadShape` são emitidos **antes** de todas as `Load` porque o `daily` referencia
-um objeto que precisa já existir — mesma disciplina de ordenação dos comandos
-`Open` em `chaves.dss`, e o motivo de o corpo ser montado em duas seções.
+`LoadShape` são emitidos **antes** de todas as `Load` porque o `daily`
+referencia um objeto que precisa já existir — mesma disciplina de ordenação dos
+comandos `Open` em `chaves.dss`, e o motivo de o corpo ser montado em duas
+seções.
 
 **A carga chega ao circuito pela barra.** `CircuitMembership` associa barras e
 trechos, nunca cargas. `_bar_owners()` resolve, em uma passada, o dono de cada
@@ -1110,56 +1206,226 @@ primeiro circuito selecionado vence e define a `VNOM` — e guarda à parte as
 barras de `VNOM` divergente, para o aviso só sair quando uma carga de fato usar
 aquela barra. Sem isso, uma barra compartilhada sem carga alguma geraria ruído.
 
+**A carga sai inteira ou não sai.** Todas as fases são resolvidas — os
+`4 × 2 × N` valores parseados, todos os nomes checados contra `reserved_names` e
+`used_names` — **antes** de qualquer linha ser emitida. Carga pela metade no
+arquivo subestimaria a demanda em silêncio, que é o pior modo de falha possível
+para um estudo de fluxo de potência.
+
+**Zero é valor válido.** Toda a validação numérica usa
+`parse_number(...) is None`, nunca teste de verdade: uma fase sem consumo tem
+patamar `0`, que precisa ser exportado; só vazio e não numérico invalidam. Há
+teste de regressão nos três arquivos de carga.
+
 **Seis casas decimais nos patamares.** `_format_pattern` usa `.6f` em vez do
 `.6g` do resto do módulo: os valores de origem têm precisão excessiva e o
 arquivo ficaria ilegível com a notação científica que o `%g` escolhe para
 magnitudes pequenas.
 
-**`class=1` é só um rótulo manual.** Não tem efeito elétrico no OpenDSS — existe
-apenas para o usuário identificar visualmente, ao abrir o arquivo, que aquela
-`Load` é monofásica. Por isso vem por último na linha, depois de `daily`. As
-bifásicas usam `class=2`.
+**`class` é só um rótulo manual.** Não tem efeito elétrico no OpenDSS — existe
+para o usuário identificar, ao abrir o arquivo, de que contagem de fases aquela
+`Load` veio. Por isso vem por último na linha, depois de `daily`.
 
-#### Cargas bifásicas (`cargasbifasicas.dss`)
+#### Master e coordenadas (`<CODIGO>_Master.dss`, `<CODIGO>_Buscoords.csv`)
 
-**Duas `Load` monofásicas, não uma bifásica.** É a diferença de modelagem que
-justifica o arquivo separado: uma única `Load` de `phases=2` distribuiria a
-potência igualmente entre as duas fases, apagando exatamente o desequilíbrio que
-os patamares por fase (`PD`/`PE`/`PF`) descrevem. Cada carga vira
-`<CODIGO>-<FASE>` com `phases=1` e seu próprio `LoadShape`, lendo só o par de
-colunas daquela fase.
+**O único arquivo executável.** Os cinco anteriores só definem elementos; o
+master cria o circuito, chama os demais por `Redirect` e resolve. É o último a
+ser montado por `build_export()`, porque a lista de `Redirect` precisa refletir
+os arquivos que de fato existem — sem cargas importadas, só os dois de rede
+entram.
 
-**O terminal de cada letra vem da entrada monofásica, não da bifásica.**
-`_terminals_by_phase_letter()` indexa as entradas de `NUMERO_FASES=1` pela
-primeira letra do `NOME` e guarda o **primeiro nó** do `DSS` — o primeiro nó,
-para tolerar tanto `D` (`"1"`) quanto `DN` (`"1.0"`). Usar o `DSS` da entrada
-bifásica seria a escolha óbvia e está errada: ele lista os nós em ordem
-crescente, não na ordem das letras do `NOME`. `FD` tem `DSS "1.3"`, então parear
-posicionalmente daria `F`→`1` e `D`→`3`, invertendo as duas fases. A ordem de
-**emissão**, essa sim, segue as letras do `NOME`.
+**A ordem das seções é obrigatória, não estética.**
+`Set DefaultBaseFrequency` precede o `New Circuit` porque a frequência base é
+fixada na criação do circuito. Os `Redirect` precedem o `calcvoltagebases`, que
+exige todas as barras já definidas. E são `Redirect`, não `Compile`: o `Compile`
+troca o diretório corrente e quebraria o `Buscoords` relativo do fim.
 
-**`_two_phase_letters()` filtra por letra, não por posição.** Extrai de `NOME`
-todos os caracteres em `{D, E, F}` e exige exatamente dois distintos, o que
-aceita um eventual `DEN` (fase + fase + neutro) sem tratamento especial e recusa
-qualquer `NOME` que não descreva duas fases.
+**Um `New Circuit` energiza um alimentador só.** Por isso o master exige
+**exatamente um** circuito selecionado, e `OpenDssExportDialog` passa a ser de
+seleção única — marcar um item desmarca os demais. Com vários circuitos, os
+arquivos de elementos saem mesclados e uma fonte só deixaria os outros
+alimentadores ilhados, com carga não atendida. O caminho futuro é somar um
+`New Vsource.<CODIGO>` na barra raiz de cada alimentador adicional; enquanto
+isso, `build_master_export()` devolve `text` vazio com o motivo nos `issues`.
 
-**A carga sai inteira ou não sai.** As duas fases são inteiramente resolvidas —
-os 8 valores parseados, os dois nomes checados contra `reserved_names` e contra
-o `used_names` local — **antes** de qualquer linha ser emitida. Meia carga
-bifásica no arquivo subestimaria a demanda em silêncio, que é o pior modo de
-falha possível para um estudo de fluxo de potência.
+**`text` vazio em vez de exceção.** O master é o único builder que pode
+legitimamente não produzir arquivo (seleção múltipla, `VNOM` inválida). Devolver
+um resultado com `text=""` e o diagnóstico preserva o relatório de ocorrências;
+`OpenDssExportBundle.files` simplesmente omite os dois arquivos. A barra raiz
+não precisa de guarda: o construtor de `CircuitCatalogModel` já valida que todo
+`root_bar_id` existe em `segments.bars`.
 
-**Namespace `Load.*` compartilhado.** Os dois arquivos de carga criam objetos no
-mesmo espaço de nomes, e o nome de fase de uma bifásica (`CG-D`) pode coincidir
-com o nome de uma monofásica. `build_export()` passa
-`single_phase_result.used_names` como `reserved_names` — a mesma disciplina que
-protege `chaves.dss` contra nomes de `trechos.dss`, e o motivo de o builder
-monofásico rodar primeiro.
+**`master_filenames()` é público por causa da confirmação de substituição.** A
+UI precisa saber os nomes **antes** de exportar, e eles dependem do `CODIGO` do
+circuito. A função aplica a mesma regra de nome do resultado, e um teste amarra
+as duas para não divergirem.
 
-**Zero é valor válido.** Toda a validação numérica usa
-`parse_number(...) is None`, nunca teste de verdade: uma fase sem consumo tem
-patamar `0`, que precisa ser exportado; só vazio e não numérico invalidam. Há
-teste de regressão nos dois arquivos de carga.
+**`_format_coordinate` existe porque `_format` estragaria as coordenadas.** O
+`.6g` do resto do módulo guarda seis algarismos significativos: um northing UTM
+de 8.000.000 viraria `8e+06` e o easting perderia as casas decimais. O CSV usa
+`.3f`, e há teste travando exatamente esse caso.
+
+**`BatchEdit` dos limites de tensão das cargas.** Quando o usuário configura
+`Vminpu`/`Vmaxpu` em **Configurações → OpenDSS…**, duas linhas entram entre os
+`Redirect` e o `Set Voltagebases`:
+
+```
+BatchEdit Load..* vminpu=0.8
+BatchEdit Load..* vmaxpu=1.2
+```
+
+A posição é obrigatória: `BatchEdit` é comando **executivo** e exige as `Load`
+já definidas, então não pode subir para antes dos `Redirect` — a mesma
+disciplina que já rege os `Open` de `chaves.dss` e os `LoadShape` antes das
+`Load`. Precisa igualmente preceder o `Solve`. Que a posição possa ser antes do
+`calcvoltagebases` foi medido: `Vminpu` é per unit da `kV` da própria `Load`, e
+não das bases de tensão das barras.
+
+**Por que isso não é cosmético.** `Vminpu`/`Vmaxpu` delimitam a faixa em que a
+`Load` respeita o seu `model`; fora dela o OpenDSS a converte para impedância
+constante. Como o exportador emite `model=1`, a faixa padrão (0,95–1,05) faz
+toda barra abaixo de 0,95 pu ter a carga convertida **em silêncio**, e o estudo
+subestima a queda de tensão exatamente onde ela interessa. Medido num
+alimentador de 20 km carregado: a ponta fica em **0,8970 pu** com o padrão e em
+**0,8810 pu** com `vminpu=0.80` — 1,6 ponto percentual que o padrão escondia.
+
+**A configuração é opt-in, e essa é a garantia de compatibilidade.** Sem a caixa
+marcada nenhuma linha é acrescentada e o master sai byte a byte como antes de o
+recurso existir — há um teste que trava o arquivo linha a linha para esse caso
+(`test_master_follows_the_opendss_template`). E `build_export()` só repassa a
+configuração ao master quando existe **arquivo de carga**: a DLL trata
+`BatchEdit` sem alvo como no-op (`Elements edited: 0`, medido), mas um comando
+que edita zero objetos só confundiria quem lesse o arquivo. A divisão é
+deliberada — `build_master_export()` emite o que recebe, `build_export()` decide
+se faz sentido.
+
+**A validação é nossa porque o OpenDSS não a faz.** Medido: `vminpu=0`,
+`vminpu=2` e `vminpu=-1` são aceitos sem erro nem aviso. Quem impede o absurdo
+são dois níveis nossos — a invariante `0 < vminpu <= 1 <= vmaxpu` de
+`OpenDssLoadSettings` (a faixa precisa conter a tensão nominal, senão a carga
+estaria sempre convertida, o oposto da intenção) e as faixas dos campos do
+diálogo, que impedem o usuário de sequer digitar o que a invariante recusaria.
+
+**As coordenadas reusam `bus_namer`.** É o mesmo nome que aparece nos
+`Bus1`/`Bus2`, e é isso que faz o OpenDSS casar cada ponto com o elemento. Como
+`bus_namer` não é injetivo — dois `CODIGO` podem colidir após o saneamento —, a
+segunda barra de um nome repetido é descartada com diagnóstico, já que no
+arquivo ela apenas sobrescreveria a primeira. A função é pública exatamente por
+ser essa definição única: a leitura dos resultados do fluxo de potência
+(seção 12.4) precisa concordar com ela.
+
+### 12.4 Fluxo de potência (`opendss_powerflow.py`, `opendss_engine.py`)
+
+**Objetivo:** resolver o fluxo de potência dos circuitos **visíveis** e devolver
+corrente por trecho e tensão por barra, um retrato por patamar, associados aos
+elementos selecionáveis na tela. Fecha o ciclo que a exportação abria: o usuário
+não precisa mais exportar, abrir o OpenDSS e ler os resultados por fora.
+
+**O modelo executado é o modelo exportado.** `run_power_flow()` chama a mesma
+`build_export()` da seção 12.3, grava o bundle numa pasta temporária e compila o
+master. Não há um segundo gerador de `.dss`, e é isso que garante a equivalência
+entre o que a aplicação mostra e o que o usuário obteria à mão — o roteiro de
+verificação inclui a prova: o estado após o `Compile` do master coincide, com
+divergência zero, com o último patamar colhido.
+
+**`Compile`, não `Redirect`.** É a inversão exata da regra do master, que usa
+`Redirect` internamente para não perder o `Buscoords` relativo. Aqui o `Compile`
+é desejável justamente porque muda o diretório do OpenDSS para a pasta do
+master — é o que faz os `Redirect` internos e o `Buscoords` resolverem.
+
+**Os quatro patamares são reconduzidos pela API.** O master termina com um
+`Solve` de `number=4`, que deixa o circuito no estado do **último** patamar. Ler
+dali daria um quarto da informação. Depois de compilar, o módulo emite
+`Set mode=daily`, `Set stepsize=1h`, `Set number=1` e `Set time=(0, 0)` e faz um
+`solution.solve()` por patamar, colhendo entre eles — os passos alinham 1:1 com
+`NPAT` 0–3. Um patamar que não converge é registrado em `unconverged` e o estudo
+segue; abortar perderia os outros três.
+
+**Um solve por circuito.** `New Circuit` energiza um alimentador só — a mesma
+razão de o master exigir seleção única —, então o módulo itera circuito a
+circuito. Em rede sobreposta o **primeiro** circuito processado é o dono do
+resultado, a mesma regra que a exportação usa para escolher a `VNOM`. Um
+circuito sem master (`VNOM` inválida, por exemplo) vai para `skipped_circuits`
+com o motivo nos `issues`, e os demais continuam: falha de dado em um
+alimentador não deve invalidar o estudo dos outros.
+
+**A associação vem do índice reverso do exportador, nunca de uma segunda
+implementação.** O OpenDSS devolve resultados por nome (`Line.xyz`, `barra.1`), e
+os nomes nascem de regras não triviais — `CODIGO` saneado, fallback para
+`TRECHO_ID`/`CHAVE_ID`, descarte de homônimos, dono do trecho sobreposto. Por
+isso `OpenDssLineExportResult` e `OpenDssSwitchExportResult` ganharam
+`exported_segments: tuple[tuple[str, int], ...]`, e `_bus_namer` virou público.
+Recompor esses nomes aqui seria a mesma divergência silenciosa que a seção 12.3
+evita ao reusar a separação de chaves do `trace()`.
+
+**Comparação por `casefold()`, com colisão descartando os dois lados.** O
+OpenDSS ignora a caixa dos nomes e devolve tudo em minúsculas; a checagem de
+homônimos do exportador **é** sensível a caixa. Logo `TR-01a` e `TR-01A` passam
+pela exportação e chegam aqui como um objeto nativo só. Nesse caso nenhuma das
+duas entradas sobrevive, com diagnóstico: um resultado atribuído ao elemento
+errado é pior que um resultado ausente.
+
+**Colheita em duas formas, por custo.** As tensões saem de três vetores
+paralelos que cobrem o sistema inteiro (`nodes_names`, `buses_vmag`,
+`buses_vmag_pu`) — três chamadas por patamar, sem laço por elemento. As correntes
+exigem o laço `lines.first()/next()` com `cktelement.currents_mag_ang` e
+`node_order`, guardando o **terminal 1** (a corrente que entra pela barra de
+montante). Chaves também são `Line` no modelo exportado, então vêm de graça no
+mesmo laço; e o `IADM` usado no carregamento percentual vem do `CABOF_ID` do
+trecho mesmo quando ele carrega uma chave: `Switch=Yes` apaga os parâmetros
+elétricos da `Line`, mas o condutor físico daquele ponto continua sendo o do cabo.
+
+**Nós de neutro não são tensão de fase.** Tanto na colheita de tensões quanto na
+de correntes, nós `<= 0` são descartados — eles aparecem no `bus.1.0` das
+entradas monofásicas com neutro explícito do `fases2.json`.
+
+**Custo medido.** O laço por elemento era o risco da abordagem — uma chamada
+`ctypes` por trecho e por patamar. Num alimentador radial sintético de 100 mil
+trechos, 100 mil barras e 10 mil cargas, a execução completa (geração dos
+arquivos, gravação, `Compile`, quatro solves e colheita de tudo) levou **13 s**,
+ou ~32 µs por trecho e patamar. Está confortavelmente dentro do que um worker com
+`QProgressDialog` e cancelamento absorve, e por isso a alternativa de trocar a
+colheita por `Export Currents` + parse de CSV não foi necessária. Se um dia for,
+a troca fica confinada a `_harvest_line_currents()`.
+
+#### As três armadilhas do `py_dss_interface`, e onde cada uma é contida
+
+Todas confirmadas lendo o fonte do pacote, e todas resolvidas em
+`opendss_engine.py` para não vazarem para o resto do projeto:
+
+| Armadilha | Contenção |
+|---|---|
+| `DSS.__init__` chama `os.chdir` para a pasta da DLL — muda o diretório corrente do processo | `acquire_engine()` salva e restaura `os.getcwd()` na entrada e na saída; sem isso todo `QFileDialog` da aplicação passaria a abrir na pasta da DLL |
+| Se a DLL não inicia, o pacote imprime e chama `exit()` | `SystemExit` deriva de `BaseException` e escaparia do `except Exception` dos workers; a criação do motor captura `BaseException` e traduz para `PowerFlowEngineError`, e `PowerFlowWorker.run` repete a guarda |
+| A DLL é global ao processo: dois `DSS` compartilham o estado nativo | motor **singleton** protegido por `threading.Lock`, com `Clear` na entrada de cada empréstimo |
+
+Há ainda uma quarta restrição, de codificação: `dss.text()` codifica o comando em
+ASCII. Um `Compile` apontando para caminho acentuado — o que acontece sempre que
+o nome de usuário do Windows tem acento, porque o `TEMP` fica sob ele —
+levantaria `UnicodeEncodeError` no meio da execução. `ascii_workspace()` testa as
+raízes candidatas antes e falha com mensagem acionável em vez de com o erro de
+codificação.
+
+**Dependência opcional de verdade.** `power_flow_import_error()` faz o import
+tardio e memoiza o resultado (importar carrega a DLL: caro demais para repetir a
+cada `_sync_*_availability()`). Sem a biblioteca, o botão fica desabilitado com o
+motivo na dica e o resto da aplicação não muda — e a suíte de testes roda inteira
+sem ela, porque o núcleo é exercitado com um motor falso.
+
+#### Apresentação no painel lateral
+
+As páginas de barra e de trecho ganharam uma seção de resultados com um
+`QComboBox` de grandeza e uma tabela de quatro linhas (`power_flow_table.py`):
+**Corrente por fase (A)** e **Carregamento (%)** no trecho, **Tensão por nó (V)**
+e **Tensão (pu)** na barra. O combobox existe para não empilhar quatro tabelas
+num painel que já é denso; a chave da grandeza viaja no `UserRole` do item, e não
+na posição. Sem `IADM` numérico no cabo, o item de carregamento fica desabilitado
+e uma nota explica o motivo — em vez de uma coluna de traços sem explicação.
+
+A seção nasce invisível e só aparece quando o elemento selecionado tem resultado.
+Qualquer reimportação chama `_invalidate_power_flow()` e a esconde: o resultado
+deriva de catálogo, trechos, chaves, cabos, cargas e patamares, e sobreviver a
+uma troca de qualquer um deles seria exibir número velho como se fosse novo.
 
 ---
 
@@ -1269,13 +1535,19 @@ aviso: é ausência de cobertura, resolvida pelo overzoom, e não falha de acess
 
 ### Modo rápido (por `CODIGO`)
 
-`_SearchPartition` por tipo de entidade: `dict[código_normalizado →
+`_SearchPartition` por tipo de entidade — barra, trecho, chave, **regulador**,
+carga e circuito: `dict[código_normalizado →
 tuple[SearchResult]]` mais uma tupla de chaves ordenadas. Busca exata é lookup
 O(1); busca por prefixo é `bisect_left` + varredura. `normalize_code()` aplica
 `casefold` + NFKD + remoção de diacríticos, então “SÃO” encontra “sao”.
 
 Resultados exatos vêm primeiro, depois os por prefixo, ordenados por
 `(código, tipo, entity_id, índice)`.
+
+Chaves e reguladores não têm geometria própria: o `target` dos dois é
+`FeatureSelection("segment", …)`, porque o que se enquadra e se seleciona é o
+trecho onde estão. `_activate_search_result()` distingue os dois só para rolar o
+painel até a seção certa.
 
 ### Modo amplo (todas as colunas)
 
@@ -1315,6 +1587,16 @@ executa fora da thread da UI.
 `pyproj` é importado defensivamente em `graphics.py` (`Transformer = None` se
 ausente): sem ele, apenas a camada de satélite deixa de funcionar.
 
+### Externas (opcionais)
+
+| Pacote | Versão | Uso | Extra |
+|---|---|---|---|
+| `py-dss-interface` | ≥2.3, <3 | motor do OpenDSS para o fluxo de potência | `opendss` |
+
+Instalação: `pip install -e ".[opendss]"`. Sem o pacote, apenas o botão
+**Executar Fluxo de Potência** fica desabilitado, com o motivo na dica; o import
+é tardio e vive só em `opendss_engine.py` (ver seção 12.4).
+
 ### Desenvolvimento
 
 `pytest` ≥8, `pytest-qt` ≥4.4 (extra `test`).
@@ -1323,16 +1605,28 @@ ausente): sem ele, apenas a camada de satélite deixa de funcionar.
 
 ```
 __main__ → main_window → {graphics, workers, *_window, *_table, search_palette,
-                          model, phase_config, mapa_tiles, *_import}
-workers  → {*_import, branch_analysis, equivalent_network, model, phase_config}
+                          model, phase_config, mapa_tiles, *_import,
+                          opendss_engine, opendss_powerflow}
+workers  → {*_import, branch_analysis, equivalent_network, model, phase_config,
+            opendss_export, opendss_engine, opendss_powerflow}
 graphics → {model, equivalent_network, mapa_tiles}
 equivalent_network → {branch_analysis, model}
 branch_analysis    → {model, phase_config}
+opendss_powerflow  → {model, phase_config, opendss_export, opendss_settings,
+                      opendss_engine}
+opendss_settings   → opendss_export (só parse_number, para não haver duas
+                     regras de leitura numérica)
+opendss_export     → {model, phase_config}
+opendss_engine     → ∅  (py_dss_interface entra por import tardio)
 search   → model
 phase_config → model (apenas o alias de tipo IndexArray)
 model    → circuit_colors
 *_import → {csv_import (exceções), model}
 ```
+
+`opendss_engine.py` é folha do pacote de propósito: ele define o `Protocol`
+`DssEngine` que `opendss_powerflow` consome, e importar qualquer coisa do
+projeto ali arrastaria a contenção da DLL para dentro do grafo do domínio.
 
 `model.py` e `circuit_colors.py` são folhas — não importam nada do pacote além
 disso. `__init__.py` re-exporta a API pública (~70 nomes em `__all__`), o que
@@ -1507,21 +1801,26 @@ sem tocar no núcleo.
 
 ## 18. Testes e benchmarks
 
-### Testes (`tests/`, 26 arquivos)
+### Testes (`tests/`, 32 arquivos)
 
 | Arquivo | Foco |
 |---|---|
 | `test_model.py` | entidades, índices espaciais, topologia |
-| `test_csv_import.py` · `test_segment_import.py` · `test_switch_import.py` · `test_load_import.py` · `test_load_pattern_import.py` · `test_circuit_import.py` · `test_cable_import.py` | importadores e casos de erro |
+| `test_csv_import.py` · `test_segment_import.py` · `test_switch_import.py` · `test_regulator_import.py` · `test_load_import.py` · `test_load_pattern_import.py` · `test_circuit_import.py` · `test_cable_import.py` | importadores e casos de erro; o de reguladores cobre também as invariantes do `RegulatorModel` independentemente do importador |
 | `test_phase_config.py` | validação do `fases2.json` |
 | `test_circuit_colors.py` | paleta e contraste |
 | `test_branch_analysis.py` · `test_equivalent_network.py` | análises topológicas |
-| `test_opendss_export.py` | linhas de trecho, de chave e das cargas mono e bifásicas, conversão de `C1` e do `kV` pela tensão de fase, ordem `New`/`Open` e `LoadShape`/`Load`, terminal por letra, colunas de patamar por fase, patamar zerado, descarte integral da bifásica, reserva de nomes entre os arquivos, arredondamento, saneamento e diagnósticos |
+| `test_opendss_export.py` | linhas de trecho, de chave e das cargas de uma, duas e três fases, conversão de `C1` e do `kV` pela tensão de fase, ordem `New`/`Open` e `LoadShape`/`Load`, nomenclatura `-NF-<FASE>`, terminal por letra, neutro preservado só na monofásica, colunas de patamar por fase, patamar zerado, descarte integral da carga, reserva de nomes entre os arquivos, arredondamento, saneamento, master (ordem das seções, `Redirect` conforme os arquivos gerados, coordenadas em casas fixas) e diagnósticos |
+| `test_opendss_settings.py` | invariante da faixa (`0 < vminpu <= 1 <= vmaxpu`), comandos `BatchEdit` exatos e sem vírgula decimal, desabilitado não emite nada, ida e volta pelo mapeamento e recuperação de preferência corrompida |
+| `test_opendss_engine.py` | detecção da biblioteca opcional, memoização do erro de import, reuso do motor único, diretório corrente restaurado (inclusive após falha) e escolha da pasta ASCII |
+| `test_opendss_powerflow.py` | com um **motor falso**: arquivos gravados iguais aos da exportação, ordem `Clear`/`Compile`/`Set …`, um `Solve` por patamar, corrente no trecho certo (inclusive em chaves), só o terminal 1, tensões e pu por nó, neutro descartado, `IADM` ausente, patamar não convergido, colisão de caixa em nome de linha e de barra, circuito sem master, sobreposição resolvida pelo primeiro circuito, progresso e cancelamento |
 | `test_search.py` | índice de busca (sem Qt) |
-| `test_graphics.py` · `test_main_window.py` · `test_branches_ui.py` · `test_circuits_ui.py` · `test_phase_ui.py` · `test_search_ui.py` · `test_map_tiles.py` · `test_satellite_ui.py` · `test_theme_ui.py` · `test_cables_ui.py` · `test_opendss_export_ui.py` | camadas Qt (exigem PyQt6) |
+| `test_graphics.py` · `test_main_window.py` · `test_branches_ui.py` · `test_circuits_ui.py` · `test_phase_ui.py` · `test_search_ui.py` · `test_map_tiles.py` · `test_satellite_ui.py` · `test_theme_ui.py` · `test_cables_ui.py` · `test_opendss_export_ui.py` · `test_powerflow_ui.py` · `test_opendss_settings_ui.py` · `test_regulators_ui.py` | camadas Qt (exigem PyQt6) |
 
 Os testes do núcleo usam apenas a biblioteca padrão e NumPy; os gráficos rodam
-quando PyQt6 está disponível.
+quando PyQt6 está disponível. **Nenhum teste exige `py-dss-interface`:** o fluxo
+de potência é exercitado com um motor falso no núcleo e com um `PowerFlowResult`
+injetado na UI, o que também mantém a suíte rápida e determinística.
 
 ```bash
 python -m unittest discover -s tests -v

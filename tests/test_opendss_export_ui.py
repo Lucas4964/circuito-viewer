@@ -39,6 +39,7 @@ try:
         LINES_FILENAME,
         SINGLE_PHASE_LOADS_FILENAME,
         SWITCHES_FILENAME,
+        THREE_PHASE_LOADS_FILENAME,
         TWO_PHASE_LOADS_FILENAME,
         build_export,
     )
@@ -159,19 +160,19 @@ class OpenDssExportUiTests(unittest.TestCase):
         if with_loads:
             loads = LoadModel(
                 bars,
-                ["CG1", "CG2"],
-                [1, 2],
-                ["EXT-1", "EXT-2"],
-                ["CARGA-1", "CARGA-2"],
-                ["10", "20"],
-                ["12", "22"],
-                ["220", "220"],
-                # FASES2 do fases2.json real: "1" é D, "7" é DE.
-                ["1", "7"],
-                ["Y", "Y"],
+                ["CG1", "CG2", "CG3"],
+                [1, 2, 0],
+                ["EXT-1", "EXT-2", "EXT-3"],
+                ["CARGA-1", "CARGA-2", "CARGA-3"],
+                ["10", "20", "30"],
+                ["12", "22", "32"],
+                ["220", "220", "220"],
+                # FASES2 do fases2.json real: "1" é D, "7" é DE, "13" é DEF.
+                ["1", "7", "13"],
+                ["Y", "Y", "Y"],
             )
             window._on_load_import_finished(
-                LoadCsvResult(loads, "utf-8-sig", 2, 2, 0, (), 0)
+                LoadCsvResult(loads, "utf-8-sig", 3, 3, 0, (), 0)
             )
             patterns = LoadPatternModel(
                 loads,
@@ -179,15 +180,16 @@ class OpenDssExportUiTests(unittest.TestCase):
                     tuple(
                         LoadPatternRecord(
                             load_id, npat, f"{1.5 + npat}", f"{2.5 + npat}",
-                            "0", f"{0.25 + npat}", f"{0.35 + npat}", "0",
+                            f"{3.5 + npat}", f"{0.25 + npat}",
+                            f"{0.35 + npat}", f"{0.45 + npat}",
                         )
                         for npat in range(4)
                     )
-                    for load_id in ("CG1", "CG2")
+                    for load_id in ("CG1", "CG2", "CG3")
                 ],
             )
             window._on_load_pattern_import_finished(
-                LoadPatternCsvResult(patterns, "utf-8-sig", 8, 8, 0, (), 0)
+                LoadPatternCsvResult(patterns, "utf-8-sig", 12, 12, 0, (), 0)
             )
         self.app.processEvents()
 
@@ -222,13 +224,39 @@ class OpenDssExportUiTests(unittest.TestCase):
         self.assertEqual(dialog.selected_circuit_indices(), (0,))
 
         ok_button = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
-        dialog.uncheck_all_button.click()
+        dialog.circuit_list.item(0).setCheckState(Qt.CheckState.Unchecked)
         self.assertEqual(dialog.selected_circuit_indices(), ())
         self.assertFalse(ok_button.isEnabled())
 
-        dialog.check_all_button.click()
+        dialog.circuit_list.item(0).setCheckState(Qt.CheckState.Checked)
         self.assertEqual(dialog.selected_circuit_indices(), (0,))
         self.assertTrue(ok_button.isEnabled())
+
+    def test_dialog_keeps_only_one_circuit_checked(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        # Um segundo circuito, para exercitar a exclusividade.
+        catalog = CircuitCatalogModel.build(
+            window._line_model,
+            window._switch_model,
+            [
+                CircuitDefinition("C1", "B0", "ALIMENTADOR", "13,8"),
+                CircuitDefinition("C2", "B2", "OUTRO", "13,8"),
+            ],
+        )
+        dialog = OpenDssExportDialog(catalog, window)
+        self.addCleanup(dialog.close)
+
+        # Só o primeiro nasce marcado.
+        self.assertEqual(dialog.selected_circuit_indices(), (0,))
+
+        dialog.circuit_list.item(1).setCheckState(Qt.CheckState.Checked)
+
+        # Marcar o segundo desmarca o primeiro: o master energiza um só.
+        self.assertEqual(dialog.selected_circuit_indices(), (1,))
+        self.assertEqual(
+            dialog.circuit_list.item(0).checkState(), Qt.CheckState.Unchecked
+        )
 
     def test_export_writes_every_file_in_the_chosen_folder(self) -> None:
         window = self._window()
@@ -261,6 +289,9 @@ class OpenDssExportUiTests(unittest.TestCase):
                 SWITCHES_FILENAME,
                 SINGLE_PHASE_LOADS_FILENAME,
                 TWO_PHASE_LOADS_FILENAME,
+                THREE_PHASE_LOADS_FILENAME,
+                "ALIMENTADOR_Master.dss",
+                "ALIMENTADOR_Buscoords.csv",
             ],
         )
         for filename, text in expected.files:
@@ -278,25 +309,64 @@ class OpenDssExportUiTests(unittest.TestCase):
         two_phase = (self.destination / TWO_PHASE_LOADS_FILENAME).read_text(
             encoding="utf-8"
         )
+        three_phase = (
+            self.destination / THREE_PHASE_LOADS_FILENAME
+        ).read_text(encoding="utf-8")
         # O trecho T1 é chave: sai de chaves.dss, nunca de trechos.dss.
         self.assertIn("New Line.TR-1 ", lines)
         self.assertNotIn("TR-2", lines)
         self.assertIn("New Line.CHV-1 Bus1=COD-B", switches)
         self.assertTrue(switches.rstrip().endswith("Switch=Yes"))
-        # CG1 é monofásica (D) e CG2 é bifásica (DE): cada uma no seu arquivo.
-        self.assertIn("New LoadShape.PERFIL-CARGA-1 npts=4", single_phase)
+        # Uma carga de cada contagem de fases, cada uma no seu arquivo.
         self.assertIn(
-            "New Load.CARGA-1 phases=1 bus1=COD-B.1 conn=wye", single_phase
-        )
-        self.assertNotIn("CARGA-2", single_phase)
-        self.assertIn(
-            "New Load.CARGA-2-D phases=1 bus1=COD-C.1 conn=wye", two_phase
+            "New LoadShape.PERFIL-CARGA-1-1F-D npts=4", single_phase
         )
         self.assertIn(
-            "New Load.CARGA-2-E phases=1 bus1=COD-C.2 conn=wye", two_phase
+            "New Load.CARGA-1-1F-D phases=1 bus1=COD-B.1 conn=wye",
+            single_phase,
+        )
+        self.assertTrue(single_phase.rstrip().endswith("class=1"))
+        self.assertIn(
+            "New Load.CARGA-2-2F-D phases=1 bus1=COD-C.1 conn=wye", two_phase
+        )
+        self.assertIn(
+            "New Load.CARGA-2-2F-E phases=1 bus1=COD-C.2 conn=wye", two_phase
         )
         self.assertTrue(two_phase.rstrip().endswith("class=2"))
+        for letter, node in (("D", "1"), ("E", "2"), ("F", "3")):
+            self.assertIn(
+                f"New Load.CARGA-3-3F-{letter} phases=1 bus1=COD-A.{node}"
+                " conn=wye",
+                three_phase,
+            )
+        self.assertTrue(three_phase.rstrip().endswith("class=3"))
+        # Cada carga aparece só no arquivo da sua contagem de fases.
+        self.assertNotIn("CARGA-2", single_phase)
+        self.assertNotIn("CARGA-3", single_phase)
         self.assertNotIn("CARGA-1", two_phase)
+        self.assertNotIn("CARGA-3", two_phase)
+        self.assertNotIn("CARGA-1", three_phase)
+        self.assertNotIn("CARGA-2", three_phase)
+        # O master chama todos os arquivos de elementos e aponta as coordenadas.
+        master = (self.destination / "ALIMENTADOR_Master.dss").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("New Circuit.ALIMENTADOR", master)
+        self.assertIn("~ bus1=COD-A.1.2.3 phases=3 basekv=13.8", master)
+        for filename, _ in expected.element_files:
+            self.assertIn(f"Redirect {filename}", master)
+        self.assertIn("Buscoords ALIMENTADOR_Buscoords.csv", master)
+        buscoords = (self.destination / "ALIMENTADOR_Buscoords.csv").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            buscoords.splitlines(),
+            [
+                "COD-A,500000.000,8000000.000",
+                "COD-B,500100.000,8000000.000",
+                "COD-C,500200.000,8000000.000",
+            ],
+        )
         self.assertIn(str(self.destination), window.statusBar().currentMessage())
 
     def test_load_files_are_skipped_without_loads_and_patterns(self) -> None:
@@ -315,10 +385,12 @@ class OpenDssExportUiTests(unittest.TestCase):
         # O menu não depende de cargas: os dois arquivos de rede saem normalmente.
         self.assertTrue((self.destination / LINES_FILENAME).is_file())
         self.assertTrue((self.destination / SWITCHES_FILENAME).is_file())
-        self.assertFalse(
-            (self.destination / SINGLE_PHASE_LOADS_FILENAME).exists()
-        )
-        self.assertFalse((self.destination / TWO_PHASE_LOADS_FILENAME).exists())
+        for filename in (
+            SINGLE_PHASE_LOADS_FILENAME,
+            TWO_PHASE_LOADS_FILENAME,
+            THREE_PHASE_LOADS_FILENAME,
+        ):
+            self.assertFalse((self.destination / filename).exists(), filename)
 
     def test_existing_load_file_is_ignored_when_it_will_not_be_written(self) -> None:
         window = self._window()

@@ -24,6 +24,10 @@ python -m pip install -e .
 python -m circuit_viewer
 ```
 
+Para habilitar também o [fluxo de potência](#fluxo-de-potência), troque a linha
+de instalação por `python -m pip install -e ".[opendss]"`. Sem esse extra a
+aplicação funciona por inteiro, apenas com o botão correspondente desabilitado.
+
 Ao importar, informe a zona e o hemisfério UTM. X e Y aceitam ponto ou vírgula
 decimal. As colunas obrigatórias podem aparecer em qualquer ordem e todas as
 colunas adicionais são ignoradas. Linhas inválidas são ignoradas e apresentadas
@@ -39,7 +43,7 @@ northing entre 0 e 10.000.000) são aceitas, mas o relatório avisa — nesse ca
 imagem de satélite não consegue se posicionar corretamente.
 
 Use **Arquivo > Importar…** e escolha entre barras, trechos, cargas, chaves,
-circuitos ou cabos. A opção de
+reguladores, circuitos ou cabos. A opção de
 trechos fica disponível depois que as barras forem carregadas. O arquivo de
 trechos deve conter `TRECHO_ID`, `CODIGO`, `FASES2`, `BARRA1_ID`, `BARRA2_ID`,
 `ARRANJO_ID`, `CABOF_ID`, `CABON_ID` e `COMPR`. A ordem é livre e colunas
@@ -72,6 +76,29 @@ conter `CHAVE_ID`, `TIPOCHV_ID`, `CIRC_ID`, `TRECHO_ID`, `CODIGO`, `ESTADO`,
 indicado por `TRECHO_ID`: ele passa a ser desenhado em vermelho e exibe uma
 segunda tabela de propriedades quando selecionado. Trechos comuns usam linha
 cosmética de 3 pixels; trechos-chave usam linha vermelha de 1 pixel.
+
+Ainda depois dos trechos, **Importar reguladores…** carrega os reguladores de
+tensão. O CSV deve conter `REGU_ID`, `TRECHO_ID`, `EXTERN_ID`, `CODIGO`,
+`LIGACAO`, `SNOM`, `FAIXA`, `NPASSOS`, `TAP`, `INOM` e `VNOM`. Cada registro é
+vinculado ao trecho indicado por `TRECHO_ID`, com **no máximo um regulador por
+trecho**: o segundo registro do mesmo trecho é descartado e relatado, assim como
+`REGU_ID` vazio ou duplicado e trecho inexistente. Todos os campos são
+preservados como texto, inclusive os numéricos — zeros à esquerda e vírgula
+decimal chegam ao painel exatamente como estão no arquivo.
+
+Ao selecionar um trecho com regulador, o painel lateral exibe a tabela **Dados do
+regulador**, abaixo da tabela de chave quando as duas existirem. Os reguladores
+também entram na busca global: procurar pelo `REGU_ID` ou pelo `CODIGO` enquadra
+o trecho e rola o painel até a seção. A importação **não** altera símbolos no
+mapa, filtros de circuito nem a topologia — reguladores não interrompem nem
+energizam nada, então importá-los não invalida ramais, rede simplificada ou um
+resultado de fluxo de potência já calculado.
+
+> **Ainda não exportados.** Os reguladores não entram nos arquivos `.dss` nem no
+> fluxo de potência: no OpenDSS eles seriam um `Transformer` mais um `RegControl`,
+> cuja modelagem exige parâmetros que o CSV não traz (tensão de referência, banda,
+> relação de PT, compensação de linha). Na prática, **o fluxo de potência resolve
+> a rede como se não houvesse regulação**.
 
 Depois dos trechos, também é possível **Importar circuitos…** usando as colunas
 `CIRC_ID`, `BARRA_ID`, `CODIGO` e `VNOM`. A aplicação executa a busca topológica
@@ -189,11 +216,13 @@ inicialização; reinicie a aplicação depois de editá-lo. Cada item deve poss
 ser consumidos pela exportação para OpenDSS:
 
 - `NOME` é o texto exibido no painel de detalhes e, na exportação, a **fonte das
-  letras de fase**: a primeira letra de uma monofásica escolhe o par de colunas
-  de patamar, e as duas letras de uma bifásica definem suas duas `Load`;
+  letras de fase**: cada letra `D`, `E` ou `F` vira uma `Load` com seu par de
+  colunas de patamar. Letras fora dessas três são ignoradas, então o `N` de
+  `DN` e `DEFN` não conta como fase;
 - `DSS` guarda a numeração de nós no formato do OpenDSS (ex.: `"1.2.3"`) e vira
-  o sufixo de `Bus1`/`Bus2` dos trechos e chaves. Para as cargas bifásicas, o
-  nó de cada fase vem do `DSS` da **entrada monofásica** daquela letra.
+  o sufixo de `Bus1`/`Bus2` dos trechos e chaves. Nas cargas monofásicas ele é
+  usado inteiro, preservando o nó de neutro; nas bi e trifásicas o nó de cada
+  fase vem do `DSS` da **entrada monofásica** daquela letra.
 
 ```json
 [
@@ -217,15 +246,24 @@ filtros de visibilidade dos circuitos continuam sendo respeitados.
 ## Exportação para OpenDSS
 
 **Exportar > OpenDSS…** gera `trechos.dss`, `chaves.dss` e, quando houver cargas
-e patamares importados, `cargasmonofasicas.dss` e `cargasbifasicas.dss`. A opção
-só fica disponível com barras, trechos, chaves, circuitos e cabos importados e
-um `fases2.json` válido — são as cinco fontes que os dois arquivos de rede
-consomem. Cargas e patamares **não** entram nessa lista: sem eles a exportação
-continua funcionando e apenas os arquivos de carga deixam de ser gerados. Quando
-são gerados, saem os dois, mesmo que um fique só com o cabeçalho. Ao acionar,
-uma janela lista os circuitos do catálogo para você escolher quais exportar, e
-em seguida é pedida **uma única pasta de destino**, que recebe todos os arquivos
-gerados; se algum deles já existir, a substituição é confirmada antes.
+e patamares importados, um arquivo de cargas por contagem de fases:
+`cargasmonofasicas.dss`, `cargasbifasicas.dss` e `cargastrifasicas.dss`. Por
+cima deles saem `<CODIGO>_Master.dss` e `<CODIGO>_Buscoords.csv`, o arquivo
+principal que cria o circuito, chama os demais e resolve, mais as coordenadas
+das barras.
+
+A opção só fica disponível com barras, trechos, chaves, circuitos e cabos
+importados e um `fases2.json` válido — são as cinco fontes que os dois arquivos
+de rede consomem. Cargas e patamares **não** entram nessa lista: sem eles a
+exportação continua funcionando e apenas os arquivos de carga deixam de ser
+gerados. Quando são gerados, saem os três, mesmo que algum fique só com o
+cabeçalho.
+
+Ao acionar, uma janela lista os circuitos do catálogo para você escolher **um**
+— marcar outro desmarca o anterior, porque o master cria um `New Circuit`, que
+energiza um alimentador só. Em seguida é pedida **uma única pasta de destino**,
+que recebe todos os arquivos gerados; se algum deles já existir, a substituição
+é confirmada antes.
 
 ### `trechos.dss`
 
@@ -296,101 +334,270 @@ exportado é descartada e reportada, em vez de sobrescrever a definição anteri
 silenciosamente. As cargas ficam fora dessa verificação por viverem em `Load.*`,
 um namespace separado.
 
-### `cargasmonofasicas.dss`
+### Arquivos de carga
 
-Gerado apenas quando cargas **e** patamares estiverem importados. Contém as
-cargas cujo `FASES2` esteja mapeado com `NUMERO_FASES=1` — as seis combinações
-do `fases2.json`, com e sem neutro explícito (`D`, `E`, `F`, `DN`, `EN`, `FN`).
-Cargas de outras contagens de fases são ignoradas e contabilizadas no relatório,
-sem virar aviso: as bifásicas têm arquivo próprio e as trifásicas ficam para uma
-etapa posterior.
+São três, um por contagem de fases, e só saem quando cargas **e** patamares
+estiverem importados. Cada carga vai para o arquivo do seu `NUMERO_FASES`
+mapeado no `fases2.json`; cargas de outra contagem são contabilizadas no
+relatório sem virar aviso, porque pertencem a outro arquivo.
 
-Todos os `LoadShape` vêm antes de todas as `Load`, porque o `daily` referencia
-um perfil que o OpenDSS precisa já ter definido:
+A modelagem é a mesma nos três: cada carga vira **uma `Load` monofásica por
+fase**, com seu próprio `LoadShape`. Nas multifásicas é o que preserva o
+**desequilíbrio entre as fases** — uma única `Load` de `phases=2` ou `3`
+distribuiria a potência igualmente, apagando justamente o que os patamares por
+fase descrevem. Todos os `LoadShape` vêm antes de todas as `Load`, porque o
+`daily` referencia um perfil que o OpenDSS precisa já ter definido.
+
+Uma carga trifásica `DEF` de código `CARGA-1` gera:
 
 ```
-New LoadShape.PERFIL-CARGA-1 npts=4 interval=1 mult=[1.500000 2.500000 3.500000 4.500000] qmult=[0.250000 1.250000 2.250000 3.250000]
-New Load.CARGA-1 phases=1 bus1=COD-B.1 conn=wye kV=7.96743 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1 class=1
+New LoadShape.PERFIL-CARGA-1-3F-D npts=4 interval=1 mult=[<PD por NPAT>] qmult=[<QD por NPAT>]
+New LoadShape.PERFIL-CARGA-1-3F-E npts=4 interval=1 mult=[<PE por NPAT>] qmult=[<QE por NPAT>]
+New LoadShape.PERFIL-CARGA-1-3F-F npts=4 interval=1 mult=[<PF por NPAT>] qmult=[<QF por NPAT>]
+
+New Load.CARGA-1-3F-D phases=1 bus1=COD-B.1 conn=wye kV=7.96743 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-D class=3
+New Load.CARGA-1-3F-E phases=1 bus1=COD-B.2 conn=wye kV=7.96743 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-E class=3
+New Load.CARGA-1-3F-F phases=1 bus1=COD-B.3 conn=wye kV=7.96743 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-F class=3
 ```
 
-- **Nome** — `CODIGO` da carga; quando vazio, cai no `CARGA_ID` com aviso. O
-  perfil recebe o mesmo nome com o prefixo `PERFIL-`.
-- **`bus1`** — `CODIGO` da barra da carga (não o `BARRA_ID`), seguido do código
-  `DSS` da configuração de fases. `FASES2=1` gera `.1`; `FASES2=4` gera `.1.0`,
-  preservando o nó de neutro.
+#### Nome
+
+Toda carga exportada segue `<CODIGO>-<N>F-<FASE>`, onde `N` é a contagem de
+fases (`1F`, `2F` ou `3F`) e `FASE` é a letra `D`, `E` ou `F`. O perfil recebe o
+mesmo nome com o prefixo `PERFIL-`. Uma carga monofásica `D` de código
+`CARGA-1` vira `CARGA-1-1F-D`; uma bifásica `DE`, `CARGA-1-2F-D` e
+`CARGA-1-2F-E`. Quando o `CODIGO` está vazio, o nome cai no `CARGA_ID` com
+aviso.
+
+As fases saem na ordem em que as letras aparecem no `NOME` do `fases2.json`:
+`FD` gera `-2F-F` antes de `-2F-D`. Letras fora de `D`/`E`/`F` são ignoradas, o
+que faz `DN` valer como `D` e `DEFN` como `DEF`.
+
+#### Demais parâmetros
+
+- **`bus1`** — `CODIGO` da barra da carga (não o `BARRA_ID`), seguido do nó da
+  fase. Nas **multifásicas** o nó vem do `DSS` da entrada **monofásica** daquela
+  letra (`D`→`1`, `E`→`2`, `F`→`3`); o `DSS` da entrada multifásica não é usado,
+  porque lista os nós em ordem crescente e não na ordem das letras — `FD` tem
+  `DSS "1.3"`, então parear posicionalmente inverteria as fases. Nas
+  **monofásicas** o `DSS` da própria entrada é usado inteiro, o que preserva o
+  nó de neutro explícito: `DN` gera `bus.1.0`.
 - **`kV`** — a **tensão de fase** do circuito: como `VNOM` é a tensão de linha,
   ela é dividida por `√3`. É a mesma conversão usada em `C1`, pela mesma razão —
   a carga é ligada entre fase e neutro (`conn=wye`).
 - **`kW=1 kvar=1`** — fixos de propósito. A potência real de cada patamar vive
   no `LoadShape`, e o OpenDSS multiplica os dois.
-- **`mult` e `qmult`** — os quatro patamares na ordem `NPAT` 0, 1, 2 e 3. As
-  colunas vêm da fase da carga: `D` usa `PD`/`QD`, `E` usa `PE`/`QE` e `F` usa
-  `PF`/`QF`. As variantes com neutro seguem a primeira letra, então `DN` também
-  usa `PD`/`QD`. Todos os valores são arredondados para **seis casas
-  decimais**.
-- **`class=1`** — sempre `1`, ao final da linha; marca a carga como monofásica
-  para identificação manual no arquivo, sem efeito elétrico no OpenDSS. As
-  bifásicas usam `class=2`.
+- **`mult` e `qmult`** — os quatro patamares na ordem `NPAT` 0, 1, 2 e 3, com
+  seis casas decimais. Cada fase lê só o seu par de colunas: `D` usa `PD`/`QD`,
+  `E` usa `PE`/`QE` e `F` usa `PF`/`QF`.
+- **`class`** — `1`, `2` ou `3` conforme a contagem de fases. Não tem efeito
+  elétrico no OpenDSS: serve para você identificar a origem da carga ao abrir o
+  arquivo.
+
+#### Descartes
+
+Uma carga **sai inteira ou não sai**. Se qualquer valor de qualquer uma das
+fases for inválido, ou se algum dos nomes já estiver em uso, nenhuma `Load`
+daquela carga é emitida e ela entra nos diagnósticos — carga pela metade
+subestimaria a demanda em silêncio. Um patamar **zerado é válido**; só vazio e
+não numérico invalidam.
+
+Também são descartadas e listadas no relatório as cargas sem os quatro patamares
+completos, com `FASES2` sem relação no `fases2.json`, com `NOME` que não resolva
+exatamente `N` fases distintas entre `D`, `E` e `F`, com uma fase sem terminal
+definido nas entradas monofásicas, ou com `VNOM` inválida. As monofásicas ainda
+exigem o `DSS` da própria entrada, já que é dele que sai o nó.
 
 A carga é associada ao circuito pela barra em que está pendurada. Uma barra
 compartilhada por dois circuitos selecionados exporta a carga uma vez só, com a
 `VNOM` do primeiro circuito escolhido; divergência de `VNOM` entre eles vira
 aviso sem descartar a carga.
 
-Cargas sem os quatro patamares completos, com valor de patamar não numérico, com
-`FASES2` sem relação no `fases2.json`, sem código `DSS`, com `NOME` fora de
-`D`/`E`/`F`, com `VNOM` inválida ou com nome repetido são descartadas e listadas
-no relatório final. Um patamar **zerado é válido** — só vazio e não numérico
-invalidam.
-
-### `cargasbifasicas.dss`
-
-Contém as cargas de `NUMERO_FASES=2`, sob as mesmas condições do arquivo
-monofásico. A modelagem, porém, é diferente: para preservar o **desequilíbrio
-entre as fases**, cada carga bifásica vira **duas `Load` monofásicas
-independentes**, uma por fase, cada uma com seu próprio `LoadShape`. Uma única
-`Load` bifásica distribuiria a potência igualmente entre as duas fases.
-
-Uma carga `DE` de código `CARGA-1` gera:
-
-```
-New LoadShape.PERFIL-CARGA-1-D npts=4 interval=1 mult=[<PD por NPAT>] qmult=[<QD por NPAT>]
-New LoadShape.PERFIL-CARGA-1-E npts=4 interval=1 mult=[<PE por NPAT>] qmult=[<QE por NPAT>]
-
-New Load.CARGA-1-D phases=1 bus1=COD-B.1 conn=wye kV=7.96743 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-D class=2
-New Load.CARGA-1-E phases=1 bus1=COD-B.2 conn=wye kV=7.96743 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-E class=2
-```
-
-- **Nomes** — o nome da carga recebe o sufixo `-<FASE>`, e o perfil de cada fase
-  acompanha. As duas fases saem na ordem em que as letras aparecem no `NOME`:
-  `FD` gera `-F` antes de `-D`.
-- **`bus1`** — o nó de cada fase vem do **terminal da fase isolada** no
-  `fases2.json`: a entrada de `NUMERO_FASES=1` cujo `NOME` começa com aquela
-  letra (`D`→`1`, `E`→`2`, `F`→`3`). O `DSS` da própria entrada bifásica **não**
-  é usado, porque ele lista os nós em ordem crescente e não na ordem das letras
-  — `FD` tem `DSS "1.3"`, então parear posicionalmente inverteria as fases.
-- **`mult`/`qmult`** — cada fase lê só o seu par de colunas: `D` usa `PD`/`QD`,
-  `E` usa `PE`/`QE` e `F` usa `PF`/`QF`.
-- **`class=2`** — marca a carga como bifásica, o análogo do `class=1` das
-  monofásicas.
-- `phases`, `conn`, `kV`, `model`, `kW`, `kvar` e o arredondamento de seis casas
-  seguem exatamente as regras do arquivo monofásico.
-
-**Uma carga bifásica sai inteira ou não sai.** Se qualquer um dos oito valores de
-qualquer uma das duas fases for inválido, ou se um dos dois nomes já estiver em
-uso, nenhuma das duas `Load` é emitida e a carga entra nos diagnósticos — meia
-carga no arquivo subestimaria a demanda em silêncio. Um `NOME` que não resolva
-exatamente duas fases distintas entre `D`, `E` e `F`, ou uma fase sem terminal
-definido no `fases2.json`, também descartam a carga.
-
-Os dois arquivos de carga criam objetos no mesmo namespace `Load.*`, então os
+Os três arquivos de carga criam objetos no mesmo namespace `Load.*`, então os
 nomes são verificados em conjunto, como acontece entre `trechos.dss` e
-`chaves.dss`: uma carga bifásica cujo nome de fase coincida com o de uma carga
-monofásica já exportada é descartada e reportada.
+`chaves.dss`. Na prática o infixo `-1F-`/`-2F-`/`-3F-` já impede a coincidência
+entre arquivos: duas cargas de contagens diferentes nunca geram o mesmo nome,
+mesmo com o mesmo `CODIGO`.
 
 Em todos os arquivos os nomes são saneados para `[A-Za-z0-9_-]` com acentos
 reduzidos a ASCII, porque no OpenDSS o ponto separa nós de barra e o espaço
 separa propriedades.
+
+### `<CODIGO>_Master.dss` e `<CODIGO>_Buscoords.csv`
+
+O master é o único arquivo executável: os demais só definem elementos. Ele leva
+o `CODIGO` do circuito no nome, com o `CIRC_ID` de reserva quando o código está
+vazio.
+
+```
+Clear
+Set DefaultBaseFrequency=60
+
+New Circuit.ALIMENTADOR
+~ bus1=COD-A.1.2.3 phases=3 basekv=13.8 pu=1 angle=0 frequency=60
+~ MVAsc3=999999 MVAsc1=999999
+
+Redirect trechos.dss
+Redirect chaves.dss
+Redirect cargasmonofasicas.dss
+Redirect cargasbifasicas.dss
+Redirect cargastrifasicas.dss
+
+Set Voltagebases=[13.8]
+calcvoltagebases
+Set mode=daily
+Set stepsize=1h
+Set number=4
+Set time=(0, 0)
+Solve
+
+Buscoords ALIMENTADOR_Buscoords.csv
+```
+
+A ordem das seções não é estética:
+
+- `Set DefaultBaseFrequency` vem **antes** do `New Circuit` porque a frequência
+  base é fixada na criação do circuito; depois seria tarde.
+- Os `Redirect` vêm **antes** do `calcvoltagebases`, que precisa de todas as
+  barras já definidas. São `Redirect`, não `Compile`, porque o `Compile` trocaria
+  o diretório corrente e quebraria o `Buscoords` relativo do fim. A lista reflete
+  exatamente os arquivos gerados: sem cargas importadas, só os dois de rede
+  aparecem.
+- `basekv` e `Set Voltagebases` são tensões de **linha** (o `VNOM` do circuito),
+  enquanto as cargas `conn=wye` usam `kV` de **fase**. As duas convenções
+  convivem: é assim que o OpenDSS espera cada grandeza.
+- `stepsize=1h` e `number=4` casam com os `LoadShape` de `npts=4 interval=1` —
+  o `interval` do OpenDSS é em **horas** —, então o `mode=daily` percorre
+  exatamente os quatro patamares.
+- `MVAsc3`/`MVAsc1` altíssimos dão a barra infinita usual de um estudo de
+  alimentador: a rede a montante da subestação não é modelada.
+
+O `<CODIGO>_Buscoords.csv` tem uma linha por barra do circuito, com o **mesmo
+nome** usado nos `Bus1`/`Bus2` dos trechos — é isso que faz o OpenDSS casar cada
+ponto com o elemento. As coordenadas saem em UTM, na unidade canônica do modelo
+(metros), com três casas decimais:
+
+```
+COD-A,500000.000,8000000.000
+```
+
+Duas barras cujo `CODIGO` colida após o saneamento geram uma coordenada só, com
+a segunda descartada e reportada — no OpenDSS a segunda linha apenas
+sobrescreveria a primeira.
+
+## Configurações do OpenDSS
+
+O menu **Configurações → OpenDSS…** define parâmetros globais aplicados a **todas
+as cargas** do modelo, tanto na exportação quanto no fluxo de potência — os dois
+caminhos geram o mesmo arquivo master.
+
+| Parâmetro | Padrão do OpenDSS | Efeito |
+|---|---|---|
+| `Vminpu` | 0,95 | Abaixo desta tensão a carga deixa de respeitar o seu `model` |
+| `Vmaxpu` | 1,05 | Acima desta tensão, idem |
+
+**Por que isso importa.** O exportador emite todas as cargas com `model=1`
+(potência constante). Fora da faixa `Vminpu`–`Vmaxpu`, o OpenDSS converte a carga
+para **impedância constante** — e não avisa. Num alimentador carregado, isso faz
+o estudo subestimar a queda de tensão justamente nas barras críticas. Num caso de
+20 km medido aqui, a barra de ponta aparece com **0,897 pu** usando o padrão e
+com **0,881 pu** ao baixar `Vminpu` para 0,80, que mantém a carga como potência
+constante.
+
+**A configuração é opcional.** A caixa *Aplicar limites de tensão às cargas*
+nasce **desmarcada**: nesse estado nenhum comando é acrescentado e o arquivo sai
+exatamente como saía antes — o OpenDSS aplica os padrões dele. Marcando-a, o
+master ganha duas linhas logo após os `Redirect`:
+
+```
+BatchEdit Load..* vminpu=0.8
+BatchEdit Load..* vmaxpu=1.2
+```
+
+A posição não é livre: `BatchEdit` é comando executivo e exige as `Load` já
+definidas pelos `Redirect`, além de ter de vir antes do `Solve`. O diálogo mostra
+as linhas exatas em uma pré-visualização antes de você confirmar.
+
+Os campos aceitam `Vminpu` entre 0,100 e 1,000 e `Vmaxpu` entre 1,000 e 2,000. A
+faixa precisa conter a tensão nominal — fora disso a carga estaria *sempre*
+convertida, o oposto da intenção. Vale notar que o OpenDSS **não** faz essa
+verificação: ele aceita `vminpu=-1` em silêncio, e é a aplicação que impede.
+
+Os valores ficam guardados entre sessões, como a preferência de tema. Alterá-los
+descarta um resultado de fluxo de potência já calculado, porque ele descreveria o
+modelo anterior.
+
+## Fluxo de potência
+
+O botão **Executar Fluxo de Potência** (na barra de ferramentas e em
+**Ferramentas**) resolve a rede sem sair da aplicação. Ele gera internamente
+exatamente os mesmos arquivos da exportação acima, compila o master no OpenDSS e
+traz as grandezas de volta para o painel lateral — o passo de exportar, abrir o
+OpenDSS e ler os resultados por fora deixa de ser necessário.
+
+### Instalação do motor
+
+O motor é uma dependência **opcional**. Sem ele a aplicação roda normalmente,
+apenas com o botão desabilitado e o motivo na dica:
+
+```powershell
+python -m pip install -e ".[opendss]"
+```
+
+### O que é executado
+
+- **Escopo:** um solve por circuito **visível** (os marcados em
+  **Visualizar > Circuitos…**). O `New Circuit` do OpenDSS energiza um
+  alimentador só, então cada circuito é resolvido na sua vez e os resultados são
+  acumulados. Trecho ou barra que pertença a mais de um circuito fica com o
+  resultado do **primeiro** processado — a mesma regra de dono usada na
+  exportação.
+- **Patamares:** os quatro (`NPAT` 0 a 3), colhidos um a um. O `Solve` do master
+  deixaria só o último; a aplicação reconduz a solução com `number=1` e resolve
+  patamar por patamar.
+- **Pré-requisitos:** os mesmos da exportação (barras, trechos, chaves,
+  circuitos, cabos e `fases2.json`). Cargas e patamares são opcionais, mas sem os
+  dois o modelo sai sem carga alguma e as correntes tendem a zero — a aplicação
+  pede confirmação antes de executar nesse caso.
+
+Os arquivos `.dss` gerados vão para uma pasta temporária e são apagados no fim.
+Quem quiser os arquivos deve usar **Exportar > OpenDSS…**, que continua
+inalterado.
+
+### Onde os resultados aparecem
+
+Selecionando um **trecho** ou uma **barra**, o painel lateral direito ganha a
+seção *Resultados do fluxo de potência*, com um seletor de grandeza e uma tabela
+de quatro linhas — uma por patamar — e uma coluna por fase:
+
+| Elemento | Grandezas no seletor |
+|---|---|
+| Trecho | **Corrente por fase (A)** — módulo no terminal de montante; **Carregamento (%)** — a corrente sobre o `IADM` do cabo de `CABOF_ID` |
+| Barra | **Tensão por nó (V)**; **Tensão (pu)** na base da barra |
+
+Chaves aparecem como trechos comuns nesta leitura: no modelo exportado elas são
+`Line` como as demais, e o `IADM` usado no carregamento é o do cabo do trecho
+onde a chave está.
+
+A seção só aparece quando aquele elemento tem resultado. Quando o cabo não tem
+`IADM` numérico, a opção de carregamento fica desabilitada e uma nota explica o
+motivo. Qualquer reimportação (trechos, chaves, circuitos, cabos, cargas ou
+patamares) descarta o resultado e esconde a seção — número velho não sobrevive a
+uma troca de dado.
+
+### Avisos
+
+Ao fim, a barra de status resume quantos circuitos foram resolvidos e quantos
+trechos e barras receberam resultado. Havendo ocorrências, abre-se um relatório
+com os detalhes:
+
+- circuitos que não puderam ser resolvidos (por exemplo, `VNOM` inválida, que
+  impede a geração do master) — os demais continuam sendo resolvidos;
+- patamares que não convergiram, identificados por circuito e `NPAT`;
+- nomes que diferem apenas em maiúsculas/minúsculas. O OpenDSS não distingue a
+  caixa dos nomes, então `TR-01a` e `TR-01A` seriam o mesmo objeto lá dentro; os
+  dois são descartados com aviso, porque atribuir a corrente ao trecho errado
+  seria pior do que não mostrar corrente alguma.
 
 ## Análise de ramais
 
@@ -448,7 +655,8 @@ cargas equivalentes, e **Enquadrar tudo** usa os limites da projeção ativa.
 ## Testes e benchmark
 
 Os testes do núcleo usam apenas a biblioteca padrão e NumPy. Os testes gráficos
-são executados quando PyQt6 estiver instalado.
+são executados quando PyQt6 estiver instalado. Nenhum teste exige
+`py-dss-interface`: o fluxo de potência é exercitado com um motor OpenDSS falso.
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -482,6 +690,7 @@ atualizado junto com mudanças relevantes de arquitetura.
 - `circuit_viewer/csv_import.py`: importação transacional.
 - `circuit_viewer/segment_import.py`: importação e vínculo dos trechos.
 - `circuit_viewer/switch_import.py`: importação e associação das chaves.
+- `circuit_viewer/regulator_import.py`: importação e associação dos reguladores.
 - `circuit_viewer/circuit_import.py`: importação e associação topológica dos circuitos.
 - `circuit_viewer/circuit_colors.py`: paleta contrastante e conversão OKLCH/sRGB.
 - `circuit_viewer/circuits_window.py`: tabela de visibilidade e cores dos circuitos.
@@ -489,6 +698,12 @@ atualizado junto com mudanças relevantes de arquitetura.
 - `circuit_viewer/branch_analysis.py`: análise topológica dos ramais.
 - `circuit_viewer/equivalent_network.py`: projeção e agregação das cargas equivalentes.
 - `circuit_viewer/branch_window.py`: tabela, filtro e avisos dos ramais.
+- `circuit_viewer/opendss_export.py`: geração dos arquivos `.dss` e do master.
+- `circuit_viewer/opendss_settings.py`: parâmetros globais das cargas e seus `BatchEdit`.
+- `circuit_viewer/opendss_settings_dialog.py`: diálogo de configurações e persistência.
+- `circuit_viewer/opendss_engine.py`: único acesso ao `py_dss_interface` (opcional).
+- `circuit_viewer/opendss_powerflow.py`: execução do fluxo e associação dos resultados.
+- `circuit_viewer/power_flow_table.py`: tabela de grandezas no painel lateral.
 - `circuit_viewer/mapa_tiles.py`: provedores, matemática XYZ, downloads e cache.
 - `circuit_viewer/graphics.py`: canvas, visão agregada e virtualização.
 - `circuit_viewer/main_window.py`: interface e integração assíncrona.

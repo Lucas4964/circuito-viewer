@@ -115,6 +115,28 @@ class SwitchRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class RegulatorRecord:
+    """Atributos de um regulador de tensão associado a um trecho da rede.
+
+    Todos os campos são texto, inclusive os numéricos por natureza (``SNOM``,
+    ``NPASSOS``, ``TAP``): eles são apenas exibidos, e a regra do projeto é
+    converter só onde há consumidor — como ``LoadRecord`` faz com ``snom``.
+    """
+
+    regulator_id: str
+    segment_id: str
+    external_id: str
+    code: str
+    connection: str
+    snom: str
+    regulation_range: str
+    step_count: str
+    tap: str
+    inom: str
+    vnom: str
+
+
+@dataclass(frozen=True, slots=True)
 class LoadRecord:
     """Atributos de uma carga associada a uma barra da rede."""
 
@@ -1211,6 +1233,176 @@ class SwitchModel:
         return None if record_index < 0 else self.record(record_index)
 
     def record_for_segment_id(self, segment_id: str) -> SwitchRecord | None:
+        segment_index = self.segments.index_for_id(segment_id)
+        if segment_index is None:
+            return None
+        return self.record_for_segment(segment_index)
+
+
+class RegulatorModel:
+    """Metadados de reguladores de tensão indexados pelos trechos onde estão.
+
+    Estruturalmente igual ao :class:`SwitchModel` — mesmo vínculo 1:1 com o
+    trecho e o mesmo ``_record_by_segment`` que torna "este trecho tem
+    regulador?" uma consulta O(1). A diferença está fora do modelo: reguladores
+    **não participam da topologia**. Eles não interrompem nem energizam nada,
+    então nem ``NetworkTopology.trace()`` nem ``CircuitCatalogModel`` os
+    consultam, e importá-los não invalida análise alguma.
+    """
+
+    __slots__ = (
+        "segments",
+        "_regulator_ids",
+        "_external_ids",
+        "_segment_indices",
+        "_codes",
+        "_connections",
+        "_snom_values",
+        "_regulation_ranges",
+        "_step_counts",
+        "_tap_values",
+        "_inom_values",
+        "_vnom_values",
+        "_by_id",
+        "_record_by_segment",
+        "source_path",
+    )
+
+    def __init__(
+        self,
+        segments: LineNetworkModel,
+        regulator_ids: Iterable[str],
+        segment_indices: Iterable[int] | IndexArray,
+        external_ids: Iterable[str],
+        codes: Iterable[str],
+        connections: Iterable[str],
+        snom_values: Iterable[str],
+        regulation_ranges: Iterable[str],
+        step_counts: Iterable[str],
+        tap_values: Iterable[str],
+        inom_values: Iterable[str],
+        vnom_values: Iterable[str],
+        *,
+        source_path: str | None = None,
+    ) -> None:
+        ids = tuple(str(value) for value in regulator_ids)
+        text_columns = tuple(
+            tuple(str(value) for value in values)
+            for values in (
+                external_ids,
+                codes,
+                connections,
+                snom_values,
+                regulation_ranges,
+                step_counts,
+                tap_values,
+                inom_values,
+                vnom_values,
+            )
+        )
+        associated_segments = np.ascontiguousarray(segment_indices, dtype=np.intp)
+        size = len(ids)
+        if size == 0:
+            raise ValueError("O modelo deve conter ao menos um regulador.")
+        if any(len(values) != size for values in text_columns):
+            raise ValueError(
+                "Todos os campos do regulador devem possuir o mesmo tamanho."
+            )
+        if associated_segments.ndim != 1 or associated_segments.size != size:
+            raise ValueError("Os índices de trechos devem formar um vetor compatível.")
+        if (
+            (associated_segments < 0).any()
+            or (associated_segments >= len(segments)).any()
+        ):
+            raise ValueError("Um regulador referencia um trecho inexistente.")
+
+        by_id: dict[str, int] = {}
+        record_by_segment = np.full(len(segments), -1, dtype=np.intp)
+        for index, (regulator_id, segment_index) in enumerate(
+            zip(ids, associated_segments, strict=True)
+        ):
+            if not regulator_id:
+                raise ValueError("REGU_ID não pode ser vazio.")
+            if regulator_id in by_id:
+                raise ValueError(f"REGU_ID duplicado no modelo: {regulator_id}")
+            segment = int(segment_index)
+            if record_by_segment[segment] >= 0:
+                raise ValueError(
+                    f"O trecho {segments.segment_ids[segment]} possui mais de "
+                    "um regulador."
+                )
+            by_id[regulator_id] = index
+            record_by_segment[segment] = index
+
+        associated_segments.setflags(write=False)
+        record_by_segment.setflags(write=False)
+        self.segments = segments
+        self._regulator_ids = ids
+        (
+            self._external_ids,
+            self._codes,
+            self._connections,
+            self._snom_values,
+            self._regulation_ranges,
+            self._step_counts,
+            self._tap_values,
+            self._inom_values,
+            self._vnom_values,
+        ) = text_columns
+        self._segment_indices = associated_segments
+        self._by_id = by_id
+        self._record_by_segment = record_by_segment
+        self.source_path = source_path
+
+    def __len__(self) -> int:
+        return len(self._regulator_ids)
+
+    @property
+    def regulator_ids(self) -> tuple[str, ...]:
+        return self._regulator_ids
+
+    @property
+    def codes(self) -> tuple[str, ...]:
+        return self._codes
+
+    @property
+    def segment_indices(self) -> IndexArray:
+        return self._segment_indices
+
+    @property
+    def record_indices_by_segment(self) -> IndexArray:
+        """Índice do registro por trecho, ou -1 para trecho sem regulador."""
+
+        return self._record_by_segment
+
+    def index_for_id(self, regulator_id: str) -> int | None:
+        return self._by_id.get(regulator_id)
+
+    def record(self, index: int) -> RegulatorRecord:
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        segment_index = int(self._segment_indices[index])
+        return RegulatorRecord(
+            regulator_id=self._regulator_ids[index],
+            segment_id=self.segments.segment_ids[segment_index],
+            external_id=self._external_ids[index],
+            code=self._codes[index],
+            connection=self._connections[index],
+            snom=self._snom_values[index],
+            regulation_range=self._regulation_ranges[index],
+            step_count=self._step_counts[index],
+            tap=self._tap_values[index],
+            inom=self._inom_values[index],
+            vnom=self._vnom_values[index],
+        )
+
+    def record_for_segment(self, segment_index: int) -> RegulatorRecord | None:
+        if not 0 <= int(segment_index) < len(self.segments):
+            raise IndexError(segment_index)
+        record_index = int(self._record_by_segment[int(segment_index)])
+        return None if record_index < 0 else self.record(record_index)
+
+    def record_for_segment_id(self, segment_id: str) -> RegulatorRecord | None:
         segment_index = self.segments.index_for_id(segment_id)
         if segment_index is None:
             return None

@@ -80,6 +80,7 @@ from .model import (
     LineNetworkModel,
     LoadModel,
     LoadPatternModel,
+    RegulatorModel,
     SwitchModel,
     UtmCrs,
 )
@@ -87,11 +88,22 @@ from .opendss_export import (
     LINES_FILENAME,
     SINGLE_PHASE_LOADS_FILENAME,
     SWITCHES_FILENAME,
+    THREE_PHASE_LOADS_FILENAME,
     TWO_PHASE_LOADS_FILENAME,
     OpenDssExportBundle,
+    master_filenames,
 )
 from .opendss_export_dialog import OpenDssExportDialog
+from .opendss_engine import power_flow_import_error
+from .opendss_powerflow import PowerFlowResult
+from .opendss_settings import OpenDssLoadSettings
+from .opendss_settings_dialog import (
+    OpenDssSettingsDialog,
+    load_opendss_settings,
+    save_opendss_settings,
+)
 from .overlap_report import CircuitOverlapReportWindow, OverlapReportTableModel
+from .power_flow_table import PowerFlowTableModel
 from .phase_config import (
     PHASE_COLORS,
     PhaseClassification,
@@ -101,6 +113,7 @@ from .phase_config import (
     load_phase_configuration,
 )
 from .phase_legend import PhaseLegend
+from .regulator_import import RegulatorLoadResult
 from .search import GlobalSearchIndex, SearchResult
 from .search_palette import SearchPalette
 from .segment_import import SegmentLoadResult
@@ -120,9 +133,33 @@ from .workers import (
     LoadImportWorker,
     LoadPatternImportWorker,
     OpenDssExportWorker,
+    PowerFlowWorker,
+    RegulatorImportWorker,
     SegmentImportWorker,
     SwitchImportWorker,
     EquivalentNetworkWorker,
+)
+
+
+# Arquivo e rótulo de cada contagem de fases, para a confirmação de
+# substituição e para o relatório final da exportação.
+_LOAD_EXPORT_FILES: tuple[tuple[int, str, str], ...] = (
+    (1, SINGLE_PHASE_LOADS_FILENAME, "monofásicas"),
+    (2, TWO_PHASE_LOADS_FILENAME, "bifásicas"),
+    (3, THREE_PHASE_LOADS_FILENAME, "trifásicas"),
+)
+
+# Grandezas do fluxo de potência oferecidas em cada página de detalhes, como
+# (chave, rótulo, casas decimais). Duas grandezas por página em vez de duas
+# tabelas: o painel já é denso, e o combobox troca a leitura sem empilhar mais
+# uma tabela de quatro linhas.
+_SEGMENT_QUANTITIES: tuple[tuple[str, str, int], ...] = (
+    ("current", "Corrente por fase (A)", 2),
+    ("loading", "Carregamento (%)", 1),
+)
+_BAR_QUANTITIES: tuple[tuple[str, str, int], ...] = (
+    ("voltage", "Tensão por nó (V)", 1),
+    ("per_unit", "Tensão (pu)", 4),
 )
 
 
@@ -248,6 +285,14 @@ class ImportChoiceDialog(QDialog):
         self.switches_button.clicked.connect(lambda: self._select("switches"))
         layout.addWidget(self.switches_button)
 
+        self.regulators_button = QPushButton("Importar reguladores…")
+        self.regulators_button.setToolTip(
+            "Carregar reguladores de tensão vinculados aos trechos importados"
+        )
+        self.regulators_button.setEnabled(has_bars and has_segments)
+        self.regulators_button.clicked.connect(lambda: self._select("regulators"))
+        layout.addWidget(self.regulators_button)
+
         self.circuits_button = QPushButton("Importar circuitos…")
         self.circuits_button.setToolTip(
             "Carregar circuitos e descobrir seus elementos na rede"
@@ -307,6 +352,9 @@ class MainWindow(QMainWindow):
         # apenas para marcar a ação correta do menu.
         self._settings = QSettings() if settings is None else settings
         self._theme = load_theme_preference(self._settings)
+        # Preferência de sessão para sessão, como o tema: os limites de tensão
+        # das cargas valem para a exportação e para o fluxo de potência.
+        self._opendss_load_settings = load_opendss_settings(self._settings)
 
         self._model: CircuitModel | None = None
         self._line_model: LineNetworkModel | None = None
@@ -315,6 +363,7 @@ class MainWindow(QMainWindow):
         self._load_pattern_model: LoadPatternModel | None = None
         self._switch_model: SwitchModel | None = None
         self._switch_item: SwitchNetworkItem | None = None
+        self._regulator_model: RegulatorModel | None = None
         self._cable_model: CableModel | None = None
         self._circuit_catalog: CircuitCatalogModel | None = None
         self._circuit_visibility: CircuitVisibilityController | None = None
@@ -352,6 +401,7 @@ class MainWindow(QMainWindow):
             | LoadImportWorker
             | LoadPatternImportWorker
             | SwitchImportWorker
+            | RegulatorImportWorker
             | CircuitImportWorker
             | None
         ) = None
@@ -375,6 +425,16 @@ class MainWindow(QMainWindow):
         self._export_progress_dialog: QProgressDialog | None = None
         self._export_directory: Path | None = None
         self._close_after_export = False
+        self._power_flow_thread: QThread | None = None
+        self._power_flow_worker: PowerFlowWorker | None = None
+        self._power_flow_progress_dialog: QProgressDialog | None = None
+        self._power_flow_snapshot: tuple[object, ...] | None = None
+        self._power_flow_result: PowerFlowResult | None = None
+        self._close_after_power_flow = False
+        # Grandezas do elemento selecionado, guardadas para o combobox poder
+        # trocar a leitura sem reconsultar o resultado.
+        self._segment_power_flow_currents = None
+        self._bar_power_flow_voltages = None
 
         self.scene = QGraphicsScene(self)
         self.scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
@@ -438,6 +498,7 @@ class MainWindow(QMainWindow):
         self._set_selection(None)
         self._update_status_counts(0)
         self._sync_export_availability()
+        self._sync_power_flow_availability()
         if self._phase_configuration_error is not None:
             QTimer.singleShot(0, self._show_phase_configuration_error)
 
@@ -561,10 +622,30 @@ class MainWindow(QMainWindow):
         self.opendss_export_action = QAction("OpenDSS…", self)
         self.opendss_export_action.setEnabled(False)
         self.opendss_export_action.setToolTip(
-            "Exportar trechos, chaves e cargas mono e bifásicas como elementos "
-            "do OpenDSS"
+            "Exportar trechos, chaves e cargas mono, bi e trifásicas como "
+            "elementos do OpenDSS"
         )
         self.opendss_export_action.triggered.connect(self._export_opendss)
+
+        self.opendss_settings_action = QAction("OpenDSS…", self)
+        self.opendss_settings_action.setToolTip(
+            "Definir parâmetros globais aplicados a todas as cargas do modelo "
+            "exportado e do fluxo de potência"
+        )
+        self.opendss_settings_action.triggered.connect(self._show_opendss_settings)
+
+        self.power_flow_action = QAction("Executar Fluxo de Potência", self)
+        self.power_flow_action.setEnabled(False)
+        self.power_flow_action.setToolTip(
+            "Converter os circuitos visíveis para o OpenDSS, resolver o fluxo "
+            "de potência e trazer correntes e tensões para o painel"
+        )
+        # Sem a biblioteca opcional o botão nunca habilita; o motivo vira a
+        # dica, no mesmo padrão de branches_action com a configuração de fases.
+        engine_error = power_flow_import_error()
+        if engine_error is not None:
+            self.power_flow_action.setToolTip(engine_error)
+        self.power_flow_action.triggered.connect(self._run_power_flow)
 
         self.branches_action = QAction("Ramais…", self)
         self.branches_action.setEnabled(False)
@@ -632,6 +713,13 @@ class MainWindow(QMainWindow):
 
         self.tools_menu = self.menuBar().addMenu("Ferramentas")
         self.tools_menu.addAction(self.branches_action)
+        self.tools_menu.addSeparator()
+        self.tools_menu.addAction(self.power_flow_action)
+
+        # Menu próprio: é estado global da aplicação, e não um passo de uma
+        # exportação ou de uma execução.
+        self.settings_menu = self.menuBar().addMenu("Configurações")
+        self.settings_menu.addAction(self.opendss_settings_action)
 
         toolbar = QToolBar("Ferramentas principais", self)
         toolbar.setObjectName("main_toolbar")
@@ -643,6 +731,8 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.fit_action)
         toolbar.addSeparator()
         toolbar.addAction(self.search_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.power_flow_action)
         self.addToolBar(toolbar)
 
     def _create_details_dock(self) -> None:
@@ -742,6 +832,71 @@ class MainWindow(QMainWindow):
             page_layout.addStretch(1)
             return page, table, labels, caption_labels, grid
 
+        def create_power_flow_section(
+            parent: QWidget,
+            quantities: tuple[tuple[str, str, int], ...],
+            object_name: str,
+        ):
+            """Seção de resultados: um combobox de grandeza e a tabela dela.
+
+            Nasce invisível — só aparece quando o elemento selecionado tem
+            resultado — e o combobox carrega a chave da grandeza no ``UserRole``
+            para o painel não depender da ordem dos itens.
+            """
+
+            section = QWidget(parent)
+            layout = QVBoxLayout(section)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(QLabel("Resultados do fluxo de potência"))
+
+            combo = QComboBox(section)
+            combo.setObjectName(object_name)
+            for key, caption, _ in quantities:
+                combo.addItem(caption, key)
+            layout.addWidget(combo)
+
+            model = PowerFlowTableModel(self)
+            table = QTableView(section)
+            table.setObjectName(f"{object_name}_table")
+            table.setModel(model)
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            table.setSelectionBehavior(
+                QAbstractItemView.SelectionBehavior.SelectItems
+            )
+            table.setSelectionMode(
+                QAbstractItemView.SelectionMode.ExtendedSelection
+            )
+            table.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+            table.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            table.verticalHeader().hide()
+            table.verticalHeader().setDefaultSectionSize(28)
+            table.horizontalHeader().setSectionResizeMode(
+                QHeaderView.ResizeMode.ResizeToContents
+            )
+            table.horizontalHeader().setStretchLastSection(False)
+            table.setStyleSheet("QTableView { gridline-color: palette(mid); }")
+            # Quatro patamares sempre; altura fixa evita a barra de rolagem
+            # vertical dentro de uma tabela que nunca cresce.
+            table.setFixedHeight(
+                table.horizontalHeader().sizeHint().height()
+                + 4 * table.verticalHeader().defaultSectionSize()
+                + 2 * table.frameWidth()
+                + 4
+            )
+            layout.addWidget(table)
+
+            note = QLabel("")
+            note.setWordWrap(True)
+            note.setVisible(False)
+            layout.addWidget(note)
+
+            section.setVisible(False)
+            return section, combo, model, note
+
         bar_fields = (
             ("bar_id", "BARRA_ID:"),
             ("code", "CODIGO:"),
@@ -758,6 +913,25 @@ class MainWindow(QMainWindow):
             self.bar_caption_labels,
             self.bar_details_grid,
         ) = create_table_page(bar_fields)
+        (
+            self.bar_power_flow_section,
+            self.bar_power_flow_combo,
+            self.bar_power_flow_model,
+            self.bar_power_flow_note,
+        ) = create_power_flow_section(
+            self.bar_details_page,
+            _BAR_QUANTITIES,
+            "bar_power_flow_quantity",
+        )
+        # Entra antes do addStretch(1) que create_table_page deixou no fim.
+        bar_layout = self.bar_details_page.layout()
+        bar_layout.insertWidget(
+            bar_layout.count() - 1,
+            self.bar_power_flow_section,
+        )
+        self.bar_power_flow_combo.currentIndexChanged.connect(
+            self._refresh_bar_power_flow_values
+        )
         self.details_stack.addWidget(self.bar_details_page)
 
         load_fields = (
@@ -969,6 +1143,50 @@ class MainWindow(QMainWindow):
         switch_layout.addWidget(self.switch_details_table)
         self.switch_details_section.setVisible(False)
         segment_layout.addWidget(self.switch_details_section)
+
+        regulator_fields = (
+            ("regulator_id", "REGU_ID:"),
+            ("segment_id", "TRECHO_ID:"),
+            ("external_id", "EXTERN_ID:"),
+            ("code", "CODIGO:"),
+            ("connection", "LIGACAO:"),
+            ("snom", "SNOM:"),
+            ("regulation_range", "FAIXA:"),
+            ("step_count", "NPASSOS:"),
+            ("tap", "TAP:"),
+            ("inom", "INOM:"),
+            ("vnom", "VNOM:"),
+        )
+        self.regulator_details_section = QWidget(self.segment_details_body)
+        regulator_layout = QVBoxLayout(self.regulator_details_section)
+        regulator_layout.setContentsMargins(0, 0, 0, 0)
+        self.regulator_table_title = QLabel("Dados do regulador")
+        regulator_layout.addWidget(self.regulator_table_title)
+        (
+            self.regulator_details_table,
+            self.regulator_detail_labels,
+            self.regulator_caption_labels,
+            self.regulator_details_grid,
+            _,
+        ) = create_table(regulator_fields, self.regulator_details_section)
+        regulator_layout.addWidget(self.regulator_details_table)
+        self.regulator_details_section.setVisible(False)
+        segment_layout.addWidget(self.regulator_details_section)
+
+        (
+            self.segment_power_flow_section,
+            self.segment_power_flow_combo,
+            self.segment_power_flow_model,
+            self.segment_power_flow_note,
+        ) = create_power_flow_section(
+            self.segment_details_body,
+            _SEGMENT_QUANTITIES,
+            "segment_power_flow_quantity",
+        )
+        self.segment_power_flow_combo.currentIndexChanged.connect(
+            self._refresh_segment_power_flow_values
+        )
+        segment_layout.addWidget(self.segment_power_flow_section)
         segment_layout.addStretch(1)
         self.segment_details_page.setWidget(self.segment_details_body)
         self.details_stack.addWidget(self.segment_details_page)
@@ -1052,6 +1270,8 @@ class MainWindow(QMainWindow):
             self._choose_load_patterns_csv()
         elif dialog.selected_kind == "switches":
             self._choose_switches_csv()
+        elif dialog.selected_kind == "regulators":
+            self._choose_regulators_csv()
         elif dialog.selected_kind == "circuits":
             self._choose_circuits_csv()
         elif dialog.selected_kind == "cables":
@@ -1120,6 +1340,23 @@ class MainWindow(QMainWindow):
         )
         if path:
             self._start_switch_import(path)
+
+    def _choose_regulators_csv(self) -> None:
+        if (
+            self._import_thread is not None
+            or self._branch_thread is not None
+            or self._equivalent_thread is not None
+            or self._line_model is None
+        ):
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importar reguladores",
+            "",
+            "Arquivos CSV (*.csv);;Todos os arquivos (*)",
+        )
+        if path:
+            self._start_regulator_import(path)
 
     def _choose_cables_csv(self) -> None:
         if (
@@ -1283,6 +1520,42 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_import_progress)
         worker.finished.connect(self._on_switch_import_finished)
+        worker.failed.connect(self._on_import_failed)
+        worker.cancelled.connect(self._on_import_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(lambda: worker.cancel())
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_import_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _start_regulator_import(self, path: str) -> None:
+        if self._line_model is None:
+            return
+        thread = QThread(self)
+        worker = RegulatorImportWorker(path, self._line_model)
+        worker.moveToThread(thread)
+
+        progress = QProgressDialog("Lendo reguladores…", "Cancelar", 0, 100, self)
+        progress.setWindowTitle("Importando reguladores")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._import_thread = thread
+        self._import_worker = worker
+        self._progress_dialog = progress
+        self._progress_entity = "reguladores"
+        self.import_action.setEnabled(False)
+        self.branches_action.setEnabled(False)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_import_progress)
+        worker.finished.connect(self._on_regulator_import_finished)
         worker.failed.connect(self._on_import_failed)
         worker.cancelled.connect(self._on_import_cancelled)
         worker.finished.connect(thread.quit)
@@ -1557,6 +1830,20 @@ class MainWindow(QMainWindow):
         )
         self._show_switch_import_report(result, topology_warnings)
 
+    def _on_regulator_import_finished(self, result: RegulatorLoadResult) -> None:
+        if self._progress_dialog is not None:
+            self._progress_dialog.setValue(100)
+            self._progress_dialog.close()
+        if self._line_model is None or result.model.segments is not self._line_model:
+            QMessageBox.critical(
+                self,
+                "Falha na importação",
+                "Os trechos foram alterados durante a importação dos reguladores.",
+            )
+            return
+        self._set_regulator_model(result.model)
+        self._show_regulator_import_report(result)
+
     def _on_circuit_import_finished(self, result: CircuitLoadResult) -> None:
         if self._progress_dialog is not None:
             self._progress_dialog.setValue(100)
@@ -1578,11 +1865,15 @@ class MainWindow(QMainWindow):
         self._show_circuit_import_report(result)
 
     def _set_line_model(self, model: LineNetworkModel | None) -> None:
+        self._invalidate_power_flow()
         self._invalidate_branch_analysis()
         if self._search_focus_active:
             self._set_selection(None)
         self._set_circuit_catalog(None)
         self._set_switch_model(None)
+        # Reguladores referenciam os trechos antigos por índice; trechos novos
+        # os invalidam. É a única cascata que eles têm.
+        self._set_regulator_model(None)
         if (
             self._selected_feature is not None
             and self._selected_feature.kind == "segment"
@@ -1619,6 +1910,7 @@ class MainWindow(QMainWindow):
         self.view.viewport().update()
 
     def _set_load_model(self, model: LoadModel | None) -> None:
+        self._invalidate_power_flow()
         self._invalidate_branch_analysis()
         if model is not None and model.bars is not self._model:
             raise ValueError("As cargas devem referenciar as barras exibidas.")
@@ -1645,6 +1937,9 @@ class MainWindow(QMainWindow):
     def _set_load_pattern_model(self, model: LoadPatternModel | None) -> None:
         if model is not None and model.loads is not self._load_model:
             raise ValueError("Os patamares devem pertencer às cargas exibidas.")
+        # Os patamares são a potência de cada Load exportada: trocá-los muda o
+        # fluxo inteiro.
+        self._invalidate_power_flow()
         rebuild_equivalent = (
             self.simplified_network_action.isChecked()
             and self._branch_analysis_result is not None
@@ -1669,13 +1964,16 @@ class MainWindow(QMainWindow):
         """Instala o catálogo de cabos.
 
         Não há cascata de invalidação: cabos são raiz e ninguém deriva deles —
-        os trechos apenas exibem o cabo correspondente quando ele existe.
+        os trechos apenas exibem o cabo correspondente quando ele existe. O
+        fluxo de potência é a exceção, porque consome R/X/QCAP e IADM do cabo.
         """
 
+        self._invalidate_power_flow()
         self._cable_model = model
         self.cable_table_model.set_catalog(model)
         self.cables_window.refresh()
         self._sync_export_availability()
+        self._sync_power_flow_availability()
         selection = self._selected_feature
         if selection is not None and selection.kind == "segment":
             self._set_selection(
@@ -1684,6 +1982,7 @@ class MainWindow(QMainWindow):
             )
 
     def _set_switch_model(self, model: SwitchModel | None) -> None:
+        self._invalidate_power_flow()
         self._invalidate_branch_analysis()
         if self._search_focus_active:
             self._set_selection(None)
@@ -1752,12 +2051,37 @@ class MainWindow(QMainWindow):
         self._sync_export_availability()
         self.view.viewport().update()
 
+    def _set_regulator_model(self, model: RegulatorModel | None) -> None:
+        """Instala os reguladores do trecho selecionável.
+
+        Setter sem cascata, ao contrário do de chaves: reguladores não
+        interrompem nem energizam nada, então não entram na topologia, não
+        reconstroem o catálogo de circuitos e não invalidam ramais, rede
+        simplificada nem fluxo de potência. O que muda é o painel e a busca.
+        """
+
+        if model is not None and model.segments is not self._line_model:
+            raise ValueError("Os reguladores devem referenciar os trechos exibidos.")
+        self._regulator_model = model
+        self.search_index.set_regulators(model, build_fields=False)
+        self.search_palette.schedule_field_index("regulator", model)
+        self._sync_search_availability()
+        selection = self._selected_feature
+        if selection is not None and selection.kind == "segment":
+            self._set_selection(
+                selection,
+                reveal_hidden=self._search_focus_active,
+            )
+        elif model is None:
+            self.regulator_details_section.setVisible(False)
+
     def _set_circuit_catalog(
         self,
         catalog: CircuitCatalogModel | None,
         checked: tuple[bool, ...] | None = None,
         colors: tuple[str, ...] | None = None,
     ) -> None:
+        self._invalidate_power_flow()
         self._invalidate_branch_analysis()
         if self._search_focus_active:
             self._set_selection(None)
@@ -1796,6 +2120,7 @@ class MainWindow(QMainWindow):
             self.overlap_report_window.hide()
         self._sync_branches_availability()
         self._sync_export_availability()
+        self._sync_power_flow_availability()
         self._apply_circuit_visibility()
 
     def _schedule_circuit_visibility_update(self, *args) -> None:  # noqa: ANN002
@@ -1896,6 +2221,9 @@ class MainWindow(QMainWindow):
                 self._set_selection(None)
         if self.search_palette.isVisible():
             self.search_palette.refresh_results()
+        # O escopo do fluxo de potência são os circuitos visíveis; desmarcar
+        # todos desabilita o botão.
+        self._sync_power_flow_availability()
         self.view.viewport().update()
 
     def _show_circuits_window(self) -> None:
@@ -1930,6 +2258,7 @@ class MainWindow(QMainWindow):
             and self._import_thread is None
             and self._branch_thread is None
             and self._equivalent_thread is None
+            and self._power_flow_thread is None
         )
         self.branches_action.setEnabled(available)
         self.simplified_network_action.setEnabled(available)
@@ -1948,6 +2277,55 @@ class MainWindow(QMainWindow):
             and self._export_thread is None
         )
 
+    def _visible_circuit_indices(self) -> tuple[int, ...]:
+        """Circuitos marcados na janela de circuitos, na ordem do catálogo.
+
+        É o escopo do fluxo de potência: o que o usuário está vendo na tela é o
+        que ele espera ver resolvido.
+        """
+
+        controller = self._circuit_visibility
+        if controller is None:
+            return ()
+        return tuple(
+            index
+            for index, checked in enumerate(controller.checked_states)
+            if checked
+        )
+
+    def _sync_power_flow_availability(self) -> None:
+        """Exige tudo que a exportação exige, mais a lib e um circuito visível."""
+
+        self.power_flow_action.setEnabled(
+            power_flow_import_error() is None
+            and self._model is not None
+            and self._line_model is not None
+            and self._switch_model is not None
+            and self._circuit_catalog is not None
+            and self._cable_model is not None
+            and self._phase_configuration is not None
+            and bool(self._visible_circuit_indices())
+            and self._import_thread is None
+            and self._branch_thread is None
+            and self._equivalent_thread is None
+            and self._power_flow_thread is None
+        )
+
+    def _invalidate_power_flow(self) -> None:
+        """Descarta o resultado: ele deriva de todos os modelos importados."""
+
+        if self._power_flow_worker is not None:
+            self._power_flow_worker.cancel()
+        self._power_flow_snapshot = None
+        self._power_flow_result = None
+        self._segment_power_flow_currents = None
+        self._bar_power_flow_voltages = None
+        self.segment_power_flow_model.clear()
+        self.bar_power_flow_model.clear()
+        self.segment_power_flow_section.setVisible(False)
+        self.bar_power_flow_section.setVisible(False)
+        self._sync_power_flow_availability()
+
     def _exportable_loads(self) -> tuple[LoadModel, LoadPatternModel] | None:
         """Cargas e patamares aptos a gerar os arquivos de carga.
 
@@ -1962,17 +2340,26 @@ class MainWindow(QMainWindow):
             return None
         return loads, patterns
 
-    def _expected_export_filenames(self) -> tuple[str, ...]:
-        """Arquivos que a exportação vai gravar no estado atual.
+    def _expected_export_filenames(
+        self,
+        circuit_indices: tuple[int, ...],
+    ) -> tuple[str, ...]:
+        """Arquivos que a exportação vai gravar para esta seleção.
 
         Sem cargas e patamares os arquivos de carga não são gerados, então eles
-        também não podem aparecer na confirmação de substituição.
+        também não podem aparecer na confirmação de substituição. O master e as
+        coordenadas dependem do circuito escolhido, por isso vêm de
+        ``master_filenames``.
         """
 
         names = [LINES_FILENAME, SWITCHES_FILENAME]
         if self._exportable_loads() is not None:
-            names.append(SINGLE_PHASE_LOADS_FILENAME)
-            names.append(TWO_PHASE_LOADS_FILENAME)
+            names.extend(filename for _, filename, _ in _LOAD_EXPORT_FILES)
+        catalog = self._circuit_catalog
+        if catalog is not None:
+            master = master_filenames(catalog, circuit_indices)
+            if master is not None:
+                names.extend(master)
         return tuple(names)
 
     def _export_opendss(self) -> None:
@@ -2002,7 +2389,7 @@ class MainWindow(QMainWindow):
         destination = Path(directory)
         existing = [
             name
-            for name in self._expected_export_filenames()
+            for name in self._expected_export_filenames(circuit_indices)
             if (destination / name).exists()
         ]
         if existing:
@@ -2038,7 +2425,8 @@ class MainWindow(QMainWindow):
             cables,
             configuration,
             circuit_indices,
-            *(exportable_loads or ()),
+            *(exportable_loads or (None, None)),
+            self._opendss_load_settings,
         )
         worker.moveToThread(thread)
 
@@ -2136,22 +2524,26 @@ class MainWindow(QMainWindow):
         result: OpenDssExportBundle,
         destination: Path,
     ) -> None:
-        summary = (
-            f"{result.lines.exported_count:n} trechos e "
-            f"{result.switches.exported_count:n} chaves"
+        captions = {count: caption for count, _, caption in _LOAD_EXPORT_FILES}
+        parts = [
+            f"{result.lines.exported_count:n} trechos",
+            f"{result.switches.exported_count:n} chaves",
+            *(
+                f"{load_result.exported_count:n} cargas {captions[count]}"
+                for count, load_result in result.loads_by_phase_count
+            ),
+        ]
+        summary = ", ".join(parts[:-1]) + f" e {parts[-1]}"
+        # O número na tela precisa ser rastreável até a configuração que o
+        # produziu; sem os limites ativos a menção só faria ruído.
+        limits = (
+            ""
+            if self._opendss_load_settings.is_default
+            else f" ({self._opendss_settings_summary(self._opendss_load_settings)})"
         )
-        if result.single_phase_loads is not None:
-            summary += (
-                f", {result.single_phase_loads.exported_count:n} cargas "
-                "monofásicas"
-            )
-        if result.two_phase_loads is not None:
-            summary += (
-                f" e {result.two_phase_loads.exported_count:n} cargas bifásicas"
-            )
         if not result.has_warnings:
             self.statusBar().showMessage(
-                f"{summary} exportados para {destination}.",
+                f"{summary} exportados para {destination}.{limits}",
                 5_000,
             )
             return
@@ -2161,31 +2553,255 @@ class MainWindow(QMainWindow):
         message.setText(f"{summary} foram exportados.")
         lines = [
             f"Pasta: {destination}",
+            *(
+                ()
+                if self._opendss_load_settings.is_default
+                else (self._opendss_settings_summary(self._opendss_load_settings),)
+            ),
             f"{LINES_FILENAME}: {result.lines.exported_count:n} trechos, "
             f"{result.lines.discarded_count:n} descartados",
             f"{SWITCHES_FILENAME}: {result.switches.exported_count:n} chaves "
             f"({result.switches.open_count:n} abertas), "
             f"{result.switches.discarded_count:n} descartadas",
         ]
-        for filename, caption, load_result in (
-            (
-                SINGLE_PHASE_LOADS_FILENAME,
-                "monofásicas",
-                result.single_phase_loads,
-            ),
-            (TWO_PHASE_LOADS_FILENAME, "bifásicas", result.two_phase_loads),
-        ):
-            if load_result is None:
-                continue
+        filenames = {count: filename for count, filename, _ in _LOAD_EXPORT_FILES}
+        for count, load_result in result.loads_by_phase_count:
             lines.append(
-                f"{filename}: {load_result.exported_count:n} cargas {caption} "
+                f"{filenames[count]}: {load_result.exported_count:n} cargas "
+                f"{captions[count]} "
                 f"({load_result.skipped_other_phase_count:n} de outras fases "
                 f"ignoradas), "
                 f"{load_result.discarded_count:n} descartadas"
             )
+        master = result.master
+        if master is not None and master.text:
+            lines.append(
+                f"{master.master_filename}: circuito, chamadas e solve; "
+                f"{master.buscoords_filename} com {master.bus_count:n} barras"
+            )
+        elif master is not None:
+            lines.append("Arquivo master não gerado; veja os detalhes.")
         message.setInformativeText("\n".join(lines))
         details = [
             f"{issue.segment_id}: {issue.reason}" for issue in result.issues
+        ]
+        if result.omitted_issues:
+            details.append(f"… e mais {result.omitted_issues:n} ocorrências.")
+        if details:
+            message.setDetailedText("\n".join(details))
+        message.exec()
+
+    def _run_power_flow(self) -> None:
+        """Resolve o fluxo de potência dos circuitos visíveis.
+
+        Ao contrário da exportação, esta operação entra na exclusão mútua com
+        importações e análises: o resultado volta para o estado da aplicação, e
+        não para o disco, então precisa dos mesmos modelos do início ao fim.
+        """
+
+        catalog = self._circuit_catalog
+        cables = self._cable_model
+        configuration = self._phase_configuration
+        if (
+            catalog is None
+            or cables is None
+            or configuration is None
+            or self._import_thread is not None
+            or self._branch_thread is not None
+            or self._equivalent_thread is not None
+            or self._power_flow_thread is not None
+        ):
+            return
+        circuit_indices = self._visible_circuit_indices()
+        if not circuit_indices:
+            self.statusBar().showMessage(
+                "Marque ao menos um circuito para executar o fluxo de potência.",
+                5_000,
+            )
+            return
+        exportable_loads = self._exportable_loads()
+        loads, patterns = exportable_loads or (None, None)
+        if exportable_loads is None:
+            answer = QMessageBox.question(
+                self,
+                "Executar sem cargas",
+                "Cargas e patamares não estão os dois importados, então o "
+                "modelo sairá sem carga alguma e as correntes tenderão a zero."
+                "\nDeseja executar mesmo assim?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        thread = QThread(self)
+        worker = PowerFlowWorker(
+            catalog,
+            cables,
+            configuration,
+            circuit_indices,
+            loads,
+            patterns,
+            self._opendss_load_settings,
+        )
+        worker.moveToThread(thread)
+
+        progress = QProgressDialog(
+            "Resolvendo o fluxo de potência…",
+            "Cancelar",
+            0,
+            len(circuit_indices),
+            self,
+        )
+        progress.setWindowTitle("Fluxo de potência")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._power_flow_thread = thread
+        self._power_flow_worker = worker
+        self._power_flow_progress_dialog = progress
+        self._power_flow_snapshot = (
+            catalog,
+            cables,
+            configuration,
+            loads,
+            patterns,
+        )
+        self.import_action.setEnabled(False)
+        self._sync_power_flow_availability()
+        self._sync_branches_availability()
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_power_flow_progress)
+        worker.finished.connect(self._on_power_flow_finished)
+        worker.failed.connect(self._on_power_flow_failed)
+        worker.cancelled.connect(self._on_power_flow_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(lambda: worker.cancel())
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_power_flow_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_power_flow_progress(self, current: int, total: int) -> None:
+        if self._power_flow_progress_dialog is None:
+            return
+        self._power_flow_progress_dialog.setMaximum(max(1, int(total)))
+        self._power_flow_progress_dialog.setValue(
+            min(int(current), max(1, int(total)))
+        )
+        self._power_flow_progress_dialog.setLabelText(
+            f"Resolvendo o fluxo de potência… {current:n}/{total:n} patamares"
+        )
+
+    def _close_power_flow_progress(self) -> None:
+        if self._power_flow_progress_dialog is not None:
+            self._power_flow_progress_dialog.close()
+
+    def _on_power_flow_finished(self, result: PowerFlowResult) -> None:
+        self._close_power_flow_progress()
+        # Revalidação por identidade, como nas demais análises: uma reimportação
+        # durante a execução torna o resultado um retrato de dados que já não
+        # estão na tela.
+        loads, patterns = self._exportable_loads() or (None, None)
+        current = (
+            self._circuit_catalog,
+            self._cable_model,
+            self._phase_configuration,
+            loads,
+            patterns,
+        )
+        snapshot = self._power_flow_snapshot
+        if snapshot is None or any(
+            expected is not actual
+            for expected, actual in zip(snapshot, current, strict=True)
+        ):
+            self.statusBar().showMessage(
+                "Os dados mudaram durante a execução; o resultado do fluxo de "
+                "potência foi descartado.",
+                5_000,
+            )
+            return
+        self._power_flow_result = result
+        # A seleção corrente precisa ser reaplicada para o painel refletir o
+        # resultado que acabou de chegar.
+        if self._selected_feature is not None:
+            self._set_selection(
+                self._selected_feature,
+                reveal_hidden=self._search_focus_active,
+                preserve_branch=True,
+            )
+        self._show_power_flow_report(result)
+
+    def _on_power_flow_failed(self, reason: str) -> None:
+        self._close_power_flow_progress()
+        QMessageBox.critical(self, "Falha no fluxo de potência", reason)
+
+    def _on_power_flow_cancelled(self) -> None:
+        self._close_power_flow_progress()
+        self.statusBar().showMessage(
+            "Fluxo de potência cancelado; nenhum resultado foi alterado.",
+            5_000,
+        )
+
+    def _on_power_flow_thread_finished(self) -> None:
+        self._power_flow_thread = None
+        self._power_flow_worker = None
+        self._power_flow_progress_dialog = None
+        self.import_action.setEnabled(True)
+        self._sync_power_flow_availability()
+        self._sync_branches_availability()
+        if self._close_after_power_flow:
+            self._close_after_power_flow = False
+            self.close()
+
+    def _show_power_flow_report(self, result: PowerFlowResult) -> None:
+        summary = (
+            f"{len(result.solved_circuits):n} circuito(s) resolvido(s): "
+            f"{len(result.segment_currents):n} trechos com corrente e "
+            f"{len(result.bar_voltages):n} barras com tensão"
+        )
+        if not result.has_warnings:
+            limits = (
+                ""
+                if self._opendss_load_settings.is_default
+                else f" {self._opendss_settings_summary(self._opendss_load_settings)}"
+            )
+            self.statusBar().showMessage(f"{summary}.{limits}", 6_000)
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle("Fluxo de potência concluído com avisos")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText(f"{summary}.")
+        lines = [
+            f"Patamares por circuito: {result.step_count:n}",
+            *(
+                ()
+                if self._opendss_load_settings.is_default
+                else (self._opendss_settings_summary(self._opendss_load_settings),)
+            ),
+        ]
+        if result.skipped_circuits:
+            lines.append(
+                "Circuitos não resolvidos: "
+                + ", ".join(result.skipped_circuits)
+            )
+        if result.unconverged:
+            lines.append(
+                f"{len(result.unconverged):n} patamar(es) não convergiram: "
+                + ", ".join(
+                    f"{circuit_id} (NPAT {step})"
+                    for circuit_id, step in result.unconverged[:10]
+                )
+            )
+        message.setInformativeText("\n".join(lines))
+        details = [
+            f"{issue.element_id}: {issue.reason}" for issue in result.issues
         ]
         if result.omitted_issues:
             details.append(f"… e mais {result.omitted_issues:n} ocorrências.")
@@ -2397,6 +3013,7 @@ class MainWindow(QMainWindow):
         self._branch_analysis_snapshot = None
         self.import_action.setEnabled(True)
         self._sync_branches_availability()
+        self._sync_power_flow_availability()
         if (
             self._pending_simplified_activation
             and self._branch_analysis_result is not None
@@ -2577,6 +3194,7 @@ class MainWindow(QMainWindow):
         self._equivalent_snapshot = None
         self.import_action.setEnabled(True)
         self._sync_branches_availability()
+        self._sync_power_flow_availability()
         if self._close_after_equivalent_build:
             self._close_after_equivalent_build = False
             self.close()
@@ -2842,6 +3460,35 @@ class MainWindow(QMainWindow):
             message.setDetailedText("\n".join(details))
         message.exec()
 
+    def _show_regulator_import_report(self, result: RegulatorLoadResult) -> None:
+        if not result.has_warnings:
+            self.statusBar().showMessage(
+                f"{result.valid_rows:n} reguladores importados com sucesso.",
+                5_000,
+            )
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle("Importação de reguladores concluída com avisos")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText(f"{result.valid_rows:n} reguladores foram importados.")
+        lines = [
+            f"Codificação: {result.encoding}",
+            f"Linhas de dados: {result.total_rows:n}",
+            f"Linhas válidas: {result.valid_rows:n}",
+            f"Linhas ignoradas: {result.invalid_rows:n}",
+        ]
+        if result.encoding.lower() == "cp1252":
+            lines.append("O arquivo não era UTF-8 e foi lido como CP-1252.")
+        message.setInformativeText("\n".join(lines))
+        details = [
+            f"Linha {issue.line_number}: {issue.reason}" for issue in result.issues
+        ]
+        if result.omitted_issues:
+            details.append(f"… e mais {result.omitted_issues:n} ocorrências.")
+        if details:
+            message.setDetailedText("\n".join(details))
+        message.exec()
+
     def _show_cable_import_report(self, result: CableCsvResult) -> None:
         if not result.has_warnings:
             message = f"{result.valid_rows:n} cabos importados com sucesso."
@@ -2927,6 +3574,7 @@ class MainWindow(QMainWindow):
         self.import_action.setEnabled(True)
         self._sync_branches_availability()
         self._sync_export_availability()
+        self._sync_power_flow_availability()
         if (
             self._pending_simplified_activation
             and self._branch_analysis_result is not None
@@ -3047,6 +3695,39 @@ class MainWindow(QMainWindow):
             apply_theme(app, theme)
         self.statusBar().showMessage(
             f"Tema {THEME_LABELS[theme].lower()} aplicado.", 4_000
+        )
+
+    def _show_opendss_settings(self) -> None:
+        """Coleta e memoriza os parâmetros globais aplicados às cargas.
+
+        Um resultado de fluxo calculado com a faixa anterior é descartado: ele
+        continuaria no painel como se descrevesse o modelo novo, que é o modo de
+        falha mais difícil de perceber neste recurso.
+        """
+
+        dialog = OpenDssSettingsDialog(self._opendss_load_settings, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = dialog.settings()
+        if chosen == self._opendss_load_settings:
+            return
+        self._opendss_load_settings = chosen
+        save_opendss_settings(self._settings, chosen)
+        self._invalidate_power_flow()
+        self.statusBar().showMessage(
+            self._opendss_settings_summary(chosen), 6_000
+        )
+
+    @staticmethod
+    def _opendss_settings_summary(settings: OpenDssLoadSettings) -> str:
+        if settings.is_default:
+            return (
+                "Limites de tensão das cargas desativados; o OpenDSS usará "
+                "0,95 e 1,05."
+            )
+        return (
+            "Limites de tensão das cargas: "
+            f"vminpu={settings.vminpu:n} e vmaxpu={settings.vmaxpu:n}."
         )
 
     def _create_satellite_manager(self, provider: Provedor) -> None:
@@ -3180,6 +3861,14 @@ class MainWindow(QMainWindow):
                     self.switch_details_section
                 ),
             )
+        elif result.kind == "regulator":
+            self.details_dock.setWindowTitle("Regulador selecionado")
+            QTimer.singleShot(
+                0,
+                lambda: self.segment_details_page.ensureWidgetVisible(
+                    self.regulator_details_section
+                ),
+            )
         elif result.kind == "circuit":
             self.statusBar().showMessage(
                 f"Circuito {result.entity_id}: origem {result.related_id}.",
@@ -3244,6 +3933,12 @@ class MainWindow(QMainWindow):
         if selection is None or selection.kind != "equivalent_load":
             self.equivalent_pattern_table_model.set_records(())
             self.equivalent_patterns_section.setVisible(False)
+        if selection is None or selection.kind != "segment":
+            self.segment_power_flow_section.setVisible(False)
+            # Só o trecho tem regulador; as demais páginas nunca o mostram.
+            self.regulator_details_section.setVisible(False)
+        if selection is None or selection.kind != "bar":
+            self.bar_power_flow_section.setVisible(False)
         if self._model is None or selection is None:
             self._selected_feature = None
             self.virtualizer.set_selected_index(None)
@@ -3256,6 +3951,7 @@ class MainWindow(QMainWindow):
                 *self.equivalent_detail_labels.values(),
                 *self.segment_detail_labels.values(),
                 *self.switch_detail_labels.values(),
+                *self.regulator_detail_labels.values(),
             ):
                 label.setText("—")
             self.switch_details_section.setVisible(False)
@@ -3284,6 +3980,7 @@ class MainWindow(QMainWindow):
             self.bar_detail_labels["zone"].setText(str(crs.zone))
             self.bar_detail_labels["hemisphere"].setText(crs.hemisphere)
             self.bar_detail_labels["epsg"].setText(str(crs.epsg))
+            self._sync_bar_power_flow_section(selection.index)
             self.details_dock.setWindowTitle("Barra selecionada")
             self.details_stack.setCurrentWidget(self.bar_details_page)
             return
@@ -3435,6 +4132,35 @@ class MainWindow(QMainWindow):
             for key, value in switch_values.items():
                 self.switch_detail_labels[key].setText(value or "—")
             self.switch_details_section.setVisible(True)
+
+        regulator_record = (
+            None
+            if self._regulator_model is None
+            else self._regulator_model.record_for_segment(selection.index)
+        )
+        if regulator_record is None:
+            for label in self.regulator_detail_labels.values():
+                label.setText("—")
+            self.regulator_details_section.setVisible(False)
+        else:
+            regulator_values = {
+                "regulator_id": regulator_record.regulator_id,
+                "segment_id": regulator_record.segment_id,
+                "external_id": regulator_record.external_id,
+                "code": regulator_record.code,
+                "connection": regulator_record.connection,
+                "snom": regulator_record.snom,
+                "regulation_range": regulator_record.regulation_range,
+                "step_count": regulator_record.step_count,
+                "tap": regulator_record.tap,
+                "inom": regulator_record.inom,
+                "vnom": regulator_record.vnom,
+            }
+            for key, value in regulator_values.items():
+                self.regulator_detail_labels[key].setText(value or "—")
+            self.regulator_details_section.setVisible(True)
+
+        self._sync_segment_power_flow_section(selection.index)
         self.details_dock.setWindowTitle("Trecho selecionado")
         self.details_stack.setCurrentWidget(self.segment_details_page)
         self.segment_details_page.verticalScrollBar().setValue(0)
@@ -3527,6 +4253,123 @@ class MainWindow(QMainWindow):
                 label.setToolTip("")
             label.setVisible(True)
 
+    @staticmethod
+    def _quantity_of(combo: QComboBox, quantities) -> tuple[str, int]:  # noqa: ANN001
+        """Chave e casas decimais da grandeza escolhida no combobox.
+
+        A chave viaja no ``UserRole`` para o painel não depender da posição do
+        item, e o ``next`` com padrão cobre o combobox ainda vazio.
+        """
+
+        key = combo.currentData()
+        return next(
+            ((name, decimals) for name, _, decimals in quantities if name == key),
+            (quantities[0][0], quantities[0][2]),
+        )
+
+    def _set_combo_item_enabled(
+        self,
+        combo: QComboBox,
+        key: str,
+        enabled: bool,
+    ) -> None:
+        model = combo.model()
+        for row in range(combo.count()):
+            if combo.itemData(row) != key:
+                continue
+            item = model.item(row) if hasattr(model, "item") else None
+            if item is not None:
+                item.setEnabled(enabled)
+            return
+
+    def _sync_segment_power_flow_section(self, segment_index: int) -> None:
+        """Mostra (ou esconde) os resultados do trecho selecionado."""
+
+        result = self._power_flow_result
+        currents = (
+            None
+            if result is None
+            else result.segment_currents.get(segment_index)
+        )
+        self._segment_power_flow_currents = currents
+        if currents is None:
+            self.segment_power_flow_model.clear()
+            self.segment_power_flow_note.setVisible(False)
+            self.segment_power_flow_section.setVisible(False)
+            return
+        # Sem IADM não há base para o percentual; a grandeza fica desabilitada
+        # em vez de exibir uma coluna de traços sem explicação.
+        self._set_combo_item_enabled(
+            self.segment_power_flow_combo,
+            "loading",
+            currents.ampacity is not None,
+        )
+        self.segment_power_flow_section.setVisible(True)
+        self._refresh_segment_power_flow_values()
+
+    def _refresh_segment_power_flow_values(self) -> None:
+        currents = self._segment_power_flow_currents
+        if currents is None:
+            return
+        key, decimals = self._quantity_of(
+            self.segment_power_flow_combo,
+            _SEGMENT_QUANTITIES,
+        )
+        if key == "loading":
+            ampacity = currents.ampacity
+            rows = tuple(
+                tuple(
+                    None if ampacity is None else value / ampacity * 100.0
+                    for value in row
+                )
+                for row in currents.magnitudes
+            )
+            self.segment_power_flow_note.setText(
+                "O cabo de fase do trecho não tem IADM numérico, então o "
+                "carregamento não pode ser calculado."
+                if ampacity is None
+                else f"Base: IADM de {ampacity:n} A."
+            )
+            self.segment_power_flow_note.setVisible(True)
+        else:
+            rows = currents.magnitudes
+            self.segment_power_flow_note.setVisible(False)
+        self.segment_power_flow_model.set_values(
+            currents.nodes,
+            rows,
+            decimals=decimals,
+        )
+
+    def _sync_bar_power_flow_section(self, bar_index: int) -> None:
+        """Mostra (ou esconde) os resultados da barra selecionada."""
+
+        result = self._power_flow_result
+        voltages = (
+            None if result is None else result.bar_voltages.get(bar_index)
+        )
+        self._bar_power_flow_voltages = voltages
+        if voltages is None:
+            self.bar_power_flow_model.clear()
+            self.bar_power_flow_section.setVisible(False)
+            return
+        self.bar_power_flow_section.setVisible(True)
+        self._refresh_bar_power_flow_values()
+
+    def _refresh_bar_power_flow_values(self) -> None:
+        voltages = self._bar_power_flow_voltages
+        if voltages is None:
+            return
+        key, decimals = self._quantity_of(
+            self.bar_power_flow_combo,
+            _BAR_QUANTITIES,
+        )
+        rows = voltages.per_unit if key == "per_unit" else voltages.magnitudes
+        self.bar_power_flow_model.set_values(
+            voltages.nodes,
+            rows,
+            decimals=decimals,
+        )
+
     def _show_coordinates(self, x: float, y: float) -> None:
         self.coordinate_status.setText(f"X: {x:.3f}   Y: {y:.3f}")
 
@@ -3578,6 +4421,15 @@ class MainWindow(QMainWindow):
             if self._export_worker is not None:
                 self._export_worker.cancel()
             self._close_after_export = True
+            event.ignore()
+            return
+        if (
+            self._power_flow_thread is not None
+            and self._power_flow_thread.isRunning()
+        ):
+            if self._power_flow_worker is not None:
+                self._power_flow_worker.cancel()
+            self._close_after_power_flow = True
             event.ignore()
             return
         self.search_palette.shutdown()

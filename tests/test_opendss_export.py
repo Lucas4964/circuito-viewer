@@ -21,17 +21,21 @@ from circuit_viewer.opendss_export import (
     MAX_REPORTED_ISSUES,
     SINGLE_PHASE_LOADS_FILENAME,
     SWITCHES_FILENAME,
+    THREE_PHASE_LOADS_FILENAME,
     TWO_PHASE_LOADS_FILENAME,
     build_export,
     build_line_export,
-    build_single_phase_load_export,
+    build_load_export,
+    build_master_export,
     build_switch_export,
-    build_two_phase_load_export,
+    bus_namer,
+    master_filenames,
     parse_number,
     phase_voltage_kv,
     positive_sequence_capacitance_nf,
     sanitize_dss_name,
 )
+from circuit_viewer.opendss_settings import OpenDssLoadSettings
 from circuit_viewer.phase_config import PhaseConfiguration, PhaseMappingEntry
 
 
@@ -51,6 +55,8 @@ PHASES = PhaseConfiguration(
         PhaseMappingEntry("10", "XY", 2, "1.2"),
         PhaseMappingEntry("11", "DE", 2, None),
         PhaseMappingEntry("13", "DEF", 3, "1.2.3"),
+        PhaseMappingEntry("14", "DEFN", 3, "1.2.3.0"),
+        PhaseMappingEntry("15", "DEX", 3, "1.2.3"),
         PhaseMappingEntry("99", "SEM_DSS", 3, None),
     )
 )
@@ -227,6 +233,39 @@ def make_patterns(
             )
         )
     return LoadPatternModel(loads, records_by_load)
+
+
+def export_loads(
+    loads: LoadModel,
+    patterns: LoadPatternModel,
+    phase_count: int,
+    **kwargs,  # noqa: ANN003
+):  # noqa: ANN201
+    """Exporta as cargas de uma contagem de fases com o catálogo padrão."""
+
+    catalog = kwargs.pop("catalog", None)
+    configuration = kwargs.pop("configuration", PHASES)
+    if catalog is None:
+        catalog = make_catalog(make_network(make_bars()))
+    return build_load_export(
+        catalog,
+        loads,
+        patterns,
+        configuration,
+        [0],
+        phase_count=phase_count,
+        **kwargs,
+    )
+
+
+def load_entries(text: str) -> list[str]:
+    return [line for line in data_lines(text) if line.startswith("New Load.")]
+
+
+def shape_entries(text: str) -> list[str]:
+    return [
+        line for line in data_lines(text) if line.startswith("New LoadShape.")
+    ]
 
 
 class CapacitanceTests(unittest.TestCase):
@@ -675,12 +714,140 @@ class SwitchExportTests(unittest.TestCase):
             )
 
 
+class ExportedSegmentIndexTests(unittest.TestCase):
+    """O índice reverso precisa descrever exatamente o arquivo emitido.
+
+    Ele é o que permite devolver um resultado de fluxo de potência ao trecho
+    certo, então qualquer divergência entre ``exported_segments`` e as linhas
+    ``New Line.<nome>`` atribuiria corrente ao elemento errado — em silêncio.
+    """
+
+    def _assert_matches_text(self, result, text: str) -> None:  # noqa: ANN001
+        emitted = data_lines(text)
+        self.assertEqual(len(result.exported_segments), len(emitted))
+        for (name, _), line in zip(result.exported_segments, emitted):
+            self.assertTrue(line.startswith(f"New Line.{name} "), line)
+
+    def test_lines_pair_every_name_with_its_segment(self) -> None:
+        network = make_network(make_bars())
+        catalog = make_catalog(network)
+
+        result = build_line_export(catalog, make_cables(), PHASES, [0])
+
+        self.assertEqual(result.exported_segments, (("TR-1", 0), ("TR-2", 1)))
+        self._assert_matches_text(result, result.text)
+
+    def test_line_fallback_name_is_the_one_indexed(self) -> None:
+        network = make_network(make_bars(), codes=("", "TR-2"))
+        catalog = make_catalog(network)
+
+        result = build_line_export(catalog, make_cables(), PHASES, [0])
+
+        # O CODIGO vazio faz o nome cair no TRECHO_ID; o índice acompanha.
+        self.assertEqual(result.exported_segments, (("T0", 0), ("TR-2", 1)))
+        self._assert_matches_text(result, result.text)
+
+    def test_discarded_line_stays_out_of_the_index(self) -> None:
+        network = make_network(make_bars(), codes=("TR-1", "TR-1"))
+        catalog = make_catalog(network)
+
+        result = build_line_export(catalog, make_cables(), PHASES, [0])
+
+        # O homônimo é descartado, então só o primeiro trecho é indexado.
+        self.assertEqual(result.exported_segments, (("TR-1", 0),))
+        self._assert_matches_text(result, result.text)
+
+    def test_shared_segment_is_indexed_once(self) -> None:
+        network = make_network(make_bars())
+        catalog = CircuitCatalogModel.build(
+            network,
+            None,
+            [
+                CircuitDefinition("C1", "B0", "A", "13,8"),
+                CircuitDefinition("C2", "B2", "B", "13,8"),
+            ],
+        )
+
+        result = build_line_export(catalog, make_cables(), PHASES, [0, 1])
+
+        self.assertEqual(
+            [index for _, index in result.exported_segments],
+            [0, 1],
+        )
+        self._assert_matches_text(result, result.text)
+
+    def test_switches_index_the_segment_the_switch_sits_on(self) -> None:
+        network = make_network(make_bars())
+        switches = make_switches(network)
+        catalog = make_catalog(network, switches=switches)
+
+        result = build_switch_export(catalog, PHASES, [0])
+
+        # O nome vem do CODIGO da chave, mas o índice é o do trecho.
+        self.assertEqual(result.exported_segments, (("CHV-001", 1),))
+        self._assert_matches_text(result, result.text)
+
+    def test_switch_discarded_by_a_reserved_name_stays_out(self) -> None:
+        network = make_network(make_bars())
+        switches = make_switches(network, codes=("TR-1",))
+        catalog = make_catalog(network, switches=switches)
+
+        result = build_switch_export(
+            catalog,
+            PHASES,
+            [0],
+            reserved_names=frozenset({"TR-1"}),
+        )
+
+        self.assertEqual(result.exported_segments, ())
+
+    def test_bundle_indexes_cover_both_network_files(self) -> None:
+        network = make_network(make_bars())
+        switches = make_switches(network)
+        catalog = make_catalog(network, switches=switches)
+
+        bundle = build_export(catalog, make_cables(), PHASES, [0])
+
+        self._assert_matches_text(bundle.lines, bundle.lines.text)
+        self._assert_matches_text(bundle.switches, bundle.switches.text)
+        indexed = {
+            index
+            for result in (bundle.lines, bundle.switches)
+            for _, index in result.exported_segments
+        }
+        self.assertEqual(indexed, {0, 1})
+
+
+class BusNamerTests(unittest.TestCase):
+    """``bus_namer`` é a única definição de nome de barra; amarra-se ao arquivo."""
+
+    def test_uses_the_code_with_the_bar_id_as_fallback(self) -> None:
+        network = make_network(make_bars(codes=("BARRA_A", "", "BARRA_C")))
+        catalog = make_catalog(network)
+
+        name = bus_namer(catalog)
+
+        self.assertEqual(name(0), "BARRA_A")
+        self.assertEqual(name(1), "B1")
+        self.assertEqual(name(2), "BARRA_C")
+
+    def test_matches_the_terminals_written_in_the_lines(self) -> None:
+        network = make_network(make_bars(codes=("BARRA A", "B.2", "BARRA_C")))
+        catalog = make_catalog(network)
+        name = bus_namer(catalog)
+
+        result = build_line_export(catalog, make_cables(), PHASES, [0])
+
+        first = data_lines(result.text)[0]
+        self.assertIn(f" Bus1={name(0)}.", first)
+        self.assertIn(f" Bus2={name(1)}.", first)
+
+
 class LoadExportTests(unittest.TestCase):
+    """Cargas monofásicas: uma Load por carga, com o nó do próprio FASES2."""
+
     def _export(self, loads: LoadModel, patterns: LoadPatternModel, **kwargs):  # noqa: ANN003, ANN202
-        catalog = kwargs.pop("catalog", None)
-        if catalog is None:
-            catalog = make_catalog(make_network(make_bars()))
-        return build_single_phase_load_export(catalog, loads, patterns, PHASES, [0], **kwargs)
+        return export_loads(loads, patterns, 1, **kwargs)
 
     def test_exports_a_load_with_its_daily_shape(self) -> None:
         bars = make_bars()
@@ -694,17 +861,16 @@ class LoadExportTests(unittest.TestCase):
         self.assertEqual(
             data_lines(result.text),
             [
-                "New LoadShape.PERFIL-CARGA-1 npts=4 interval=1"
+                "New LoadShape.PERFIL-CARGA-1-1F-D npts=4 interval=1"
                 " mult=[1.500000 2.500000 3.500000 4.500000]"
                 " qmult=[0.250000 1.250000 2.250000 3.250000]",
-                f"New Load.CARGA-1 phases=1 bus1=BARRA_B.1 conn=wye"
-                f" kV={kv:.6g} model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1"
+                f"New Load.CARGA-1-1F-D phases=1 bus1=BARRA_B.1 conn=wye"
+                f" kV={kv:.6g} model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-1F-D"
                 " class=1",
             ],
         )
 
     def test_every_shape_precedes_every_load(self) -> None:
-        # O daily= referencia um perfil que o OpenDSS precisa já ter definido.
         bars = make_bars()
         loads = make_loads(
             bars,
@@ -717,10 +883,7 @@ class LoadExportTests(unittest.TestCase):
         result = self._export(loads, make_patterns(loads))
 
         kinds = [line.split(".", 1)[0] for line in data_lines(result.text)]
-        self.assertEqual(
-            kinds,
-            ["New LoadShape", "New LoadShape", "New Load", "New Load"],
-        )
+        self.assertEqual(kinds, ["New LoadShape"] * 2 + ["New Load"] * 2)
 
     def test_phase_letter_chooses_the_pattern_columns(self) -> None:
         bars = make_bars()
@@ -734,9 +897,7 @@ class LoadExportTests(unittest.TestCase):
 
         result = self._export(loads, make_patterns(loads))
 
-        shapes = [
-            line for line in data_lines(result.text) if "LoadShape" in line
-        ]
+        shapes = shape_entries(result.text)
         # D consome PD/QD; E consome PE/QE.
         self.assertIn("mult=[1.500000 2.500000 3.500000 4.500000]", shapes[0])
         self.assertIn("qmult=[0.250000 1.250000 2.250000 3.250000]", shapes[0])
@@ -749,12 +910,14 @@ class LoadExportTests(unittest.TestCase):
 
         result = self._export(loads, make_patterns(loads))
 
-        entry = data_lines(result.text)[1]
-        # DN é monofásica: nó de neutro preservado e as colunas de D.
+        entry = load_entries(result.text)[0]
+        # DN é a fase D com neutro: o nó explícito do próprio DSS é preservado,
+        # mas o nome e as colunas de patamar são os de D.
         self.assertIn("bus1=BARRA_B.1.0", entry)
-        self.assertIn("phases=1", entry)
+        self.assertIn("New Load.COM-NEUTRO-1F-D ", entry)
         self.assertIn(
-            "mult=[1.500000 2.500000 3.500000 4.500000]", data_lines(result.text)[0]
+            "mult=[1.500000 2.500000 3.500000 4.500000]",
+            shape_entries(result.text)[0],
         )
 
     def test_pattern_values_are_rounded_to_six_decimals(self) -> None:
@@ -769,7 +932,7 @@ class LoadExportTests(unittest.TestCase):
 
         result = self._export(loads, make_patterns(loads, groups=groups))
 
-        shape = data_lines(result.text)[0]
+        shape = shape_entries(result.text)[0]
         self.assertIn("mult=[1.234568 1.234568 1.234568 1.234568]", shape)
         self.assertIn("qmult=[9.876543 9.876543 9.876543 9.876543]", shape)
 
@@ -787,7 +950,7 @@ class LoadExportTests(unittest.TestCase):
             "mult=[0.000000 0.000000 0.000000 0.000000]", result.text
         )
 
-    def test_polyphase_loads_are_counted_without_diagnostics(self) -> None:
+    def test_other_phase_counts_are_counted_without_diagnostics(self) -> None:
         bars = make_bars()
         loads = make_loads(
             bars,
@@ -838,7 +1001,7 @@ class LoadExportTests(unittest.TestCase):
         self.assertEqual(result.exported_count, 0)
         self.assertEqual(
             [issue.reason for issue in result.issues],
-            ["patamar com PD não numérico"],
+            ["patamar com PD não numérico; a carga inteira foi descartada"],
         )
 
     def test_unmapped_phase_is_reported(self) -> None:
@@ -869,8 +1032,11 @@ class LoadExportTests(unittest.TestCase):
         reasons = [issue.reason for issue in result.issues]
         self.assertEqual(result.exported_count, 0)
         self.assertIn("FASES2 '6' sem código DSS em fases2.json", reasons)
+        # "SEM_LETRA" tem dois E: não resolve uma fase única.
         self.assertIn(
-            "FASES2 '5' com NOME 'SEM_LETRA' fora de D, E ou F", reasons
+            "FASES2 '5' com NOME 'SEM_LETRA' não resolve 1 fase(s) "
+            "distinta(s) entre D, E e F",
+            reasons,
         )
 
     def test_empty_code_falls_back_to_the_load_id(self) -> None:
@@ -881,8 +1047,8 @@ class LoadExportTests(unittest.TestCase):
 
         self.assertEqual(result.exported_count, 1)
         self.assertEqual(result.discarded_count, 0)
-        self.assertIn("New Load.CG1 ", result.text)
-        self.assertIn("daily=PERFIL-CG1", result.text)
+        self.assertIn("New Load.CG1-1F-D ", result.text)
+        self.assertIn("daily=PERFIL-CG1-1F-D", result.text)
         self.assertTrue(result.has_warnings)
 
     def test_duplicate_names_are_discarded(self) -> None:
@@ -899,7 +1065,8 @@ class LoadExportTests(unittest.TestCase):
 
         self.assertEqual(result.exported_count, 1)
         self.assertIn(
-            "nome 'IGUAL' já usado pela carga CG1",
+            "nome 'IGUAL-1F-D' já usado pela carga CG1; a carga inteira foi "
+            "descartada",
             [issue.reason for issue in result.issues],
         )
 
@@ -916,8 +1083,8 @@ class LoadExportTests(unittest.TestCase):
         )
         loads = make_loads(bars)
 
-        result = build_single_phase_load_export(
-            catalog, loads, make_patterns(loads), PHASES, [1]
+        result = build_load_export(
+            catalog, loads, make_patterns(loads), PHASES, [1], phase_count=1
         )
 
         # O circuito 2 parte de B2 e alcança as mesmas barras; ainda assim a
@@ -938,8 +1105,8 @@ class LoadExportTests(unittest.TestCase):
         )
         loads = make_loads(bars)
 
-        result = build_single_phase_load_export(
-            catalog, loads, make_patterns(loads), PHASES, [0, 1]
+        result = build_load_export(
+            catalog, loads, make_patterns(loads), PHASES, [0, 1], phase_count=1
         )
 
         self.assertEqual(result.exported_count, 1)
@@ -956,9 +1123,7 @@ class LoadExportTests(unittest.TestCase):
         catalog = make_catalog(network, voltage="")
         loads = make_loads(network.bars)
 
-        result = build_single_phase_load_export(
-            catalog, loads, make_patterns(loads), PHASES, [0]
-        )
+        result = self._export(loads, make_patterns(loads), catalog=catalog)
 
         self.assertEqual(result.exported_count, 0)
         self.assertIn(
@@ -984,21 +1149,17 @@ class LoadExportTests(unittest.TestCase):
 
 
 class TwoPhaseLoadExportTests(unittest.TestCase):
-    def _export(self, loads: LoadModel, patterns: LoadPatternModel, **kwargs):  # noqa: ANN003, ANN202
-        catalog = kwargs.pop("catalog", None)
-        configuration = kwargs.pop("configuration", PHASES)
-        if catalog is None:
-            catalog = make_catalog(make_network(make_bars()))
-        return build_two_phase_load_export(
-            catalog, loads, patterns, configuration, [0], **kwargs
-        )
+    """Bifásicas: duas Load independentes, uma por fase."""
 
-    def _two_phase_loads(self, bars: CircuitModel, phases: str) -> LoadModel:
+    def _export(self, loads: LoadModel, patterns: LoadPatternModel, **kwargs):  # noqa: ANN003, ANN202
+        return export_loads(loads, patterns, 2, **kwargs)
+
+    def _loads(self, bars: CircuitModel, phases: str) -> LoadModel:
         return make_loads(bars, phases=(phases,))
 
     def test_one_load_becomes_two_independent_single_phase_loads(self) -> None:
         bars = make_bars()
-        loads = self._two_phase_loads(bars, "7")  # DE
+        loads = self._loads(bars, "7")  # DE
 
         result = self._export(loads, make_patterns(loads))
 
@@ -1008,17 +1169,17 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
         self.assertEqual(
             data_lines(result.text),
             [
-                "New LoadShape.PERFIL-CARGA-1-D npts=4 interval=1"
+                "New LoadShape.PERFIL-CARGA-1-2F-D npts=4 interval=1"
                 " mult=[1.500000 2.500000 3.500000 4.500000]"
                 " qmult=[0.250000 1.250000 2.250000 3.250000]",
-                "New LoadShape.PERFIL-CARGA-1-E npts=4 interval=1"
+                "New LoadShape.PERFIL-CARGA-1-2F-E npts=4 interval=1"
                 " mult=[2.500000 3.500000 4.500000 5.500000]"
                 " qmult=[0.350000 1.350000 2.350000 3.350000]",
-                f"New Load.CARGA-1-D phases=1 bus1=BARRA_B.1 conn=wye"
-                f" kV={kv:.6g} model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-D"
+                f"New Load.CARGA-1-2F-D phases=1 bus1=BARRA_B.1 conn=wye"
+                f" kV={kv:.6g} model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-2F-D"
                 " class=2",
-                f"New Load.CARGA-1-E phases=1 bus1=BARRA_B.2 conn=wye"
-                f" kV={kv:.6g} model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-E"
+                f"New Load.CARGA-1-2F-E phases=1 bus1=BARRA_B.2 conn=wye"
+                f" kV={kv:.6g} model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-2F-E"
                 " class=2",
             ],
         )
@@ -1027,33 +1188,31 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
         # "FD" tem DSS "1.3": parear posicionalmente daria F=1 e D=3. O terminal
         # de cada letra vem da entrada monofásica, então F=3 e D=1.
         bars = make_bars()
-        loads = self._two_phase_loads(bars, "9")  # FD
+        loads = self._loads(bars, "9")  # FD
 
         result = self._export(loads, make_patterns(loads))
 
-        entries = [line for line in data_lines(result.text) if " Load." in line]
+        entries = load_entries(result.text)
         self.assertEqual(
             [line.split(" bus1=")[1].split(" ")[0] for line in entries],
             ["BARRA_B.3", "BARRA_B.1"],
         )
         # A ordem das fases segue as letras do NOME, não a ordem dos nós.
-        self.assertIn("New Load.CARGA-1-F ", entries[0])
-        self.assertIn("New Load.CARGA-1-D ", entries[1])
+        self.assertIn("New Load.CARGA-1-2F-F ", entries[0])
+        self.assertIn("New Load.CARGA-1-2F-D ", entries[1])
 
     def test_each_phase_reads_its_own_pattern_columns(self) -> None:
         bars = make_bars()
-        loads = self._two_phase_loads(bars, "8")  # EF
+        loads = self._loads(bars, "8")  # EF
 
         result = self._export(loads, make_patterns(loads))
 
-        shapes = [
-            line for line in data_lines(result.text) if "LoadShape" in line
-        ]
+        shapes = shape_entries(result.text)
         # E consome PE/QE; F consome PF/QF.
-        self.assertIn("PERFIL-CARGA-1-E", shapes[0])
+        self.assertIn("PERFIL-CARGA-1-2F-E", shapes[0])
         self.assertIn("mult=[2.500000 3.500000 4.500000 5.500000]", shapes[0])
         self.assertIn("qmult=[0.350000 1.350000 2.350000 3.350000]", shapes[0])
-        self.assertIn("PERFIL-CARGA-1-F", shapes[1])
+        self.assertIn("PERFIL-CARGA-1-2F-F", shapes[1])
         self.assertIn("mult=[3.500000 4.500000 5.500000 6.500000]", shapes[1])
         self.assertIn("qmult=[0.450000 1.450000 2.450000 3.450000]", shapes[1])
 
@@ -1075,7 +1234,7 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
     def test_zeroed_pattern_is_valid(self) -> None:
         # Zero é diferente de vazio: uma fase sem consumo ainda é exportável.
         bars = make_bars()
-        loads = self._two_phase_loads(bars, "7")
+        loads = self._loads(bars, "7")
         groups = {0: tuple(("0",) * 6 for _ in range(4))}
 
         result = self._export(loads, make_patterns(loads, groups=groups))
@@ -1088,7 +1247,7 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
 
     def test_one_invalid_phase_discards_the_whole_load(self) -> None:
         bars = make_bars()
-        loads = self._two_phase_loads(bars, "7")  # DE
+        loads = self._loads(bars, "7")  # DE
         # PD válido, PE vazio: nenhuma das duas fases pode sair.
         groups = {0: tuple(("1", "", "0", "1", "1", "1") for _ in range(4))}
 
@@ -1098,10 +1257,7 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
         self.assertEqual(data_lines(result.text), [])
         self.assertEqual(
             [issue.reason for issue in result.issues],
-            [
-                "patamar com PE não numérico; a carga bifásica inteira foi "
-                "descartada"
-            ],
+            ["patamar com PE não numérico; a carga inteira foi descartada"],
         )
 
     def test_other_phase_counts_are_counted_without_diagnostics(self) -> None:
@@ -1122,20 +1278,20 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
 
     def test_name_without_two_phases_is_reported(self) -> None:
         bars = make_bars()
-        loads = self._two_phase_loads(bars, "10")  # NOME "XY"
+        loads = self._loads(bars, "10")  # NOME "XY"
 
         result = self._export(loads, make_patterns(loads))
 
         self.assertEqual(result.exported_count, 0)
         self.assertIn(
-            "FASES2 '10' com NOME 'XY' não resolve duas fases distintas "
+            "FASES2 '10' com NOME 'XY' não resolve 2 fase(s) distinta(s) "
             "entre D, E e F",
             [issue.reason for issue in result.issues],
         )
 
     def test_letter_without_a_terminal_is_reported(self) -> None:
         bars = make_bars()
-        loads = self._two_phase_loads(bars, "8")  # EF, sem entrada de F
+        loads = self._loads(bars, "8")  # EF, sem entrada de F
 
         result = self._export(
             loads, make_patterns(loads), configuration=PHASES_WITHOUT_F
@@ -1150,6 +1306,16 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
             ],
         )
 
+    def test_missing_dss_does_not_matter_for_multi_phase(self) -> None:
+        # O DSS da entrada bifásica não é usado: os nós vêm das monofásicas.
+        bars = make_bars()
+        loads = self._loads(bars, "11")  # DE sem DSS
+
+        result = self._export(loads, make_patterns(loads))
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertEqual(result.issues, ())
+
     def test_empty_code_falls_back_to_the_load_id(self) -> None:
         bars = make_bars()
         loads = make_loads(bars, codes=("",), phases=("7",))
@@ -1158,8 +1324,8 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
 
         self.assertEqual(result.exported_count, 1)
         self.assertEqual(result.discarded_count, 0)
-        self.assertIn("New Load.CG1-D ", result.text)
-        self.assertIn("New Load.CG1-E ", result.text)
+        self.assertIn("New Load.CG1-2F-D ", result.text)
+        self.assertIn("New Load.CG1-2F-E ", result.text)
         self.assertTrue(result.has_warnings)
 
     def test_duplicate_names_discard_the_second_load_entirely(self) -> None:
@@ -1176,8 +1342,28 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
 
         self.assertEqual(result.exported_count, 1)
         self.assertIn(
-            "nome 'IGUAL-D' já usado pela carga CG1; a carga bifásica inteira "
-            "foi descartada",
+            "nome 'IGUAL-2F-D' já usado pela carga CG1; a carga inteira foi "
+            "descartada",
+            [issue.reason for issue in result.issues],
+        )
+
+    def test_name_reserved_by_another_file_discards_the_load(self) -> None:
+        # O infixo -NF- torna a colisão entre arquivos impossível na prática,
+        # então a reserva só se exercita passando os nomes diretamente.
+        bars = make_bars()
+        loads = self._loads(bars, "7")
+
+        result = self._export(
+            loads,
+            make_patterns(loads),
+            reserved_names=frozenset({"CARGA-1-2F-E"}),
+        )
+
+        self.assertEqual(result.exported_count, 0)
+        self.assertEqual(data_lines(result.text), [])
+        self.assertIn(
+            "nome 'CARGA-1-2F-E' já usado por uma carga de outra contagem de "
+            "fases; a carga inteira foi descartada",
             [issue.reason for issue in result.issues],
         )
 
@@ -1202,7 +1388,7 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
     def test_circuit_without_voltage_discards_the_load(self) -> None:
         network = make_network(make_bars())
         catalog = make_catalog(network, voltage="")
-        loads = self._two_phase_loads(network.bars, "7")
+        loads = self._loads(network.bars, "7")
 
         result = self._export(loads, make_patterns(loads), catalog=catalog)
 
@@ -1223,10 +1409,10 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
                 CircuitDefinition("C2", "B2", "OUTRO", "34,5"),
             ],
         )
-        loads = self._two_phase_loads(bars, "7")
+        loads = self._loads(bars, "7")
 
-        result = build_two_phase_load_export(
-            catalog, loads, make_patterns(loads), PHASES, [0, 1]
+        result = build_load_export(
+            catalog, loads, make_patterns(loads), PHASES, [0, 1], phase_count=2
         )
 
         self.assertEqual(result.exported_count, 1)
@@ -1239,7 +1425,7 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
 
     def test_progress_and_cancellation(self) -> None:
         bars = make_bars()
-        loads = self._two_phase_loads(bars, "7")
+        loads = self._loads(bars, "7")
         patterns = make_patterns(loads)
         events: list[tuple[int, int]] = []
 
@@ -1254,6 +1440,526 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
             self._export(loads, patterns, cancel_check=lambda: True)
 
 
+class ThreePhaseLoadExportTests(unittest.TestCase):
+    """Trifásicas: três Load independentes, uma por fase."""
+
+    def _export(self, loads: LoadModel, patterns: LoadPatternModel, **kwargs):  # noqa: ANN003, ANN202
+        return export_loads(loads, patterns, 3, **kwargs)
+
+    def _loads(self, bars: CircuitModel, phases: str = "13") -> LoadModel:
+        return make_loads(bars, phases=(phases,))
+
+    def test_one_load_becomes_three_independent_single_phase_loads(self) -> None:
+        bars = make_bars()
+        loads = self._loads(bars)  # DEF
+
+        result = self._export(loads, make_patterns(loads))
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertFalse(result.has_warnings)
+        kv = phase_voltage_kv(13.8)
+        self.assertEqual(
+            data_lines(result.text),
+            [
+                "New LoadShape.PERFIL-CARGA-1-3F-D npts=4 interval=1"
+                " mult=[1.500000 2.500000 3.500000 4.500000]"
+                " qmult=[0.250000 1.250000 2.250000 3.250000]",
+                "New LoadShape.PERFIL-CARGA-1-3F-E npts=4 interval=1"
+                " mult=[2.500000 3.500000 4.500000 5.500000]"
+                " qmult=[0.350000 1.350000 2.350000 3.350000]",
+                "New LoadShape.PERFIL-CARGA-1-3F-F npts=4 interval=1"
+                " mult=[3.500000 4.500000 5.500000 6.500000]"
+                " qmult=[0.450000 1.450000 2.450000 3.450000]",
+                f"New Load.CARGA-1-3F-D phases=1 bus1=BARRA_B.1 conn=wye"
+                f" kV={kv:.6g} model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-D"
+                " class=3",
+                f"New Load.CARGA-1-3F-E phases=1 bus1=BARRA_B.2 conn=wye"
+                f" kV={kv:.6g} model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-E"
+                " class=3",
+                f"New Load.CARGA-1-3F-F phases=1 bus1=BARRA_B.3 conn=wye"
+                f" kV={kv:.6g} model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-F"
+                " class=3",
+            ],
+        )
+
+    def test_neutral_in_the_name_is_ignored(self) -> None:
+        # "DEFN" resolve as mesmas três fases de "DEF": o N não é fase.
+        bars = make_bars()
+        loads = self._loads(bars, "14")
+
+        result = self._export(loads, make_patterns(loads))
+
+        entries = load_entries(result.text)
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(
+            [line.split(" bus1=")[1].split(" ")[0] for line in entries],
+            ["BARRA_B.1", "BARRA_B.2", "BARRA_B.3"],
+        )
+        self.assertIn("New Load.CARGA-1-3F-D ", entries[0])
+
+    def test_every_shape_precedes_every_load(self) -> None:
+        bars = make_bars()
+        loads = make_loads(
+            bars,
+            load_ids=("CG1", "CG2"),
+            bar_indices=(1, 2),
+            codes=("CARGA-1", "CARGA-2"),
+            phases=("13", "13"),
+        )
+
+        result = self._export(loads, make_patterns(loads))
+
+        kinds = [line.split(".", 1)[0] for line in data_lines(result.text)]
+        self.assertEqual(kinds, ["New LoadShape"] * 6 + ["New Load"] * 6)
+
+    def test_zeroed_pattern_is_valid(self) -> None:
+        bars = make_bars()
+        loads = self._loads(bars)
+        groups = {0: tuple(("0",) * 6 for _ in range(4))}
+
+        result = self._export(loads, make_patterns(loads, groups=groups))
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertEqual(result.discarded_count, 0)
+        self.assertEqual(len(load_entries(result.text)), 3)
+
+    def test_one_invalid_phase_discards_the_whole_load(self) -> None:
+        bars = make_bars()
+        loads = self._loads(bars)
+        # PD e PE válidos, PF vazio: nenhuma das três fases pode sair.
+        groups = {0: tuple(("1", "1", "", "1", "1", "1") for _ in range(4))}
+
+        result = self._export(loads, make_patterns(loads, groups=groups))
+
+        self.assertEqual(result.exported_count, 0)
+        self.assertEqual(data_lines(result.text), [])
+        self.assertEqual(
+            [issue.reason for issue in result.issues],
+            ["patamar com PF não numérico; a carga inteira foi descartada"],
+        )
+
+    def test_other_phase_counts_are_counted_without_diagnostics(self) -> None:
+        bars = make_bars()
+        loads = make_loads(
+            bars,
+            load_ids=("CG1", "CG2", "CG3"),
+            bar_indices=(1, 2, 1),
+            codes=("MONO", "BI", "TRI"),
+            phases=("1", "7", "13"),
+        )
+
+        result = self._export(loads, make_patterns(loads))
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertEqual(result.skipped_other_phase_count, 2)
+        self.assertEqual(result.issues, ())
+
+    def test_name_without_three_phases_is_reported(self) -> None:
+        bars = make_bars()
+        loads = self._loads(bars, "15")  # NOME "DEX"
+
+        result = self._export(loads, make_patterns(loads))
+
+        self.assertEqual(result.exported_count, 0)
+        self.assertIn(
+            "FASES2 '15' com NOME 'DEX' não resolve 3 fase(s) distinta(s) "
+            "entre D, E e F",
+            [issue.reason for issue in result.issues],
+        )
+
+    def test_empty_code_falls_back_to_the_load_id(self) -> None:
+        bars = make_bars()
+        loads = make_loads(bars, codes=("",), phases=("13",))
+
+        result = self._export(loads, make_patterns(loads))
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertEqual(result.discarded_count, 0)
+        for letter in ("D", "E", "F"):
+            self.assertIn(f"New Load.CG1-3F-{letter} ", result.text)
+        self.assertTrue(result.has_warnings)
+
+    def test_circuit_without_voltage_discards_the_load(self) -> None:
+        network = make_network(make_bars())
+        catalog = make_catalog(network, voltage="")
+        loads = self._loads(network.bars)
+
+        result = self._export(loads, make_patterns(loads), catalog=catalog)
+
+        self.assertEqual(result.exported_count, 0)
+        self.assertIn(
+            "circuito C1 sem VNOM numérica positiva",
+            [issue.reason for issue in result.issues],
+        )
+
+    def test_progress_and_cancellation(self) -> None:
+        bars = make_bars()
+        loads = self._loads(bars)
+        patterns = make_patterns(loads)
+        events: list[tuple[int, int]] = []
+
+        self._export(
+            loads,
+            patterns,
+            progress=lambda current, total: events.append((current, total)),
+        )
+
+        self.assertEqual(events[-1], (1, 1))
+        with self.assertRaises(InterruptedError):
+            self._export(loads, patterns, cancel_check=lambda: True)
+
+
+def make_two_circuit_catalog(network: LineNetworkModel) -> CircuitCatalogModel:
+    return CircuitCatalogModel.build(
+        network,
+        None,
+        [
+            CircuitDefinition("C1", "B0", "ALIMENTADOR", "13,8"),
+            CircuitDefinition("C2", "B2", "OUTRO", "13,8"),
+        ],
+    )
+
+
+class MasterExportTests(unittest.TestCase):
+    def _catalog(self, **kwargs):  # noqa: ANN003, ANN202
+        return make_catalog(make_network(make_bars()), **kwargs)
+
+    def test_master_follows_the_opendss_template(self) -> None:
+        result = build_master_export(
+            self._catalog(),
+            [0],
+            redirects=[LINES_FILENAME, SWITCHES_FILENAME],
+        )
+
+        self.assertFalse(result.has_warnings)
+        self.assertEqual(result.master_filename, "ALIMENTADOR_Master.dss")
+        self.assertEqual(
+            result.text.splitlines(),
+            [
+                "Clear",
+                "Set DefaultBaseFrequency=60",
+                "",
+                "New Circuit.ALIMENTADOR",
+                "~ bus1=BARRA_A.1.2.3 phases=3 basekv=13.8 pu=1 angle=0"
+                " frequency=60",
+                "~ MVAsc3=999999 MVAsc1=999999",
+                "",
+                "Redirect trechos.dss",
+                "Redirect chaves.dss",
+                "",
+                "Set Voltagebases=[13.8]",
+                "calcvoltagebases",
+                "Set mode=daily",
+                "Set stepsize=1h",
+                "Set number=4",
+                "Set time=(0, 0)",
+                "Solve",
+                "",
+                "Buscoords ALIMENTADOR_Buscoords.csv",
+            ],
+        )
+
+    def test_redirects_follow_the_files_that_were_generated(self) -> None:
+        catalog = self._catalog()
+
+        without = build_master_export(catalog, [0], redirects=[])
+        with_loads = build_master_export(
+            catalog,
+            [0],
+            redirects=[LINES_FILENAME, SINGLE_PHASE_LOADS_FILENAME],
+        )
+
+        self.assertNotIn("Redirect", without.text)
+        self.assertEqual(
+            [
+                line
+                for line in with_loads.text.splitlines()
+                if line.startswith("Redirect")
+            ],
+            [f"Redirect {LINES_FILENAME}", f"Redirect {SINGLE_PHASE_LOADS_FILENAME}"],
+        )
+
+    def test_buscoords_keeps_full_utm_precision(self) -> None:
+        # O _format do módulo (.6g) viraria 8000000.0 em "8e+06".
+        result = build_master_export(self._catalog(), [0])
+
+        self.assertEqual(result.bus_count, 3)
+        self.assertEqual(
+            result.buscoords_text.splitlines(),
+            [
+                "BARRA_A,500000.000,8000000.000",
+                "BARRA_B,500100.000,8000000.000",
+                "BARRA_C,500200.000,8000000.000",
+            ],
+        )
+
+    def test_bus_names_match_the_line_terminals(self) -> None:
+        catalog = self._catalog()
+        lines = build_line_export(catalog, make_cables(), PHASES, [0])
+        master = build_master_export(catalog, [0])
+
+        coordinate_names = {
+            line.split(",", 1)[0]
+            for line in master.buscoords_text.splitlines()
+            if line
+        }
+        # Toda barra citada em Bus1/Bus2 precisa ter coordenada.
+        for entry in data_lines(lines.text):
+            for part in entry.split():
+                if part.startswith(("Bus1=", "Bus2=")):
+                    bus = part.split("=", 1)[1].split(".", 1)[0]
+                    self.assertIn(bus, coordinate_names)
+
+    def test_empty_code_falls_back_to_the_circuit_id(self) -> None:
+        network = make_network(make_bars())
+        catalog = CircuitCatalogModel.build(
+            network, None, [CircuitDefinition("C1", "B0", "", "13,8")]
+        )
+
+        result = build_master_export(catalog, [0])
+
+        self.assertEqual(result.master_filename, "C1_Master.dss")
+        self.assertIn("New Circuit.C1", result.text)
+        self.assertEqual(result.discarded_count, 0)
+        self.assertTrue(result.has_warnings)
+
+    def test_circuit_without_voltage_produces_no_master(self) -> None:
+        result = build_master_export(self._catalog(voltage=""), [0])
+
+        self.assertEqual(result.text, "")
+        self.assertEqual(result.buscoords_text, "")
+        self.assertIn(
+            "circuito sem VNOM numérica positiva (<vazio>); o master não foi "
+            "gerado",
+            [issue.reason for issue in result.issues],
+        )
+
+    def test_more_than_one_circuit_produces_no_master(self) -> None:
+        catalog = make_two_circuit_catalog(make_network(make_bars()))
+
+        result = build_master_export(catalog, [0, 1])
+
+        self.assertEqual(result.text, "")
+        self.assertIn(
+            "2 circuitos selecionados; o master exige exatamente um, porque "
+            "um New Circuit energiza um alimentador só",
+            [issue.reason for issue in result.issues],
+        )
+
+    def test_repeated_bus_name_is_reported_once(self) -> None:
+        bars = make_bars(codes=("IGUAL", "IGUAL", "BARRA_C"))
+        catalog = make_catalog(make_network(bars))
+
+        result = build_master_export(catalog, [0])
+
+        self.assertEqual(result.bus_count, 2)
+        self.assertIn(
+            "nome de barra 'IGUAL' já usado pela barra B0; a coordenada foi "
+            "descartada",
+            [issue.reason for issue in result.issues],
+        )
+
+    def test_master_filenames_matches_the_result(self) -> None:
+        catalog = self._catalog()
+
+        names = master_filenames(catalog, [0])
+
+        self.assertEqual(
+            names, ("ALIMENTADOR_Master.dss", "ALIMENTADOR_Buscoords.csv")
+        )
+        result = build_master_export(catalog, [0])
+        self.assertEqual(
+            names, (result.master_filename, result.buscoords_filename)
+        )
+
+    def test_master_filenames_is_none_without_a_single_circuit(self) -> None:
+        catalog = make_two_circuit_catalog(make_network(make_bars()))
+
+        self.assertIsNone(master_filenames(catalog, [0, 1]))
+        self.assertIsNone(master_filenames(catalog, []))
+
+
+class LoadSettingsInMasterTests(unittest.TestCase):
+    """Os BatchEdit dos limites de tensão, e a compatibilidade sem eles.
+
+    ``MasterExportTests.test_master_follows_the_opendss_template`` trava o
+    arquivo linha a linha para o caso sem configuração; o que se verifica aqui é
+    o caso configurado e a posição exata dos comandos.
+    """
+
+    def _catalog(self):  # noqa: ANN202
+        return make_catalog(make_network(make_bars()))
+
+    def _enabled(self, **kwargs):  # noqa: ANN003, ANN202
+        return OpenDssLoadSettings(voltage_limits_enabled=True, **kwargs)
+
+    def test_no_settings_changes_nothing(self) -> None:
+        catalog = self._catalog()
+
+        without = build_master_export(catalog, [0], redirects=[LINES_FILENAME])
+        explicit_none = build_master_export(
+            catalog,
+            [0],
+            redirects=[LINES_FILENAME],
+            load_settings=None,
+        )
+
+        self.assertNotIn("BatchEdit", without.text)
+        self.assertEqual(without.text, explicit_none.text)
+
+    def test_disabled_settings_change_nothing(self) -> None:
+        catalog = self._catalog()
+
+        result = build_master_export(
+            catalog,
+            [0],
+            redirects=[LINES_FILENAME],
+            load_settings=OpenDssLoadSettings(vminpu=0.8, vmaxpu=1.2),
+        )
+
+        self.assertNotIn("BatchEdit", result.text)
+
+    def test_commands_sit_between_the_redirects_and_the_voltage_bases(self) -> None:
+        result = build_master_export(
+            self._catalog(),
+            [0],
+            redirects=[LINES_FILENAME, SINGLE_PHASE_LOADS_FILENAME],
+            load_settings=self._enabled(vminpu=0.8, vmaxpu=1.2),
+        )
+
+        lines = [line for line in result.text.splitlines() if line]
+        last_redirect = max(
+            index for index, line in enumerate(lines) if line.startswith("Redirect")
+        )
+        first_batch = min(
+            index for index, line in enumerate(lines) if line.startswith("BatchEdit")
+        )
+        voltage_bases = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("Set Voltagebases")
+        )
+
+        # BatchEdit é executivo: exige as Load já definidas pelos Redirect, e
+        # precisa preceder o Solve.
+        self.assertLess(last_redirect, first_batch)
+        self.assertLess(first_batch, voltage_bases)
+
+    def test_both_properties_are_emitted_in_order(self) -> None:
+        result = build_master_export(
+            self._catalog(),
+            [0],
+            redirects=[LINES_FILENAME],
+            load_settings=self._enabled(vminpu=0.8, vmaxpu=1.2),
+        )
+
+        self.assertEqual(
+            [
+                line
+                for line in result.text.splitlines()
+                if line.startswith("BatchEdit")
+            ],
+            [
+                "BatchEdit Load..* vminpu=0.8",
+                "BatchEdit Load..* vmaxpu=1.2",
+            ],
+        )
+
+    def test_values_never_reach_the_file_with_a_decimal_comma(self) -> None:
+        result = build_master_export(
+            self._catalog(),
+            [0],
+            redirects=[LINES_FILENAME],
+            load_settings=self._enabled(vminpu=0.875, vmaxpu=1.125),
+        )
+
+        for line in result.text.splitlines():
+            if line.startswith("BatchEdit"):
+                self.assertNotIn(",", line)
+
+    def test_the_master_is_still_valid_without_redirects(self) -> None:
+        result = build_master_export(
+            self._catalog(),
+            [0],
+            load_settings=self._enabled(vminpu=0.9, vmaxpu=1.1),
+        )
+
+        lines = result.text.splitlines()
+        self.assertIn("BatchEdit Load..* vminpu=0.9", lines)
+        self.assertLess(
+            lines.index("BatchEdit Load..* vminpu=0.9"),
+            lines.index("Set Voltagebases=[13.8]"),
+        )
+
+
+class LoadSettingsInBundleTests(unittest.TestCase):
+    """``build_export`` só leva a configuração ao master quando há cargas."""
+
+    def setUp(self) -> None:
+        self.network = make_network(make_bars())
+        self.catalog = make_catalog(self.network)
+        self.settings = OpenDssLoadSettings(
+            voltage_limits_enabled=True,
+            vminpu=0.8,
+            vmaxpu=1.2,
+        )
+
+    def test_bundle_with_loads_carries_the_commands(self) -> None:
+        # As cargas precisam pendurar nas barras do catálogo em uso, e não em
+        # outras equivalentes: a regra de identidade do projeto é por objeto.
+        loads = LoadModel(
+            self.network.bars,
+            ["CG1"],
+            [1],
+            ["EXT-1"],
+            ["CARGA-1"],
+            ["10"],
+            ["12"],
+            ["220"],
+            ["1"],
+            ["Y"],
+        )
+        patterns = LoadPatternModel(
+            loads,
+            [
+                tuple(
+                    LoadPatternRecord("CG1", npat, "1", "2", "3", "4", "5", "6")
+                    for npat in range(4)
+                )
+            ],
+        )
+
+        bundle = build_export(
+            self.catalog,
+            make_cables(),
+            PHASES,
+            [0],
+            loads=loads,
+            patterns=patterns,
+            load_settings=self.settings,
+        )
+
+        self.assertIn("BatchEdit Load..* vminpu=0.8", bundle.master.text)
+
+    def test_bundle_without_loads_omits_the_commands(self) -> None:
+        # Sem arquivo de carga o comando editaria zero objetos; a DLL tolera,
+        # mas o arquivo ficaria enganoso.
+        bundle = build_export(
+            self.catalog,
+            make_cables(),
+            PHASES,
+            [0],
+            load_settings=self.settings,
+        )
+
+        self.assertNotIn("BatchEdit", bundle.master.text)
+
+    def test_bundle_without_settings_is_unchanged(self) -> None:
+        bundle = build_export(self.catalog, make_cables(), PHASES, [0])
+
+        self.assertNotIn("BatchEdit", bundle.master.text)
+
+
 class ExportBundleTests(unittest.TestCase):
     def _bundle(self, **switch_kwargs):  # noqa: ANN003, ANN202
         network = make_network(make_bars())
@@ -1266,27 +1972,22 @@ class ExportBundleTests(unittest.TestCase):
 
         self.assertEqual(
             [name for name, _ in bundle.files],
-            [LINES_FILENAME, SWITCHES_FILENAME],
+            [
+                LINES_FILENAME,
+                SWITCHES_FILENAME,
+                "ALIMENTADOR_Master.dss",
+                "ALIMENTADOR_Buscoords.csv",
+            ],
         )
-        self.assertIsNone(bundle.single_phase_loads)
-        self.assertIsNone(bundle.two_phase_loads)
+        self.assertEqual(bundle.loads_by_phase_count, ())
         self.assertEqual(bundle.lines.exported_count, 1)
         self.assertEqual(bundle.switches.exported_count, 1)
         self.assertFalse(bundle.has_warnings)
 
-    def test_bundle_carries_both_load_files_when_patterns_exist(self) -> None:
-        bars = make_bars()
-        network = make_network(bars)
+    def _bundle_with_loads(self, loads: LoadModel):  # noqa: ANN202
+        network = make_network(loads.bars)
         catalog = make_catalog(network, switches=make_switches(network))
-        loads = make_loads(
-            bars,
-            load_ids=("CG1", "CG2"),
-            bar_indices=(1, 2),
-            codes=("MONO", "BI"),
-            phases=("1", "7"),
-        )
-
-        bundle = build_export(
+        return build_export(
             catalog,
             make_cables(),
             PHASES,
@@ -1294,6 +1995,18 @@ class ExportBundleTests(unittest.TestCase):
             loads=loads,
             patterns=make_patterns(loads),
         )
+
+    def test_bundle_carries_every_load_file_when_patterns_exist(self) -> None:
+        bars = make_bars()
+        loads = make_loads(
+            bars,
+            load_ids=("CG1", "CG2", "CG3"),
+            bar_indices=(1, 2, 1),
+            codes=("MONO", "BI", "TRI"),
+            phases=("1", "7", "13"),
+        )
+
+        bundle = self._bundle_with_loads(loads)
 
         self.assertEqual(
             [name for name, _ in bundle.files],
@@ -1302,62 +2015,59 @@ class ExportBundleTests(unittest.TestCase):
                 SWITCHES_FILENAME,
                 SINGLE_PHASE_LOADS_FILENAME,
                 TWO_PHASE_LOADS_FILENAME,
+                THREE_PHASE_LOADS_FILENAME,
+                "ALIMENTADOR_Master.dss",
+                "ALIMENTADOR_Buscoords.csv",
             ],
         )
-        self.assertEqual(bundle.single_phase_loads.exported_count, 1)
-        self.assertEqual(bundle.two_phase_loads.exported_count, 1)
+        self.assertEqual(
+            [(count, result.exported_count) for count, result in bundle.loads_by_phase_count],
+            [(1, 1), (2, 1), (3, 1)],
+        )
         self.assertFalse(bundle.has_warnings)
 
-    def test_both_load_files_are_written_even_when_one_is_empty(self) -> None:
+    def test_every_load_file_is_written_even_when_empty(self) -> None:
         # A lista de arquivos gerados não pode depender do conteúdo do CSV.
+        loads = make_loads(make_bars())  # só uma carga monofásica
+
+        bundle = self._bundle_with_loads(loads)
+
+        self.assertEqual(len(bundle.files), 7)
+        for result in (bundle.two_phase_loads, bundle.three_phase_loads):
+            self.assertEqual(result.exported_count, 0)
+            self.assertEqual(result.skipped_other_phase_count, 1)
+            self.assertEqual(data_lines(result.text), [])
+
+    def test_phase_count_infix_keeps_the_files_from_colliding(self) -> None:
+        # Mesmo CODIGO em três contagens de fases: o infixo -NF- separa os
+        # nomes, então nenhuma carga é descartada por colisão.
         bars = make_bars()
-        network = make_network(bars)
-        catalog = make_catalog(network, switches=make_switches(network))
-        loads = make_loads(bars)  # só uma carga monofásica
-
-        bundle = build_export(
-            catalog,
-            make_cables(),
-            PHASES,
-            [0],
-            loads=loads,
-            patterns=make_patterns(loads),
-        )
-
-        self.assertEqual(len(bundle.files), 4)
-        self.assertEqual(bundle.two_phase_loads.exported_count, 0)
-        self.assertEqual(bundle.two_phase_loads.skipped_other_phase_count, 1)
-        self.assertEqual(data_lines(bundle.two_phase_loads.text), [])
-
-    def test_two_phase_name_colliding_with_a_single_phase_is_discarded(self) -> None:
-        bars = make_bars()
-        network = make_network(bars)
-        catalog = make_catalog(network, switches=make_switches(network))
-        # A monofásica se chama como a primeira fase da bifásica.
         loads = make_loads(
             bars,
-            load_ids=("CG1", "CG2"),
-            bar_indices=(1, 2),
-            codes=("BI-D", "BI"),
-            phases=("1", "7"),
+            load_ids=("CG1", "CG2", "CG3"),
+            bar_indices=(1, 2, 1),
+            codes=("MESMO", "MESMO", "MESMO"),
+            phases=("1", "7", "13"),
         )
 
-        bundle = build_export(
-            catalog,
-            make_cables(),
-            PHASES,
-            [0],
-            loads=loads,
-            patterns=make_patterns(loads),
-        )
+        bundle = self._bundle_with_loads(loads)
 
-        self.assertEqual(bundle.single_phase_loads.exported_count, 1)
-        self.assertEqual(bundle.two_phase_loads.exported_count, 0)
-        self.assertIn(
-            f"nome 'BI-D' já usado por uma carga em "
-            f"{SINGLE_PHASE_LOADS_FILENAME}; a carga bifásica inteira foi "
-            "descartada",
-            [issue.reason for issue in bundle.issues],
+        self.assertFalse(bundle.has_warnings)
+        names = sorted(
+            name
+            for _, result in bundle.loads_by_phase_count
+            for name in result.used_names
+        )
+        self.assertEqual(
+            names,
+            [
+                "MESMO-1F-D",
+                "MESMO-2F-D",
+                "MESMO-2F-E",
+                "MESMO-3F-D",
+                "MESMO-3F-E",
+                "MESMO-3F-F",
+            ],
         )
 
     def test_patterns_from_another_import_are_refused(self) -> None:
@@ -1377,8 +2087,9 @@ class ExportBundleTests(unittest.TestCase):
         )
 
         # Patamares de outra importação nunca se combinam com estas cargas.
-        self.assertIsNone(bundle.single_phase_loads)
-        self.assertIsNone(bundle.two_phase_loads)
+        self.assertEqual(bundle.loads_by_phase_count, ())
+        # Rede e master saem mesmo assim: só os arquivos de carga somem.
+        self.assertEqual(len(bundle.files), 4)
 
     def test_switch_name_colliding_with_a_segment_is_discarded(self) -> None:
         # A chave passa a se chamar como o trecho exportado em trechos.dss.

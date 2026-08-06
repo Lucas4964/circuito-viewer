@@ -3,9 +3,10 @@
 Camada de núcleo: não importa Qt, para poder ser testada headless e executada
 em thread secundária sem cuidados de afinidade.
 
-Quatro arquivos são gerados: ``trechos.dss`` (``Line``), ``chaves.dss``
-(``Line ... Switch=Yes``), ``cargasmonofasicas.dss`` e ``cargasbifasicas.dss``
-(``Load`` + ``LoadShape``).
+Cinco arquivos de elementos são gerados — ``trechos.dss`` (``Line``),
+``chaves.dss`` (``Line ... Switch=Yes``) e um de cargas por contagem de fases
+(``Load`` + ``LoadShape``) — mais o par ``<CODIGO>_Master.dss`` e
+``<CODIGO>_Buscoords.csv``, que cria o circuito, chama os demais e resolve.
 
 Convenções de unidade adotadas, todas amarradas ao ``units=km`` emitido em cada
 linha:
@@ -27,7 +28,7 @@ import math
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Callable, Iterable, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
 from .model import (
     CableModel,
@@ -37,17 +38,37 @@ from .model import (
 )
 from .phase_config import PhaseConfiguration
 
+if TYPE_CHECKING:
+    # Só para tipagem: em tempo de execução o import seria circular, porque
+    # opendss_settings reusa o parse_number deste módulo — de propósito, para
+    # não existirem duas regras de leitura de separador decimal no projeto.
+    from .opendss_settings import OpenDssLoadSettings
+
 
 FREQUENCY_HZ = 60.0
 LINES_FILENAME = "trechos.dss"
 SWITCHES_FILENAME = "chaves.dss"
 SINGLE_PHASE_LOADS_FILENAME = "cargasmonofasicas.dss"
 TWO_PHASE_LOADS_FILENAME = "cargasbifasicas.dss"
+THREE_PHASE_LOADS_FILENAME = "cargastrifasicas.dss"
+# O master e as coordenadas levam o código do circuito no nome, então só o
+# sufixo é constante.
+MASTER_FILENAME_SUFFIX = "_Master.dss"
+BUSCOORDS_FILENAME_SUFFIX = "_Buscoords.csv"
+# Barra infinita: o estudo de alimentador não modela a montante da subestação.
+SOURCE_SHORT_CIRCUIT_MVA = "999999"
 CLOSED_SWITCH_STATE = "1"
 MAX_REPORTED_ISSUES = 200
 LOAD_SHAPE_PREFIX = "PERFIL-"
 # NPAT 0..3: o LoadShape diário tem exatamente quatro pontos.
 LOAD_PATTERN_COUNT = 4
+# Um arquivo por contagem de fases, com o rótulo usado no cabeçalho.
+_LOAD_FILES = {
+    1: (SINGLE_PHASE_LOADS_FILENAME, "monofasicas"),
+    2: (TWO_PHASE_LOADS_FILENAME, "bifasicas"),
+    3: (THREE_PHASE_LOADS_FILENAME, "trifasicas"),
+}
+LOAD_PHASE_COUNTS = tuple(sorted(_LOAD_FILES))
 # As letras do NOME em fases2.json dizem quais colunas de patamar a carga
 # consome. "DN" (fase com neutro) usa as mesmas PD/QD de "D", e a bifásica "DE"
 # usa PD/QD em uma fase e PE/QE na outra.
@@ -82,6 +103,11 @@ class OpenDssLineExportResult:
     issues: tuple[OpenDssExportIssue, ...]
     omitted_issues: int
     used_names: frozenset[str] = frozenset()
+    # Índice reverso ``nome da Line`` → índice do trecho, na ordem de emissão.
+    # Só quem exporta conhece as regras que produziram cada nome (CODIGO
+    # saneado, fallback para o TRECHO_ID, descarte de homônimos), então
+    # recompor esse vínculo depois exigiria uma segunda cópia dessas regras.
+    exported_segments: tuple[tuple[str, int], ...] = ()
 
     @property
     def has_warnings(self) -> bool:
@@ -97,6 +123,8 @@ class OpenDssSwitchExportResult:
     issues: tuple[OpenDssExportIssue, ...]
     omitted_issues: int
     used_names: frozenset[str] = frozenset()
+    # Mesmo índice reverso dos trechos; aqui o nome vem do CODIGO da chave.
+    exported_segments: tuple[tuple[str, int], ...] = ()
 
     @property
     def has_warnings(self) -> bool:
@@ -127,40 +155,87 @@ class OpenDssLoadExportResult:
 
 
 @dataclass(frozen=True, slots=True)
+class OpenDssMasterExportResult:
+    """Arquivo principal e as coordenadas de barra que ele referencia.
+
+    Os nomes vivem aqui, e não em constantes como os demais arquivos, porque
+    dependem do código do circuito exportado. ``text`` vazio significa que o
+    master não pôde ser montado — o motivo está em ``issues``.
+    """
+
+    master_filename: str
+    text: str
+    buscoords_filename: str
+    buscoords_text: str
+    bus_count: int
+    discarded_count: int
+    issues: tuple[OpenDssExportIssue, ...]
+    omitted_issues: int
+
+    @property
+    def has_warnings(self) -> bool:
+        return self.discarded_count > 0 or bool(self.issues)
+
+
+@dataclass(frozen=True, slots=True)
 class OpenDssExportBundle:
     """Conjunto de arquivos gerados por uma única exportação.
 
-    Os dois resultados de carga são opcionais e andam juntos: sem cargas e
-    patamares importados nenhum dos dois arquivos é gerado, e a exportação segue
-    produzindo apenas os dois arquivos de rede.
+    Os três resultados de carga são opcionais e andam juntos: sem cargas e
+    patamares importados nenhum dos arquivos de carga é gerado, e a exportação
+    segue produzindo apenas os dois arquivos de rede.
     """
 
     lines: OpenDssLineExportResult
     switches: OpenDssSwitchExportResult
     single_phase_loads: OpenDssLoadExportResult | None = None
     two_phase_loads: OpenDssLoadExportResult | None = None
+    three_phase_loads: OpenDssLoadExportResult | None = None
+    master: OpenDssMasterExportResult | None = None
 
     @property
-    def _load_results(self) -> tuple[OpenDssLoadExportResult, ...]:
+    def loads_by_phase_count(
+        self,
+    ) -> tuple[tuple[int, OpenDssLoadExportResult], ...]:
+        """Resultados de carga presentes, em ordem de contagem de fases."""
+
         return tuple(
-            result
-            for result in (self.single_phase_loads, self.two_phase_loads)
+            (count, result)
+            for count, result in (
+                (1, self.single_phase_loads),
+                (2, self.two_phase_loads),
+                (3, self.three_phase_loads),
+            )
             if result is not None
         )
 
     @property
-    def files(self) -> tuple[tuple[str, str], ...]:
-        files = [
+    def _load_results(self) -> tuple[OpenDssLoadExportResult, ...]:
+        return tuple(result for _, result in self.loads_by_phase_count)
+
+    @property
+    def element_files(self) -> tuple[tuple[str, str], ...]:
+        """Arquivos de elementos, na ordem em que o master os chama."""
+
+        return (
             (LINES_FILENAME, self.lines.text),
             (SWITCHES_FILENAME, self.switches.text),
-        ]
-        if self.single_phase_loads is not None:
-            files.append(
-                (SINGLE_PHASE_LOADS_FILENAME, self.single_phase_loads.text)
-            )
-        if self.two_phase_loads is not None:
-            files.append((TWO_PHASE_LOADS_FILENAME, self.two_phase_loads.text))
-        return tuple(files)
+            *(
+                (_LOAD_FILES[count][0], result.text)
+                for count, result in self.loads_by_phase_count
+            ),
+        )
+
+    @property
+    def files(self) -> tuple[tuple[str, str], ...]:
+        master = self.master
+        if master is None or not master.text:
+            return self.element_files
+        return (
+            *self.element_files,
+            (master.master_filename, master.text),
+            (master.buscoords_filename, master.buscoords_text),
+        )
 
     @property
     def issues(self) -> tuple[OpenDssExportIssue, ...]:
@@ -168,20 +243,21 @@ class OpenDssExportBundle:
             *self.lines.issues,
             *self.switches.issues,
             *(issue for result in self._load_results for issue in result.issues),
+            *(() if self.master is None else self.master.issues),
         )
 
     @property
     def omitted_issues(self) -> int:
         total = self.lines.omitted_issues + self.switches.omitted_issues
-        return total + sum(
-            result.omitted_issues for result in self._load_results
-        )
+        total += sum(result.omitted_issues for result in self._load_results)
+        return total + (0 if self.master is None else self.master.omitted_issues)
 
     @property
     def discarded_count(self) -> int:
         total = self.lines.discarded_count + self.switches.discarded_count
-        return total + sum(
-            result.discarded_count for result in self._load_results
+        total += sum(result.discarded_count for result in self._load_results)
+        return total + (
+            0 if self.master is None else self.master.discarded_count
         )
 
     @property
@@ -190,6 +266,7 @@ class OpenDssExportBundle:
             self.lines.has_warnings
             or self.switches.has_warnings
             or any(result.has_warnings for result in self._load_results)
+            or (self.master is not None and self.master.has_warnings)
         )
 
 
@@ -274,6 +351,17 @@ def _format_pattern(value: float) -> str:
     return f"{value:.6f}"
 
 
+def _format_coordinate(value: float) -> str:
+    """Casas fixas para as coordenadas UTM.
+
+    O ``.6g`` de :func:`_format` guarda seis algarismos significativos, o que
+    transformaria um northing de 8.000.000 em ``8e+06`` e truncaria as casas do
+    easting. Milímetro é precisão de sobra para posicionar uma barra.
+    """
+
+    return f"{value:.3f}"
+
+
 class _ExportReport:
     """Acumula ocorrências respeitando o teto de detalhamento."""
 
@@ -337,25 +425,32 @@ def _terminals_by_phase_letter(
     return terminals
 
 
-def _two_phase_letters(name: str | None) -> tuple[str, str] | None:
-    """As duas fases de um NOME bifásico, na ordem em que aparecem.
+def _phase_letters(name: str | None, expected: int) -> tuple[str, ...] | None:
+    """As fases de um NOME, na ordem em que aparecem.
 
-    Ignora letras fora de D/E/F (``"DEN"`` → ``D``, ``E``) e recusa qualquer
-    NOME que não resolva exatamente duas fases distintas.
+    Ignora letras fora de D/E/F, o que absorve o neutro de ``DN`` (→ ``D``) e de
+    ``DEFN`` (→ ``D``, ``E``, ``F``) sem tratamento especial, e recusa qualquer
+    NOME que não resolva exatamente ``expected`` fases distintas.
     """
 
-    letters = [
+    letters = tuple(
         char
         for char in (name or "").strip().upper()
         if char in _PATTERN_COLUMNS_BY_PHASE
-    ]
-    if len(letters) != 2 or letters[0] == letters[1]:
+    )
+    if len(letters) != expected or len(set(letters)) != expected:
         return None
-    return letters[0], letters[1]
+    return letters
 
 
-def _bus_namer(catalog: CircuitCatalogModel) -> Callable[[int], str]:
-    """Resolve o nome da barra pelo CODIGO, com o BARRA_ID como reserva."""
+def bus_namer(catalog: CircuitCatalogModel) -> Callable[[int], str]:
+    """Resolve o nome da barra pelo CODIGO, com o BARRA_ID como reserva.
+
+    Público porque é a **única** definição de "nome da barra no OpenDSS": os
+    ``Bus1``/``Bus2`` dos trechos, o ``bus1`` das cargas, as coordenadas do
+    ``Buscoords`` e a leitura dos resultados do fluxo de potência precisam
+    concordar, e uma segunda definição divergiria em silêncio.
+    """
 
     bars = catalog.segments.bars
 
@@ -396,7 +491,7 @@ def build_line_export(
     segments = catalog.segments
     entries_by_value = _entries_by_value(phase_configuration)
     report = _ExportReport()
-    bus_name = _bus_namer(catalog)
+    bus_name = bus_namer(catalog)
 
     total = sum(
         int(catalog.membership(index).common_segment_indices.size)
@@ -408,6 +503,7 @@ def build_line_export(
     # contém é o dono e define a tensão usada em C1.
     owner_voltage: dict[int, tuple[str, float | None]] = {}
     used_names: dict[str, str] = {}
+    exported_segments: list[tuple[str, int]] = []
     switch_segments: set[int] = set()
 
     for circuit_index in selected:
@@ -535,6 +631,7 @@ def build_line_export(
                 " units=km"
             )
             used_names[name] = segment_id
+            exported_segments.append((name, segment_index))
 
     if cancel_check is not None and cancel_check():
         raise InterruptedError("Exportação cancelada.")
@@ -563,6 +660,7 @@ def build_line_export(
         issues=tuple(report.issues),
         omitted_issues=report.omitted,
         used_names=frozenset(used_names),
+        exported_segments=tuple(exported_segments),
     )
 
 
@@ -589,7 +687,7 @@ def build_switch_export(
     switches = catalog.switches
     entries_by_value = _entries_by_value(phase_configuration)
     report = _ExportReport()
-    bus_name = _bus_namer(catalog)
+    bus_name = bus_namer(catalog)
 
     total = sum(
         int(catalog.membership(index).switch_segment_indices.size)
@@ -599,6 +697,7 @@ def build_switch_export(
     lines: list[str] = []
     open_commands: list[str] = []
     used_names: dict[str, str] = {}
+    exported_segments: list[tuple[str, int]] = []
     seen_segments: set[int] = set()
 
     for circuit_index in selected:
@@ -676,6 +775,7 @@ def build_switch_export(
                 " Switch=Yes"
             )
             used_names[name] = switch.switch_id
+            exported_segments.append((name, segment_index))
 
             state = switch.state.strip()
             if state != CLOSED_SWITCH_STATE:
@@ -717,6 +817,7 @@ def build_switch_export(
         issues=tuple(report.issues),
         omitted_issues=report.omitted,
         used_names=frozenset(used_names),
+        exported_segments=tuple(exported_segments),
     )
 
 
@@ -748,227 +849,78 @@ def _bar_owners(
     return owner_by_bar, conflicting_bars
 
 
-def build_single_phase_load_export(
-    catalog: CircuitCatalogModel,
-    loads: LoadModel,
-    patterns: LoadPatternModel,
-    phase_configuration: PhaseConfiguration,
-    circuit_indices: Sequence[int] | Iterable[int],
-    *,
-    cancel_check: Callable[[], bool] | None = None,
-    progress: ProgressCallback | None = None,
-) -> OpenDssLoadExportResult:
-    """Gera o conteúdo de ``cargasmonofasicas.dss`` para os circuitos escolhidos.
+def _phase_nodes(
+    entry,  # noqa: ANN001
+    letters: tuple[str, ...],
+    terminals: dict[str, str],
+) -> tuple[tuple[str, ...] | None, str | None]:
+    """Nó DSS de cada fase da carga, ou a razão de não ser possível resolvê-lo.
 
-    Exporta apenas as cargas cujo ``FASES2`` está mapeado com ``NUMERO_FASES=1``
-    — as seis combinações do ``fases2.json``, com e sem neutro explícito. Cada
-    carga vira uma ``Load`` de ``kW=1 kvar=1`` acompanhada de um ``LoadShape``
-    diário: a potência real de cada patamar vive no perfil, não na carga.
-
-    ``CircuitMembership`` não associa cargas, apenas barras, então a carga é
-    atribuída ao circuito pela barra em que está pendurada.
+    A monofásica usa o ``DSS`` da **própria entrada**, o que preserva o nó de
+    neutro explícito de ``DN``/``EN``/``FN`` (``bus.1.0``). As multifásicas usam
+    o terminal da fase isolada, porque o ``DSS`` delas lista os nós em ordem
+    crescente e não na ordem das letras do ``NOME`` — ``FD`` tem ``"1.3"``,
+    então parear posicionalmente inverteria as fases.
     """
 
-    selected = _selected_indices(catalog, circuit_indices)
-    entries_by_value = _entries_by_value(phase_configuration)
-    report = _ExportReport()
-    bus_name = _bus_namer(catalog)
-    owner_by_bar, conflicting_bars = _bar_owners(catalog, selected)
-
-    total = len(loads)
-    processed = 0
-    shapes: list[str] = []
-    entries: list[str] = []
-    used_names: dict[str, str] = {}
-    skipped_other_phase = 0
-
-    for load_index in range(total):
-        if cancel_check is not None and processed % 4_096 == 0 and cancel_check():
-            raise InterruptedError("Exportação cancelada.")
-        processed += 1
-        if progress is not None and processed % 1_000 == 0:
-            progress(processed, total)
-
-        bar_index = int(loads.bar_indices[load_index])
-        owner = owner_by_bar.get(bar_index)
-        if owner is None:
-            # A carga está fora dos circuitos selecionados.
-            continue
-        owner_id, nominal_voltage = owner
-        load_id = loads.load_ids[load_index]
-
-        raw_phases = loads.phases[load_index]
-        entry = entries_by_value.get(raw_phases.strip().casefold())
-        if entry is None:
-            report.add(
-                load_id,
-                f"FASES2 '{raw_phases.strip() or '<vazio>'}' sem relação "
-                "em fases2.json",
-            )
-            continue
-        if entry.phase_count != 1:
-            # Bi e trifásicas são esperadas aqui: contadas, não diagnosticadas.
-            skipped_other_phase += 1
-            continue
+    if len(letters) == 1:
         if not entry.dss:
-            report.add(
-                load_id,
-                f"FASES2 '{entry.fases2}' sem código DSS em fases2.json",
+            return None, (
+                f"FASES2 '{entry.fases2}' sem código DSS em fases2.json"
             )
-            continue
-
-        columns = _PATTERN_COLUMNS_BY_PHASE.get(_phase_letter(entry.name))
-        if columns is None:
-            report.add(
-                load_id,
-                f"FASES2 '{entry.fases2}' com NOME "
-                f"'{(entry.name or '').strip() or '<vazio>'}' fora de D, E ou F",
-            )
-            continue
-
-        if nominal_voltage is None:
-            report.add(
-                load_id,
-                f"circuito {owner_id} sem VNOM numérica positiva",
-            )
-            continue
-
-        group = patterns.records_for_load(load_index)
-        if len(group) != LOAD_PATTERN_COUNT:
-            report.add(load_id, "sem os quatro patamares (NPAT 0 a 3)")
-            continue
-
-        active_column, reactive_column = columns
-        active: list[float] = []
-        reactive: list[float] = []
-        invalid_column: str | None = None
-        for record in group:
-            for column, target in (
-                (active_column, active),
-                (reactive_column, reactive),
-            ):
-                parsed = parse_number(getattr(record, column))
-                if parsed is None:
-                    invalid_column = column.upper()
-                    break
-                target.append(parsed)
-            if invalid_column is not None:
-                break
-        if invalid_column is not None:
-            report.add(
-                load_id,
-                f"patamar com {invalid_column} não numérico",
-            )
-            continue
-
-        name = sanitize_dss_name(loads.codes[load_index])
-        if not name:
-            name = sanitize_dss_name(load_id)
-            report.add(
-                load_id,
-                "CODIGO vazio ou sem caracteres válidos; o nome da carga usou "
-                "o CARGA_ID",
-                discarded=False,
-            )
-        if name in used_names:
-            report.add(
-                load_id,
-                f"nome '{name}' já usado pela carga {used_names[name]}",
-            )
-            continue
-
-        if bar_index in conflicting_bars:
-            report.add(
-                load_id,
-                f"barra compartilhada com o circuito {conflicting_bars[bar_index]}, "
-                f"de VNOM diferente; foi usada a do circuito {owner_id}",
-                discarded=False,
-            )
-
-        shape_name = f"{LOAD_SHAPE_PREFIX}{name}"
-        shapes.append(
-            f"New LoadShape.{shape_name}"
-            f" npts={LOAD_PATTERN_COUNT}"
-            " interval=1"
-            f" mult=[{' '.join(_format_pattern(value) for value in active)}]"
-            f" qmult=[{' '.join(_format_pattern(value) for value in reactive)}]"
-        )
-        entries.append(
-            f"New Load.{name}"
-            f" phases={entry.phase_count}"
-            f" bus1={bus_name(bar_index)}.{entry.dss}"
-            " conn=wye"
-            f" kV={_format(phase_voltage_kv(nominal_voltage))}"
-            " model=1 kW=1 kvar=1"
-            f" daily={shape_name}"
-            " class=1"
-        )
-        used_names[name] = load_id
-
-    if cancel_check is not None and cancel_check():
-        raise InterruptedError("Exportação cancelada.")
-    if progress is not None:
-        progress(total, total)
-
-    header = (
-        "! Cargas monofasicas exportadas pelo Visualizador de Circuitos Eletricos",
-        "! kW=1 e kvar=1 sao fixos: a potencia de cada patamar vem do LoadShape",
-        "! kV e a tensao de fase do circuito (VNOM de linha dividida por raiz de 3)",
-        "! Circuitos: "
-        + ", ".join(
-            sanitize_dss_name(catalog.definition(index).circuit_id)
-            for index in selected
-        ),
-        "",
+        return (entry.dss,), None
+    missing = next(
+        (letter for letter in letters if letter not in terminals),
+        None,
     )
-    # Os LoadShape vêm antes das Load: o daily= referencia um perfil que o
-    # OpenDSS precisa já ter definido.
-    body = (*shapes, *(("",) if shapes and entries else ()), *entries)
-    text = "\n".join((*header, *body))
-    if body:
-        text += "\n"
-    return OpenDssLoadExportResult(
-        text=text,
-        exported_count=len(entries),
-        skipped_other_phase_count=skipped_other_phase,
-        discarded_count=report.discarded,
-        issues=tuple(report.issues),
-        omitted_issues=report.omitted,
-        used_names=frozenset(used_names),
-    )
+    if missing is not None:
+        return None, (
+            f"fase '{missing}' sem terminal DSS: nenhuma entrada monofásica "
+            "de fases2.json a define"
+        )
+    return tuple(terminals[letter] for letter in letters), None
 
 
-def build_two_phase_load_export(
+def build_load_export(
     catalog: CircuitCatalogModel,
     loads: LoadModel,
     patterns: LoadPatternModel,
     phase_configuration: PhaseConfiguration,
     circuit_indices: Sequence[int] | Iterable[int],
     *,
+    phase_count: int,
     reserved_names: frozenset[str] = frozenset(),
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssLoadExportResult:
-    """Gera o conteúdo de ``cargasbifasicas.dss`` para os circuitos escolhidos.
+    """Gera o arquivo de cargas de ``phase_count`` fases.
 
-    Cada carga de ``NUMERO_FASES=2`` vira **duas ``Load`` monofásicas
-    independentes**, uma por fase, cada uma com seu próprio ``LoadShape``. É o
-    que permite representar o desequilíbrio entre as fases: uma única ``Load``
-    bifásica distribuiria a potência igualmente pelas duas.
+    Cada carga vira **uma ``Load`` monofásica por fase**, com seu próprio
+    ``LoadShape`` diário. Para as multifásicas é o que preserva o desequilíbrio:
+    uma única ``Load`` de ``phases=2`` ou ``3`` distribuiria a potência
+    igualmente entre as fases, apagando exatamente o que os patamares por fase
+    (``PD``/``PE``/``PF``) descrevem. As monofásicas seguem a mesma forma por
+    uniformidade, com uma fase só.
 
-    O nó de cada fase vem do terminal da fase isolada no ``fases2.json``, não do
-    ``DSS`` da entrada bifásica — ver :func:`_terminals_by_phase_letter`.
+    O nome de cada ``Load`` é ``<CODIGO>-<N>F-<FASE>``, e o perfil acompanha com
+    o prefixo ``PERFIL-``. ``kW=1 kvar=1`` são fixos: a potência real de cada
+    patamar vive no perfil.
 
-    Uma carga só sai completa ou não sai: qualquer problema em uma das fases
-    descarta as duas, porque meia carga no arquivo subestimaria a demanda em
-    silêncio.
+    ``CircuitMembership`` não associa cargas, apenas barras, então a carga é
+    atribuída ao circuito pela barra em que está pendurada.
+
+    Uma carga sai completa ou não sai: qualquer problema em uma das fases
+    descarta todas, porque carga pela metade subestimaria a demanda em silêncio.
     """
+
+    if phase_count not in _LOAD_FILES:
+        raise ValueError(f"Contagem de fases sem arquivo: {phase_count}")
 
     selected = _selected_indices(catalog, circuit_indices)
     entries_by_value = _entries_by_value(phase_configuration)
     terminals = _terminals_by_phase_letter(phase_configuration)
     report = _ExportReport()
-    bus_name = _bus_namer(catalog)
+    bus_name = bus_namer(catalog)
     owner_by_bar, conflicting_bars = _bar_owners(catalog, selected)
 
     total = len(loads)
@@ -1003,31 +955,25 @@ def build_two_phase_load_export(
                 "em fases2.json",
             )
             continue
-        if entry.phase_count != 2:
-            # Mono e trifásicas pertencem a outro arquivo: contadas, não
+        if entry.phase_count != phase_count:
+            # Cargas de outra contagem pertencem a outro arquivo: contadas, não
             # diagnosticadas.
             skipped_other_phase += 1
             continue
 
-        letters = _two_phase_letters(entry.name)
+        letters = _phase_letters(entry.name, phase_count)
         if letters is None:
             report.add(
                 load_id,
                 f"FASES2 '{entry.fases2}' com NOME "
-                f"'{(entry.name or '').strip() or '<vazio>'}' não resolve duas "
-                "fases distintas entre D, E e F",
+                f"'{(entry.name or '').strip() or '<vazio>'}' não resolve "
+                f"{phase_count} fase(s) distinta(s) entre D, E e F",
             )
             continue
-        missing_letter = next(
-            (letter for letter in letters if letter not in terminals),
-            None,
-        )
-        if missing_letter is not None:
-            report.add(
-                load_id,
-                f"fase '{missing_letter}' sem terminal DSS: nenhuma entrada "
-                "monofásica de fases2.json a define",
-            )
+
+        nodes, node_error = _phase_nodes(entry, letters, terminals)
+        if node_error is not None:
+            report.add(load_id, node_error)
             continue
 
         if nominal_voltage is None:
@@ -1042,9 +988,9 @@ def build_two_phase_load_export(
             report.add(load_id, "sem os quatro patamares (NPAT 0 a 3)")
             continue
 
-        # As duas fases são resolvidas por inteiro antes de qualquer emissão:
+        # Todas as fases são resolvidas por inteiro antes de qualquer emissão:
         # zero é valor válido, só vazio e não numérico invalidam.
-        series: list[tuple[str, list[float], list[float]]] = []
+        series: list[tuple[list[float], list[float]]] = []
         invalid_column: str | None = None
         for letter in letters:
             active_column, reactive_column = _PATTERN_COLUMNS_BY_PHASE[letter]
@@ -1064,12 +1010,12 @@ def build_two_phase_load_export(
                     break
             if invalid_column is not None:
                 break
-            series.append((letter, active, reactive))
+            series.append((active, reactive))
         if invalid_column is not None:
             report.add(
                 load_id,
-                f"patamar com {invalid_column} não numérico; a carga bifásica "
-                "inteira foi descartada",
+                f"patamar com {invalid_column} não numérico; a carga inteira "
+                "foi descartada",
             )
             continue
 
@@ -1082,7 +1028,9 @@ def build_two_phase_load_export(
                 "o CARGA_ID",
                 discarded=False,
             )
-        phase_names = [f"{base_name}-{letter}" for letter, _, _ in series]
+        phase_names = [
+            f"{base_name}-{phase_count}F-{letter}" for letter in letters
+        ]
         taken = next(
             (
                 name
@@ -1095,12 +1043,12 @@ def build_two_phase_load_export(
             owner_note = (
                 f"pela carga {used_names[taken]}"
                 if taken in used_names
-                else f"por uma carga em {SINGLE_PHASE_LOADS_FILENAME}"
+                else "por uma carga de outra contagem de fases"
             )
             report.add(
                 load_id,
-                f"nome '{taken}' já usado {owner_note}; a carga bifásica "
-                "inteira foi descartada",
+                f"nome '{taken}' já usado {owner_note}; a carga inteira foi "
+                "descartada",
             )
             continue
 
@@ -1114,7 +1062,7 @@ def build_two_phase_load_export(
 
         bus = bus_name(bar_index)
         voltage = _format(phase_voltage_kv(nominal_voltage))
-        for name, (letter, active, reactive) in zip(phase_names, series):
+        for name, node, (active, reactive) in zip(phase_names, nodes, series):
             shape_name = f"{LOAD_SHAPE_PREFIX}{name}"
             shapes.append(
                 f"New LoadShape.{shape_name}"
@@ -1126,12 +1074,12 @@ def build_two_phase_load_export(
             entries.append(
                 f"New Load.{name}"
                 " phases=1"
-                f" bus1={bus}.{terminals[letter]}"
+                f" bus1={bus}.{node}"
                 " conn=wye"
                 f" kV={voltage}"
                 " model=1 kW=1 kvar=1"
                 f" daily={shape_name}"
-                " class=2"
+                f" class={phase_count}"
             )
             used_names[name] = load_id
         exported += 1
@@ -1141,10 +1089,17 @@ def build_two_phase_load_export(
     if progress is not None:
         progress(total, total)
 
+    label = _LOAD_FILES[phase_count][1]
     header = (
-        "! Cargas bifasicas exportadas pelo Visualizador de Circuitos Eletricos",
-        "! Cada carga vira duas Load monofasicas, uma por fase, para preservar "
-        "o desequilibrio",
+        f"! Cargas {label} exportadas pelo Visualizador de Circuitos Eletricos",
+        *(
+            (
+                f"! Cada carga vira {phase_count} Load monofasicas, uma por "
+                "fase, para preservar o desequilibrio",
+            )
+            if phase_count > 1
+            else ()
+        ),
         "! kW=1 e kvar=1 sao fixos: a potencia de cada patamar vem do LoadShape",
         "! kV e a tensao de fase do circuito (VNOM de linha dividida por raiz de 3)",
         "! Circuitos: "
@@ -1154,6 +1109,8 @@ def build_two_phase_load_export(
         ),
         "",
     )
+    # Os LoadShape vêm antes das Load: o daily= referencia um perfil que o
+    # OpenDSS precisa já ter definido.
     body = (*shapes, *(("",) if shapes and entries else ()), *entries)
     text = "\n".join((*header, *body))
     if body:
@@ -1168,6 +1125,188 @@ def build_two_phase_load_export(
         used_names=frozenset(used_names),
     )
 
+def _master_base_name(definition) -> str:  # noqa: ANN001
+    """Nome do circuito no OpenDSS, com o CIRC_ID de reserva."""
+
+    return sanitize_dss_name(definition.code) or sanitize_dss_name(
+        definition.circuit_id
+    )
+
+
+def master_filenames(
+    catalog: CircuitCatalogModel,
+    circuit_indices: Sequence[int] | Iterable[int],
+) -> tuple[str, str] | None:
+    """Nomes do master e das coordenadas, ou ``None`` sem master a gerar.
+
+    Público para a UI montar a confirmação de substituição **antes** de
+    exportar, sem precisar rodar a exportação inteira.
+    """
+
+    selected = _selected_indices(catalog, circuit_indices)
+    if len(selected) != 1:
+        return None
+    base = _master_base_name(catalog.definition(selected[0]))
+    return (
+        f"{base}{MASTER_FILENAME_SUFFIX}",
+        f"{base}{BUSCOORDS_FILENAME_SUFFIX}",
+    )
+
+
+def _empty_master(
+    report: _ExportReport,
+    master_filename: str,
+    buscoords_filename: str,
+) -> OpenDssMasterExportResult:
+    """Resultado sem master, carregando só o motivo."""
+
+    return OpenDssMasterExportResult(
+        master_filename=master_filename,
+        text="",
+        buscoords_filename=buscoords_filename,
+        buscoords_text="",
+        bus_count=0,
+        discarded_count=report.discarded,
+        issues=tuple(report.issues),
+        omitted_issues=report.omitted,
+    )
+
+
+def build_master_export(
+    catalog: CircuitCatalogModel,
+    circuit_indices: Sequence[int] | Iterable[int],
+    *,
+    redirects: Sequence[str] = (),
+    load_settings: OpenDssLoadSettings | None = None,
+) -> OpenDssMasterExportResult:
+    """Gera o arquivo principal e o CSV de coordenadas de barra.
+
+    O master cria o circuito, chama os arquivos de elementos e resolve. A ordem
+    das seções não é estética: ``Set DefaultBaseFrequency`` precede o
+    ``New Circuit`` porque a frequência base é fixada na criação do circuito, e
+    os ``Redirect`` precedem o ``calcvoltagebases`` porque este precisa de todas
+    as barras já definidas.
+
+    ``load_settings`` traz os parâmetros globais das cargas escolhidos pelo
+    usuário. Os ``BatchEdit`` que ele gera entram **depois** dos ``Redirect``,
+    porque são comandos executivos e exigem as ``Load`` já definidas — mesma
+    disciplina dos ``Open`` de ``chaves.dss``. Sem configuração, nenhuma linha é
+    acrescentada e o arquivo permanece idêntico.
+
+    Um ``New Circuit`` energiza um alimentador só, então o master exige
+    **exatamente um** circuito selecionado. Com vários, o correto seria somar um
+    ``Vsource`` por alimentador adicional — fica para quando a exportação
+    múltipla for tratada.
+
+    ``text`` vazio indica que o master não pôde ser montado; o motivo está nos
+    ``issues``.
+    """
+
+    selected = _selected_indices(catalog, circuit_indices)
+    report = _ExportReport()
+    if len(selected) != 1:
+        report.add(
+            "master",
+            f"{len(selected)} circuitos selecionados; o master exige "
+            "exatamente um, porque um New Circuit energiza um alimentador só",
+        )
+        return _empty_master(report, "", "")
+
+    definition = catalog.definition(selected[0])
+    base = _master_base_name(definition)
+    master_filename = f"{base}{MASTER_FILENAME_SUFFIX}"
+    buscoords_filename = f"{base}{BUSCOORDS_FILENAME_SUFFIX}"
+    if not sanitize_dss_name(definition.code):
+        report.add(
+            definition.circuit_id,
+            "CODIGO vazio ou sem caracteres válidos; o nome do circuito usou "
+            "o CIRC_ID",
+            discarded=False,
+        )
+
+    nominal_voltage = parse_number(definition.nominal_voltage)
+    if nominal_voltage is None or nominal_voltage <= 0.0:
+        report.add(
+            definition.circuit_id,
+            f"circuito sem VNOM numérica positiva "
+            f"({definition.nominal_voltage.strip() or '<vazio>'}); o master "
+            "não foi gerado",
+        )
+        return _empty_master(report, master_filename, buscoords_filename)
+
+    bars = catalog.segments.bars
+    bus_name = bus_namer(catalog)
+    # O construtor do catálogo já garante que a barra raiz existe.
+    root_index = bars.index_for_id(definition.root_bar_id)
+    voltage = _format(nominal_voltage)
+
+    lines = [
+        "Clear",
+        f"Set DefaultBaseFrequency={_format(FREQUENCY_HZ)}",
+        "",
+        f"New Circuit.{base}",
+        f"~ bus1={bus_name(int(root_index))}.1.2.3 phases=3"
+        f" basekv={voltage} pu=1 angle=0 frequency={_format(FREQUENCY_HZ)}",
+        f"~ MVAsc3={SOURCE_SHORT_CIRCUIT_MVA} MVAsc1={SOURCE_SHORT_CIRCUIT_MVA}",
+        "",
+    ]
+    lines.extend(f"Redirect {name}" for name in redirects)
+    if redirects:
+        lines.append("")
+    batch_edits = (
+        () if load_settings is None else load_settings.batch_edit_commands()
+    )
+    if batch_edits:
+        lines.extend(batch_edits)
+        lines.append("")
+    lines.extend(
+        [
+            f"Set Voltagebases=[{voltage}]",
+            "calcvoltagebases",
+            "Set mode=daily",
+            "Set stepsize=1h",
+            # Um passo por patamar: o LoadShape tem npts=4 e interval=1 hora.
+            f"Set number={LOAD_PATTERN_COUNT}",
+            "Set time=(0, 0)",
+            "Solve",
+            "",
+            f"Buscoords {buscoords_filename}",
+            "",
+        ]
+    )
+
+    # As coordenadas usam o mesmo nome de barra dos Bus1/Bus2; é isso que faz o
+    # OpenDSS casar cada ponto com o elemento correspondente.
+    coordinates: list[str] = []
+    seen_names: dict[str, str] = {}
+    for raw_index in catalog.membership(selected[0]).bar_indices:
+        bar_index = int(raw_index)
+        name = bus_name(bar_index)
+        bar_id = bars.bar_ids[bar_index]
+        if name in seen_names:
+            report.add(
+                bar_id,
+                f"nome de barra '{name}' já usado pela barra "
+                f"{seen_names[name]}; a coordenada foi descartada",
+            )
+            continue
+        seen_names[name] = bar_id
+        coordinates.append(
+            f"{name},{_format_coordinate(float(bars.x[bar_index]))},"
+            f"{_format_coordinate(float(bars.y[bar_index]))}"
+        )
+
+    return OpenDssMasterExportResult(
+        master_filename=master_filename,
+        text="\n".join(lines),
+        buscoords_filename=buscoords_filename,
+        buscoords_text="\n".join((*coordinates, "")),
+        bus_count=len(coordinates),
+        discarded_count=report.discarded,
+        issues=tuple(report.issues),
+        omitted_issues=report.omitted,
+    )
+
 
 def build_export(
     catalog: CircuitCatalogModel,
@@ -1177,20 +1316,29 @@ def build_export(
     *,
     loads: LoadModel | None = None,
     patterns: LoadPatternModel | None = None,
+    load_settings: OpenDssLoadSettings | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssExportBundle:
     """Monta todos os arquivos de uma exportação.
 
-    Dois pares de arquivos compartilham namespace no OpenDSS e por isso reservam
-    nomes entre si: trechos e chaves em ``Line.*``, cargas monofásicas e
-    bifásicas em ``Load.*``. Sem a reserva, a segunda definição sobrescreveria a
-    primeira em silêncio.
+    Arquivos que compartilham namespace no OpenDSS reservam nomes entre si:
+    trechos e chaves em ``Line.*``, e os três arquivos de carga em ``Load.*``.
+    Sem a reserva, a segunda definição sobrescreveria a primeira em silêncio.
+    Entre os arquivos de carga o infixo ``-1F-``/``-2F-``/``-3F-`` já torna a
+    coincidência impossível na prática; a reserva permanece porque essa
+    unicidade é propriedade do esquema de nomes, não invariante imposta.
 
     Os arquivos de carga só saem com cargas **e** patamares: sem os quatro NPAT
     não há ``LoadShape`` para o ``daily`` das cargas apontar. Quando saem, saem
-    os dois, mesmo que um fique só com o cabeçalho — assim a lista de arquivos
-    gerados não depende do conteúdo do CSV.
+    os três, mesmo que algum fique só com o cabeçalho — assim a lista de
+    arquivos gerados não depende do conteúdo do CSV.
+
+    ``load_settings`` só chega ao master quando há arquivo de carga a editar. A
+    DLL trata ``BatchEdit`` sem alvo como no-op (``Elements edited: 0``), mas um
+    comando que edita zero objetos num arquivo sem cargas só confundiria quem o
+    lesse. A divisão de responsabilidade é essa: ``build_master_export`` emite o
+    que recebe, e é aqui que se decide se faz sentido.
     """
 
     selected = _selected_indices(catalog, circuit_indices)
@@ -1210,33 +1358,45 @@ def build_export(
         cancel_check=cancel_check,
         progress=progress,
     )
-    single_phase_result: OpenDssLoadExportResult | None = None
-    two_phase_result: OpenDssLoadExportResult | None = None
+    load_results: dict[int, OpenDssLoadExportResult] = {}
     # A identidade amarra os patamares às cargas exibidas, como no resto do
     # projeto: modelos de importações diferentes nunca se combinam.
     if loads is not None and patterns is not None and patterns.loads is loads:
-        single_phase_result = build_single_phase_load_export(
-            catalog,
-            loads,
-            patterns,
-            phase_configuration,
-            selected,
-            cancel_check=cancel_check,
-            progress=progress,
-        )
-        two_phase_result = build_two_phase_load_export(
-            catalog,
-            loads,
-            patterns,
-            phase_configuration,
-            selected,
-            reserved_names=single_phase_result.used_names,
-            cancel_check=cancel_check,
-            progress=progress,
-        )
+        reserved: frozenset[str] = frozenset()
+        for count in LOAD_PHASE_COUNTS:
+            result = build_load_export(
+                catalog,
+                loads,
+                patterns,
+                phase_configuration,
+                selected,
+                phase_count=count,
+                reserved_names=reserved,
+                cancel_check=cancel_check,
+                progress=progress,
+            )
+            reserved |= result.used_names
+            load_results[count] = result
+    bundle = OpenDssExportBundle(
+        lines=line_result,
+        switches=switch_result,
+        single_phase_loads=load_results.get(1),
+        two_phase_loads=load_results.get(2),
+        three_phase_loads=load_results.get(3),
+    )
+    # O master vem por último: ele chama os arquivos de elementos e por isso
+    # precisa saber quais existem.
+    master_result = build_master_export(
+        catalog,
+        selected,
+        redirects=[name for name, _ in bundle.element_files],
+        load_settings=load_settings if load_results else None,
+    )
     return OpenDssExportBundle(
         lines=line_result,
         switches=switch_result,
-        single_phase_loads=single_phase_result,
-        two_phase_loads=two_phase_result,
+        single_phase_loads=load_results.get(1),
+        two_phase_loads=load_results.get(2),
+        three_phase_loads=load_results.get(3),
+        master=master_result,
     )

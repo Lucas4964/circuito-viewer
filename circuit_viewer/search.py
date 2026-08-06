@@ -15,15 +15,21 @@ from .model import (
     FeatureSelection,
     LineNetworkModel,
     LoadModel,
+    RegulatorModel,
     SwitchModel,
 )
 
 
-SearchKind = Literal["bar", "segment", "switch", "load", "circuit"]
+SearchKind = Literal["bar", "segment", "switch", "regulator", "load", "circuit"]
 SearchMode = Literal["code", "all_fields"]
 MatchQuality = Literal["exact", "prefix", "contains"]
 SearchSource: TypeAlias = (
-    CircuitModel | LineNetworkModel | SwitchModel | LoadModel | CircuitCatalogModel
+    CircuitModel
+    | LineNetworkModel
+    | SwitchModel
+    | RegulatorModel
+    | LoadModel
+    | CircuitCatalogModel
 )
 CancelCheck = Callable[[], bool]
 
@@ -31,13 +37,15 @@ _KIND_ORDER: dict[SearchKind, int] = {
     "bar": 0,
     "segment": 1,
     "switch": 2,
-    "load": 3,
-    "circuit": 4,
+    "regulator": 3,
+    "load": 4,
+    "circuit": 5,
 }
 _KIND_LABELS: dict[SearchKind, str] = {
     "bar": "Barra",
     "segment": "Trecho",
     "switch": "Chave",
+    "regulator": "Regulador",
     "load": "Carga",
     "circuit": "Circuito",
 }
@@ -95,6 +103,11 @@ class SearchResult:
         if self.kind == "switch":
             return (
                 f"{prefix}Chave · {self.entity_id} · "
+                f"{self.related_id or 'trecho desconhecido'}"
+            )
+        if self.kind == "regulator":
+            return (
+                f"{prefix}Regulador · {self.entity_id} · "
                 f"{self.related_id or 'trecho desconhecido'}"
             )
         if self.kind == "circuit":
@@ -346,6 +359,53 @@ def _source_rows(
                     record.corn,
                     record.elo,
                     record.elo_type,
+                ),
+            )
+        return
+
+    if kind == "regulator":
+        if not isinstance(source, RegulatorModel):
+            raise TypeError("A partição de reguladores requer RegulatorModel.")
+        columns = (
+            "REGU_ID",
+            "TRECHO_ID",
+            "EXTERN_ID",
+            "CODIGO",
+            "LIGACAO",
+            "SNOM",
+            "FAIXA",
+            "NPASSOS",
+            "TAP",
+            "INOM",
+            "VNOM",
+        )
+        for index in range(len(source)):
+            record = source.record(index)
+            segment_index = int(source.segment_indices[index])
+            yield (
+                SearchResult(
+                    "regulator",
+                    index,
+                    record.code,
+                    record.regulator_id,
+                    # Como as chaves: o regulador não tem geometria própria, o
+                    # que se enquadra e se seleciona é o trecho onde ele está.
+                    FeatureSelection("segment", segment_index),
+                    record.segment_id,
+                ),
+                columns,
+                (
+                    record.regulator_id,
+                    record.segment_id,
+                    record.external_id,
+                    record.code,
+                    record.connection,
+                    record.snom,
+                    record.regulation_range,
+                    record.step_count,
+                    record.tap,
+                    record.inom,
+                    record.vnom,
                 ),
             )
         return
@@ -687,6 +747,27 @@ class GlobalSearchIndex:
         )
         return self._set_partition(
             "switch", model, values, build_fields=build_fields
+        )
+
+    def set_regulators(
+        self,
+        model: RegulatorModel | None,
+        *,
+        build_fields: bool = True,
+    ) -> bool:
+        values = () if model is None else (
+            SearchResult(
+                "regulator",
+                index,
+                code,
+                model.regulator_ids[index],
+                FeatureSelection("segment", int(model.segment_indices[index])),
+                model.segments.segment_ids[int(model.segment_indices[index])],
+            )
+            for index, code in enumerate(model.codes)
+        )
+        return self._set_partition(
+            "regulator", model, values, build_fields=build_fields
         )
 
     def set_loads(

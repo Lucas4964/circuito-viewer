@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QSignalBlocker
 from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
-    QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QPushButton,
     QVBoxLayout,
 )
 
@@ -18,7 +16,11 @@ from .model import CircuitCatalogModel
 
 
 class OpenDssExportDialog(QDialog):
-    """Lista os circuitos do catálogo com caixas de seleção."""
+    """Lista os circuitos do catálogo para escolher **um** a exportar.
+
+    A seleção é única porque o master cria um ``New Circuit``, que energiza um
+    alimentador só. Marcar um circuito desmarca o anterior.
+    """
 
     def __init__(self, catalog: CircuitCatalogModel, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
@@ -29,10 +31,11 @@ class OpenDssExportDialog(QDialog):
 
         layout = QVBoxLayout(self)
         instruction = QLabel(
-            "Selecione os circuitos a exportar. Os trechos comuns e os que "
-            "representam chaves vão para arquivos separados; as cargas "
-            "monofásicas e as bifásicas saem em mais dois arquivos, quando "
-            "cargas e patamares estiverem importados."
+            "Selecione o circuito a exportar. Os trechos comuns e os que "
+            "representam chaves vão para arquivos separados; as cargas saem em "
+            "mais três arquivos, um por contagem de fases, quando cargas e "
+            "patamares estiverem importados. O arquivo master criado no fim "
+            "cria o circuito e chama todos eles."
         )
         instruction.setWordWrap(True)
         layout.addWidget(instruction)
@@ -49,19 +52,12 @@ class OpenDssExportDialog(QDialog):
                 caption += f" ({definition.nominal_voltage.strip()} kV)"
             item = QListWidgetItem(caption, self.circuit_list)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked)
+            # Só o primeiro nasce marcado: a seleção é única.
+            item.setCheckState(
+                Qt.CheckState.Checked if index == 0 else Qt.CheckState.Unchecked
+            )
             item.setData(Qt.ItemDataRole.UserRole, index)
         layout.addWidget(self.circuit_list, 1)
-
-        selection_buttons = QHBoxLayout()
-        self.check_all_button = QPushButton("Marcar todos", self)
-        self.check_all_button.clicked.connect(lambda: self._set_all(True))
-        self.uncheck_all_button = QPushButton("Desmarcar todos", self)
-        self.uncheck_all_button.clicked.connect(lambda: self._set_all(False))
-        selection_buttons.addWidget(self.check_all_button)
-        selection_buttons.addWidget(self.uncheck_all_button)
-        selection_buttons.addStretch(1)
-        layout.addLayout(selection_buttons)
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -72,16 +68,25 @@ class OpenDssExportDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
-        self.circuit_list.itemChanged.connect(self._sync_ok_button)
+        self.circuit_list.itemChanged.connect(self._on_item_changed)
         self._sync_ok_button()
 
-    def _set_all(self, checked: bool) -> None:
-        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-        for row in range(self.circuit_list.count()):
-            self.circuit_list.item(row).setCheckState(state)
+    def _on_item_changed(self, item: QListWidgetItem) -> None:
+        """Mantém no máximo um circuito marcado."""
 
-    def _sync_ok_button(self, *args) -> None:  # noqa: ANN002
-        del args
+        if item.checkState() != Qt.CheckState.Checked:
+            self._sync_ok_button()
+            return
+        # Desmarcar os demais reentraria neste handler pelo itemChanged.
+        blocker = QSignalBlocker(self.circuit_list)
+        for row in range(self.circuit_list.count()):
+            other = self.circuit_list.item(row)
+            if other is not item:
+                other.setCheckState(Qt.CheckState.Unchecked)
+        del blocker
+        self._sync_ok_button()
+
+    def _sync_ok_button(self) -> None:
         button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
         if button is not None:
             button.setEnabled(bool(self.selected_circuit_indices()))
