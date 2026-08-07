@@ -13,6 +13,8 @@ from .csv_import import CsvImportCancelled, load_csv
 from .load_import import load_loads_csv
 from .load_pattern_import import load_load_patterns_csv
 from .equivalent_network import build_equivalent_network
+from .mdb_engine import open_database
+from .mdb_import import load_database
 from .model import (
     CableModel,
     CircuitCatalogModel,
@@ -307,6 +309,69 @@ class CircuitImportWorker(QObject):
                     rows, current, total
                 ),
             )
+        except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class MdbImportWorker(QObject):
+    """Importa as oito entidades de um banco Access numa única execução.
+
+    A cadeia inteira roda num worker só porque cada importador recebe o modelo
+    do anterior: dividir em oito threads exigiria sequenciá-las de qualquer
+    forma, e ainda multiplicaria as revalidações de identidade na chegada.
+
+    A conexão é aberta **aqui dentro**, na thread secundária, e fechada antes de
+    o sinal ser emitido: uma conexão ODBC não é segura para atravessar threads.
+    """
+
+    progress = pyqtSignal(int, int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        path: str,
+        crs: UtmCrs,
+        *,
+        password: str | None = None,
+        entities: tuple[str, ...] | None = None,
+        overrides: dict[str, str] | None = None,
+        scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.path = path
+        self.crs = crs
+        # A senha vive só na memória do worker e nunca é gravada nem registrada.
+        self._password = password
+        self.entities = entities
+        self.overrides = dict(overrides or {})
+        self.scale = float(scale)
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            with open_database(self.path, self._password) as database:
+                result = load_database(
+                    database,
+                    self.crs,
+                    source_path=self.path,
+                    overrides=self.overrides,
+                    entities=self.entities,
+                    scale=self.scale,
+                    cancel_event=self._cancel_event,
+                    progress=lambda rows, current, total: self.progress.emit(
+                        rows, current, total
+                    ),
+                )
         except CsvImportCancelled:
             self.cancelled.emit()
         except Exception as exc:

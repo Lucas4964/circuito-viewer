@@ -148,18 +148,24 @@ class SegmentPowers:
 
 @dataclass(frozen=True, slots=True)
 class RegulatorTap:
-    """Tap resolvido de uma unidade monofásica do regulador.
+    """Tap resolvido de uma unidade monofásica do regulador, num patamar.
 
     ``tap`` é a relação em pu do enrolamento 2, e ``minimum``/``maximum`` são os
-    limites do transformador. ``at_limit`` é o que interessa na prática: um
-    regulador encostado no fim do curso **parou de regular**, e sem isso a
-    interface mostraria um número que parece normal.
+    limites do transformador. ``num_taps`` é o total de passos do comutador
+    entre ``minimum`` e ``maximum`` (``Transformer.NumTaps`` do OpenDSS — por
+    ora sempre o padrão do motor, 32, porque ``FAIXA``/``NPASSOS`` do CSV ainda
+    não alimentam a exportação; ver ``opendss_export.py``).
+
+    ``at_limit`` é o que interessa na prática: um regulador encostado no fim do
+    curso **parou de regular**, e sem isso a interface mostraria um número que
+    parece normal.
     """
 
     phase: str
     tap: float
     minimum: float
     maximum: float
+    num_taps: int = 0
 
     @property
     def at_limit(self) -> bool:
@@ -171,6 +177,21 @@ class RegulatorTap:
             self.tap <= self.minimum + tolerance
             or self.tap >= self.maximum - tolerance
         )
+
+    @property
+    def step(self) -> int:
+        """Passos inteiros a partir do neutro (tap = 1,0 pu ⇒ passo 0).
+
+        É a única grandeza de "quantos passos o comutador precisou dar" que a
+        API do OpenDSS permite calcular: ela expõe a razão de tap resolvida,
+        não um log de quantas vezes o ``RegControl`` moveu o tap durante a
+        convergência.
+        """
+
+        span = self.maximum - self.minimum
+        if span <= 0.0 or self.num_taps <= 0:
+            return 0
+        return round((self.tap - 1.0) / (span / self.num_taps))
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +232,10 @@ class PowerFlowResult:
     regulators: RegulatorModel | None = None
     segment_currents: Mapping[int, SegmentCurrents] = field(default_factory=dict)
     segment_powers: Mapping[int, SegmentPowers] = field(default_factory=dict)
-    regulator_taps: Mapping[int, tuple[RegulatorTap, ...]] = field(
+    # Trecho → um retrato por patamar, cada um com um RegulatorTap por fase —
+    # a mesma forma (externo = patamar, interno = fase) de segment_currents e
+    # bar_voltages.
+    regulator_taps: Mapping[int, tuple[tuple[RegulatorTap, ...], ...]] = field(
         default_factory=dict
     )
     bar_voltages: Mapping[int, BarVoltages] = field(default_factory=dict)
@@ -729,6 +753,7 @@ def _harvest_regulator_taps(
                     tap=float(engine.transformers.tap),
                     minimum=float(engine.transformers.min_tap),
                     maximum=float(engine.transformers.max_tap),
+                    num_taps=int(engine.transformers.num_taps),
                 )
             )
         has_transformer = bool(engine.transformers.next())
@@ -770,7 +795,7 @@ def run_power_flow(
     report = _PowerFlowReport()
     segment_currents: dict[int, SegmentCurrents] = {}
     segment_powers: dict[int, SegmentPowers] = {}
-    regulator_taps: dict[int, tuple[RegulatorTap, ...]] = {}
+    regulator_taps: dict[int, tuple[tuple[RegulatorTap, ...], ...]] = {}
     bar_voltages: dict[int, BarVoltages] = {}
     solved: list[str] = []
     skipped: list[str] = []
@@ -836,6 +861,10 @@ def run_power_flow(
         line_reactive: dict[int, list[float]] = {}
         line_active_losses: dict[int, list[float]] = {}
         line_reactive_losses: dict[int, list[float]] = {}
+        # Índice nome→(trecho, fase) não muda entre patamares; calculado uma
+        # vez fora do laço, como segment_by_line_name e bar_by_bus_name.
+        regulator_unit_index = _regulator_unit_index(bundle)
+        circuit_taps: dict[int, list[tuple[RegulatorTap, ...]]] = {}
 
         for step in range(step_count):
             if cancel_check is not None and cancel_check():
@@ -867,20 +896,19 @@ def run_power_flow(
                 line_reactive_losses,
                 cancel_check,
             )
+            # Um retrato por patamar: o tap resolvido muda a cada solve(), e a
+            # tabela de passos por patamar do painel precisa de todos, não só
+            # do último.
+            step_taps: dict[int, list[RegulatorTap]] = {}
+            _harvest_regulator_taps(engine, regulator_unit_index, step_taps)
+            for segment_index, units in step_taps.items():
+                circuit_taps.setdefault(segment_index, []).append(tuple(units))
             completed += 1
             if progress is not None:
                 progress(min(completed, total), total)
 
-        # Um tap por circuito, depois do último passo: é o estado com que o
-        # alimentador terminou de ser resolvido.
-        circuit_taps: dict[int, list[RegulatorTap]] = {}
-        _harvest_regulator_taps(
-            engine,
-            _regulator_unit_index(bundle),
-            circuit_taps,
-        )
-        for segment_index, units in circuit_taps.items():
-            regulator_taps.setdefault(segment_index, tuple(units))
+        for segment_index, steps in circuit_taps.items():
+            regulator_taps.setdefault(segment_index, tuple(steps))
 
         _merge_circuit_results(
             catalog,

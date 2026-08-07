@@ -7,9 +7,17 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
-from .csv_import import CsvImportCancelled, CsvImportError
+from .csv_import import (
+    PROGRESS_ROW_INTERVAL,
+    CsvImportCancelled,
+    CsvImportError,
+    RowProgress,
+    TextRow,
+    byte_progress,
+    normalize_header,
+)
 from .model import (
     CircuitCatalogModel,
     CircuitDefinition,
@@ -72,20 +80,30 @@ def _column_positions(header: tuple[str, ...]) -> dict[str, int]:
     return positions
 
 
-def _parse_file(
-    path: Path,
+def parse_circuit_rows(
+    raw_header: Iterable[str],
+    rows: Iterable[TextRow],
     segments: LineNetworkModel,
-    switches: SwitchModel | None,
+    switches: SwitchModel | None = None,
+    *,
+    source_label: str,
     encoding: str,
-    cancel_event: threading.Event | None,
-    progress: ProgressCallback | None,
+    first_line_number: int = 2,
+    cancel_event: threading.Event | None = None,
+    progress: RowProgress | None = None,
 ) -> CircuitLoadResult:
+    """Valida linhas de circuitos já em texto e constrói o catálogo.
+
+    Toda a validação vive aqui, independente da fonte: o CSV e o banco Access
+    apenas entregam cabeçalho e linhas de texto. O custo dominante não é o
+    parsing e sim a busca topológica de ``CircuitCatalogModel.build``.
+    """
+
     definitions: list[CircuitDefinition] = []
     seen_ids: set[str] = set()
     issues: list[CircuitIssue] = []
     total_rows = 0
     invalid_rows = 0
-    total_bytes = max(path.stat().st_size, 1)
 
     def add_issue(line_number: int, reason: str) -> None:
         nonlocal invalid_rows
@@ -93,57 +111,47 @@ def _parse_file(
         if len(issues) < MAX_REPORTED_ISSUES:
             issues.append(CircuitIssue(line_number, reason))
 
-    with path.open("r", encoding=encoding, newline="") as source:
-        reader = csv.reader(source, delimiter=";")
-        try:
-            raw_header = next(reader)
-        except StopIteration as exc:
-            raise CsvImportError("O arquivo CSV de circuitos está vazio.") from exc
-        header = tuple(value.strip().lstrip("\ufeff") for value in raw_header)
-        positions = _column_positions(header)
-        last_required_position = max(positions.values())
+    header = normalize_header(raw_header)
+    positions = _column_positions(header)
+    last_required_position = max(positions.values())
 
-        for line_number, row in enumerate(reader, start=2):
-            if cancel_event is not None and cancel_event.is_set():
-                raise CsvImportCancelled("Importação cancelada.")
-            if not row or not any(value.strip() for value in row):
-                continue
-            total_rows += 1
-            if progress is not None and total_rows % 1_000 == 0:
-                try:
-                    position = source.buffer.tell()
-                except (AttributeError, OSError):
-                    position = 0
-                progress(total_rows, min(position, total_bytes), total_bytes)
-            if len(row) <= last_required_position:
-                add_issue(line_number, "faltam valores em colunas obrigatórias")
-                continue
+    for line_number, row in enumerate(rows, start=first_line_number):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CsvImportCancelled("Importação cancelada.")
+        if not row or not any(value.strip() for value in row):
+            continue
+        total_rows += 1
+        if progress is not None and total_rows % PROGRESS_ROW_INTERVAL == 0:
+            progress(total_rows)
+        if len(row) <= last_required_position:
+            add_issue(line_number, "faltam valores em colunas obrigatórias")
+            continue
 
-            values = {name: row[index].strip() for name, index in positions.items()}
-            circuit_id = values["CIRC_ID"]
-            if not circuit_id:
-                add_issue(line_number, "CIRC_ID vazio")
-                continue
-            if circuit_id in seen_ids:
-                add_issue(line_number, f"CIRC_ID duplicado: {circuit_id}")
-                continue
-            root_bar_id = values["BARRA_ID"]
-            if not root_bar_id:
-                add_issue(line_number, "BARRA_ID vazio")
-                continue
-            if segments.bars.index_for_id(root_bar_id) is None:
-                add_issue(line_number, f"barra inicial inexistente: {root_bar_id}")
-                continue
+        values = {name: row[index].strip() for name, index in positions.items()}
+        circuit_id = values["CIRC_ID"]
+        if not circuit_id:
+            add_issue(line_number, "CIRC_ID vazio")
+            continue
+        if circuit_id in seen_ids:
+            add_issue(line_number, f"CIRC_ID duplicado: {circuit_id}")
+            continue
+        root_bar_id = values["BARRA_ID"]
+        if not root_bar_id:
+            add_issue(line_number, "BARRA_ID vazio")
+            continue
+        if segments.bars.index_for_id(root_bar_id) is None:
+            add_issue(line_number, f"barra inicial inexistente: {root_bar_id}")
+            continue
 
-            seen_ids.add(circuit_id)
-            definitions.append(
-                CircuitDefinition(
-                    circuit_id=circuit_id,
-                    root_bar_id=root_bar_id,
-                    code=values["CODIGO"],
-                    nominal_voltage=values["VNOM"],
-                )
+        seen_ids.add(circuit_id)
+        definitions.append(
+            CircuitDefinition(
+                circuit_id=circuit_id,
+                root_bar_id=root_bar_id,
+                code=values["CODIGO"],
+                nominal_voltage=values["VNOM"],
             )
+        )
 
     if cancel_event is not None and cancel_event.is_set():
         raise CsvImportCancelled("Importação cancelada.")
@@ -154,13 +162,13 @@ def _parse_file(
             segments,
             switches,
             definitions,
-            source_path=str(path.resolve()),
+            source_path=source_label,
             cancel_check=(None if cancel_event is None else cancel_event.is_set),
         )
     except InterruptedError as exc:
         raise CsvImportCancelled("Importação cancelada.") from exc
     if progress is not None:
-        progress(total_rows, total_bytes, total_bytes)
+        progress(total_rows)
     return CircuitLoadResult(
         model=model,
         encoding=encoding,
@@ -170,6 +178,33 @@ def _parse_file(
         issues=tuple(issues),
         omitted_issues=max(0, invalid_rows - len(issues)),
     )
+
+
+def _parse_file(
+    path: Path,
+    segments: LineNetworkModel,
+    switches: SwitchModel | None,
+    encoding: str,
+    cancel_event: threading.Event | None,
+    progress: ProgressCallback | None,
+) -> CircuitLoadResult:
+    total_bytes = max(path.stat().st_size, 1)
+    with path.open("r", encoding=encoding, newline="") as source:
+        reader = csv.reader(source, delimiter=";")
+        try:
+            raw_header = next(reader)
+        except StopIteration as exc:
+            raise CsvImportError("O arquivo CSV de circuitos está vazio.") from exc
+        return parse_circuit_rows(
+            raw_header,
+            reader,
+            segments,
+            switches,
+            source_label=str(path.resolve()),
+            encoding=encoding,
+            cancel_event=cancel_event,
+            progress=byte_progress(source, total_bytes, progress),
+        )
 
 
 def load_circuits_csv(

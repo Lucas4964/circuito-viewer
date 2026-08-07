@@ -21,6 +21,7 @@ from circuit_viewer.model import (
     LoadModel,
     LoadPatternModel,
     LoadPatternRecord,
+    RegulatorModel,
     SwitchModel,
     UtmCrs,
 )
@@ -108,6 +109,36 @@ def make_catalog(
         network,
         switches,
         [CircuitDefinition("C1", "B0", "ALIMENTADOR", voltage)],
+    )
+
+
+def make_regulators(
+    network: LineNetworkModel,
+    *,
+    segment_index: int = 0,
+    code: str = "RG01",
+    vnom: str = "13,8",
+) -> RegulatorModel:
+    """Um regulador trifásico no trecho indicado, exportável sem ocorrências.
+
+    ``code`` sem acento nem espaço vira o nome do ``Transformer`` sem
+    saneamento (``REG-<code>-<letra>``), o que mantém os testes lendo o nome
+    exato sem duplicar ``sanitize_dss_name``.
+    """
+
+    return RegulatorModel(
+        network,
+        ["REGU1"],
+        [segment_index],
+        ["EXT-1"],
+        [code],
+        ["Y"],
+        ["333"],
+        ["0,1"],
+        ["32"],
+        ["0"],
+        ["200"],
+        [vnom],
     )
 
 
@@ -204,7 +235,13 @@ class FakeCktElement:
 
 
 class FakeTransformers:
-    """Itera Transformer no protocolo first()/next(), como o OpenDSS."""
+    """Itera Transformer no protocolo first()/next(), como o OpenDSS.
+
+    ``tap`` depende do passo (``owner.step``) pelo mesmo motivo de
+    ``FakeCircuit.buses_vmag``: sem variação por patamar, um teste não consegue
+    provar que os quatro retratos de tap foram colhidos separadamente, e não
+    quatro cópias do mesmo estado.
+    """
 
     def __init__(self, owner: FakeEngine) -> None:
         self._owner = owner
@@ -225,7 +262,10 @@ class FakeTransformers:
 
     @property
     def tap(self) -> float:
-        return self._owner.transformer_taps[self.name]
+        base = self._owner.transformer_taps[self.name]
+        # step é 1-indexado (ver FakeSolution.solve); o primeiro patamar não
+        # tem deslocamento algum, como em buses_vmag.
+        return base + self._owner.transformer_tap_step * (self._owner.step - 1)
 
     @property
     def min_tap(self) -> float:
@@ -234,6 +274,10 @@ class FakeTransformers:
     @property
     def max_tap(self) -> float:
         return self._owner.transformer_tap_limits[1]
+
+    @property
+    def num_taps(self) -> int:
+        return self._owner.transformer_num_taps
 
 
 class FakeCircuit:
@@ -294,7 +338,9 @@ class FakeEngine:
         line_powers: dict[str, tuple[tuple[float, float], ...]] | None = None,
         line_losses: dict[str, tuple[float, float]] | None = None,
         transformer_taps: dict[str, float] | None = None,
+        transformer_tap_step: float = 0.0,
         transformer_tap_limits: tuple[float, float] = (0.9, 1.1),
+        transformer_num_taps: int = 32,
         node_names: tuple[str, ...] = (
             "barra_a.1",
             "barra_a.2",
@@ -334,7 +380,9 @@ class FakeEngine:
         }
         self.diverging_steps = diverging_steps
         self.transformer_taps = transformer_taps or {}
+        self.transformer_tap_step = transformer_tap_step
         self.transformer_tap_limits = transformer_tap_limits
+        self.transformer_num_taps = transformer_num_taps
         self.circuit = FakeCircuit(self)
         self.lines = FakeLines(self)
         self.transformers = FakeTransformers(self)
@@ -1090,6 +1138,124 @@ class RegulatorTapTests(unittest.TestCase):
         self.assertFalse(
             RegulatorTap(phase="D", tap=1.0, minimum=1.0, maximum=1.0).at_limit
         )
+
+    def _stepped(self, tap: float, num_taps: int = 32) -> RegulatorTap:
+        return RegulatorTap(
+            phase="D", tap=tap, minimum=0.9, maximum=1.1, num_taps=num_taps
+        )
+
+    def test_neutral_tap_is_step_zero(self) -> None:
+        self.assertEqual(self._stepped(1.0).step, 0)
+
+    def test_step_above_neutral(self) -> None:
+        # ±10% em 32 passos ⇒ 0,00625 pu por passo; 0,05/0,00625 = 8.
+        self.assertEqual(self._stepped(1.05).step, 8)
+
+    def test_step_below_neutral_is_negative(self) -> None:
+        self.assertEqual(self._stepped(0.95).step, -8)
+
+    def test_step_rounds_to_the_nearest_integer(self) -> None:
+        # 0,003/0,00625 = 0,48 ⇒ arredonda para 0.
+        self.assertEqual(self._stepped(1.003).step, 0)
+        # 0,004/0,00625 = 0,64 ⇒ arredonda para 1.
+        self.assertEqual(self._stepped(1.004).step, 1)
+
+    def test_step_at_either_limit(self) -> None:
+        self.assertEqual(self._stepped(1.1).step, 16)
+        self.assertEqual(self._stepped(0.9).step, -16)
+
+    def test_zero_num_taps_is_step_zero(self) -> None:
+        # Sem número de passos declarado (o campo tem padrão 0), não há como
+        # calcular a granularidade; melhor 0 do que ZeroDivisionError.
+        self.assertEqual(RegulatorTap(phase="D", tap=1.05, minimum=0.9, maximum=1.1).step, 0)
+
+    def test_degenerate_range_is_step_zero(self) -> None:
+        self.assertEqual(
+            RegulatorTap(
+                phase="D", tap=1.0, minimum=1.0, maximum=1.0, num_taps=32
+            ).step,
+            0,
+        )
+
+
+class RegulatorTapHarvestTests(unittest.TestCase):
+    """O tap é colhido a cada patamar, não só depois do último solve()."""
+
+    def _run(self, engine: FakeEngine, *, segments=None):  # noqa: ANN001, ANN202
+        network = make_network(make_bars())
+        with tempfile.TemporaryDirectory() as directory:
+            return run_power_flow(
+                engine,
+                make_catalog(network),
+                make_cables(),
+                PHASES,
+                [0],
+                workspace=Path(directory),
+                regulators=make_regulators(network),
+            )
+
+    def test_one_snapshot_per_patamar(self) -> None:
+        engine = FakeEngine(
+            transformer_taps={
+                "REG-RG01-D": 1.0,
+                "REG-RG01-E": 1.0,
+                "REG-RG01-F": 1.0,
+            }
+        )
+
+        result = self._run(engine)
+
+        # Quatro retratos, um por NPAT — não mais um só, depois do último.
+        self.assertEqual(len(result.regulator_taps[0]), 4)
+        for step_taps in result.regulator_taps[0]:
+            self.assertEqual({tap.phase for tap in step_taps}, {"D", "E", "F"})
+
+    def test_the_tap_changes_across_patamares(self) -> None:
+        # Um passo (0,00625 pu, ±10% em 32) a mais por patamar.
+        engine = FakeEngine(
+            transformer_taps={
+                "REG-RG01-D": 1.0,
+                "REG-RG01-E": 1.0,
+                "REG-RG01-F": 1.0,
+            },
+            transformer_tap_step=0.00625,
+        )
+
+        result = self._run(engine)
+
+        steps_by_patamar = [
+            next(tap.step for tap in step_taps if tap.phase == "D")
+            for step_taps in result.regulator_taps[0]
+        ]
+        self.assertEqual(steps_by_patamar, [0, 1, 2, 3])
+
+    def test_num_taps_reaches_the_result(self) -> None:
+        engine = FakeEngine(
+            transformer_taps={
+                "REG-RG01-D": 1.0,
+                "REG-RG01-E": 1.0,
+                "REG-RG01-F": 1.0,
+            },
+            transformer_num_taps=16,
+        )
+
+        result = self._run(engine)
+
+        first_tap = result.regulator_taps[0][0][0]
+        self.assertEqual(first_tap.num_taps, 16)
+
+    def test_a_segment_without_a_regulator_has_no_taps(self) -> None:
+        engine = FakeEngine(
+            transformer_taps={
+                "REG-RG01-D": 1.0,
+                "REG-RG01-E": 1.0,
+                "REG-RG01-F": 1.0,
+            }
+        )
+
+        result = self._run(engine)
+
+        self.assertEqual(result.regulator_taps.get(1, ()), ())
 
 
 class IssueTests(unittest.TestCase):

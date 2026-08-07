@@ -7,9 +7,17 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
-from .csv_import import CsvImportCancelled, CsvImportError
+from .csv_import import (
+    PROGRESS_ROW_INTERVAL,
+    CsvImportCancelled,
+    CsvImportError,
+    RowProgress,
+    TextRow,
+    byte_progress,
+    normalize_header,
+)
 from .model import LineNetworkModel, SwitchModel
 
 
@@ -74,13 +82,23 @@ def _column_positions(header: tuple[str, ...]) -> dict[str, int]:
     return positions
 
 
-def _parse_file(
-    path: Path,
+def parse_switch_rows(
+    raw_header: Iterable[str],
+    rows: Iterable[TextRow],
     segments: LineNetworkModel,
+    *,
+    source_label: str,
     encoding: str,
-    cancel_event: threading.Event | None,
-    progress: ProgressCallback | None,
+    first_line_number: int = 2,
+    cancel_event: threading.Event | None = None,
+    progress: RowProgress | None = None,
 ) -> SwitchLoadResult:
+    """Valida linhas de chaves já em texto e devolve o modelo.
+
+    Toda a validação vive aqui, independente da fonte: o CSV e o banco Access
+    apenas entregam cabeçalho e linhas de texto.
+    """
+
     switch_ids: list[str] = []
     switch_type_ids: list[str] = []
     circuit_ids: list[str] = []
@@ -96,7 +114,6 @@ def _parse_file(
     issues: list[SwitchIssue] = []
     total_rows = 0
     invalid_rows = 0
-    total_bytes = max(path.stat().st_size, 1)
 
     def add_issue(line_number: int, reason: str) -> None:
         nonlocal invalid_rows
@@ -104,72 +121,62 @@ def _parse_file(
         if len(issues) < MAX_REPORTED_ISSUES:
             issues.append(SwitchIssue(line_number, reason))
 
-    with path.open("r", encoding=encoding, newline="") as source:
-        reader = csv.reader(source, delimiter=";")
-        try:
-            raw_header = next(reader)
-        except StopIteration as exc:
-            raise CsvImportError("O arquivo CSV de chaves está vazio.") from exc
-        header = tuple(value.strip().lstrip("\ufeff") for value in raw_header)
-        positions = _column_positions(header)
-        last_required_position = max(positions.values())
+    header = normalize_header(raw_header)
+    positions = _column_positions(header)
+    last_required_position = max(positions.values())
 
-        for line_number, row in enumerate(reader, start=2):
-            if cancel_event is not None and cancel_event.is_set():
-                raise CsvImportCancelled("Importação cancelada.")
-            if not row or not any(value.strip() for value in row):
-                continue
-            total_rows += 1
-            if progress is not None and total_rows % 1_000 == 0:
-                try:
-                    position = source.buffer.tell()
-                except (AttributeError, OSError):
-                    position = 0
-                progress(total_rows, min(position, total_bytes), total_bytes)
-            if len(row) <= last_required_position:
-                add_issue(line_number, "faltam valores em colunas obrigatórias")
-                continue
+    for line_number, row in enumerate(rows, start=first_line_number):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CsvImportCancelled("Importação cancelada.")
+        if not row or not any(value.strip() for value in row):
+            continue
+        total_rows += 1
+        if progress is not None and total_rows % PROGRESS_ROW_INTERVAL == 0:
+            progress(total_rows)
+        if len(row) <= last_required_position:
+            add_issue(line_number, "faltam valores em colunas obrigatórias")
+            continue
 
-            values = {name: row[index].strip() for name, index in positions.items()}
-            switch_id = values["CHAVE_ID"]
-            if not switch_id:
-                add_issue(line_number, "CHAVE_ID vazio")
-                continue
-            if switch_id in seen_switch_ids:
-                add_issue(line_number, f"CHAVE_ID duplicado: {switch_id}")
-                continue
+        values = {name: row[index].strip() for name, index in positions.items()}
+        switch_id = values["CHAVE_ID"]
+        if not switch_id:
+            add_issue(line_number, "CHAVE_ID vazio")
+            continue
+        if switch_id in seen_switch_ids:
+            add_issue(line_number, f"CHAVE_ID duplicado: {switch_id}")
+            continue
 
-            segment_id = values["TRECHO_ID"]
-            segment_index = segments.index_for_id(segment_id)
-            if not segment_id or segment_index is None:
-                add_issue(
-                    line_number,
-                    f"trecho inexistente: {segment_id or '<vazio>'}",
-                )
-                continue
-            if segment_index in seen_segment_indices:
-                add_issue(line_number, f"TRECHO_ID com mais de uma chave: {segment_id}")
-                continue
+        segment_id = values["TRECHO_ID"]
+        segment_index = segments.index_for_id(segment_id)
+        if not segment_id or segment_index is None:
+            add_issue(
+                line_number,
+                f"trecho inexistente: {segment_id or '<vazio>'}",
+            )
+            continue
+        if segment_index in seen_segment_indices:
+            add_issue(line_number, f"TRECHO_ID com mais de uma chave: {segment_id}")
+            continue
 
-            seen_switch_ids.add(switch_id)
-            seen_segment_indices.add(segment_index)
-            switch_ids.append(switch_id)
-            switch_type_ids.append(values["TIPOCHV_ID"])
-            circuit_ids.append(values["CIRC_ID"])
-            segment_indices.append(segment_index)
-            codes.append(values["CODIGO"])
-            states.append(values["ESTADO"])
-            normal_states.append(values["ESTADO_NORMAL"])
-            corn_values.append(values["CORN"])
-            elo_values.append(values["ELO"])
-            elo_types.append(values["ELO_TIPO"])
+        seen_switch_ids.add(switch_id)
+        seen_segment_indices.add(segment_index)
+        switch_ids.append(switch_id)
+        switch_type_ids.append(values["TIPOCHV_ID"])
+        circuit_ids.append(values["CIRC_ID"])
+        segment_indices.append(segment_index)
+        codes.append(values["CODIGO"])
+        states.append(values["ESTADO"])
+        normal_states.append(values["ESTADO_NORMAL"])
+        corn_values.append(values["CORN"])
+        elo_values.append(values["ELO"])
+        elo_types.append(values["ELO_TIPO"])
 
     if cancel_event is not None and cancel_event.is_set():
         raise CsvImportCancelled("Importação cancelada.")
     if not switch_ids:
         raise CsvImportError("Nenhuma chave válida foi encontrada no arquivo.")
     if progress is not None:
-        progress(total_rows, total_bytes, total_bytes)
+        progress(total_rows)
 
     model = SwitchModel(
         segments,
@@ -183,7 +190,7 @@ def _parse_file(
         corn_values,
         elo_values,
         elo_types,
-        source_path=str(path.resolve()),
+        source_path=source_label,
     )
     return SwitchLoadResult(
         model=model,
@@ -194,6 +201,31 @@ def _parse_file(
         issues=tuple(issues),
         omitted_issues=max(0, invalid_rows - len(issues)),
     )
+
+
+def _parse_file(
+    path: Path,
+    segments: LineNetworkModel,
+    encoding: str,
+    cancel_event: threading.Event | None,
+    progress: ProgressCallback | None,
+) -> SwitchLoadResult:
+    total_bytes = max(path.stat().st_size, 1)
+    with path.open("r", encoding=encoding, newline="") as source:
+        reader = csv.reader(source, delimiter=";")
+        try:
+            raw_header = next(reader)
+        except StopIteration as exc:
+            raise CsvImportError("O arquivo CSV de chaves está vazio.") from exc
+        return parse_switch_rows(
+            raw_header,
+            reader,
+            segments,
+            source_label=str(path.resolve()),
+            encoding=encoding,
+            cancel_event=cancel_event,
+            progress=byte_progress(source, total_bytes, progress),
+        )
 
 
 def load_switches_csv(

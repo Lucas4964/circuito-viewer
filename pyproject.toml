@@ -24,6 +24,13 @@ test = [
 opendss = [
     "py-dss-interface>=2.3,<3",
 ]
+# A leitura de bancos Access é opcional pelo mesmo motivo, e ainda depende de um
+# driver ODBC externo — o Microsoft Access Database Engine Redistributable, na
+# mesma arquitetura do Python. Sem os dois, apenas "Importar banco de dados…"
+# fica desabilitado, com o motivo na dica.
+mdb = [
+    "pyodbc>=5.1,<6",
+]
 
 [project.scripts]
 circuit-viewer = "circuit_viewer.__main__:main"
@@ -33,6 +40,7 @@ include = ["circuit_viewer*"]
 
 [tool.setuptools.package-data]
 circuit_viewer = ["config/*.json"]
+
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

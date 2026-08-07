@@ -64,6 +64,16 @@ from .graphics import (
 from .load_import import LoadCsvResult
 from .load_pattern_import import LoadPatternCsvResult
 from .load_pattern_table import LoadPatternTableModel
+from .mdb_engine import (
+    MdbEngineError,
+    MdbPasswordError,
+    mdb_import_error,
+    open_database,
+)
+from .mdb_import import MdbImportResult, detect_database_scale
+from .mdb_import_dialog import MdbImportDialog, MdbPasswordDialog
+from .mdb_import_report import MdbImportReportWindow
+from .mdb_mapping import MdbMappingError, load_table_mapping, resolve_mapping
 from .mapa_tiles import (
     PROVEDORES,
     PROVEDOR_ESRI,
@@ -130,7 +140,7 @@ from .search import GlobalSearchIndex, SearchResult
 from .search_palette import SearchPalette
 from .segment_import import SegmentLoadResult
 from .switch_import import SwitchLoadResult
-from .table_columns import enable_interactive_columns
+from .table_columns import EXCEL_LIKE_TABLE_STYLE, enable_interactive_columns
 from .theme import (
     THEME_LABELS,
     AppTheme,
@@ -145,6 +155,7 @@ from .workers import (
     CsvImportWorker,
     LoadImportWorker,
     LoadPatternImportWorker,
+    MdbImportWorker,
     OpenDssExportWorker,
     PowerFlowWorker,
     RegulatorImportWorker,
@@ -171,28 +182,33 @@ _LOAD_EXPORT_FILES: tuple[tuple[int, str, str], ...] = (
 # fora de propósito: o ângulo dele é o mesmo da tensão de fase, só o módulo muda
 # de escala, então repeti-lo seria ruído. O carregamento é uma razão de módulos
 # e não tem fase alguma.
+#
+# Todas as grandezas usam 4 casas decimais fixas — inclusive ângulo,
+# carregamento e desequilíbrio —, para que a tabela inteira tenha a mesma
+# precisão visual em vez de variar coluna a coluna.
 _SEGMENT_QUANTITIES: tuple[tuple[str, str, int, bool], ...] = (
-    ("current", "Corrente por fase (A)", 2, True),
-    ("loading", "Carregamento (%)", 1, False),
-    ("active_power", "Potência ativa (kW)", 2, False),
-    ("reactive_power", "Potência reativa (kvar)", 2, False),
-    ("apparent_power", "Potência aparente (kVA)", 2, True),
-    ("three_phase_power", "Potência trifásica", 2, False),
+    ("current", "Corrente por fase (A)", 4, True),
+    ("loading", "Carregamento (%)", 4, False),
+    ("active_power", "Potência ativa (kW)", 4, False),
+    ("reactive_power", "Potência reativa (kvar)", 4, False),
+    ("apparent_power", "Potência aparente (kVA)", 4, True),
+    ("three_phase_power", "Potência trifásica", 4, False),
     ("power_factor", "Fator de potência", 4, False),
-    ("losses", "Perdas", 3, False),
+    ("losses", "Perdas", 4, False),
 )
 # "voltage" precisa continuar em primeiro: é o padrão do combobox e o recuo de
 # _quantity_of quando a chave ainda não foi escolhida.
 _BAR_QUANTITIES: tuple[tuple[str, str, int, bool], ...] = (
-    ("voltage", "Tensão de fase (V)", 1, True),
-    ("line_voltage", "Tensão de linha (V)", 1, True),
+    ("voltage", "Tensão de fase (V)", 4, True),
+    ("line_voltage", "Tensão de linha (V)", 4, True),
     ("per_unit", "Tensão de fase (pu)", 4, False),
     ("line_per_unit", "Tensão de linha (pu)", 4, False),
-    ("unbalance", "Desequilíbrio de tensão (%)", 2, False),
+    ("unbalance", "Desequilíbrio de tensão (%)", 4, False),
 )
-# Casas decimais das colunas de ângulo; um décimo de grau é resolução de sobra
-# para ler um fasor.
-_ANGLE_DECIMALS = 1
+# Casas decimais das colunas de ângulo — mesma precisão fixa das demais
+# colunas de fluxo de potência, para a tabela não variar de precisão por
+# coluna.
+_ANGLE_DECIMALS = 4
 # Grandezas que saem de SegmentPowers, e não de SegmentCurrents.
 _POWER_QUANTITY_KEYS = frozenset(
     {
@@ -438,6 +454,15 @@ class MainWindow(QMainWindow):
             )
         except PhaseConfigurationError as exc:
             self._phase_configuration_error = str(exc)
+        # Como o fases2.json, um mapeamento inválido desabilita apenas o recurso
+        # que depende dele — aqui, a importação por banco.
+        self._mdb_table_mapping = None
+        self._mdb_mapping_error: str | None = None
+        self._mdb_report_window: MdbImportReportWindow | None = None
+        try:
+            self._mdb_table_mapping = load_table_mapping()
+        except MdbMappingError as exc:
+            self._mdb_mapping_error = str(exc)
         self._import_thread: QThread | None = None
         self._import_worker: (
             CsvImportWorker
@@ -447,6 +472,7 @@ class MainWindow(QMainWindow):
             | SwitchImportWorker
             | RegulatorImportWorker
             | CircuitImportWorker
+            | MdbImportWorker
             | None
         ) = None
         self._progress_dialog: QProgressDialog | None = None
@@ -554,6 +580,22 @@ class MainWindow(QMainWindow):
             "Importar barras, trechos, cargas, chaves ou circuitos de arquivos CSV"
         )
         self.import_action.triggered.connect(self._choose_import)
+
+        self.mdb_import_action = QAction("Importar banco de dados…", self)
+        self.mdb_import_action.setToolTip(
+            "Importar barras, trechos, cargas, patamares, chaves, reguladores, "
+            "circuitos e cabos de um banco Access (.mdb/.accdb), em modo "
+            "somente leitura"
+        )
+        # Sem pyodbc ou sem driver ODBC a ação nunca habilita, e o motivo vira a
+        # dica — o mesmo padrão de power_flow_action com o py-dss-interface.
+        self._mdb_error = mdb_import_error()
+        if self._mdb_error is None and self._mdb_mapping_error is not None:
+            self._mdb_error = self._mdb_mapping_error
+        if self._mdb_error is not None:
+            self.mdb_import_action.setEnabled(False)
+            self.mdb_import_action.setToolTip(self._mdb_error)
+        self.mdb_import_action.triggered.connect(self._choose_mdb_import)
 
         self.fit_action = QAction("Enquadrar tudo", self)
         self.fit_action.setShortcut(QKeySequence("F"))
@@ -728,6 +770,7 @@ class MainWindow(QMainWindow):
     def _create_menus_and_toolbar(self) -> None:
         file_menu = self.menuBar().addMenu("Arquivo")
         file_menu.addAction(self.import_action)
+        file_menu.addAction(self.mdb_import_action)
         file_menu.addSeparator()
         file_menu.addAction(self.exit_action)
 
@@ -919,8 +962,8 @@ class MainWindow(QMainWindow):
             )
             table.verticalHeader().hide()
             table.verticalHeader().setDefaultSectionSize(28)
-            enable_interactive_columns(table)
-            table.setStyleSheet("QTableView { gridline-color: palette(mid); }")
+            enable_interactive_columns(table, always_refit=True)
+            table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
             # Quatro patamares sempre; altura fixa evita a barra de rolagem
             # vertical dentro de uma tabela que nunca cresce.
             table.setFixedHeight(
@@ -1035,10 +1078,8 @@ class MainWindow(QMainWindow):
         )
         self.load_patterns_table.verticalHeader().hide()
         self.load_patterns_table.verticalHeader().setDefaultSectionSize(28)
-        enable_interactive_columns(self.load_patterns_table)
-        self.load_patterns_table.setStyleSheet(
-            "QTableView { gridline-color: palette(mid); }"
-        )
+        enable_interactive_columns(self.load_patterns_table, always_refit=True)
+        self.load_patterns_table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
         table_height = (
             self.load_patterns_table.horizontalHeader().sizeHint().height()
             + 4 * self.load_patterns_table.verticalHeader().defaultSectionSize()
@@ -1113,7 +1154,10 @@ class MainWindow(QMainWindow):
         )
         self.equivalent_patterns_table.verticalHeader().hide()
         self.equivalent_patterns_table.verticalHeader().setDefaultSectionSize(28)
-        enable_interactive_columns(self.equivalent_patterns_table)
+        enable_interactive_columns(
+            self.equivalent_patterns_table, always_refit=True
+        )
+        self.equivalent_patterns_table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
         self.equivalent_patterns_table.setFixedHeight(table_height)
         equivalent_pattern_layout.addWidget(self.equivalent_patterns_table)
         self.equivalent_patterns_section.setVisible(False)
@@ -1213,6 +1257,43 @@ class MainWindow(QMainWindow):
         self.regulator_tap_label.setWordWrap(True)
         self.regulator_tap_label.setVisible(False)
         regulator_layout.addWidget(self.regulator_tap_label)
+
+        # Passos de tap por patamar: um retrato por NPAT, e não só o final.
+        self.regulator_tap_table_title = QLabel("Passos de tap por patamar")
+        self.regulator_tap_table_title.setVisible(False)
+        regulator_layout.addWidget(self.regulator_tap_table_title)
+        self.regulator_tap_table_model = PowerFlowTableModel(self)
+        self.regulator_tap_table = QTableView(self.regulator_details_section)
+        self.regulator_tap_table.setObjectName("regulator_tap_table")
+        self.regulator_tap_table.setModel(self.regulator_tap_table_model)
+        self.regulator_tap_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.regulator_tap_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectItems
+        )
+        self.regulator_tap_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.regulator_tap_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.regulator_tap_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.regulator_tap_table.verticalHeader().hide()
+        self.regulator_tap_table.verticalHeader().setDefaultSectionSize(28)
+        enable_interactive_columns(self.regulator_tap_table, always_refit=True)
+        self.regulator_tap_table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
+        self.regulator_tap_table.setFixedHeight(
+            self.regulator_tap_table.horizontalHeader().sizeHint().height()
+            + 4 * self.regulator_tap_table.verticalHeader().defaultSectionSize()
+            + 2 * self.regulator_tap_table.frameWidth()
+            + 4
+        )
+        self.regulator_tap_table.setVisible(False)
+        regulator_layout.addWidget(self.regulator_tap_table)
+
         self.regulator_details_section.setVisible(False)
         segment_layout.addWidget(self.regulator_details_section)
 
@@ -1467,6 +1548,210 @@ class MainWindow(QMainWindow):
         )
         if path:
             self._start_circuit_import(path)
+
+    def _busy(self) -> bool:
+        """``True`` quando alguma operação pesada já ocupa um dos slots."""
+
+        return (
+            self._import_thread is not None
+            or self._branch_thread is not None
+            or self._equivalent_thread is not None
+            or self._power_flow_thread is not None
+        )
+
+    def _open_mdb(self, path: str):  # noqa: ANN201
+        """Abre o banco pedindo a senha quando o driver reclamar dela.
+
+        Devolve ``(gerenciador, senha)`` ou ``None`` se o usuário desistir. O
+        contexto volta aberto de propósito: o diálogo precisa consultar tabelas
+        e amostrar coordenadas antes de a importação começar.
+        """
+
+        password: str | None = None
+        retry = False
+        while True:
+            manager = open_database(path, password)
+            try:
+                database = manager.__enter__()
+            except MdbPasswordError:
+                dialog = MdbPasswordDialog(Path(path).name, self, retry=retry)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return None
+                password = dialog.password()
+                retry = True
+                continue
+            return manager, database, password
+
+    def _choose_mdb_import(self) -> None:
+        if self._busy() or self._mdb_error is not None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importar banco de dados",
+            "",
+            "Bancos Access (*.mdb *.accdb);;Todos os arquivos (*)",
+        )
+        if not path:
+            return
+
+        try:
+            opened = self._open_mdb(path)
+        except MdbEngineError as exc:
+            QMessageBox.critical(self, "Falha ao abrir o banco", str(exc))
+            return
+        if opened is None:
+            return
+        manager, database, password = opened
+
+        try:
+            plan = resolve_mapping(database, self._mdb_table_mapping)
+            table_names = database.tables()
+            row_counts: dict[str, int] = {}
+            for entity in plan.resolved:
+                try:
+                    row_counts[entity.table] = database.row_count(entity.table)
+                except Exception:  # noqa: BLE001 — a contagem é informativa
+                    continue
+            suggested_scale = detect_database_scale(database, plan)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Falha ao ler o banco", str(exc))
+            return
+        finally:
+            # A conexão de inspeção é fechada antes de o worker começar: ele
+            # abre a sua própria, porque uma conexão ODBC não é segura para
+            # atravessar threads.
+            manager.__exit__(None, None, None)
+
+        if not plan.has_mandatory:
+            QMessageBox.critical(
+                self,
+                "Banco incompatível",
+                "A tabela de barras não foi encontrada no banco.\n\n"
+                + (plan.reason_for("barras") or ""),
+            )
+            return
+
+        dialog = MdbImportDialog(
+            path,
+            plan,
+            table_names,
+            self,
+            suggested_scale=suggested_scale,
+            row_counts=row_counts,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selection = dialog.selection()
+        self._start_mdb_import(path, selection, password)
+
+    def _start_mdb_import(self, path: str, selection, password) -> None:  # noqa: ANN001
+        thread = QThread(self)
+        worker = MdbImportWorker(
+            path,
+            selection.crs,
+            password=password,
+            entities=selection.entities,
+            overrides=selection.overrides,
+            scale=selection.scale,
+        )
+        worker.moveToThread(thread)
+
+        progress = QProgressDialog("Lendo o banco…", "Cancelar", 0, 100, self)
+        progress.setWindowTitle("Importando banco de dados")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._import_thread = thread
+        self._import_worker = worker
+        self._progress_dialog = progress
+        self._progress_entity = "registros"
+        self.import_action.setEnabled(False)
+        self.mdb_import_action.setEnabled(False)
+        self.branches_action.setEnabled(False)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_import_progress)
+        worker.finished.connect(self._on_mdb_import_finished)
+        worker.failed.connect(self._on_import_failed)
+        worker.cancelled.connect(self._on_import_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(lambda: worker.cancel())
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_import_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_mdb_import_finished(self, result: MdbImportResult) -> None:
+        """Instala os oito modelos pelos setters existentes, na mesma ordem.
+
+        Não há cascata nova aqui: reusar ``_set_*_model`` é o que mantém as
+        invalidações exatamente como estão documentadas na seção 6 da
+        arquitetura. A ordem importa — as chaves precisam entrar antes do
+        catálogo de circuitos, que é reconstruído por ``_set_switch_model``.
+        """
+
+        if self._progress_dialog is not None:
+            self._progress_dialog.setValue(100)
+            self._progress_dialog.close()
+
+        # As barras substituem tudo: trechos e cargas antigos referenciam o
+        # modelo anterior e precisam sair antes.
+        self._set_load_model(None)
+        self._set_line_model(None)
+        self._model = result.bars.model
+        self.search_index.set_bars(result.bars.model, build_fields=False)
+        self.search_palette.schedule_field_index("bar", result.bars.model)
+        self._selected_feature = None
+        self.view.set_model(result.bars.model)
+        self.virtualizer.reset_model(result.bars.model)
+        self._set_selection(None)
+        self.total_status.setText(f"Barras: {len(result.bars.model):n}")
+        self.show_bars_action.setEnabled(True)
+        self.fit_action.setEnabled(True)
+
+        if result.cables is not None:
+            self._set_cable_model(result.cables.model)
+        if result.segments is not None:
+            self._set_line_model(result.segments.model)
+        if result.loads is not None:
+            self._set_load_model(result.loads.model)
+        if result.patterns is not None:
+            self._set_load_pattern_model(result.patterns.model)
+        if result.switches is not None:
+            self._set_switch_model(result.switches.model)
+        if result.regulators is not None:
+            self._set_regulator_model(result.regulators.model)
+        if result.circuits is not None:
+            self._set_circuit_catalog(result.circuits.model)
+
+        self._sync_search_availability()
+        self._sync_export_availability()
+        self._fit_all()
+        if result.circuits is not None:
+            self._show_circuits_window()
+        self._show_mdb_import_report(result)
+
+    def _show_mdb_import_report(self, result: MdbImportResult) -> None:
+        imported = len(result.imported_entities)
+        summary = (
+            f"Banco importado: {imported} de 8 entidades, "
+            f"{len(result.bars.model):n} barras."
+        )
+        self.statusBar().showMessage(summary, 10_000)
+        if not result.has_warnings:
+            return
+        # A referência fica na janela: sem ela o diálogo não modal seria
+        # coletado assim que o método retornasse.
+        if self._mdb_report_window is not None:
+            self._mdb_report_window.close()
+        self._mdb_report_window = MdbImportReportWindow(result, self)
+        self._mdb_report_window.show()
+        self._mdb_report_window.raise_()
 
     def _start_import(self, path: str, crs: UtmCrs, scale: float = 1.0) -> None:
         thread = QThread(self)
@@ -2386,6 +2671,11 @@ class MainWindow(QMainWindow):
         self.bar_power_flow_model.clear()
         self.segment_power_flow_section.setVisible(False)
         self.bar_power_flow_section.setVisible(False)
+        self.regulator_tap_label.setVisible(False)
+        self.regulator_tap_label.setText("")
+        self.regulator_tap_table_model.clear()
+        self.regulator_tap_table_title.setVisible(False)
+        self.regulator_tap_table.setVisible(False)
         self._sync_power_flow_availability()
 
     def _exportable_loads(self) -> tuple[LoadModel, LoadPatternModel] | None:
@@ -3660,6 +3950,7 @@ class MainWindow(QMainWindow):
         self._import_worker = None
         self._progress_dialog = None
         self.import_action.setEnabled(True)
+        self.mdb_import_action.setEnabled(self._mdb_error is None)
         self._sync_branches_availability()
         self._sync_export_availability()
         self._sync_power_flow_availability()
@@ -4229,6 +4520,11 @@ class MainWindow(QMainWindow):
         if regulator_record is None:
             for label in self.regulator_detail_labels.values():
                 label.setText("—")
+            self.regulator_tap_label.setVisible(False)
+            self.regulator_tap_label.setText("")
+            self.regulator_tap_table_model.clear()
+            self.regulator_tap_table_title.setVisible(False)
+            self.regulator_tap_table.setVisible(False)
             self.regulator_details_section.setVisible(False)
         else:
             regulator_values = {
@@ -4361,21 +4657,31 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_regulator_tap(self, segment_index: int) -> None:
-        """Escreve o tap resolvido do regulador daquele trecho, se houver.
+        """Escreve o tap final do regulador e a tabela de passos por patamar.
 
-        O aviso de fim de curso é o motivo de a linha existir: um regulador que
-        esgotou o tap **parou de regular**, e sem dizê-lo o painel mostraria uma
-        posição de aparência normal.
+        ``result.regulator_taps`` traz um retrato por patamar (o mesmo formato
+        de ``segment_currents``/``bar_voltages``); o rótulo "Tap resolvido"
+        continua mostrando só o **último** patamar — o aviso de fim de curso é
+        o motivo de a linha existir: um regulador que esgotou o tap **parou de
+        regular**, e sem dizê-lo o painel mostraria uma posição de aparência
+        normal.
         """
 
         result = self._power_flow_result
-        taps = () if result is None else result.regulator_taps.get(segment_index, ())
-        if not taps:
+        taps_by_step = (
+            () if result is None else result.regulator_taps.get(segment_index, ())
+        )
+        if not taps_by_step:
             self.regulator_tap_label.setVisible(False)
             self.regulator_tap_label.setText("")
+            self.regulator_tap_table_model.clear()
+            self.regulator_tap_table_title.setVisible(False)
+            self.regulator_tap_table.setVisible(False)
             return
-        parts = ", ".join(f"{tap.phase}: {tap.tap:.4f}" for tap in taps)
-        saturated = [tap.phase for tap in taps if tap.at_limit]
+
+        final_taps = taps_by_step[-1]
+        parts = ", ".join(f"{tap.phase}: {tap.tap:.4f}" for tap in final_taps)
+        saturated = [tap.phase for tap in final_taps if tap.at_limit]
         text = f"Tap resolvido — {parts}"
         if saturated:
             text += (
@@ -4384,6 +4690,18 @@ class MainWindow(QMainWindow):
             )
         self.regulator_tap_label.setText(text)
         self.regulator_tap_label.setVisible(True)
+
+        # A ordem das fases segue a que já sai do exportador (não é sempre
+        # D, E, F — depende da ordem das letras em NOME no fases2.json), então
+        # a lê da própria primeira linha em vez de fixar uma ordem própria.
+        labels = tuple(f"Fase {tap.phase}" for tap in taps_by_step[0])
+        rows = tuple(
+            tuple(float(tap.step) for tap in step_taps)
+            for step_taps in taps_by_step
+        )
+        self.regulator_tap_table_model.set_values(labels, rows, decimals=0)
+        self.regulator_tap_table_title.setVisible(True)
+        self.regulator_tap_table.setVisible(True)
 
     def _phase_letter_of_node(self, node: int) -> str | None:
         """Letra da fase de um nó DSS, segundo o ``fases2.json`` carregado."""

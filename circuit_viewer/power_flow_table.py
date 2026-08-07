@@ -43,7 +43,7 @@ class PowerFlowTableModel(QAbstractTableModel):
         labels: Sequence[str],
         rows: Sequence[Sequence[float | None]],
         *,
-        decimals: int | Sequence[int] = 2,
+        decimals: int | Sequence[int] = 4,
     ) -> None:
         """Instala rótulos, valores e casas decimais.
 

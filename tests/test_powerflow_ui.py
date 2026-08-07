@@ -344,6 +344,11 @@ class PowerFlowUiTests(unittest.TestCase):
             ("Fase D", "Fase E", "Fase F", "θD", "θE", "θF"),
         )
         self.assertEqual(model.rows[0], (10.0, 20.0, 30.0, 0.0, -120.0, 120.0))
+        # Precisão fixa de 4 casas, inclusive na coluna de ângulo — não é mais
+        # a 1 casa de antes desta mudança.
+        self.assertEqual(model.data(model.index(0, 1)), "10.0000")
+        self.assertEqual(model.data(model.index(0, 4)), "0.0000")
+        self.assertEqual(model.data(model.index(0, 5)), "-120.0000")
 
     def test_segment_combobox_switches_to_loading(self) -> None:
         window = self._window()
@@ -360,10 +365,13 @@ class PowerFlowUiTests(unittest.TestCase):
             )
         )
 
-        rows = window.segment_power_flow_model.rows
+        model = window.segment_power_flow_model
+        rows = model.rows
         # 10 A sobre 340 A de IADM.
         self.assertAlmostEqual(rows[0][0], 10.0 / 340.0 * 100.0)
         self.assertTrue(window.segment_power_flow_note.isVisible())
+        # Percentual também em 4 casas fixas, não mais 1.
+        self.assertEqual(model.data(model.index(0, 1)), "2.9412")
 
     def test_loading_without_ampacity_is_disabled_and_dashed(self) -> None:
         window = self._window()
@@ -404,6 +412,8 @@ class PowerFlowUiTests(unittest.TestCase):
         model = window.bar_power_flow_model
         self.assertEqual(model.labels, ("Fase D", "Fase E", "θD", "θE"))
         self.assertEqual(model.rows[0], (7_960.0, 7_950.0, 0.0, -120.0))
+        # Precisão fixa de 4 casas, com separador de milhar em espaço.
+        self.assertEqual(model.data(model.index(0, 1)), "7 960.0000")
 
         combo = window.bar_power_flow_combo
         combo.setCurrentIndex(
@@ -414,8 +424,10 @@ class PowerFlowUiTests(unittest.TestCase):
             )
         )
         # O pu não traz ângulo: seria o mesmo da tensão de fase.
-        self.assertEqual(window.bar_power_flow_model.labels, ("Fase D", "Fase E"))
-        self.assertEqual(window.bar_power_flow_model.rows[0], (0.999, 0.998))
+        per_unit_model = window.bar_power_flow_model
+        self.assertEqual(per_unit_model.labels, ("Fase D", "Fase E"))
+        self.assertEqual(per_unit_model.rows[0], (0.999, 0.998))
+        self.assertEqual(per_unit_model.data(per_unit_model.index(0, 1)), "0.9990")
 
     def _select_quantity(self, combo, key: str) -> None:  # noqa: ANN001
         combo.setCurrentIndex(

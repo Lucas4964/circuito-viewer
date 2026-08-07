@@ -17,9 +17,17 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
-from .csv_import import CsvImportCancelled, CsvImportError
+from .csv_import import (
+    PROGRESS_ROW_INTERVAL,
+    CsvImportCancelled,
+    CsvImportError,
+    RowProgress,
+    TextRow,
+    byte_progress,
+    normalize_header,
+)
 from .model import CableModel
 
 
@@ -41,7 +49,6 @@ EXPECTED_CABLE_HEADER = (
 )
 MAX_REPORTED_ISSUES = 200
 REQUIRED_CABLE_TYPE = "1"
-BOM = chr(0xFEFF)
 ProgressCallback = Callable[[int, int, int], None]
 
 
@@ -91,19 +98,29 @@ def _column_positions(header: tuple[str, ...]) -> dict[str, int]:
     return positions
 
 
-def _parse_file(
-    path: Path,
+def parse_cable_rows(
+    raw_header: Iterable[str],
+    rows: Iterable[TextRow],
+    *,
+    source_label: str,
     encoding: str,
-    cancel_event: threading.Event | None,
-    progress: ProgressCallback | None,
+    first_line_number: int = 2,
+    cancel_event: threading.Event | None = None,
+    progress: RowProgress | None = None,
 ) -> CableCsvResult:
+    """Valida linhas de cabos já em texto e devolve o catálogo.
+
+    Toda a validação vive aqui, independente da fonte: o CSV e o banco Access
+    apenas entregam cabeçalho e linhas de texto. O filtro por ``TIPO=1`` vale
+    igualmente nos dois casos, porque é regra de negócio e não do arquivo.
+    """
+
     columns: dict[str, list[str]] = {name: [] for name in EXPECTED_CABLE_HEADER}
     seen_cable_ids: set[str] = set()
     issues: list[CableIssue] = []
     total_rows = 0
     invalid_rows = 0
     ignored_type_rows = 0
-    total_bytes = max(path.stat().st_size, 1)
 
     def add_issue(line_number: int, reason: str) -> None:
         nonlocal invalid_rows
@@ -111,57 +128,47 @@ def _parse_file(
         if len(issues) < MAX_REPORTED_ISSUES:
             issues.append(CableIssue(line_number, reason))
 
-    with path.open("r", encoding=encoding, newline="") as source:
-        reader = csv.reader(source, delimiter=";")
-        try:
-            raw_header = next(reader)
-        except StopIteration as exc:
-            raise CsvImportError("O arquivo CSV de cabos está vazio.") from exc
-        header = tuple(value.strip().lstrip(BOM) for value in raw_header)
-        positions = _column_positions(header)
-        last_required_position = max(positions.values())
+    header = normalize_header(raw_header)
+    positions = _column_positions(header)
+    last_required_position = max(positions.values())
 
-        for line_number, row in enumerate(reader, start=2):
-            if cancel_event is not None and cancel_event.is_set():
-                raise CsvImportCancelled("Importação cancelada.")
-            if not row or not any(value.strip() for value in row):
-                continue
-            total_rows += 1
-            if progress is not None and total_rows % 1_000 == 0:
-                try:
-                    position = source.buffer.tell()
-                except (AttributeError, OSError):
-                    position = 0
-                progress(total_rows, min(position, total_bytes), total_bytes)
-            if len(row) <= last_required_position:
-                add_issue(line_number, "faltam valores em colunas obrigatórias")
-                continue
+    for line_number, row in enumerate(rows, start=first_line_number):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CsvImportCancelled("Importação cancelada.")
+        if not row or not any(value.strip() for value in row):
+            continue
+        total_rows += 1
+        if progress is not None and total_rows % PROGRESS_ROW_INTERVAL == 0:
+            progress(total_rows)
+        if len(row) <= last_required_position:
+            add_issue(line_number, "faltam valores em colunas obrigatórias")
+            continue
 
-            values = {name: row[index].strip() for name, index in positions.items()}
-            if values["TIPO"] != REQUIRED_CABLE_TYPE:
-                # Não é um erro de dados: o arquivo traz um registro por TIPO
-                # para o mesmo CABO_ID, e só o TIPO=1 representa o cabo.
-                ignored_type_rows += 1
-                continue
+        values = {name: row[index].strip() for name, index in positions.items()}
+        if values["TIPO"] != REQUIRED_CABLE_TYPE:
+            # Não é um erro de dados: o arquivo traz um registro por TIPO
+            # para o mesmo CABO_ID, e só o TIPO=1 representa o cabo.
+            ignored_type_rows += 1
+            continue
 
-            cable_id = values["CABO_ID"]
-            if not cable_id:
-                add_issue(line_number, "CABO_ID vazio")
-                continue
-            if cable_id in seen_cable_ids:
-                add_issue(line_number, f"CABO_ID duplicado: {cable_id}")
-                continue
+        cable_id = values["CABO_ID"]
+        if not cable_id:
+            add_issue(line_number, "CABO_ID vazio")
+            continue
+        if cable_id in seen_cable_ids:
+            add_issue(line_number, f"CABO_ID duplicado: {cable_id}")
+            continue
 
-            seen_cable_ids.add(cable_id)
-            for name in EXPECTED_CABLE_HEADER:
-                columns[name].append(values[name])
+        seen_cable_ids.add(cable_id)
+        for name in EXPECTED_CABLE_HEADER:
+            columns[name].append(values[name])
 
     if cancel_event is not None and cancel_event.is_set():
         raise CsvImportCancelled("Importação cancelada.")
     if not columns["CABO_ID"]:
         raise CsvImportError("Nenhum cabo válido foi encontrado no arquivo.")
     if progress is not None:
-        progress(total_rows, total_bytes, total_bytes)
+        progress(total_rows)
 
     # Explícito de propósito: reordenar EXPECTED_CABLE_HEADER não pode embaralhar
     # silenciosamente as colunas do modelo.
@@ -180,7 +187,7 @@ def _parse_file(
         columns["X1"],
         columns["NOME"],
         columns["EXTERN_ID"],
-        source_path=str(path.resolve()),
+        source_path=source_label,
     )
     return CableCsvResult(
         model=model,
@@ -192,6 +199,29 @@ def _parse_file(
         issues=tuple(issues),
         omitted_issues=max(0, invalid_rows - len(issues)),
     )
+
+
+def _parse_file(
+    path: Path,
+    encoding: str,
+    cancel_event: threading.Event | None,
+    progress: ProgressCallback | None,
+) -> CableCsvResult:
+    total_bytes = max(path.stat().st_size, 1)
+    with path.open("r", encoding=encoding, newline="") as source:
+        reader = csv.reader(source, delimiter=";")
+        try:
+            raw_header = next(reader)
+        except StopIteration as exc:
+            raise CsvImportError("O arquivo CSV de cabos está vazio.") from exc
+        return parse_cable_rows(
+            raw_header,
+            reader,
+            source_label=str(path.resolve()),
+            encoding=encoding,
+            cancel_event=cancel_event,
+            progress=byte_progress(source, total_bytes, progress),
+        )
 
 
 def load_cables_csv(

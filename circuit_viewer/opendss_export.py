@@ -92,8 +92,9 @@ REGULATOR_LOAD_LOSS_PERCENT = 0.01
 # Transformador de potencial: 115 V entre fases no secundário, como o primário,
 # de modo que ``ptratio`` fica VNOM*1000/115 — o √3 dos dois lados se cancela.
 REGULATOR_PT_SECONDARY_V = 115.0
-# Banda de 2 % em torno de vreg, folgada o bastante para um passo de tap.
-REGULATOR_BAND_FRACTION = 0.02
+# Banda fixa, na mesma base do TP secundário (115 V) que vreg — o mesmo jeito
+# de especificar bandwidth no dial de um regulador real.
+REGULATOR_BAND_V = 3.0
 # O regulador ocupa o lugar do trecho, então a impedância dele sai do modelo.
 # Acima deste comprimento isso deixa de ser desprezível e vira aviso.
 REGULATOR_SEGMENT_LENGTH_WARNING_M = 10.0
@@ -1107,7 +1108,7 @@ def build_regulator_export(
             phase_kv = _format(phase_voltage_kv(voltage))
             phase_kva = _format(power / 3.0)
             vreg = REGULATOR_PT_SECONDARY_V / math.sqrt(3.0)
-            band = vreg * REGULATOR_BAND_FRACTION
+            band = REGULATOR_BAND_V
             ptratio = voltage * 1_000.0 / REGULATOR_PT_SECONDARY_V
             bus1 = bus_name(int(segments.start_indices[segment_index]))
             bus2 = bus_name(int(segments.end_indices[segment_index]))

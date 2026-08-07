@@ -25,6 +25,7 @@ try:
         SwitchModel,
         UtmCrs,
     )
+    from circuit_viewer.opendss_powerflow import PowerFlowResult, RegulatorTap
     from circuit_viewer.regulator_import import RegulatorLoadResult
     from circuit_viewer.segment_import import SegmentLoadResult
     from circuit_viewer.switch_import import SwitchLoadResult
@@ -249,6 +250,141 @@ class RegulatorUiTests(unittest.TestCase):
             layout.indexOf(window.switch_details_section),
             layout.indexOf(window.regulator_details_section),
         )
+
+    # ------------------------------------------------------ fluxo de potência
+
+    def _taps_by_step(
+        self,
+        *,
+        d_steps: tuple[float, ...] = (0.0, 8.0, -8.0, 16.0),
+        num_taps: int = 32,
+        minimum: float = 0.9,
+        maximum: float = 1.1,
+    ):  # noqa: ANN202
+        """Quatro retratos, com o passo pedido na fase D e 0 nas demais.
+
+        O passo vem em pu (``tap - 1.0``) para poder afirmar o inteiro
+        resultante sem repetir a conta de ``RegulatorTap.step`` no teste.
+        """
+
+        step_size = (maximum - minimum) / num_taps
+        return tuple(
+            (
+                RegulatorTap(
+                    phase="D",
+                    tap=1.0 + steps * step_size,
+                    minimum=minimum,
+                    maximum=maximum,
+                    num_taps=num_taps,
+                ),
+                RegulatorTap(
+                    phase="E", tap=1.0, minimum=minimum, maximum=maximum,
+                    num_taps=num_taps,
+                ),
+                RegulatorTap(
+                    phase="F", tap=1.0, minimum=minimum, maximum=maximum,
+                    num_taps=num_taps,
+                ),
+            )
+            for steps in d_steps
+        )
+
+    def _install_taps(self, window: MainWindow, taps_by_step) -> None:  # noqa: ANN001
+        """Instala um resultado direto em ``_power_flow_result``.
+
+        É o mesmo atalho já usado por
+        ``test_importing_regulators_invalidates_only_the_power_flow``: os
+        testes de painel só precisam que o resultado exista, não da
+        consistência de instantâneo que ``_on_power_flow_finished`` confere.
+        """
+
+        window._power_flow_result = PowerFlowResult(
+            catalog=None,
+            cables=None,
+            phase_configuration=None,
+            loads=None,
+            patterns=None,
+            step_count=4,
+            regulator_taps={0: taps_by_step},
+        )
+
+    def test_the_table_appears_only_with_a_result(self) -> None:
+        window = self._window()
+        self._load_network(window)
+        self._load_regulators(window)
+        window._set_selection(FeatureSelection("segment", 0))
+
+        self.assertFalse(window.regulator_tap_table.isVisible())
+        self.assertFalse(window.regulator_tap_table_title.isVisible())
+
+        self._install_taps(window, self._taps_by_step())
+        window._set_selection(FeatureSelection("segment", 0))
+
+        self.assertTrue(window.regulator_tap_table.isVisible())
+        self.assertTrue(window.regulator_tap_table_title.isVisible())
+
+    def test_one_row_per_patamar_and_integer_steps(self) -> None:
+        window = self._window()
+        self._load_network(window)
+        self._load_regulators(window)
+        self._install_taps(window, self._taps_by_step())
+
+        window._set_selection(FeatureSelection("segment", 0))
+
+        model = window.regulator_tap_table_model
+        self.assertEqual(model.rowCount(), 4)
+        self.assertEqual(model.labels, ("Fase D", "Fase E", "Fase F"))
+        self.assertEqual(
+            [row[0] for row in model.rows], [0.0, 8.0, -8.0, 16.0]
+        )
+        # Sem casas decimais: "8", não "8.0000".
+        self.assertEqual(model.data(model.index(1, 1)), "8")
+        self.assertEqual(model.data(model.index(2, 1)), "-8")
+
+    def test_the_resolved_label_still_shows_the_last_patamar(self) -> None:
+        # A mudança de forma de regulator_taps não pode alterar esse texto —
+        # ele já existia antes da tabela nova. O último patamar do fixture
+        # (passo 16, o limite de ±10%/32) também prova que o aviso de fim de
+        # curso continua lendo o tap certo.
+        window = self._window()
+        self._load_network(window)
+        self._load_regulators(window)
+        self._install_taps(window, self._taps_by_step())
+
+        window._set_selection(FeatureSelection("segment", 0))
+
+        text = window.regulator_tap_label.text()
+        self.assertIn("D: 1.1000", text)
+        self.assertIn("no fim do curso", text)
+
+    def test_no_taps_for_this_segment_hides_the_table(self) -> None:
+        window = self._window()
+        self._load_network(window)
+        self._load_regulators(window)
+        self._install_taps(window, self._taps_by_step())
+        window._set_selection(FeatureSelection("segment", 0))
+        self.assertTrue(window.regulator_tap_table.isVisible())
+
+        # Trecho 1 não tem regulador, então result.regulator_taps não o lista.
+        window._set_selection(FeatureSelection("segment", 1))
+
+        self.assertFalse(window.regulator_tap_table.isVisible())
+        self.assertEqual(window.regulator_tap_table_model.rowCount(), 0)
+
+    def test_invalidating_the_result_clears_and_hides_the_table(self) -> None:
+        window = self._window()
+        self._load_network(window)
+        self._load_regulators(window)
+        self._install_taps(window, self._taps_by_step())
+        window._set_selection(FeatureSelection("segment", 0))
+        self.assertTrue(window.regulator_tap_table.isVisible())
+
+        window._invalidate_power_flow()
+
+        self.assertFalse(window.regulator_tap_table.isVisible())
+        self.assertFalse(window.regulator_tap_table_title.isVisible())
+        self.assertEqual(window.regulator_tap_table_model.rowCount(), 0)
+        self.assertFalse(window.regulator_tap_label.isVisible())
 
     # --------------------------------------------------------------- cascata
 

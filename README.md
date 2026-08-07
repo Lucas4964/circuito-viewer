@@ -25,8 +25,10 @@ python -m circuit_viewer
 ```
 
 Para habilitar também o [fluxo de potência](#fluxo-de-potência), troque a linha
-de instalação por `python -m pip install -e ".[opendss]"`. Sem esse extra a
-aplicação funciona por inteiro, apenas com o botão correspondente desabilitado.
+de instalação por `python -m pip install -e ".[opendss]"`. Para a
+[importação por banco de dados](#importação-por-banco-de-dados-mdb), use
+`".[mdb]"`; para os dois, `".[opendss,mdb]"`. Sem esses extras a aplicação
+funciona por inteiro, apenas com os itens correspondentes desabilitados.
 
 Ao importar, informe a zona e o hemisfério UTM. X e Y aceitam ponto ou vírgula
 decimal. As colunas obrigatórias podem aparecer em qualquer ordem e todas as
@@ -121,6 +123,123 @@ Todos os campos são preservados como texto, inclusive com vírgula decimal; só
 `CABO_ID` é obrigatório e precisa ser único. O catálogo é consultado em
 **Tabelas > Cabos…** e nunca altera a rede desenhada — importar cabos não
 invalida nada, e importar qualquer outra entidade não invalida os cabos.
+
+## Importação por banco de dados (`.mdb`)
+
+**Arquivo > Importar banco de dados…** lê um banco Microsoft Access e importa as
+oito entidades de uma vez, dispensando exportar cada tabela para CSV. Os dados
+são os mesmos e passam pelas mesmas validações — a única diferença é a fonte.
+
+O banco é aberto **somente para leitura**, em quatro camadas: `ReadOnly=1` na
+cadeia de conexão, `SQL_MODE_READ_ONLY` no driver, conexão sem transação e uma
+API que só emite `SELECT`. Nenhum comando de escrita existe no código.
+
+> Enquanto a conexão está aberta, o próprio motor do Access cria um arquivo de
+> trava `.ldb` ao lado do banco e o remove ao fechar. Ele não altera o `.mdb`,
+> mas exige **permissão de escrita na pasta**: num diretório somente leitura o
+> Access se recusa a abrir o arquivo, e a mensagem de erro explica isso. Nesse
+> caso, copie o banco para uma pasta gravável.
+
+### Requisitos
+
+- `pyodbc` (`python -m pip install -e ".[mdb]"`);
+- o **Microsoft Access Database Engine Redistributable**, na **mesma
+  arquitetura do Python**. Um Python de 64 bits não enxerga o driver de 32 bits,
+  e o sintoma é "driver não encontrado" com o driver visivelmente instalado — a
+  mensagem da aplicação diz explicitamente qual arquitetura ela procura.
+
+Sem qualquer um dos dois, a aplicação roda inteira e apenas este item de menu
+fica desabilitado, com o motivo na dica.
+
+| Formato | Situação |
+|---|---|
+| Access 97 (Jet 3) | **Não suportado** pelo driver atual. A aplicação lê o cabeçalho do arquivo e recusa com essa explicação, em vez de repassar o erro genérico do driver; converta em **Salvar Como** no próprio Access |
+| Access 2000–2003 (Jet 4) | Suportado |
+| Access 2007 (ACE 12) | Suportado |
+| Access 2010 ou posterior, `.accdb` | Suportado |
+
+### O diálogo
+
+Escolhido o arquivo, um diálogo mostra as tabelas detectadas, uma por entidade,
+com a contagem de registros. Cada linha tem uma caixa de seleção e uma lista com
+todas as tabelas do banco: **a detecção automática é sempre ajustável à mão**, e
+escolher uma tabela reabilita uma entidade que não foi encontrada. As barras são
+obrigatórias — sem elas não há o que desenhar — e o botão de confirmação fica
+desabilitado enquanto não estiverem marcadas.
+
+O mesmo diálogo pede zona, hemisfério e **unidade das coordenadas**, como na
+importação de barras por CSV. A unidade é deduzida de uma amostra da tabela de
+barras e já vem selecionada.
+
+**Se o banco tiver senha**, a aplicação a pede antes de abrir e repergunta
+quando não confere, em vez de mostrar o erro do driver. A senha é usada apenas
+para abrir a conexão: não é gravada em disco, não vai para log e não aparece em
+mensagem de erro.
+
+### Ordem e dependências
+
+As entidades são importadas numa passada só, na ordem imposta pelas dependências
+entre elas:
+
+```
+barras → cabos → trechos → cargas → patamares → chaves → reguladores → circuitos
+```
+
+As chaves vêm antes dos circuitos porque a topologia energizada depende delas.
+Uma entidade que falhe — tabela ausente, coluna faltando, nenhum registro
+válido — **não interrompe as demais**: ela é listada no relatório com o motivo, e
+o que dependia dela é pulado com a explicação. Só as barras são fatais.
+
+Ao final abre-se um relatório único, com uma linha por entidade (tabela de
+origem, lidas, válidas, inválidas, situação) e as ocorrências agrupadas. Sem
+nada a relatar, apenas a barra de status resume a importação.
+
+### Correspondência entre tabelas e entidades
+
+Fica em `circuit_viewer/config/mdb_tabelas.json`, no mesmo espírito de
+`fases2.json`: nome de tabela e de coluna é convenção da concessionária, não
+regra da aplicação. O arquivo é lido na inicialização; reinicie depois de
+editá-lo. Um erro nele desabilita **apenas** a importação por banco, com o
+caminho e o problema na dica.
+
+```json
+[
+  {"entidade": "barras", "tabelas": ["BARRA"],
+   "colunas": {"BARRA_ID": [], "CODIGO": [], "X": [], "Y": []}},
+  {"entidade": "cabos", "tabelas": ["CABOS", "CABO"], "colunas": {"...": []}}
+]
+```
+
+- `tabelas` lista candidatos em ordem de preferência; o primeiro que existir no
+  banco vence. Maiúsculas e minúsculas são ignoradas, como no próprio Access.
+- Cada coluna obrigatória lista **apelidos aceitos**; a lista vazia significa
+  "mesmo nome do CSV". É por aqui que se acomoda uma base cujas colunas tenham
+  outro nome, sem tocar em código.
+- Só as colunas obrigatórias são lidas. A tabela `CARGA` da base de referência
+  tem 43 colunas e apenas 9 interessam; as demais nunca chegam a ser
+  consultadas.
+- Colunas extras são simplesmente ignoradas. O `CENARIO_ID` de `MODELO_CARGA` é
+  um exemplo: a importação usa exatamente as mesmas colunas do CSV.
+
+### Conversão de tipos
+
+Um banco é tipado e o CSV não. A conversão para texto é única e deliberada,
+porque três comparações do núcleo são textuais e exatas — `FASES2` contra o
+`fases2.json`, `ESTADO` contra `"1"` na topologia, e todo identificador entre
+tabelas:
+
+| Valor no banco | Vira |
+|---|---|
+| Nulo | campo vazio |
+| Texto | inalterado |
+| Sim/Não | `1` / `0` |
+| Número inteiro, ou decimal de valor inteiro | sem casa decimal (`1.0` → `1`) |
+| Número decimal | preservado por inteiro (`41.297000885009766`) |
+| Data e hora | ISO 8601 |
+
+A regra do valor inteiro não é cosmética: `ESTADO` lido como `"1.0"` faria toda
+chave fechada virar aberta, e `FASES2` como `"13.0"` não casaria com o
+`fases2.json`.
 
 ## Controles
 
@@ -354,9 +473,9 @@ New Transformer.REG-X-D phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA
 New Transformer.REG-X-E phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA1.2.0, BARRA2.2.0] conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]
 New Transformer.REG-X-F phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA1.3.0, BARRA2.3.0] conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]
 
-New RegControl.CTRL-X-D transformer=REG-X-D winding=2 vreg=66.3953 band=1.32791 ptratio=300
-New RegControl.CTRL-X-E transformer=REG-X-E winding=2 vreg=66.3953 band=1.32791 ptratio=300
-New RegControl.CTRL-X-F transformer=REG-X-F winding=2 vreg=66.3953 band=1.32791 ptratio=300
+New RegControl.CTRL-X-D transformer=REG-X-D winding=2 vreg=66.3953 band=3 ptratio=300
+New RegControl.CTRL-X-E transformer=REG-X-E winding=2 vreg=66.3953 band=3 ptratio=300
+New RegControl.CTRL-X-F transformer=REG-X-F winding=2 vreg=66.3953 band=3 ptratio=300
 ```
 
 - **Nome** — `REG-<CODIGO>-<FASE>` e `CTRL-<CODIGO>-<FASE>`, com o `CODIGO` do
@@ -365,9 +484,9 @@ New RegControl.CTRL-X-F transformer=REG-X-F winding=2 vreg=66.3953 band=1.32791 
   `fases2.json`. O `.0` fecha o neutro do enrolamento em estrela.
 - **`kVs`** — `VNOM/√3`, a tensão de fase, porque cada unidade é monofásica
   entre fase e neutro. **`kVAs`** — `SNOM/3`.
-- **`vreg`/`band`/`ptratio`** — TP de 115 V: `vreg = 115/√3`, banda de 2 % de
-  `vreg` e `ptratio = VNOM×1000/115`. Os √3 do primário e do secundário se
-  cancelam, então o controle regula a barra em **1,0000 pu**.
+- **`vreg`/`band`/`ptratio`** — TP de 115 V: `vreg = 115/√3`, banda fixa de
+  3 V (mesma base de `vreg`) e `ptratio = VNOM×1000/115`. Os √3 do primário e
+  do secundário se cancelam, então o controle regula a barra em **1,0000 pu**.
 - **`XHL` e `%LoadLoss` de 0,01 %** — transformador quase ideal: o regulador
   injeta tensão em série, não impedância.
 - Todas as definições de `Transformer` vêm **antes** de todos os `RegControl`,
@@ -728,7 +847,8 @@ cargas equivalentes, e **Enquadrar tudo** usa os limites da projeção ativa.
 
 Os testes do núcleo usam apenas a biblioteca padrão e NumPy. Os testes gráficos
 são executados quando PyQt6 estiver instalado. Nenhum teste exige
-`py-dss-interface`: o fluxo de potência é exercitado com um motor OpenDSS falso.
+`py-dss-interface` nem `pyodbc`: o fluxo de potência é exercitado com um motor
+OpenDSS falso, e a importação por banco com um banco Access falso.
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -759,7 +879,14 @@ descreve o uso; aquele documento descreve o funcionamento interno e deve ser
 atualizado junto com mudanças relevantes de arquitetura.
 
 - `circuit_viewer/model.py`: modelo lógico e índice espacial.
-- `circuit_viewer/csv_import.py`: importação transacional.
+- `circuit_viewer/csv_import.py`: importação transacional e a validação de
+  barras compartilhada entre CSV e banco.
+- `circuit_viewer/mdb_engine.py`: único acesso ao `pyodbc` (opcional), leitura
+  somente leitura e conversão de tipos.
+- `circuit_viewer/mdb_mapping.py`: correspondência tabela/coluna → entidade.
+- `circuit_viewer/mdb_import.py`: importação encadeada das oito entidades.
+- `circuit_viewer/mdb_import_dialog.py`: escolha de tabelas, senha e UTM.
+- `circuit_viewer/mdb_import_report.py`: relatório consolidado da importação.
 - `circuit_viewer/segment_import.py`: importação e vínculo dos trechos.
 - `circuit_viewer/switch_import.py`: importação e associação das chaves.
 - `circuit_viewer/regulator_import.py`: importação e associação dos reguladores.

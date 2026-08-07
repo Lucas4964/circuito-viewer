@@ -1,0 +1,64 @@
+[
+  {
+    "entidade": "barras",
+    "tabelas": ["BARRA"],
+    "colunas": {"BARRA_ID": [], "CODIGO": [], "X": [], "Y": []}
+  },
+  {
+    "entidade": "cabos",
+    "tabelas": ["CABOS", "CABO"],
+    "colunas": {
+      "CABO_ID": [], "TIPO": [], "CODIGO": [], "IADM": [], "GMR": [],
+      "R": [], "X": [], "QCAP": [], "R0": [], "X0": [], "R1": [], "X1": [],
+      "NOME": [], "EXTERN_ID": []
+    }
+  },
+  {
+    "entidade": "trechos",
+    "tabelas": ["TRECHO"],
+    "colunas": {
+      "TRECHO_ID": [], "CODIGO": [], "FASES2": [], "BARRA1_ID": [],
+      "BARRA2_ID": [], "ARRANJO_ID": [], "CABOF_ID": [], "CABON_ID": [],
+      "COMPR": []
+    }
+  },
+  {
+    "entidade": "cargas",
+    "tabelas": ["CARGA"],
+    "colunas": {
+      "CARGA_ID": [], "BARRA_ID": [], "EXTERN_ID": [], "CODIGO": [],
+      "SNOM": [], "SADM": [], "VLINHASEC": [], "FASES2": [], "TIPO_LIG": []
+    }
+  },
+  {
+    "entidade": "patamares",
+    "tabelas": ["MODELO_CARGA"],
+    "colunas": {
+      "CARGA_ID": [], "NPAT": [], "PD": [], "PE": [], "PF": [],
+      "QD": [], "QE": [], "QF": []
+    }
+  },
+  {
+    "entidade": "chaves",
+    "tabelas": ["CHAVE"],
+    "colunas": {
+      "CHAVE_ID": [], "TIPOCHV_ID": [], "CIRC_ID": [], "TRECHO_ID": [],
+      "CODIGO": [], "ESTADO": [], "ESTADO_NORMAL": [], "CORN": [],
+      "ELO": [], "ELO_TIPO": []
+    }
+  },
+  {
+    "entidade": "reguladores",
+    "tabelas": ["REGULADOR"],
+    "colunas": {
+      "REGU_ID": [], "TRECHO_ID": [], "EXTERN_ID": [], "CODIGO": [],
+      "LIGACAO": [], "SNOM": [], "FAIXA": [], "NPASSOS": [], "TAP": [],
+      "INOM": [], "VNOM": []
+    }
+  },
+  {
+    "entidade": "circuitos",
+    "tabelas": ["CIRCUITO"],
+    "colunas": {"CIRC_ID": [], "BARRA_ID": [], "CODIGO": [], "VNOM": []}
+  }
+]

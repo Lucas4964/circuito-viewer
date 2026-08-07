@@ -1,4 +1,10 @@
-"""Importação transacional do CSV de barras."""
+"""Importação transacional do CSV de barras.
+
+Além das barras, este módulo hospeda o que é comum a todos os importadores: as
+exceções compartilhadas, o envelope UTM, a dedução de unidade das coordenadas e
+os utilitários que ligam uma fonte de linhas à validação — ``normalize_header``,
+``byte_progress`` e os tipos ``RowProgress``/``TextRow``.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,7 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, IO, Iterable, Sequence
 
 from .model import CircuitModel, UtmCrs
 
@@ -35,6 +41,17 @@ COORDINATE_UNITS: tuple[tuple[float, str], ...] = (
 DEFAULT_SCALE_SAMPLE_SIZE = 5_000
 
 ProgressCallback = Callable[[int, int, int], None]
+
+# Progresso das funções ``parse_*_rows``: elas só sabem quantas linhas leram, e
+# quem as chama traduz isso para a unidade que faz sentido na sua fonte — bytes
+# do arquivo, no CSV; linhas acumuladas do banco, na importação por MDB.
+RowProgress = Callable[[int], None]
+
+# Uma linha de cabeçalho ou de dados, já em texto. É o contrato entre as fontes
+# (CSV, banco Access) e a validação compartilhada dos importadores.
+TextRow = Sequence[str]
+
+PROGRESS_ROW_INTERVAL = 1_000
 
 
 class CsvImportError(ValueError):
@@ -70,6 +87,42 @@ class CsvLoadResult:
             or self.encoding.lower() == "cp1252"
             or self.crs_warning is not None
         )
+
+
+def normalize_header(header: Iterable[str]) -> tuple[str, ...]:
+    """Limpa espaços e o BOM de cada nome de coluna.
+
+    Idempotente para fontes que não são arquivos de texto, o que permite as
+    ``parse_*_rows`` aceitarem cabeçalhos de qualquer origem sem que cada
+    chamador precise repetir a limpeza.
+    """
+
+    return tuple(str(value).strip().lstrip(_BOM) for value in header)
+
+
+def byte_progress(
+    source: IO[str],
+    total_bytes: int,
+    progress: ProgressCallback | None,
+) -> RowProgress | None:
+    """Adapta o progresso por linhas para o progresso por bytes do CSV.
+
+    O deslocamento vem de ``source.buffer.tell()`` — progresso real de leitura,
+    e não uma estimativa por contagem de linhas. A chamada final acontece com o
+    arquivo já fechado, e aí o deslocamento é o próprio tamanho.
+    """
+
+    if progress is None:
+        return None
+
+    def emit(rows: int) -> None:
+        try:
+            position = source.buffer.tell()
+        except Exception:  # noqa: BLE001 — arquivo fechado, sem buffer, etc.
+            position = total_bytes
+        progress(rows, min(position, total_bytes), total_bytes)
+
+    return emit
 
 
 def _within(value_range: tuple[float, float], envelope: tuple[float, float]) -> bool:
@@ -110,6 +163,25 @@ def utm_range_warning(
     )
 
 
+def scale_from_ranges(
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+) -> float:
+    """Escolhe o divisor que leva as faixas amostradas para metros UTM.
+
+    Devolve o MENOR divisor de ``COORDINATE_UNITS`` que coloca as duas faixas
+    dentro do envelope UTM, ou ``1.0`` quando nenhuma unidade conhecida encaixa.
+
+    É a decisão em si, separada de como a amostra foi obtida: o CSV a alimenta
+    lendo o início do arquivo, e a importação por banco, com um ``SELECT TOP``.
+    """
+
+    for factor, _label in COORDINATE_UNITS:
+        if _fits_utm(x_range, y_range, factor):
+            return factor
+    return COORDINATE_UNITS[0][0]
+
+
 def detect_coordinate_scale(
     path: str | os.PathLike[str],
     *,
@@ -142,9 +214,7 @@ def detect_coordinate_scale(
                     raw_header = next(reader)
                 except StopIteration:
                     return default_factor
-                header = tuple(
-                    value.strip().lstrip(_BOM) for value in raw_header
-                )
+                header = normalize_header(raw_header)
                 try:
                     x_position = header.index("X")
                     y_position = header.index("Y")
@@ -175,12 +245,10 @@ def detect_coordinate_scale(
     if not x_values:
         return default_factor
 
-    x_range = (min(x_values), max(x_values))
-    y_range = (min(y_values), max(y_values))
-    for factor, _label in COORDINATE_UNITS:
-        if _fits_utm(x_range, y_range, factor):
-            return factor
-    return default_factor
+    return scale_from_ranges(
+        (min(x_values), max(x_values)),
+        (min(y_values), max(y_values)),
+    )
 
 
 def _parse_coordinate(value: str) -> float:
@@ -201,14 +269,25 @@ def _cancelled(cancel_event: threading.Event | None) -> bool:
     return cancel_event is not None and cancel_event.is_set()
 
 
-def _parse_file(
-    path: Path,
+def parse_bar_rows(
+    header: Iterable[str],
+    rows: Iterable[TextRow],
     crs: UtmCrs,
+    *,
+    source_label: str,
     encoding: str,
-    cancel_event: threading.Event | None,
-    progress: ProgressCallback | None,
+    first_line_number: int = 2,
+    cancel_event: threading.Event | None = None,
+    progress: RowProgress | None = None,
     scale: float = 1.0,
 ) -> CsvLoadResult:
+    """Valida linhas de barras já em texto e devolve o modelo.
+
+    Aqui mora toda a validação; quem chama só precisa entregar um cabeçalho e
+    uma sequência de linhas de texto. É o que permite o CSV e o banco Access
+    compartilharem as mesmas regras em vez de manterem duas cópias delas.
+    """
+
     bar_ids: list[str] = []
     codes: list[str] = []
     xs: list[float] = []
@@ -217,7 +296,6 @@ def _parse_file(
     issues: list[CsvIssue] = []
     total_rows = 0
     invalid_rows = 0
-    total_bytes = max(path.stat().st_size, 1)
 
     def add_issue(line_number: int, reason: str) -> None:
         nonlocal invalid_rows
@@ -225,82 +303,71 @@ def _parse_file(
         if len(issues) < MAX_REPORTED_ISSUES:
             issues.append(CsvIssue(line_number, reason))
 
-    with path.open("r", encoding=encoding, newline="") as source:
-        reader = csv.reader(source, delimiter=";")
+    normalized_header = normalize_header(header)
+    column_positions: dict[str, int] = {}
+    missing_columns: list[str] = []
+    duplicated_columns: list[str] = []
+    for required_name in EXPECTED_HEADER:
+        positions = [
+            index
+            for index, column_name in enumerate(normalized_header)
+            if column_name == required_name
+        ]
+        if not positions:
+            missing_columns.append(required_name)
+        elif len(positions) > 1:
+            duplicated_columns.append(required_name)
+        else:
+            column_positions[required_name] = positions[0]
+
+    if missing_columns or duplicated_columns:
+        problems: list[str] = []
+        if missing_columns:
+            problems.append("ausentes: " + ", ".join(missing_columns))
+        if duplicated_columns:
+            problems.append("duplicadas: " + ", ".join(duplicated_columns))
+        raise CsvImportError(
+            "Cabeçalho inválido; colunas obrigatórias " + "; ".join(problems) + "."
+        )
+
+    last_required_position = max(column_positions.values())
+
+    for line_number, row in enumerate(rows, start=first_line_number):
+        if _cancelled(cancel_event):
+            raise CsvImportCancelled("Importação cancelada.")
+        if not row or not any(value.strip() for value in row):
+            continue
+
+        total_rows += 1
+        if progress is not None and total_rows % PROGRESS_ROW_INTERVAL == 0:
+            progress(total_rows)
+        if len(row) <= last_required_position:
+            add_issue(line_number, "faltam valores em colunas obrigatórias")
+            continue
+
+        bar_id = row[column_positions["BARRA_ID"]].strip()
+        code = row[column_positions["CODIGO"]].strip()
+        raw_x = row[column_positions["X"]].strip()
+        raw_y = row[column_positions["Y"]].strip()
+        if not bar_id:
+            add_issue(line_number, "BARRA_ID vazio")
+            continue
+        if bar_id in seen_ids:
+            add_issue(line_number, f"BARRA_ID duplicado: {bar_id}")
+            continue
+
         try:
-            header = next(reader)
-        except StopIteration as exc:
-            raise CsvImportError("O arquivo CSV está vazio.") from exc
+            x = _parse_coordinate(raw_x) / scale
+            y = _parse_coordinate(raw_y) / scale
+        except ValueError as exc:
+            add_issue(line_number, str(exc))
+            continue
 
-        normalized_header = tuple(value.strip().lstrip("\ufeff") for value in header)
-        column_positions: dict[str, int] = {}
-        missing_columns: list[str] = []
-        duplicated_columns: list[str] = []
-        for required_name in EXPECTED_HEADER:
-            positions = [
-                index
-                for index, column_name in enumerate(normalized_header)
-                if column_name == required_name
-            ]
-            if not positions:
-                missing_columns.append(required_name)
-            elif len(positions) > 1:
-                duplicated_columns.append(required_name)
-            else:
-                column_positions[required_name] = positions[0]
-
-        if missing_columns or duplicated_columns:
-            problems: list[str] = []
-            if missing_columns:
-                problems.append("ausentes: " + ", ".join(missing_columns))
-            if duplicated_columns:
-                problems.append("duplicadas: " + ", ".join(duplicated_columns))
-            raise CsvImportError(
-                "Cabeçalho inválido; colunas obrigatórias " + "; ".join(problems) + "."
-            )
-
-        last_required_position = max(column_positions.values())
-
-        for line_number, row in enumerate(reader, start=2):
-            if _cancelled(cancel_event):
-                raise CsvImportCancelled("Importação cancelada.")
-            if not row or not any(value.strip() for value in row):
-                continue
-
-            total_rows += 1
-            if progress is not None and total_rows % 1_000 == 0:
-                try:
-                    position = source.buffer.tell()
-                except (AttributeError, OSError):
-                    position = 0
-                progress(total_rows, min(position, total_bytes), total_bytes)
-            if len(row) <= last_required_position:
-                add_issue(line_number, "faltam valores em colunas obrigatórias")
-                continue
-
-            bar_id = row[column_positions["BARRA_ID"]].strip()
-            code = row[column_positions["CODIGO"]].strip()
-            raw_x = row[column_positions["X"]].strip()
-            raw_y = row[column_positions["Y"]].strip()
-            if not bar_id:
-                add_issue(line_number, "BARRA_ID vazio")
-                continue
-            if bar_id in seen_ids:
-                add_issue(line_number, f"BARRA_ID duplicado: {bar_id}")
-                continue
-
-            try:
-                x = _parse_coordinate(raw_x) / scale
-                y = _parse_coordinate(raw_y) / scale
-            except ValueError as exc:
-                add_issue(line_number, str(exc))
-                continue
-
-            seen_ids.add(bar_id)
-            bar_ids.append(bar_id)
-            codes.append(code)
-            xs.append(x)
-            ys.append(y)
+        seen_ids.add(bar_id)
+        bar_ids.append(bar_id)
+        codes.append(code)
+        xs.append(x)
+        ys.append(y)
 
     if _cancelled(cancel_event):
         raise CsvImportCancelled("Importação cancelada.")
@@ -308,7 +375,7 @@ def _parse_file(
         raise CsvImportError("Nenhuma linha válida foi encontrada no arquivo.")
 
     if progress is not None:
-        progress(total_rows, total_bytes, total_bytes)
+        progress(total_rows)
 
     model = CircuitModel(
         bar_ids,
@@ -316,7 +383,7 @@ def _parse_file(
         xs,
         ys,
         crs,
-        source_path=str(path.resolve()),
+        source_path=source_label,
     )
     bounds = model.bounds
     return CsvLoadResult(
@@ -333,6 +400,33 @@ def _parse_file(
             (bounds.top, bounds.bottom),
         ),
     )
+
+
+def _parse_file(
+    path: Path,
+    crs: UtmCrs,
+    encoding: str,
+    cancel_event: threading.Event | None,
+    progress: ProgressCallback | None,
+    scale: float = 1.0,
+) -> CsvLoadResult:
+    total_bytes = max(path.stat().st_size, 1)
+    with path.open("r", encoding=encoding, newline="") as source:
+        reader = csv.reader(source, delimiter=";")
+        try:
+            header = next(reader)
+        except StopIteration as exc:
+            raise CsvImportError("O arquivo CSV está vazio.") from exc
+        return parse_bar_rows(
+            header,
+            reader,
+            crs,
+            source_label=str(path.resolve()),
+            encoding=encoding,
+            cancel_event=cancel_event,
+            progress=byte_progress(source, total_bytes, progress),
+            scale=scale,
+        )
 
 
 def load_csv(

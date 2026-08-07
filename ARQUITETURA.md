@@ -27,7 +27,7 @@ NumPy 2.x, pyproj 3.5+.
 9. [Seleção, interação e navegação](#9-seleção-interação-e-navegação)
 10. [Estruturas de dados e finalidades](#10-estruturas-de-dados-e-finalidades)
 11. [Concorrência e ciclo de vida das threads](#11-concorrência-e-ciclo-de-vida-das-threads)
-12. [Subsistemas analíticos](#12-subsistemas-analíticos) (ramais · rede simplificada · exportação OpenDSS · fluxo de potência)
+12. [Subsistemas analíticos](#12-subsistemas-analíticos) (ramais · rede simplificada · exportação OpenDSS · fluxo de potência · leitura de bancos Access)
 13. [Camada de satélite](#13-camada-de-satélite)
 14. [Busca global](#14-busca-global)
 15. [Dependências](#15-dependências)
@@ -63,13 +63,14 @@ CIRCUITO_VIEWER/
 │   ├── __init__.py            # fachada pública (re-exporta a API do pacote)
 │   ├── __main__.py            # ponto de entrada (QApplication + MainWindow)
 │   ├── config/
-│   │   └── fases2.json        # mapeamento FASES2 → NUMERO_FASES (dado externo)
+│   │   ├── fases2.json        # mapeamento FASES2 → NUMERO_FASES (dado externo)
+│   │   └── mdb_tabelas.json   # mapeamento tabela/coluna → entidade (dado externo)
 │   │
 │   ├── model.py               # NÚCLEO: entidades, índices espaciais, topologia
 │   ├── circuit_colors.py      # paleta OKLCH contrastante
 │   ├── phase_config.py        # carga e validação de fases2.json
 │   │
-│   ├── csv_import.py          # importação de barras (+ exceções compartilhadas)
+│   ├── csv_import.py          # importação de barras (+ exceções e o seam comum)
 │   ├── segment_import.py      # importação de trechos
 │   ├── switch_import.py       # importação de chaves
 │   ├── regulator_import.py    # importação de reguladores de tensão
@@ -77,6 +78,10 @@ CIRCUITO_VIEWER/
 │   ├── load_pattern_import.py # importação de patamares (NPAT 0–3)
 │   ├── circuit_import.py      # importação de circuitos + build da topologia
 │   ├── cable_import.py        # importação do catálogo de cabos (sem dependência)
+│   │
+│   ├── mdb_engine.py          # único acesso ao pyodbc (opcional) + conversão
+│   ├── mdb_mapping.py         # tabela/coluna → entidade, a partir do JSON
+│   ├── mdb_import.py          # importação encadeada das oito entidades
 │   │
 │   ├── opendss_export.py      # geração dos .dss de rede e de cargas
 │   ├── opendss_settings.py    # parâmetros globais das cargas (Vminpu/Vmaxpu)
@@ -95,6 +100,8 @@ CIRCUITO_VIEWER/
 │   ├── cables_window.py       # tabela do catálogo de cabos
 │   ├── opendss_export_dialog.py  # seleção dos circuitos a exportar
 │   ├── opendss_settings_dialog.py # Configurações → OpenDSS… + QSettings
+│   ├── mdb_import_dialog.py   # tabelas detectadas, senha e metadados UTM
+│   ├── mdb_import_report.py   # relatório consolidado das oito entidades
 │   ├── overlap_report.py      # relatório de trechos sobrepostos
 │   ├── search_palette.py      # janela de busca não modal
 │   ├── load_pattern_table.py  # tabela de patamares no painel lateral
@@ -149,16 +156,19 @@ secundárias sem cuidados com afinidade de objetos Qt.
 │ model.py · *_import.py · branch_analysis · equivalent_network   │
 │ opendss_export · opendss_settings · opendss_powerflow           │
 │ opendss_engine                                                  │
+│ mdb_engine · mdb_mapping · mdb_import                           │
 │ search · phase_config · circuit_colors                          │
 │ (matemática de tiles em mapa_tiles também é pura)               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Uma segunda regra, análoga, vale para a dependência opcional do OpenDSS: **só
-`opendss_engine.py` importa `py_dss_interface`**, e mesmo ali o import é tardio.
-`opendss_powerflow.py` recebe o motor por parâmetro, o que o mantém testável
-headless com um motor falso e faz a aplicação inteira funcionar sem a biblioteca
-instalada — apenas com o botão de fluxo de potência desabilitado.
+Uma segunda regra, análoga, vale para as dependências opcionais: **só
+`opendss_engine.py` importa `py_dss_interface`** e **só `mdb_engine.py` importa
+`pyodbc`**, e nos dois casos o import é tardio. `opendss_powerflow.py` recebe o
+motor por parâmetro e `mdb_import.py` recebe o banco por parâmetro, o que os
+mantém testáveis headless com um motor e um banco falsos, e faz a aplicação
+inteira funcionar sem as bibliotecas instaladas — apenas com o botão de fluxo de
+potência e o item de importação por banco desabilitados.
 
 Exceções conhecidas e deliberadas:
 
@@ -188,6 +198,10 @@ Todos seguem o mesmo contrato: `load_*_csv(path, dependência, *, cancel_event,
 progress) -> *LoadResult`. São **transacionais** — ou retornam um modelo válido
 completo, ou levantam exceção; nunca mutam estado externo.
 
+Cada um expõe também `parse_*_rows(header, rows, dependência, *, source_label,
+encoding, first_line_number, cancel_event, progress)`, a **mesma validação sem o
+arquivo**: é o seam que a importação por banco consome (seção 6).
+
 | Módulo | Entidade | Depende de | Colunas obrigatórias |
 |---|---|---|---|
 | `csv_import.py` | Barra | — (só do `UtmCrs`) | `BARRA_ID, CODIGO, X, Y` |
@@ -201,7 +215,16 @@ completo, ou levantam exceção; nunca mutam estado externo.
 
 `csv_import.py` também exporta as exceções compartilhadas `CsvImportError`
 (fatal) e `CsvImportCancelled` (interrupção do usuário), reutilizadas por todos
-os demais importadores.
+os demais importadores, mais os utilitários do seam: `normalize_header`,
+`byte_progress`, `scale_from_ranges` e os tipos `RowProgress`/`TextRow`.
+
+### Leitura de banco Access
+
+| Módulo | Responsabilidade | Não faz |
+|---|---|---|
+| `mdb_engine.py` | Único acesso ao `pyodbc`; conexão somente leitura, sniff do formato, detecção de senha, `cell_to_text` | Conhecer entidades do modelo |
+| `mdb_mapping.py` | Ler `mdb_tabelas.json`; casar entidade → tabela → colunas reais | Ler linhas |
+| `mdb_import.py` | Encadear as oito entidades na ordem de dependência | Validar linhas (delega às `parse_*_rows`) |
 
 ### Análise
 
@@ -219,7 +242,9 @@ os demais importadores.
 | `graphics.py` | Toda a pintura, virtualização, hit-test geométrico, zoom/pan, desenho do fundo de satélite |
 | `opendss_settings.py` | Valor imutável dos parâmetros globais das cargas (`Vminpu`/`Vmaxpu`), com a invariante que o OpenDSS não impõe e a tradução para os comandos `BatchEdit` |
 | `opendss_engine.py` | Contenção dos efeitos globais do `py_dss_interface`: singleton com trava, diretório corrente preservado, `SystemExit` capturado, pasta temporária ASCII |
-| `workers.py` | 9 workers `QObject` que apenas encapsulam funções puras e emitem `progress/finished/failed/cancelled` |
+| `workers.py` | 10 workers `QObject` que apenas encapsulam funções puras e emitem `progress/finished/failed/cancelled` |
+| `mdb_import_dialog.py` | Tabelas detectadas com ajuste manual, senha mascarada e metadados UTM; `MdbPasswordDialog` é separado porque a senha só se sabe necessária **depois** da primeira tentativa de conexão |
+| `mdb_import_report.py` | Relatório consolidado das oito entidades — não modal, como o de sobreposições, porque os dois abrem sozinhos ao fim de uma operação |
 | `main_window.py` | Dono de todo o estado da aplicação; coordena importações, invalidações em cascata, máscaras efetivas, painel de detalhes e menus |
 | `circuits_window.py` | `QAbstractTableModel` fino sobre `CircuitVisibilityController` + delegate de cor |
 | `branch_window.py` | Tabela de ramais com `QSortFilterProxyModel` (ordenação por `UserRole`, filtro por circuito) |
@@ -453,6 +478,40 @@ a seta no diagrama aponta só para dentro. `_set_regulator_model()` instala o
 modelo, atualiza a busca e reaplica a seleção; e a única cascata que os atinge é
 a inversa, `_set_line_model()` zerando-os quando os trechos mudam.
 
+### O seam `parse_*_rows`: uma validação, duas fontes
+
+Os oito `_parse_file` tinham a mesma forma — abrir, ler cabeçalho, resolver
+posições de coluna, iterar linhas de texto, validar, montar o modelo. **Só os
+três primeiros passos dependem do CSV.** A validação por linha, os `*Issue`, o
+teto de `MAX_REPORTED_ISSUES` e a construção do `*Model` são idênticos venha a
+linha de um arquivo ou de uma tabela.
+
+Daí a separação em duas camadas por importador:
+
+```
+load_*_csv(path, …)        abre o arquivo, tenta utf-8-sig e depois cp1252
+  └─ _parse_file(…)        lê o cabeçalho e delega
+       └─ parse_*_rows(header, rows, …)   ← toda a validação mora aqui
+```
+
+Duas escolhas de assinatura sustentam isso:
+
+- **`progress` encolhe para `Callable[[int], None]`** dentro das `parse_*_rows`:
+  elas só sabem quantas linhas leram. O CSV reexpande para a tripla
+  `(linhas, bytes, total)` com `byte_progress()`, que lê `source.buffer.tell()`;
+  a importação por banco expande para linhas acumuladas da cadeia inteira. A
+  `ProgressCallback` pública e o `_on_import_progress` da `MainWindow` não mudam.
+- **`source_label`** substitui o `str(path.resolve())` que era montado lá dentro.
+  O campo `source_path` dos modelos já era texto livre; o banco grava
+  `"C:\...\rede.mdb::TRECHO"`, preservando a tabela de origem.
+
+`first_line_number` existe porque o CSV numera a partir de 2 (a linha 1 é o
+cabeçalho) e a tabela, a partir de 1.
+
+A régua desta separação foi dura de propósito: a suíte inteira passa **sem
+nenhuma edição em `tests/`**. Um teste que precisasse mudar denunciaria uma
+mudança de comportamento escondida na refatoração.
+
 ### Pipeline comum de cada importador
 
 1. **Detecção de encoding** — tenta `utf-8-sig`; em `UnicodeDecodeError`,
@@ -536,6 +595,44 @@ Falha total apenas se nenhum grupo completo existir.
 `CircuitCatalogModel.build(segments, switches, definitions)`, que executa a busca
 topológica por circuito. É o único importador cujo custo dominante não é o
 parsing e sim o BFS; por isso propaga `cancel_check` para dentro do `trace`.
+
+### Importação por banco Access
+
+`load_database()` percorre `ENTITY_ORDER` — `barras → cabos → trechos → cargas →
+patamares → chaves → reguladores → circuitos` — e entrega as linhas de cada
+tabela à `parse_*_rows` correspondente. A ordem é a das dependências entre
+modelos, com um caso não óbvio: **as chaves vêm antes dos circuitos** porque
+`parse_circuit_rows` recebe o `SwitchModel` e a topologia energizada depende
+dele.
+
+Três decisões merecem registro:
+
+- **Só as barras são fatais.** Qualquer outra entidade que falhe — tabela
+  ausente, coluna faltando, nenhum registro válido — vira um `MdbEntityOutcome`
+  com o motivo e não interrompe as demais. É coerente com o estado da aplicação
+  hoje: trechos sem circuitos, ou cargas sem patamares, são estados válidos. O
+  que dependia da entidade que falhou é pulado com a explicação, via
+  `ENTITY_DEPENDENCIES`.
+- **Só as colunas obrigatórias são projetadas.** `CARGA` tem 43 colunas na base
+  de referência e 9 interessam; o `SELECT` lista exatamente essas. Colunas
+  extras, como o `CENARIO_ID` de `MODELO_CARGA`, nunca são lidas — a importação
+  usa as mesmas colunas do CSV.
+- **A conversão de tipos é uma função só, `cell_to_text`.** É a fronteira mais
+  perigosa do recurso: três comparações do núcleo são textuais e exatas —
+  `FASES2` contra o `fases2.json`, `ESTADO == "1"` em `trace()`, e todo
+  `index_for_id` entre tabelas. Um `float` de valor inteiro **precisa** sair sem
+  casa decimal: `"1.0"` faria toda chave fechada virar aberta, ilhando a rede
+  sem nenhum aviso. Há teste de regressão que importa `ESTADO` como inteiro e
+  como `float` e confere que o circuito alcança as três barras.
+
+`detect_database_scale()` espelha `detect_coordinate_scale()` do CSV: amostra o
+início da tabela de barras e delega a `scale_from_ranges()`, que é a mesma
+decisão para as duas fontes.
+
+Na chegada, `_on_mdb_import_finished` instala os modelos pelos **setters
+existentes** (`_set_line_model`, `_set_switch_model`, `_set_circuit_catalog`…),
+na mesma ordem. Nenhuma cascata nova é escrita: é o que mantém as invalidações
+descritas abaixo exatamente como estão.
 
 ### Substituição em cascata
 
@@ -918,6 +1015,16 @@ handler de limpeza e `thread.deleteLater`.
 menu verifica os quatro antes de iniciar — nunca há duas operações pesadas
 simultâneas.
 
+**A importação por banco ocupa o slot `_import_thread`**, como as de CSV. A
+cadeia inteira roda num worker só porque cada importador recebe o modelo do
+anterior: dividir em oito threads exigiria sequenciá-las de qualquer forma, e
+ainda multiplicaria as revalidações de identidade na chegada. Uma restrição
+física reforça a escolha — **uma conexão ODBC não é segura para atravessar
+threads**, então `MdbImportWorker` abre a sua própria conexão dentro de `run()` e
+a fecha antes de emitir o sinal. A conexão que a `MainWindow` usa para inspecionar
+o banco (tabelas, contagens, amostra de coordenadas) é fechada assim que o
+diálogo é montado.
+
 **O fluxo de potência entra nessa exclusão, e a exportação não.** A diferença é
 o destino do resultado: a exportação escreve em disco e pode conviver com
 qualquer outra operação, enquanto o fluxo devolve grandezas para o estado da
@@ -1095,11 +1202,12 @@ trifásica do CSV: `kV = VNOM/√3` — a mesma `phase_voltage_kv()` do `C1` dos
 trechos e do `kV` das cargas — e `kVA = SNOM/3`.
 
 A modelagem que faltava está fixada em constantes do módulo: transformador quase
-ideal (`XHL` e `%LoadLoss` de 0,01 %), TP de 115 V, `vreg = 115/√3` e banda de
-2 % de `vreg`. A relação de PT é `VNOM×1000/115`, e a simplificação é exata: o
-√3 do primário e o do secundário se cancelam, de modo que o controle lê
-exatamente `vreg` quando a barra está na tensão nominal — isto é, regula em
-1,0000 pu.
+ideal (`XHL` e `%LoadLoss` de 0,01 %), TP de 115 V, `vreg = 115/√3` e banda
+fixa de 3 V — na mesma base de `vreg`, o mesmo jeito de especificar bandwidth
+no dial de um regulador real. A relação de PT é `VNOM×1000/115`, e a
+simplificação é exata: o √3 do primário e o do secundário se cancelam, de modo
+que o controle lê exatamente `vreg` quando a barra está na tensão nominal —
+isto é, regula em 1,0000 pu.
 
 **O regulador ocupa o lugar do trecho.** Os transformadores ligam as duas barras
 do trecho, exatamente como a `Line ... Switch=Yes` da chave faz, e é por isso que
@@ -1538,6 +1646,67 @@ Qualquer reimportação chama `_invalidate_power_flow()` e a esconde: o resultad
 deriva de catálogo, trechos, chaves, cabos, cargas e patamares, e sobreviver a
 uma troca de qualquer um deles seria exibir número velho como se fosse novo.
 
+### 12.5 Leitura de bancos Access (`mdb_engine.py`, `mdb_mapping.py`, `mdb_import.py`)
+
+**Objetivo:** importar as oito entidades direto de um `.mdb`, em modo somente
+leitura, sem duplicar nenhuma regra de validação. A mecânica da cadeia está na
+seção 6; aqui ficam as decisões que a sustentam.
+
+**A leitura é somente leitura em quatro camadas**, da mais forte para a mais
+fraca: `ReadOnly=1` na cadeia de conexão (o atributo que o ACE de fato honra),
+`SQL_MODE_READ_ONLY` pelo `readonly=True` do pyodbc, `autocommit` para nunca
+abrir transação, e uma API que **só emite `SELECT`** — não há `execute` livre,
+`commit` nem cursor exposto para fora do módulo. Se o driver recusar o
+`SQL_MODE_READ_ONLY`, a conexão é refeita sem ele e `readonly_attribute` registra
+o fato; as outras três camadas continuam valendo, e bloquear a leitura por causa
+da camada mais fraca seria pior.
+
+**Dois detalhes da cadeia de conexão foram medidos, não deduzidos.** `Mode=Read`
+**não serve**: é atributo do OLEDB, e o ODBC responde "Atributo de cadeia de
+conexão inválido Mode". E **nenhum atributo do ACE aceita citação entre chaves**:
+`DBQ={C:\...\rede.mdb}` faz o driver tratá-las como parte do nome e responder
+"Nome de arquivo inválido (-1044)", e `PWD={senha}` faz a senha chegar ao driver
+com as chaves — rejeitada como incorreta **sempre**, independentemente do que o
+usuário digite. Por isso caminho e senha vão crus, e um `;` em qualquer um dos
+dois é recusado antes de chegar ao driver.
+
+O `DRIVER={...}` é a exceção aparente, e ela confirma a regra: quem lê esse
+atributo é o **Gerenciador de Driver do Windows**, que segue o padrão ODBC e
+remove as chaves; `DBQ` e `PWD` são lidos pelo **driver do Access**, que faz a
+própria análise e não as remove. A assimetria custou um defeito — a senha correta
+era recusada em laço, e o teste que existia travava justamente a forma errada.
+Hoje há um teste que compara a cadeia gerada com a do
+`mdb_viewer_app/database.py` do projeto MDB_VIEWER, conhecido por abrir o mesmo
+banco protegido, admitindo só o `ReadOnly=1` a mais.
+
+**Efeito colateral documentado:** enquanto a conexão existe, o ACE cria um `.ldb`
+ao lado do banco e o remove ao fechar. Não altera o `.mdb`, mas exige escrita na
+pasta — numa pasta somente leitura o Access se recusa a abrir o arquivo.
+
+**O sniff de formato precede a conexão.** O ACE 2013+ não abre Access 97 (Jet 3)
+e responde um erro genérico de formato. `sniff_access_format()` lê 32 bytes do
+arquivo — magia `Standard Jet DB`/`Standard ACE DB` e o byte 0x14 — e recusa o
+Jet 3 com uma explicação acionável. Formato desconhecido **passa**: quem decide é
+o driver, e recusar aqui bloquearia um arquivo válido a mais.
+
+**A senha vira exceção própria.** O ACE responde `-1905`/`1907` e é localizado,
+então `is_password_error()` casa por código **e** por palavra. `MdbPasswordError`
+existe para a interface reperguntar em vez de mostrar o erro ODBC cru. A senha
+nunca é gravada, nunca entra em mensagem de erro e o `__repr__` do banco a omite.
+
+**O mapeamento é externo**, `config/mdb_tabelas.json`, pelo mesmo motivo do
+`fases2.json`: nome de tabela é convenção da concessionária. As colunas
+obrigatórias de cada entidade **vêm dos próprios importadores**
+(`EXPECTED_*_HEADER`), e não de uma segunda lista no JSON — uma cópia poderia
+divergir em silêncio. O casamento ignora caixa nos dois lados, porque o Access
+também ignora.
+
+**A resolução nunca falha por inteiro.** Cada entidade é resolvida
+independentemente e a que não encontra tabela ou coluna vira uma
+`UnavailableEntity` com o motivo. Uma tabela **forçada pelo usuário** que não
+sirva é relatada em vez de cair de volta na detecção: passar por cima de uma
+escolha explícita seria pior do que dizer que não deu.
+
 ---
 
 ## 13. Camada de satélite
@@ -1703,10 +1872,18 @@ ausente): sem ele, apenas a camada de satélite deixa de funcionar.
 | Pacote | Versão | Uso | Extra |
 |---|---|---|---|
 | `py-dss-interface` | ≥2.3, <3 | motor do OpenDSS para o fluxo de potência | `opendss` |
+| `pyodbc` | ≥5.1, <6 | leitura de bancos Access (`.mdb`/`.accdb`) | `mdb` |
 
-Instalação: `pip install -e ".[opendss]"`. Sem o pacote, apenas o botão
-**Executar Fluxo de Potência** fica desabilitado, com o motivo na dica; o import
-é tardio e vive só em `opendss_engine.py` (ver seção 12.4).
+Instalação: `pip install -e ".[opendss,mdb]"`. Sem `py-dss-interface`, apenas o
+botão **Executar Fluxo de Potência** fica desabilitado; sem `pyodbc`, apenas
+**Importar banco de dados…**. Os dois imports são tardios e vivem só em
+`opendss_engine.py` (seção 12.4) e `mdb_engine.py` (seção 12.5).
+
+`pyodbc` sozinho não basta: é preciso o **driver ODBC do Microsoft Access
+Database Engine na mesma arquitetura do processo Python**. Um Python de 64 bits
+não enxerga o driver de 32 bits, e o sintoma é "driver não encontrado" com o
+driver visivelmente instalado — por isso `mdb_import_error()` cita a arquitetura
+na mensagem.
 
 ### Desenvolvimento
 
@@ -1719,7 +1896,12 @@ __main__ → main_window → {graphics, workers, *_window, *_table, search_palet
                           model, phase_config, mapa_tiles, *_import,
                           opendss_engine, opendss_powerflow}
 workers  → {*_import, branch_analysis, equivalent_network, model, phase_config,
-            opendss_export, opendss_engine, opendss_powerflow}
+            opendss_export, opendss_engine, opendss_powerflow,
+            mdb_engine, mdb_import}
+mdb_import   → {*_import (as parse_*_rows), csv_import, mdb_engine, mdb_mapping,
+                model}
+mdb_mapping  → {*_import (só os EXPECTED_*_HEADER), mdb_engine}
+mdb_engine   → ∅  (pyodbc entra por import tardio)
 graphics → {model, equivalent_network, mapa_tiles}
 equivalent_network → {branch_analysis, model}
 branch_analysis    → {model, phase_config}
@@ -1735,9 +1917,11 @@ model    → circuit_colors
 *_import → {csv_import (exceções), model}
 ```
 
-`opendss_engine.py` é folha do pacote de propósito: ele define o `Protocol`
-`DssEngine` que `opendss_powerflow` consome, e importar qualquer coisa do
-projeto ali arrastaria a contenção da DLL para dentro do grafo do domínio.
+`opendss_engine.py` e `mdb_engine.py` são folhas do pacote de propósito: cada um
+define o `Protocol` que o seu consumidor usa — `DssEngine` para
+`opendss_powerflow`, `AccessDatabase` para `mdb_import` —, e importar qualquer
+coisa do projeto ali arrastaria a contenção da dependência externa para dentro do
+grafo do domínio.
 
 `model.py` e `circuit_colors.py` são folhas — não importam nada do pacote além
 disso. `__init__.py` re-exporta a API pública (~70 nomes em `__all__`), o que
@@ -1791,6 +1975,23 @@ perdido.
 
 **Duck typing entre `LoadModel` e `EquivalentNetworkModel`.** Evita duplicar
 todo o `LoadVirtualizer` para uma segunda camada de cargas.
+
+**Uma validação, duas fontes (`parse_*_rows`).** Aceitar uma segunda fonte de
+dados sem duplicar as regras exigia separar "de onde vêm as linhas" de "o que
+faz uma linha ser válida". A alternativa — um importador de banco próprio —
+criaria oito pares de regras capazes de divergir em silêncio, exatamente o modo
+de falha que a seção 12.3 evita ao reusar a separação de chaves do `trace()`.
+
+**Conversão de tipos numa função só (`cell_to_text`).** Um banco é tipado e o CSV
+não; a fronteira entre os dois precisa de um lugar único, porque três comparações
+do núcleo são textuais e exatas. A regra que parece um detalhe — `float` de valor
+inteiro sai sem casa decimal — é a que impede `ESTADO` virar `"1.0"` e abrir toda
+chave fechada da rede.
+
+**Mapeamento de tabelas externo (`mdb_tabelas.json`).** Mesmo raciocínio do
+`fases2.json`: nome de tabela e de coluna é convenção da concessionária. As
+colunas obrigatórias, porém, vêm dos `EXPECTED_*_HEADER` dos importadores — essas
+**são** regra da aplicação, e duplicá-las no JSON criaria uma segunda verdade.
 
 **Configuração de fases externa (`fases2.json`).** O mapeamento `FASES2` →
 número de fases é convenção da concessionária, não regra de negócio da
@@ -1856,8 +2057,9 @@ e evita que uma heurística errada corrompa silenciosamente toda a importação.
 ### Adicionar uma nova entidade importável
 
 1. Criar `nova_entidade_import.py` seguindo o contrato dos importadores
-   (`EXPECTED_*_HEADER`, `_column_positions`, `_parse_file`, `load_*_csv`,
-   `*Issue`, `*LoadResult` com `has_warnings`).
+   (`EXPECTED_*_HEADER`, `_column_positions`, `parse_*_rows`, `_parse_file`,
+   `load_*_csv`, `*Issue`, `*LoadResult` com `has_warnings`). Toda a validação
+   vai em `parse_*_rows`; `_parse_file` só abre o arquivo e delega.
 2. Criar o `*Model` colunar em `model.py`, referenciando o modelo-pai por
    índices e expondo `__len__`, `index_for_id`, `record(i)` e — se for
    selecionável — `spatial_index`.
@@ -1869,6 +2071,11 @@ e evita que uma heurística errada corrompa silenciosamente toda a importação.
 6. Se for pesquisável, adicionar o `SearchKind`, o branch em `_source_rows()` e
    o `set_*` em `GlobalSearchIndex`.
 7. Exportar em `__init__.py`; adicionar testes e (se for escala grande) benchmark.
+8. Para que a entidade também venha de banco: acrescentar a entrada em
+   `config/mdb_tabelas.json`, o nome em `ENTITY_ORDER`, `REQUIRED_COLUMNS`,
+   `ENTITY_LABELS` e `ENTITY_DEPENDENCIES`, e o ramo em
+   `mdb_import._import_entity`. O diálogo e o relatório se ajustam sozinhos,
+   porque ambos percorrem `ENTITY_ORDER`.
 
 ### Adicionar um modo de coloração
 
@@ -1912,7 +2119,7 @@ sem tocar no núcleo.
 
 ## 18. Testes e benchmarks
 
-### Testes (`tests/`, 32 arquivos)
+### Testes (`tests/`, 36 arquivos)
 
 | Arquivo | Foco |
 |---|---|
@@ -1925,13 +2132,19 @@ sem tocar no núcleo.
 | `test_opendss_settings.py` | invariante da faixa (`0 < vminpu <= 1 <= vmaxpu`), comandos `BatchEdit` exatos e sem vírgula decimal, desabilitado não emite nada, ida e volta pelo mapeamento e recuperação de preferência corrompida |
 | `test_opendss_engine.py` | detecção da biblioteca opcional, memoização do erro de import, reuso do motor único, diretório corrente restaurado (inclusive após falha) e escolha da pasta ASCII |
 | `test_opendss_powerflow.py` | com um **motor falso**: arquivos gravados iguais aos da exportação, ordem `Clear`/`Compile`/`Set …`, um `Solve` por patamar, corrente no trecho certo (inclusive em chaves), só o terminal 1, tensões e pu por nó, neutro descartado, `IADM` ausente, patamar não convergido, colisão de caixa em nome de linha e de barra, circuito sem master, sobreposição resolvida pelo primeiro circuito, progresso e cancelamento |
+| `test_mdb_engine.py` | `cell_to_text` exaustivo (o inteiro sem `.0`, o decimal íntegro, Sim/Não, nulo, binário), sniff de formato por versão do Access, detecção de senha, cadeia de conexão somente leitura **sem chaves em `DBQ` nem em `PWD`** e comparada com a forma comprovadamente funcional, recuo do `SQL_MODE_READ_ONLY`, senha fora das mensagens, e a garantia de que só `SELECT` é emitido |
+| `test_mdb_mapping.py` | apelidos de coluna, casamento sem caixa, tabela de reserva, tabela e coluna ausentes desabilitando só a própria entidade, tabela ilegível reportada, `MSys*` nunca escolhidas, override que não cai de volta na detecção, e o JSON distribuído conferido contra a base real |
+| `test_mdb_import.py` | com um **banco falso**: ordem de dependência (chaves antes de circuitos), identidade encadeada dos modelos, projeção só das colunas obrigatórias, `CENARIO_ID` ignorado, dedução de decímetros, entidade ausente não derrubando as demais, barras fatais, cancelamento nunca virando falha de entidade, progresso único da cadeia, e a **regressão de tipos**: `ESTADO` inteiro e `float` mantendo a chave fechada e a topologia alcançando as três barras |
+| `test_mdb_import_ui.py` | com um `MdbImportResult` injetado: instalação dos oito modelos pelos setters existentes, catálogo sobrevivendo à cascata das chaves, banco parcial, diálogo (pré-seleção, override manual reabilitando entidade, barras obrigatórias), senha mascarada, e o relatório não modal |
 | `test_search.py` | índice de busca (sem Qt) |
 | `test_graphics.py` · `test_main_window.py` · `test_branches_ui.py` · `test_circuits_ui.py` · `test_phase_ui.py` · `test_search_ui.py` · `test_map_tiles.py` · `test_satellite_ui.py` · `test_theme_ui.py` · `test_cables_ui.py` · `test_opendss_export_ui.py` · `test_powerflow_ui.py` · `test_opendss_settings_ui.py` · `test_regulators_ui.py` | camadas Qt (exigem PyQt6) |
 
 Os testes do núcleo usam apenas a biblioteca padrão e NumPy; os gráficos rodam
-quando PyQt6 está disponível. **Nenhum teste exige `py-dss-interface`:** o fluxo
-de potência é exercitado com um motor falso no núcleo e com um `PowerFlowResult`
-injetado na UI, o que também mantém a suíte rápida e determinística.
+quando PyQt6 está disponível. **Nenhum teste exige `py-dss-interface` nem
+`pyodbc`:** o fluxo de potência é exercitado com um motor falso e um
+`PowerFlowResult` injetado na UI, e a importação por banco com um banco falso e
+um `MdbImportResult` injetado — o que também mantém a suíte rápida e
+determinística.
 
 ```bash
 python -m unittest discover -s tests -v

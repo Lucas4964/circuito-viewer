@@ -798,11 +798,11 @@ class RegulatorExportTests(unittest.TestCase):
             control_entries(result.text),
             [
                 "New RegControl.CTRL-X-D transformer=REG-X-D winding=2 "
-                "vreg=66.3953 band=1.32791 ptratio=300",
+                "vreg=66.3953 band=3 ptratio=300",
                 "New RegControl.CTRL-X-E transformer=REG-X-E winding=2 "
-                "vreg=66.3953 band=1.32791 ptratio=300",
+                "vreg=66.3953 band=3 ptratio=300",
                 "New RegControl.CTRL-X-F transformer=REG-X-F winding=2 "
-                "vreg=66.3953 band=1.32791 ptratio=300",
+                "vreg=66.3953 band=3 ptratio=300",
             ],
         )
 

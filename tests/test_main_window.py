@@ -450,6 +450,23 @@ class MainWindowSelectionTests(unittest.TestCase):
                         QHeaderView.ResizeMode.Interactive,
                     )
 
+    def test_detail_tables_have_internal_cell_padding(self) -> None:
+        # As quatro tabelas "estilo Excel" do painel — fluxo de potência e
+        # patamares — precisam da margem interna, não só das outras janelas
+        # com tabela que reaproveitam o mesmo mecanismo de arraste.
+        window, _, _ = self._make_window()
+        self.addCleanup(window.close)
+
+        tables = (
+            window.load_patterns_table,
+            window.equivalent_patterns_table,
+            window.findChild(QTableView, "bar_power_flow_quantity_table"),
+            window.findChild(QTableView, "segment_power_flow_quantity_table"),
+        )
+        for table in tables:
+            with self.subTest(table=table.objectName() or "patterns"):
+                self.assertIn("padding", table.styleSheet())
+
     def test_switch_table_is_conditional_and_reimport_preserves_selection(self) -> None:
         window, _, network = self._make_window()
         self.addCleanup(window.close)
