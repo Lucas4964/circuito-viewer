@@ -143,8 +143,9 @@ class MainWindowSelectionTests(unittest.TestCase):
         import_actions = [
             action for action in toolbar.actions() if action.text().startswith("Importar")
         ]
-        self.assertEqual(window.import_action.text(), "Importar…")
-        self.assertEqual(len(import_actions), 1)
+        self.assertEqual(window.import_action.text(), "Importar CSV…")
+        self.assertEqual(len(import_actions), 0)
+        self.assertIn(window.import_action, window.file_menu.actions())
         self.assertTrue(window.show_bars_action.isChecked())
         self.assertFalse(window.show_bars_action.isEnabled())
         self.assertNotIn(window.show_bars_action, toolbar.actions())

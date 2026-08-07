@@ -218,7 +218,7 @@ class CablesWindow(QDialog):
         if count == 0:
             self.summary_label.setText(
                 "Nenhum cabo importado. Use o botão abaixo ou "
-                "Arquivo > Importar… > Importar cabos…"
+                "Arquivo > Importar CSV… > Importar cabos…"
             )
         else:
             self.summary_label.setText(f"{count:n} cabo(s) no catálogo.")

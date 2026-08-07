@@ -126,7 +126,7 @@ class CablesWindowTests(unittest.TestCase):
         self.assertFalse(window.cables_window.table.isVisible())
         self.assertIn("Nenhum cabo", window.cables_window.summary_label.text())
 
-        # O botão precisa chegar ao mesmo fluxo de Arquivo > Importar…; o
+        # O botão precisa chegar ao mesmo fluxo de Arquivo > Importar CSV…; o
         # diálogo de arquivo é substituído por um cancelamento.
         with patch(
             "circuit_viewer.main_window.QFileDialog.getOpenFileName",

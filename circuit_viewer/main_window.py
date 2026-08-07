@@ -50,6 +50,9 @@ from .csv_import import (
     CsvLoadResult,
     detect_coordinate_scale,
 )
+from .curvas import CurveCatalog
+from .curvas_store import load_curves
+from .curvas_window import CurvesWindow
 from .graphics import (
     BranchHighlightOverlayItem,
     DiagramView,
@@ -402,6 +405,7 @@ class MainWindow(QMainWindow):
         self,
         phase_configuration_path: str | Path | None = None,
         settings: QSettings | None = None,
+        curves_path: str | Path | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Visualizador de Circuitos Elétricos")
@@ -554,6 +558,17 @@ class MainWindow(QMainWindow):
         self.branches_window = BranchesWindow(self.branch_table_model, self)
         self.cable_table_model = CableTableModel(self)
         self.cables_window = CablesWindow(self.cable_table_model, self)
+        # As curvas são cadastro do usuário, não dado importado: carregam junto
+        # com a janela e sobrevivem a qualquer importação.
+        self._curves_path = curves_path
+        self._curves_load = load_curves(curves_path)
+        self.curve_catalog = CurveCatalog.from_curves(self._curves_load.curves)
+        self.curves_window = CurvesWindow(
+            self.curve_catalog,
+            storage_path=curves_path,
+            parent=self,
+        )
+        self.curves_window.curvesSaved.connect(self._on_curves_saved)
         self._circuit_visibility_timer = QTimer(self)
         self._circuit_visibility_timer.setSingleShot(True)
         self._circuit_visibility_timer.setInterval(50)
@@ -572,9 +587,11 @@ class MainWindow(QMainWindow):
         self._sync_power_flow_availability()
         if self._phase_configuration_error is not None:
             QTimer.singleShot(0, self._show_phase_configuration_error)
+        if self._curves_load.issue is not None:
+            QTimer.singleShot(0, self._show_curves_load_warning)
 
     def _create_actions(self) -> None:
-        self.import_action = QAction("Importar…", self)
+        self.import_action = QAction("Importar CSV…", self)
         self.import_action.setShortcut(QKeySequence.StandardKey.Open)
         self.import_action.setToolTip(
             "Importar barras, trechos, cargas, chaves ou circuitos de arquivos CSV"
@@ -721,6 +738,15 @@ class MainWindow(QMainWindow):
         )
         self.opendss_settings_action.triggered.connect(self._show_opendss_settings)
 
+        # Sem setEnabled(False): é cadastro do usuário, nunca depende de dado
+        # importado — a mesma razão de opendss_settings_action.
+        self.curves_action = QAction("Curvas…", self)
+        self.curves_action.setToolTip(
+            "Criar e editar curvas horárias de 24 pontos para associar a "
+            "cargas e geradores"
+        )
+        self.curves_action.triggered.connect(self._show_curves_window)
+
         self.power_flow_action = QAction("Executar Fluxo de Potência", self)
         self.power_flow_action.setEnabled(False)
         self.power_flow_action.setToolTip(
@@ -768,11 +794,11 @@ class MainWindow(QMainWindow):
         self.exit_action.triggered.connect(self.close)
 
     def _create_menus_and_toolbar(self) -> None:
-        file_menu = self.menuBar().addMenu("Arquivo")
-        file_menu.addAction(self.import_action)
-        file_menu.addAction(self.mdb_import_action)
-        file_menu.addSeparator()
-        file_menu.addAction(self.exit_action)
+        self.file_menu = self.menuBar().addMenu("Arquivo")
+        self.file_menu.addAction(self.import_action)
+        self.file_menu.addAction(self.mdb_import_action)
+        self.file_menu.addSeparator()
+        self.file_menu.addAction(self.exit_action)
 
         view_menu = self.menuBar().addMenu("Visualizar")
         view_menu.addAction(self.show_bars_action)
@@ -808,12 +834,11 @@ class MainWindow(QMainWindow):
         # exportação ou de uma execução.
         self.settings_menu = self.menuBar().addMenu("Configurações")
         self.settings_menu.addAction(self.opendss_settings_action)
+        self.settings_menu.addAction(self.curves_action)
 
         toolbar = QToolBar("Ferramentas principais", self)
         toolbar.setObjectName("main_toolbar")
         toolbar.setMovable(False)
-        toolbar.addAction(self.import_action)
-        toolbar.addSeparator()
         toolbar.addAction(self.select_action)
         toolbar.addAction(self.pan_action)
         toolbar.addAction(self.fit_action)
@@ -2571,6 +2596,22 @@ class MainWindow(QMainWindow):
         # todos desabilita o botão.
         self._sync_power_flow_availability()
         self.view.viewport().update()
+
+    def _show_curves_window(self) -> None:
+        # Sempre disponível: sem curvas, a janela oferece a criação.
+        self.curves_window.refresh()
+        self.curves_window.show()
+        self.curves_window.raise_()
+        self.curves_window.activateWindow()
+
+    def _on_curves_saved(self, count: int) -> None:
+        self.statusBar().showMessage(f"{count:n} curva(s) salva(s).", 6_000)
+
+    def _show_curves_load_warning(self) -> None:
+        issue = self._curves_load.issue
+        if issue is None:
+            return
+        QMessageBox.warning(self, "Curvas", issue)
 
     def _show_circuits_window(self) -> None:
         if self._circuit_catalog is None:
@@ -5089,6 +5130,12 @@ class MainWindow(QMainWindow):
             if self._power_flow_worker is not None:
                 self._power_flow_worker.cancel()
             self._close_after_power_flow = True
+            event.ignore()
+            return
+        # Última guarda, e depois das de thread: fechar a janela de curvas
+        # dispara o próprio aviso de alterações pendentes, e close() devolve
+        # False quando o usuário cancela. Sem pendências é inerte.
+        if not self.curves_window.close():
             event.ignore()
             return
         self.search_palette.shutdown()

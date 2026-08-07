@@ -65,6 +65,8 @@ CIRCUITO_VIEWER/
 │   ├── config/
 │   │   ├── fases2.json        # mapeamento FASES2 → NUMERO_FASES (dado externo)
 │   │   └── mdb_tabelas.json   # mapeamento tabela/coluna → entidade (dado externo)
+│   ├── dados/                 # DADO DO USUÁRIO (gitignored, criado em runtime)
+│   │   └── curvas.json        # curvas horárias cadastradas na interface
 │   │
 │   ├── model.py               # NÚCLEO: entidades, índices espaciais, topologia
 │   ├── circuit_colors.py      # paleta OKLCH contrastante
@@ -82,6 +84,9 @@ CIRCUITO_VIEWER/
 │   ├── mdb_engine.py          # único acesso ao pyodbc (opcional) + conversão
 │   ├── mdb_mapping.py         # tabela/coluna → entidade, a partir do JSON
 │   ├── mdb_import.py          # importação encadeada das oito entidades
+│   │
+│   ├── curvas.py              # NÚCLEO: curvas de 24 pontos, validação, colagem
+│   ├── curvas_store.py        # NÚCLEO: leitura/gravação atômica de curvas.json
 │   │
 │   ├── opendss_export.py      # geração dos .dss de rede e de cargas
 │   ├── opendss_settings.py    # parâmetros globais das cargas (Vminpu/Vmaxpu)
@@ -104,12 +109,15 @@ CIRCUITO_VIEWER/
 │   ├── mdb_import_report.py   # relatório consolidado das oito entidades
 │   ├── overlap_report.py      # relatório de trechos sobrepostos
 │   ├── search_palette.py      # janela de busca não modal
+│   ├── curvas_window.py       # Configurações → Curvas… (lista, grade, gráfico)
+│   ├── curvas_table.py        # grade editável das 24 horas + colar/copiar
+│   ├── curva_chart.py         # gráfico da curva, desenhado com QPainter
 │   ├── load_pattern_table.py  # tabela de patamares no painel lateral
 │   ├── power_flow_table.py    # tabela de grandezas do fluxo no painel lateral
 │   ├── phase_legend.py        # legenda flutuante do modo por fases
 │   └── theme.py               # tema claro/escuro escolhido manualmente
 │
-├── tests/                     # 32 arquivos de teste (unittest + pytest-qt)
+├── tests/                     # 43 arquivos de teste (unittest + pytest-qt)
 ├── benchmarks/                # 8 benchmarks com modo --enforce
 ├── README.md                  # documentação de uso
 ├── ARQUITETURA.md             # este documento
@@ -189,6 +197,8 @@ Exceções conhecidas e deliberadas:
 |---|---|---|
 | `model.py` | Entidades imutáveis, modelos colunares, índices espaciais, adjacência CSR, busca elétrica, controlador de visibilidade | I/O, Qt |
 | `phase_config.py` | Ler/validar `fases2.json`; classificar `FASES2` em categorias de renderização | Definir cores da UI (só as constantes) |
+| `curvas.py` | `Curve`/`CurveDraft`/`CurveCatalog`, validação de nome e das 24 horas, interpretação do bloco colado | I/O, Qt |
+| `curvas_store.py` | Ler/gravar `dados/curvas.json` de forma atômica e tolerante a arquivo corrompido | Qt, validar regras de negócio |
 | `circuit_colors.py` | Gerar paleta contrastante em OKLCH; normalizar `#RRGGBB` | Aplicar cores |
 | `search.py` | Índice por `CODIGO` e índice por todas as colunas; consultas canceláveis | Widgets |
 
@@ -252,6 +262,9 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | `cables_window.py` | Tabela do catálogo de cabos (ordenação numérica por `UserRole`) + rótulos `cable_summary`/`cable_tooltip` reutilizados no painel de trechos |
 | `opendss_export_dialog.py` | Lista de circuitos com caixas de seleção **mutuamente exclusivas**; devolve o índice escolhido para a exportação |
 | `opendss_settings_dialog.py` | Diálogo dos parâmetros globais **e** a persistência em `QSettings` — que mora aqui, e não no núcleo, porque `QSettings` é Qt (mesma divisão de `theme.py`) |
+| `curvas_window.py` | Mestre-detalhe das curvas: lista, nome, grade e gráfico; estado sujo e confirmação ao fechar. A persistência **não** mora aqui, porque JSON não é Qt — ao contrário do `QSettings`, ela fica no núcleo (`curvas_store.py`) |
+| `curvas_table.py` | `QAbstractTableModel` fino sobre um `CurveDraft` (coluna "Hora" sintética, só "Valor" editável) + a única `QTableView` do projeto com colar/copiar |
+| `curva_chart.py` | Gráfico das 24 horas com `QPainter`: um `QPainterPath` único, cores lidas da paleta a cada pintura, lacuna interrompe o traço |
 | `search_palette.py` | Diálogo não modal; roda indexação e consultas em `QThreadPool` com tokens de cancelamento |
 | `load_pattern_table.py` | Modelo somente leitura de exatamente 4 linhas (NPAT 0–3) |
 | `power_flow_table.py` | Modelo somente leitura da matriz `[patamar][nó]`; não sabe qual grandeza exibe, recebe a matriz já escolhida pelo combobox |
@@ -2115,11 +2128,41 @@ mecanismo de remapeamento já usado em `_set_switch_model`.
 em forma tabular — um exportador CSV/XLSX é um consumidor direto desses modelos,
 sem tocar no núcleo.
 
+### Associar curvas horárias a cargas e geradores
+
+O cadastro de curvas (`curvas.py`, `curvas_store.py`) foi desenhado para receber
+esse vínculo sem alteração. Três encaixes já estão prontos:
+
+1. **A chave é o `Curve.curve_id`**, um `uuid4` estável que a renomeação não
+   toca. A carga guarda esse identificador, nunca o nome — se o vínculo fosse
+   pelo nome, renomear uma curva o quebraria em silêncio, e trocar os nomes de
+   duas curvas trocaria as associações sem aviso. `CurveCatalog.index_for_id`
+   resolve a busca.
+2. **A forma do vínculo já existe no projeto**: espelhar `LoadPatternModel`, com
+   um array paralelo denso indexado pelo índice da carga
+   (`curve_ids: tuple[str | None, ...]`, `len == len(loads)`, validado no
+   construtor). O vínculo mora do lado da carga, em estrutura própria — nem
+   `Curve` nem `curvas.json` precisam mudar.
+3. **A emissão para o OpenDSS é direta**: `Curve.values` são 24 `float`, que é
+   exatamente o que `New LoadShape.{nome} npts=24 interval=1 mult=[…]` consome,
+   com `sanitize_dss_name` no nome e `_format_pattern` nos valores — a mesma
+   linha que já emite os patamares, só com `npts` diferente.
+
+Atenção a uma armadilha: `LOAD_PATTERN_COUNT` (=4) descreve os patamares NPAT
+importados e é usado em laço na exportação e importado por `opendss_powerflow`.
+As curvas horárias usam a constante própria `HOURLY_CURVE_POINT_COUNT` (=24);
+unificar as duas quebraria a exportação inteira.
+
+O formato em disco também está preparado: o leitor **ignora chaves
+desconhecidas** dentro de cada curva, então acrescentar `"tipo"`, `"unidade"` ou
+`"observacao"` não exige virar `CURVES_FILE_VERSION` nem invalida um arquivo
+lido por uma build anterior.
+
 ---
 
 ## 18. Testes e benchmarks
 
-### Testes (`tests/`, 36 arquivos)
+### Testes (`tests/`, 43 arquivos)
 
 | Arquivo | Foco |
 |---|---|
@@ -2137,6 +2180,10 @@ sem tocar no núcleo.
 | `test_mdb_import.py` | com um **banco falso**: ordem de dependência (chaves antes de circuitos), identidade encadeada dos modelos, projeção só das colunas obrigatórias, `CENARIO_ID` ignorado, dedução de decímetros, entidade ausente não derrubando as demais, barras fatais, cancelamento nunca virando falha de entidade, progresso único da cadeia, e a **regressão de tipos**: `ESTADO` inteiro e `float` mantendo a chave fechada e a topologia alcançando as três barras |
 | `test_mdb_import_ui.py` | com um `MdbImportResult` injetado: instalação dos oito modelos pelos setters existentes, catálogo sobrevivendo à cascata das chaves, banco parcial, diálogo (pré-seleção, override manual reabilitando entidade, barras obrigatórias), senha mascarada, e o relatório não modal |
 | `test_search.py` | índice de busca (sem Qt) |
+| `test_curvas.py` | invariantes da curva (24 pontos, sem `nan`/`inf`, negativos e zero aceitos), `curve_id` sobrevivendo à renomeação, unicidade de nome sem caixa, horas faltantes em base 1, e o parser de colagem: `\r\n`/`\r`, linha vazia final descartada mas a do meio preservada, bloco de duas colunas, vírgula decimal e recusa de `1.234,56` |
+| `test_curvas_store.py` | ida e volta preservando id/acentos/negativos, criação do diretório, regravação por cima (regressão de `os.rename` no Windows), nenhum `.tmp` remanescente, e a tolerância de leitura: JSON quebrado, raiz inesperada, entrada inválida entre válidas, versão mais nova, ids/nomes repetidos, id ausente gerado e chaves desconhecidas ignoradas |
+| `test_curvas_table.py` | coluna "Hora" sintética e não editável, `EditRole` sem truncar a precisão, `setData` com ponto e vírgula, texto recusado sem apagar o valor anterior, célula esvaziada, colagem com âncora, truncamento na hora 24 e a **regressão de alinhamento** (um texto não numérico no meio não desloca as horas seguintes) |
+| `test_curvas_ui.py` | estado vazio, criação/renomeação/exclusão com confirmação, recusa de salvar incompleta sem criar o arquivo, gravação e `curvesSaved`, fechar com Salvar/Descartar/Cancelar (Descartar relê o disco), gráfico acompanhando a edição, os casos-limite de pintura (vazio, todos iguais, todos zero, faixa negativa, lacunas) e a entrada de menu **Configurações → Curvas…** |
 | `test_graphics.py` · `test_main_window.py` · `test_branches_ui.py` · `test_circuits_ui.py` · `test_phase_ui.py` · `test_search_ui.py` · `test_map_tiles.py` · `test_satellite_ui.py` · `test_theme_ui.py` · `test_cables_ui.py` · `test_opendss_export_ui.py` · `test_powerflow_ui.py` · `test_opendss_settings_ui.py` · `test_regulators_ui.py` | camadas Qt (exigem PyQt6) |
 
 Os testes do núcleo usam apenas a biblioteca padrão e NumPy; os gráficos rodam

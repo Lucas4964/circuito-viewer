@@ -44,7 +44,7 @@ que continuem fora da faixa UTM válida (easting entre 100.000 e 900.000;
 northing entre 0 e 10.000.000) são aceitas, mas o relatório avisa — nesse caso a
 imagem de satélite não consegue se posicionar corretamente.
 
-Use **Arquivo > Importar…** e escolha entre barras, trechos, cargas, chaves,
+Use **Arquivo > Importar CSV…** e escolha entre barras, trechos, cargas, chaves,
 reguladores, circuitos ou cabos. A opção de
 trechos fica disponível depois que as barras forem carregadas. O arquivo de
 trechos deve conter `TRECHO_ID`, `CODIGO`, `FASES2`, `BARRA1_ID`, `BARRA2_ID`,
@@ -699,6 +699,57 @@ verificação: ele aceita `vminpu=-1` em silêncio, e é a aplicação que imped
 Os valores ficam guardados entre sessões, como a preferência de tema. Alterá-los
 descarta um resultado de fluxo de potência já calculado, porque ele descreveria o
 modelo anterior.
+
+## Curvas horárias
+
+O menu **Configurações → Curvas…** abre o cadastro das curvas de 24 pontos — uma
+por hora do dia. Elas são independentes de qualquer importação: existem antes de
+haver barras carregadas e sobrevivem a uma nova importação.
+
+A janela é dividida em três partes: a lista das curvas à esquerda, a grade das 24
+horas no centro e o gráfico da curva selecionada à direita. A coluna **Hora** é
+preenchida sozinha de 1 a 24 e não é editável; só a coluna **Valor** recebe
+dados. O gráfico acompanha cada alteração imediatamente.
+
+**Preenchendo os valores.** Dá para digitar célula por célula — com ponto ou
+vírgula decimal, a mesma regra do resto da aplicação — ou colar uma coluna
+inteira copiada do Excel:
+
+| Atalho | Efeito |
+|---|---|
+| `Ctrl+V` | Cola a partir da linha selecionada |
+| `Ctrl+C` | Copia as células selecionadas; sem seleção, a coluna inteira |
+| `Delete` | Esvazia as células selecionadas |
+
+A colagem é tolerante de propósito. Se o bloco tiver duas colunas, a **última** é
+usada — é a ordem em que se copia "Hora, Valor" de uma planilha — e a janela
+informa isso. Um texto que não seja número (um cabeçalho copiado junto, por
+exemplo) é pulado sem interromper o resto, e a hora correspondente fica como
+estava: o bloco **não** é compactado, para que as horas seguintes não escorreguem
+uma posição. O que passar da hora 24 é descartado, também com aviso. Uma linha
+vazia no meio esvazia aquela hora; a linha vazia que o Excel sempre acrescenta ao
+final é ignorada.
+
+**Valores aceitos.** Qualquer número finito, inclusive zero e negativos — uma
+curva de geração injeta potência e precisa do sinal. Quando a curva cruza o zero,
+o gráfico marca a linha de base para os dois lados ficarem distinguíveis.
+
+**Salvando.** As alterações — inclusive exclusões — ficam pendentes até o botão
+**Salvar**; até lá dá para desistir. Salvar exige que o nome seja válido e que as
+24 horas estejam preenchidas, e a mensagem diz exatamente quais horas faltam.
+Fechar a janela com pendências pergunta se você quer salvar, descartar ou
+continuar editando.
+
+As curvas ficam em `circuit_viewer/dados/curvas.json`, dentro da própria pasta do
+programa, em JSON legível e com acentos preservados. A gravação é atômica: uma
+interrupção no meio do caminho não deixa o arquivo pela metade. Se o arquivo for
+editado à mão e ficar inválido, a aplicação **abre mesmo assim** — o que não
+puder ser lido é descartado e um aviso explica o que aconteceu, em vez de
+impedir o programa de iniciar.
+
+Cada curva guarda um identificador interno que a renomeação não altera. É esse
+identificador que permitirá associá-las a cargas e geradores nos cálculos, sem
+que trocar o nome de uma curva quebre o vínculo.
 
 ## Fluxo de potência
 
