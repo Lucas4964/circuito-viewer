@@ -27,7 +27,11 @@ try:
         MdbImportReportWindow,
         issue_lines,
     )
-    from circuit_viewer.mdb_mapping import ENTITY_ORDER, resolve_mapping
+    from circuit_viewer.mdb_mapping import (
+        ENTITY_ORDER,
+        GENERATOR_CONSUMER_ENTITY,
+        resolve_mapping,
+    )
     from circuit_viewer.model import UtmCrs
 
     PYQT_AVAILABLE = True
@@ -96,6 +100,7 @@ class InstallResultTests(unittest.TestCase):
         self.assertIs(self.window._model, self.result.bars.model)
         self.assertIs(self.window._line_model, self.result.segments.model)
         self.assertIs(self.window._load_model, self.result.loads.model)
+        self.assertIs(self.window._generator_model, self.result.generators.model)
         self.assertIs(self.window._load_pattern_model, self.result.patterns.model)
         self.assertIs(self.window._switch_model, self.result.switches.model)
         self.assertIs(self.window._regulator_model, self.result.regulators.model)
@@ -140,11 +145,15 @@ class InstallResultTests(unittest.TestCase):
     def test_bars_only_clears_the_previous_dependents(self) -> None:
         self.window._on_mdb_import_finished(self.result)
         database = network_database()
-        for table in ("TRECHO", "CARGA", "MODELO_CARGA", "CHAVE", "REGULADOR", "CIRCUITO"):
+        for table in (
+            "TRECHO", "CARGA", "MT_GERADOR_CONS", "MT_CONS",
+            "MODELO_CARGA", "CHAVE", "REGULADOR", "CIRCUITO",
+        ):
             del database._tables[table]
         self.window._on_mdb_import_finished(run_import(database))
         self.assertIsNone(self.window._line_model)
         self.assertIsNone(self.window._load_model)
+        self.assertIsNone(self.window._generator_model)
         self.assertIsNone(self.window._circuit_catalog)
 
 
@@ -171,6 +180,23 @@ class ImportDialogTests(unittest.TestCase):
         )
         self.assertEqual(
             self.dialog.entity_combos["patamares"].currentData(), "MODELO_CARGA"
+        )
+        self.assertEqual(
+            self.dialog.entity_combos["geradores"].currentData(),
+            "MT_GERADOR_CONS",
+        )
+        self.assertEqual(
+            self.dialog.entity_combos[GENERATOR_CONSUMER_ENTITY].currentData(),
+            "MT_CONS",
+        )
+
+    def test_generators_are_one_checkbox_with_two_table_selectors(self) -> None:
+        self.assertIn("geradores", self.dialog.entity_checks)
+        self.assertIn("geradores", self.dialog.entity_combos)
+        self.assertIn(GENERATOR_CONSUMER_ENTITY, self.dialog.entity_combos)
+        self.assertEqual(
+            sum(1 for entity in self.dialog.entity_checks if entity == "geradores"),
+            1,
         )
 
     def test_the_suggested_unit_is_preselected(self) -> None:
@@ -199,6 +225,22 @@ class ImportDialogTests(unittest.TestCase):
         combo.setCurrentIndex(combo.findData("REGU"))
         self.assertIn("reguladores", dialog.selected_entities())
         self.assertEqual(dialog.overrides()["reguladores"], "REGU")
+
+    def test_generators_need_both_tables_and_allow_independent_overrides(self) -> None:
+        database = network_database()
+        del database._tables["MT_CONS"]
+        database._tables["CONS_ALT"] = network_database()._tables["MT_CONS"]
+        dialog = MdbImportDialog(
+            r"C:\dados\rede.mdb", resolve_mapping(database), database.tables()
+        )
+        self.addCleanup(dialog.close)
+        self.assertNotIn("geradores", dialog.selected_entities())
+        helper = dialog.entity_combos[GENERATOR_CONSUMER_ENTITY]
+        helper.setCurrentIndex(helper.findData("CONS_ALT"))
+        self.assertIn("geradores", dialog.selected_entities())
+        self.assertEqual(
+            dialog.overrides()[GENERATOR_CONSUMER_ENTITY], "CONS_ALT"
+        )
 
     def test_overrides_are_empty_when_the_detection_is_kept(self) -> None:
         self.assertEqual(self.dialog.overrides(), {})
@@ -272,6 +314,14 @@ class ReportTests(unittest.TestCase):
         window = MdbImportReportWindow(result)
         self.addCleanup(window.close)
         self.assertEqual(window.table_model.rowCount(), len(ENTITY_ORDER))
+
+    def test_generator_report_has_one_row_naming_both_tables(self) -> None:
+        result = run_import(network_database())
+        outcome = result.outcome_for("geradores")
+        self.assertEqual(outcome.table, "MT_GERADOR_CONS + MT_CONS")
+        self.assertEqual(
+            sum(item.entity == "geradores" for item in result.outcomes), 1
+        )
 
     def test_a_failure_shows_its_reason_in_the_situation_column(self) -> None:
         database = network_database()

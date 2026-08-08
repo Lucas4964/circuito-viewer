@@ -23,6 +23,7 @@ from typing import Mapping, Sequence
 from .cable_import import EXPECTED_CABLE_HEADER
 from .circuit_import import EXPECTED_CIRCUIT_HEADER
 from .csv_import import EXPECTED_HEADER as EXPECTED_BAR_HEADER
+from .generator_import import CONSUMER_HEADER, GENERATOR_HEADER
 from .load_import import EXPECTED_LOAD_HEADER
 from .load_pattern_import import EXPECTED_LOAD_PATTERN_HEADER
 from .mdb_engine import AccessDatabase
@@ -40,10 +41,21 @@ ENTITY_ORDER: tuple[str, ...] = (
     "cabos",
     "trechos",
     "cargas",
+    "geradores",
     "patamares",
     "chaves",
     "reguladores",
     "circuitos",
+)
+
+# ``geradores_mt_cons`` é uma fonte auxiliar da entidade lógica ``geradores``.
+# Ela participa da resolução de tabelas, mas não ganha checkbox nem linha própria
+# no relatório consolidado.
+GENERATOR_CONSUMER_ENTITY = "geradores_mt_cons"
+MAPPING_ORDER: tuple[str, ...] = (
+    *ENTITY_ORDER[: ENTITY_ORDER.index("geradores") + 1],
+    GENERATOR_CONSUMER_ENTITY,
+    *ENTITY_ORDER[ENTITY_ORDER.index("geradores") + 1 :],
 )
 
 # Colunas que cada entidade exige, reaproveitadas dos importadores de CSV para
@@ -53,6 +65,8 @@ REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "cabos": EXPECTED_CABLE_HEADER,
     "trechos": EXPECTED_SEGMENT_HEADER,
     "cargas": EXPECTED_LOAD_HEADER,
+    "geradores": GENERATOR_HEADER,
+    GENERATOR_CONSUMER_ENTITY: CONSUMER_HEADER,
     "patamares": EXPECTED_LOAD_PATTERN_HEADER,
     "chaves": EXPECTED_SWITCH_HEADER,
     "reguladores": EXPECTED_REGULATOR_HEADER,
@@ -65,6 +79,8 @@ ENTITY_LABELS: Mapping[str, str] = {
     "cabos": "Cabos",
     "trechos": "Trechos",
     "cargas": "Cargas",
+    "geradores": "Geradores",
+    GENERATOR_CONSUMER_ENTITY: "MT_CONS dos geradores",
     "patamares": "Patamares de carga",
     "chaves": "Chaves",
     "reguladores": "Reguladores",
@@ -199,7 +215,7 @@ def load_table_mapping(path: str | Path | None = None) -> tuple[EntityMapping, .
             )
         entity = entity.strip()
         if entity not in REQUIRED_COLUMNS:
-            known = ", ".join(ENTITY_ORDER)
+            known = ", ".join(MAPPING_ORDER)
             raise MdbMappingError(
                 f"Entrada {row_number}: entidade desconhecida '{entity}'. "
                 f"Esperadas: {known}."
@@ -294,7 +310,7 @@ def resolve_mapping(
     resolved: list[ResolvedEntity] = []
     unavailable: list[UnavailableEntity] = []
 
-    for entity in ENTITY_ORDER:
+    for entity in MAPPING_ORDER:
         entry = by_entity.get(entity)
         if entry is None:
             unavailable.append(

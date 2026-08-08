@@ -1,4 +1,4 @@
-"""Importação encadeada das oito entidades a partir de um banco Access.
+"""Importação encadeada das nove entidades lógicas a partir de um banco Access.
 
 Este módulo não valida nada por conta própria: ele resolve o mapeamento, lê as
 linhas já convertidas em texto e as entrega às funções ``parse_*_rows`` dos
@@ -32,12 +32,14 @@ from .csv_import import (
     parse_bar_rows,
     scale_from_ranges,
 )
+from .generator_import import GeneratorCsvResult, parse_generator_rows
 from .load_import import LoadCsvResult, parse_load_rows
 from .load_pattern_import import LoadPatternCsvResult, parse_load_pattern_rows
 from .mdb_engine import AccessDatabase
 from .mdb_mapping import (
     ENTITY_LABELS,
     ENTITY_ORDER,
+    GENERATOR_CONSUMER_ENTITY,
     EntityMapping,
     ResolvedEntity,
     ResolvedMapping,
@@ -65,6 +67,7 @@ ENTITY_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "cabos": (),
     "trechos": ("barras",),
     "cargas": ("barras",),
+    "geradores": ("cargas",),
     "patamares": ("cargas",),
     "chaves": ("trechos",),
     "reguladores": ("trechos",),
@@ -101,6 +104,7 @@ class MdbImportResult:
     cables: CableCsvResult | None = None
     segments: SegmentLoadResult | None = None
     loads: LoadCsvResult | None = None
+    generators: GeneratorCsvResult | None = None
     patterns: LoadPatternCsvResult | None = None
     switches: SwitchLoadResult | None = None
     regulators: RegulatorLoadResult | None = None
@@ -137,6 +141,7 @@ class MdbImportResult:
             self.cables,
             self.segments,
             self.loads,
+            self.generators,
             self.patterns,
             self.switches,
             self.regulators,
@@ -148,7 +153,7 @@ class MdbImportResult:
 def source_label(source_path: str, table: str) -> str:
     """Rótulo gravado em ``source_path`` dos modelos vindos de um banco.
 
-    Preserva a tabela de origem — sem ela, oito modelos apontariam para o mesmo
+    Preserva a tabela de origem — sem ela, os modelos apontariam para o mesmo
     arquivo e o painel não diria de onde cada um veio.
     """
 
@@ -216,7 +221,7 @@ class _ProgressTracker:
     """Converte o progresso por entidade num progresso único da cadeia.
 
     O total é a soma dos ``COUNT(*)`` das tabelas resolvidas, então a barra
-    percorre a importação inteira uma vez só, em vez de reiniciar oito vezes.
+    percorre a importação inteira uma vez só, em vez de reiniciar nove vezes.
     """
 
     def __init__(self, total_rows: int, progress: ProgressCallback | None) -> None:
@@ -239,13 +244,25 @@ class _ProgressTracker:
         self._done = min(self._done + max(rows, 0), self._total)
 
 
-def _count_rows(database: AccessDatabase, mapping: ResolvedMapping) -> int:
+def _count_rows(
+    database: AccessDatabase,
+    mapping: ResolvedMapping,
+    wanted: set[str],
+) -> int:
     total = 0
-    for entity in mapping.resolved:
-        try:
-            total += max(0, database.row_count(entity.table))
-        except Exception:  # noqa: BLE001 — o total é estimativa de barra
+    for entity in ENTITY_ORDER:
+        if entity not in wanted:
             continue
+        targets = [mapping.get(entity)]
+        if entity == "geradores":
+            targets.append(mapping.get(GENERATOR_CONSUMER_ENTITY))
+        for target in targets:
+            if target is None:
+                continue
+            try:
+                total += max(0, database.row_count(target.table))
+            except Exception:  # noqa: BLE001 — o total é estimativa de barra
+                continue
     return total
 
 
@@ -262,7 +279,7 @@ def load_database(
     cancel_event: threading.Event | None = None,
     progress: ProgressCallback | None = None,
 ) -> MdbImportResult:
-    """Importa as oito entidades de um banco, na ordem de dependência.
+    """Importa as nove entidades lógicas de um banco, na ordem de dependência.
 
     ``entities`` restringe a importação ao que o usuário marcou no diálogo; o
     padrão é tudo o que o mapeamento resolveu.
@@ -280,7 +297,7 @@ def load_database(
         else resolved
     )
     wanted = set(ENTITY_ORDER if entities is None else entities)
-    tracker = _ProgressTracker(_count_rows(database, plan), progress)
+    tracker = _ProgressTracker(_count_rows(database, plan, wanted), progress)
 
     outcomes: list[MdbEntityOutcome] = []
     results: dict[str, Any] = {}
@@ -316,11 +333,40 @@ def load_database(
             continue
 
         target = plan.get(entity)
-        if target is None:
-            record(entity, None, None, plan.reason_for(entity) or "Não encontrada.")
+        consumer_target = (
+            plan.get(GENERATOR_CONSUMER_ENTITY)
+            if entity == "geradores"
+            else None
+        )
+        if target is None or (entity == "geradores" and consumer_target is None):
+            reasons = [plan.reason_for(entity)] if target is None else []
+            if entity == "geradores" and consumer_target is None:
+                reasons.append(plan.reason_for(GENERATOR_CONSUMER_ENTITY))
+            record(
+                entity,
+                None,
+                None,
+                "; ".join(reason for reason in reasons if reason)
+                or "Não encontrada.",
+            )
             continue
 
         emit = tracker.for_entity()
+        consumer_rows_seen = 0
+        generator_rows_seen = 0
+
+        def consumer_emit(rows: int) -> None:
+            nonlocal consumer_rows_seen
+            consumer_rows_seen = rows
+            if emit is not None:
+                emit(rows)
+
+        def generator_emit(rows: int) -> None:
+            nonlocal generator_rows_seen
+            generator_rows_seen = rows
+            if emit is not None:
+                emit(consumer_rows_seen + rows)
+
         try:
             result = _import_entity(
                 entity,
@@ -328,22 +374,41 @@ def load_database(
                 target,
                 crs,
                 results,
+                consumer_target=consumer_target,
                 source_path=source_path,
                 scale=scale,
                 cancel_event=cancel_event,
-                progress=emit,
+                progress=generator_emit if entity == "geradores" else emit,
+                consumer_progress=(
+                    consumer_emit if entity == "geradores" else None
+                ),
             )
         except CsvImportCancelled:
             raise
         except Exception as exc:  # noqa: BLE001 — uma entidade não derruba as outras
             if entity == "barras":
                 raise
-            record(entity, target.table, None, str(exc))
+            if entity == "geradores":
+                tracker.finish_entity(consumer_rows_seen + generator_rows_seen)
+            table = (
+                f"{target.table} + {consumer_target.table}"
+                if consumer_target is not None
+                else target.table
+            )
+            record(entity, table, None, str(exc))
             continue
 
         results[entity] = result
-        record(entity, target.table, result, None)
-        tracker.finish_entity(getattr(result, "total_rows", 0))
+        table = (
+            f"{target.table} + {consumer_target.table}"
+            if consumer_target is not None
+            else target.table
+        )
+        record(entity, table, result, None)
+        rows_read = getattr(result, "total_rows", 0)
+        if entity == "geradores":
+            rows_read += getattr(result, "consumer_total_rows", 0)
+        tracker.finish_entity(rows_read)
 
     bars = results.get("barras")
     if bars is None:  # pragma: no cover - garantido pelo raise acima
@@ -355,6 +420,7 @@ def load_database(
         cables=results.get("cabos"),
         segments=results.get("trechos"),
         loads=results.get("cargas"),
+        generators=results.get("geradores"),
         patterns=results.get("patamares"),
         switches=results.get("chaves"),
         regulators=results.get("reguladores"),
@@ -371,10 +437,12 @@ def _import_entity(
     crs: UtmCrs,
     results: dict[str, Any],
     *,
+    consumer_target: ResolvedEntity | None,
     source_path: str,
     scale: float,
     cancel_event: threading.Event | None,
     progress: Callable[[int], None] | None,
+    consumer_progress: Callable[[int], None] | None,
 ) -> Any:
     """Entrega as linhas da tabela ao ``parse_*_rows`` da entidade."""
 
@@ -387,6 +455,35 @@ def _import_entity(
     }
     header = target.header
     rows = _rows(database, target)
+
+    if entity == "geradores":
+        if consumer_target is None:  # pragma: no cover - validado pelo chamador
+            raise CsvImportError("A tabela MT_CONS não foi resolvida.")
+        consumer_rows = _rows(database, consumer_target)
+        try:
+            return parse_generator_rows(
+                header,
+                rows,
+                consumer_target.header,
+                consumer_rows,
+                results["cargas"].model,
+                generator_source_label=source_label(source_path, target.table),
+                consumer_source_label=source_label(
+                    source_path, consumer_target.table
+                ),
+                generator_encoding=MDB_ENCODING,
+                consumer_encoding=MDB_ENCODING,
+                generator_first_line_number=FIRST_ROW_NUMBER,
+                consumer_first_line_number=FIRST_ROW_NUMBER,
+                cancel_event=cancel_event,
+                generator_progress=progress,
+                consumer_progress=consumer_progress,
+            )
+        finally:
+            for iterator in (rows, consumer_rows):
+                close = getattr(iterator, "close", None)
+                if close is not None:
+                    close()
 
     if entity == "barras":
         return parse_bar_rows(header, rows, crs, scale=scale, **common)

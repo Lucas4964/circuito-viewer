@@ -64,6 +64,7 @@ from .graphics import (
     SegmentSelectionOverlayItem,
     SwitchNetworkItem,
 )
+from .generator_import import GeneratorCsvResult
 from .load_import import LoadCsvResult
 from .load_pattern_import import LoadPatternCsvResult
 from .load_pattern_table import LoadPatternTableModel
@@ -76,7 +77,12 @@ from .mdb_engine import (
 from .mdb_import import MdbImportResult, detect_database_scale
 from .mdb_import_dialog import MdbImportDialog, MdbPasswordDialog
 from .mdb_import_report import MdbImportReportWindow
-from .mdb_mapping import MdbMappingError, load_table_mapping, resolve_mapping
+from .mdb_mapping import (
+    ENTITY_ORDER,
+    MdbMappingError,
+    load_table_mapping,
+    resolve_mapping,
+)
 from .mapa_tiles import (
     PROVEDORES,
     PROVEDOR_ESRI,
@@ -91,6 +97,7 @@ from .model import (
     CircuitModel,
     CircuitVisibilityController,
     FeatureSelection,
+    GeneratorModel,
     LineNetworkModel,
     LoadModel,
     LoadPatternModel,
@@ -156,6 +163,7 @@ from .workers import (
     CableImportWorker,
     CircuitImportWorker,
     CsvImportWorker,
+    GeneratorImportWorker,
     LoadImportWorker,
     LoadPatternImportWorker,
     MdbImportWorker,
@@ -339,6 +347,14 @@ class ImportChoiceDialog(QDialog):
         )
         layout.addWidget(self.load_patterns_button)
 
+        self.generators_button = QPushButton("Importar geradores…")
+        self.generators_button.setToolTip(
+            "Associar MT_GERADOR_CONS e MT_CONS às cargas importadas"
+        )
+        self.generators_button.setEnabled(has_loads)
+        self.generators_button.clicked.connect(lambda: self._select("generators"))
+        layout.addWidget(self.generators_button)
+
         self.switches_button = QPushButton("Importar chaves…")
         self.switches_button.setToolTip(
             "Carregar atributos de chaves vinculados aos trechos importados"
@@ -400,6 +416,102 @@ class ImportChoiceDialog(QDialog):
         self.accept()
 
 
+class GeneratorCsvImportDialog(QDialog):
+    """Escolhe explicitamente as duas fontes CSV antes de iniciar o worker."""
+
+    def __init__(self, parent=None) -> None:  # noqa: ANN001
+        super().__init__(parent)
+        self.setWindowTitle("Importar geradores")
+        self.setModal(True)
+        self._generator_path = ""
+        self._consumer_path = ""
+
+        layout = QVBoxLayout(self)
+        message = QLabel(
+            "Selecione os dois arquivos necessários para importar os geradores."
+        )
+        message.setWordWrap(True)
+        layout.addWidget(message)
+
+        grid = QGridLayout()
+        self.generator_file_button = QPushButton("Importar MT_GERADOR_CONS…")
+        self.generator_file_button.clicked.connect(self._choose_generator_file)
+        self.generator_file_label = QLabel("Nenhum arquivo selecionado")
+        self.generator_file_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        grid.addWidget(self.generator_file_button, 0, 0)
+        grid.addWidget(self.generator_file_label, 0, 1)
+
+        self.consumer_file_button = QPushButton("Importar MT_CONS…")
+        self.consumer_file_button.clicked.connect(self._choose_consumer_file)
+        self.consumer_file_label = QLabel("Nenhum arquivo selecionado")
+        self.consumer_file_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        grid.addWidget(self.consumer_file_button, 1, 0)
+        grid.addWidget(self.consumer_file_label, 1, 1)
+        grid.setColumnStretch(1, 1)
+        layout.addLayout(grid)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.import_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.import_button.setText("Importar")
+        self.import_button.setEnabled(False)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def _initial_directory(self, other_path: str) -> str:
+        return "" if not other_path else str(Path(other_path).parent)
+
+    def _choose_generator_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar MT_GERADOR_CONS.csv",
+            self._initial_directory(self._consumer_path),
+            "Arquivos CSV (*.csv);;Todos os arquivos (*)",
+        )
+        if path:
+            self.set_generator_path(path)
+
+    def _choose_consumer_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar MT_CONS.csv",
+            self._initial_directory(self._generator_path),
+            "Arquivos CSV (*.csv);;Todos os arquivos (*)",
+        )
+        if path:
+            self.set_consumer_path(path)
+
+    def set_generator_path(self, path: str) -> None:
+        self._generator_path = str(path)
+        self.generator_file_label.setText(Path(path).name)
+        self.generator_file_label.setToolTip(str(path))
+        self._sync_import_enabled()
+
+    def set_consumer_path(self, path: str) -> None:
+        self._consumer_path = str(path)
+        self.consumer_file_label.setText(Path(path).name)
+        self.consumer_file_label.setToolTip(str(path))
+        self._sync_import_enabled()
+
+    def _sync_import_enabled(self) -> None:
+        self.import_button.setEnabled(
+            bool(self._generator_path and self._consumer_path)
+        )
+
+    def generator_path(self) -> str:
+        return self._generator_path
+
+    def consumer_path(self) -> str:
+        return self._consumer_path
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -424,6 +536,7 @@ class MainWindow(QMainWindow):
         self._line_item: LineNetworkItem | None = None
         self._load_model: LoadModel | None = None
         self._load_pattern_model: LoadPatternModel | None = None
+        self._generator_model: GeneratorModel | None = None
         self._switch_model: SwitchModel | None = None
         self._switch_item: SwitchNetworkItem | None = None
         self._regulator_model: RegulatorModel | None = None
@@ -442,6 +555,7 @@ class MainWindow(QMainWindow):
         self._active_bar_count = 0
         self._active_load_count = 0
         self._active_equivalent_load_count = 0
+        self._active_generator_count = 0
         self._satellite_provider = PROVEDOR_ESRI
         self._google_satellite_authorized = False
         self.phase_configuration_path = (
@@ -472,6 +586,7 @@ class MainWindow(QMainWindow):
             CsvImportWorker
             | SegmentImportWorker
             | LoadImportWorker
+            | GeneratorImportWorker
             | LoadPatternImportWorker
             | SwitchImportWorker
             | RegulatorImportWorker
@@ -522,6 +637,13 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.view.set_load_layer(self.load_virtualizer)
+        self.generator_virtualizer = LoadVirtualizer(
+            self.scene,
+            self.view,
+            symbol_kind="generator",
+            parent=self,
+        )
+        self.view.set_generator_layer(self.generator_virtualizer)
         self.equivalent_load_virtualizer = LoadVirtualizer(
             self.scene,
             self.view,
@@ -594,7 +716,7 @@ class MainWindow(QMainWindow):
         self.import_action = QAction("Importar CSV…", self)
         self.import_action.setShortcut(QKeySequence.StandardKey.Open)
         self.import_action.setToolTip(
-            "Importar barras, trechos, cargas, chaves ou circuitos de arquivos CSV"
+            "Importar barras, trechos, cargas, geradores, chaves ou circuitos de arquivos CSV"
         )
         self.import_action.triggered.connect(self._choose_import)
 
@@ -638,6 +760,12 @@ class MainWindow(QMainWindow):
         self.show_loads_action.setChecked(True)
         self.show_loads_action.setEnabled(False)
         self.show_loads_action.toggled.connect(self._set_loads_visible)
+
+        self.show_generators_action = QAction("Mostrar geradores", self)
+        self.show_generators_action.setCheckable(True)
+        self.show_generators_action.setChecked(True)
+        self.show_generators_action.setEnabled(False)
+        self.show_generators_action.toggled.connect(self._set_generators_visible)
 
         self.phase_coloring_action = QAction("Colorir trechos por fases", self)
         self.phase_coloring_action.setCheckable(True)
@@ -803,6 +931,7 @@ class MainWindow(QMainWindow):
         view_menu = self.menuBar().addMenu("Visualizar")
         view_menu.addAction(self.show_bars_action)
         view_menu.addAction(self.show_loads_action)
+        view_menu.addAction(self.show_generators_action)
         view_menu.addAction(self.phase_coloring_action)
         view_menu.addAction(self.simplified_network_action)
         view_menu.addSeparator()
@@ -861,7 +990,7 @@ class MainWindow(QMainWindow):
         self.empty_details_page = QWidget(self.details_stack)
         empty_layout = QVBoxLayout(self.empty_details_page)
         empty_message = QLabel(
-            "Clique em uma barra, trecho, carga ou carga equivalente para ver seus dados."
+            "Clique em uma barra, trecho, carga, gerador ou carga equivalente para ver seus dados."
         )
         empty_message.setWordWrap(True)
         empty_layout.addWidget(empty_message)
@@ -1119,6 +1248,54 @@ class MainWindow(QMainWindow):
         self.load_details_page.setWidget(self.load_details_body)
         self.details_stack.addWidget(self.load_details_page)
 
+        self.generator_details_page = QScrollArea(self.details_stack)
+        self.generator_details_page.setFrameShape(QFrame.Shape.NoFrame)
+        self.generator_details_page.setWidgetResizable(True)
+        self.generator_details_page.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.generator_details_body = QWidget(self.generator_details_page)
+        generator_layout = QVBoxLayout(self.generator_details_body)
+        generator_layout.addWidget(QLabel("MT_GERADOR_CONS"))
+        generator_fields = (
+            ("generator_id", "GERADOR_ID:"),
+            ("mt_cons_id", "MT_CONS_ID:"),
+            ("generator_code", "CODIGO:"),
+            ("nominal_voltage", "VNOM:"),
+            ("nominal_power", "SNOM:"),
+            ("connection", "LIGACAO:"),
+            ("curve_id", "CURVA_ID:"),
+            ("generation_kwh", "GERACAO_KWH:"),
+        )
+        (
+            self.generator_details_table,
+            self.generator_detail_labels,
+            self.generator_caption_labels,
+            self.generator_details_grid,
+            _,
+        ) = create_table(generator_fields, self.generator_details_body)
+        generator_layout.addWidget(self.generator_details_table)
+        generator_layout.addWidget(QLabel("MT_CONS"))
+        generator_consumer_fields = (
+            ("consumer_id", "ID:"),
+            ("load_id", "CARGA_ID:"),
+            ("consumer_code", "CODIGO:"),
+            ("external_id", "EXTERN_ID:"),
+            ("name", "NOME:"),
+            ("phases", "FASES2:"),
+        )
+        (
+            self.generator_consumer_details_table,
+            self.generator_consumer_detail_labels,
+            self.generator_consumer_caption_labels,
+            self.generator_consumer_details_grid,
+            _,
+        ) = create_table(generator_consumer_fields, self.generator_details_body)
+        generator_layout.addWidget(self.generator_consumer_details_table)
+        generator_layout.addStretch(1)
+        self.generator_details_page.setWidget(self.generator_details_body)
+        self.details_stack.addWidget(self.generator_details_page)
+
         equivalent_fields = (
             ("origin", "ORIGEM:"),
             ("load_id", "CARGA_ID:"),
@@ -1350,6 +1527,7 @@ class MainWindow(QMainWindow):
         self.total_status = QLabel("Barras: 0")
         self.segment_status = QLabel("Trechos: 0")
         self.load_status = QLabel("Cargas: 0")
+        self.generator_status = QLabel("Geradores: 0")
         self.active_status = QLabel("Itens ativos: 0")
         self.mode_status = QLabel("Visão geral")
         self.overlap_status = QLabel("Sobreposições: 0")
@@ -1358,6 +1536,7 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self.total_status)
         status.addPermanentWidget(self.segment_status)
         status.addPermanentWidget(self.load_status)
+        status.addPermanentWidget(self.generator_status)
         status.addPermanentWidget(self.overlap_status)
         status.addPermanentWidget(self.active_status)
         status.addPermanentWidget(self.mode_status)
@@ -1376,6 +1555,9 @@ class MainWindow(QMainWindow):
         )
         self.equivalent_load_virtualizer.countsChanged.connect(
             self._update_equivalent_load_status_counts
+        )
+        self.generator_virtualizer.countsChanged.connect(
+            self._update_generator_status_counts
         )
         self.virtualizer.modeChanged.connect(self.mode_status.setText)
         self.circuit_table_model.visibilityChanged.connect(
@@ -1417,6 +1599,8 @@ class MainWindow(QMainWindow):
             self._choose_loads_csv()
         elif dialog.selected_kind == "load_patterns":
             self._choose_load_patterns_csv()
+        elif dialog.selected_kind == "generators":
+            self._choose_generators_csv()
         elif dialog.selected_kind == "switches":
             self._choose_switches_csv()
         elif dialog.selected_kind == "regulators":
@@ -1556,6 +1740,20 @@ class MainWindow(QMainWindow):
         )
         if path:
             self._start_load_pattern_import(path)
+
+    def _choose_generators_csv(self) -> None:
+        if (
+            self._import_thread is not None
+            or self._branch_thread is not None
+            or self._equivalent_thread is not None
+            or self._load_model is None
+        ):
+            return
+        dialog = GeneratorCsvImportDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._start_generator_import(
+                dialog.generator_path(), dialog.consumer_path()
+            )
 
     def _choose_circuits_csv(self) -> None:
         if (
@@ -1712,7 +1910,7 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_mdb_import_finished(self, result: MdbImportResult) -> None:
-        """Instala os oito modelos pelos setters existentes, na mesma ordem.
+        """Instala os nove modelos pelos setters existentes, na mesma ordem.
 
         Não há cascata nova aqui: reusar ``_set_*_model`` é o que mantém as
         invalidações exatamente como estão documentadas na seção 6 da
@@ -1745,6 +1943,8 @@ class MainWindow(QMainWindow):
             self._set_line_model(result.segments.model)
         if result.loads is not None:
             self._set_load_model(result.loads.model)
+        if result.generators is not None:
+            self._set_generator_model(result.generators.model)
         if result.patterns is not None:
             self._set_load_pattern_model(result.patterns.model)
         if result.switches is not None:
@@ -1764,7 +1964,7 @@ class MainWindow(QMainWindow):
     def _show_mdb_import_report(self, result: MdbImportResult) -> None:
         imported = len(result.imported_entities)
         summary = (
-            f"Banco importado: {imported} de 8 entidades, "
+            f"Banco importado: {imported} de {len(ENTITY_ORDER)} entidades, "
             f"{len(result.bars.model):n} barras."
         )
         self.statusBar().showMessage(summary, 10_000)
@@ -2032,6 +2232,52 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
+    def _start_generator_import(
+        self, generator_path: str, consumer_path: str
+    ) -> None:
+        if self._load_model is None:
+            return
+        thread = QThread(self)
+        worker = GeneratorImportWorker(
+            generator_path, consumer_path, self._load_model
+        )
+        worker.moveToThread(thread)
+
+        progress = QProgressDialog(
+            "Lendo MT_CONS…", "Cancelar", 0, 100, self
+        )
+        progress.setWindowTitle("Importando geradores")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._import_thread = thread
+        self._import_worker = worker
+        self._progress_dialog = progress
+        self._progress_entity = "MT_CONS"
+        self.import_action.setEnabled(False)
+        self.branches_action.setEnabled(False)
+
+        thread.started.connect(worker.run)
+        worker.stageChanged.connect(self._on_generator_stage_changed)
+        worker.progress.connect(self._on_import_progress)
+        worker.finished.connect(self._on_generator_import_finished)
+        worker.failed.connect(self._on_import_failed)
+        worker.cancelled.connect(self._on_import_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(worker.cancel)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_import_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_generator_stage_changed(self, stage: str) -> None:
+        self._progress_entity = stage
+
     def _start_circuit_import(self, path: str) -> None:
         if self._line_model is None:
             return
@@ -2138,6 +2384,20 @@ class MainWindow(QMainWindow):
             return
         self._set_load_model(result.model)
         self._show_load_import_report(result)
+
+    def _on_generator_import_finished(self, result: GeneratorCsvResult) -> None:
+        if self._progress_dialog is not None:
+            self._progress_dialog.setValue(100)
+            self._progress_dialog.close()
+        if self._load_model is None or result.model.loads is not self._load_model:
+            QMessageBox.critical(
+                self,
+                "Falha na importação",
+                "As cargas foram alteradas durante a importação dos geradores.",
+            )
+            return
+        self._set_generator_model(result.model)
+        self._show_generator_import_report(result)
 
     def _on_load_pattern_import_finished(
         self,
@@ -2267,6 +2527,8 @@ class MainWindow(QMainWindow):
         self._invalidate_branch_analysis()
         if model is not None and model.bars is not self._model:
             raise ValueError("As cargas devem referenciar as barras exibidas.")
+        if model is not self._load_model:
+            self._set_generator_model(None)
         if (
             self._selected_feature is not None
             and self._selected_feature.kind == "load"
@@ -2285,6 +2547,27 @@ class MainWindow(QMainWindow):
         self._apply_circuit_visibility()
         if model is not None and self.show_loads_action.isChecked():
             self.load_virtualizer.refresh(force=True)
+        self.view.viewport().update()
+
+    def _set_generator_model(self, model: GeneratorModel | None) -> None:
+        if model is not None and model.loads is not self._load_model:
+            raise ValueError("Os geradores devem pertencer às cargas exibidas.")
+        if (
+            self._selected_feature is not None
+            and self._selected_feature.kind == "generator"
+        ):
+            self._set_selection(None)
+        self._generator_model = model
+        self.view.set_generator_model(model)
+        self.generator_virtualizer.reset_model(model)
+        self._sync_load_layout()
+        self.show_generators_action.setEnabled(model is not None)
+        self.generator_status.setText(
+            f"Geradores: {len(model) if model is not None else 0:n}"
+        )
+        self._apply_circuit_visibility()
+        if model is not None and self.show_generators_action.isChecked():
+            self.generator_virtualizer.refresh(force=True)
         self.view.viewport().update()
 
     def _set_load_pattern_model(self, model: LoadPatternModel | None) -> None:
@@ -2508,6 +2791,11 @@ class MainWindow(QMainWindow):
             if controller is None or self._load_model is None
             else controller.bar_visible_mask[self._load_model.bar_indices]
         )
+        generator_mask = (
+            None
+            if controller is None or self._generator_model is None
+            else controller.bar_visible_mask[self._generator_model.bar_indices]
+        )
         equivalent_mask = None
         simplified = (
             self.simplified_network_action.isChecked()
@@ -2533,6 +2821,7 @@ class MainWindow(QMainWindow):
         self._effective_load_mask = load_mask
         self.virtualizer.set_visibility_mask(bar_mask)
         self.load_virtualizer.set_visibility_mask(load_mask)
+        self.generator_virtualizer.set_visibility_mask(generator_mask)
         if self._equivalent_network_result is not None:
             self.equivalent_load_virtualizer.set_visibility_mask(equivalent_mask)
         if self._line_item is not None:
@@ -2587,6 +2876,10 @@ class MainWindow(QMainWindow):
                 selection.kind == "equivalent_load"
                 and equivalent_mask is not None
                 and not bool(equivalent_mask[selection.index])
+            ) or (
+                selection.kind == "generator"
+                and generator_mask is not None
+                and not bool(generator_mask[selection.index])
             )
             if hidden and not self._search_focus_active:
                 self._set_selection(None)
@@ -3234,17 +3527,19 @@ class MainWindow(QMainWindow):
             if self._equivalent_network_result is None
             else self._equivalent_network_result.model
         )
-        if (
+        show_equivalent = (
             self.simplified_network_action.isChecked()
             and equivalent_model is not None
-        ):
-            models = tuple(
-                model
-                for model in (self._load_model, equivalent_model)
-                if model is not None
+        )
+        models = tuple(
+            model
+            for model in (
+                self._load_model,
+                self._generator_model,
+                equivalent_model if show_equivalent else None,
             )
-        else:
-            models = () if self._load_model is None else (self._load_model,)
+            if model is not None
+        )
         if not models:
             return
         layouts = load_layout_offsets_for_models(models)
@@ -3252,10 +3547,10 @@ class MainWindow(QMainWindow):
         if self._load_model is not None:
             self.load_virtualizer.set_layout_offsets(*layouts[layout_index])
             layout_index += 1
-        if (
-            self.simplified_network_action.isChecked()
-            and equivalent_model is not None
-        ):
+        if self._generator_model is not None:
+            self.generator_virtualizer.set_layout_offsets(*layouts[layout_index])
+            layout_index += 1
+        if show_equivalent:
             self.equivalent_load_virtualizer.set_layout_offsets(
                 *layouts[layout_index]
             )
@@ -3838,6 +4133,40 @@ class MainWindow(QMainWindow):
             message.setDetailedText("\n".join(details))
         message.exec()
 
+    def _show_generator_import_report(self, result: GeneratorCsvResult) -> None:
+        if not result.has_warnings:
+            self.statusBar().showMessage(
+                f"{result.valid_rows:n} geradores importados com sucesso.", 5_000
+            )
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle("Importação de geradores concluída com avisos")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText(f"{result.valid_rows:n} geradores foram importados.")
+        lines = [
+            f"MT_GERADOR_CONS: {result.generator_encoding}; "
+            f"{result.generator_total_rows:n} linhas",
+            f"MT_CONS: {result.consumer_encoding}; "
+            f"{result.consumer_total_rows:n} linhas",
+            f"Geradores válidos: {result.valid_rows:n}",
+            f"Geradores ignorados: {result.invalid_rows:n}",
+        ]
+        if (
+            result.generator_encoding.lower() == "cp1252"
+            or result.consumer_encoding.lower() == "cp1252"
+        ):
+            lines.append("Ao menos um arquivo foi lido como CP-1252.")
+        message.setInformativeText("\n".join(lines))
+        details = [
+            f"{issue.source}, linha {issue.line_number}: {issue.reason}"
+            for issue in result.issues
+        ]
+        if result.omitted_issues:
+            details.append(f"… e mais {result.omitted_issues:n} ocorrências.")
+        if details:
+            message.setDetailedText("\n".join(details))
+        message.exec()
+
     def _show_switch_import_report(
         self,
         result: SwitchLoadResult,
@@ -4337,6 +4666,19 @@ class MainWindow(QMainWindow):
         state = "visíveis" if visible else "ocultas"
         self.statusBar().showMessage(f"Cargas {state}.", 3_000)
 
+    def _set_generators_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if (
+            not visible
+            and self._selected_feature is not None
+            and self._selected_feature.kind == "generator"
+            and not self._search_focus_active
+        ):
+            self._set_selection(None)
+        self.generator_virtualizer.set_loads_visible(visible)
+        state = "visíveis" if visible else "ocultos"
+        self.statusBar().showMessage(f"Geradores {state}.", 3_000)
+
     def _set_selection(
         self,
         selection: FeatureSelection | None,
@@ -4364,10 +4706,13 @@ class MainWindow(QMainWindow):
             self.virtualizer.set_selected_index(None)
             self.load_virtualizer.set_selected_index(None)
             self.equivalent_load_virtualizer.set_selected_index(None)
+            self.generator_virtualizer.set_selected_index(None)
             self.segment_selection_overlay.clear()
             for label in (
                 *self.bar_detail_labels.values(),
                 *self.load_detail_labels.values(),
+                *self.generator_detail_labels.values(),
+                *self.generator_consumer_detail_labels.values(),
                 *self.equivalent_detail_labels.values(),
                 *self.segment_detail_labels.values(),
                 *self.switch_detail_labels.values(),
@@ -4378,6 +4723,9 @@ class MainWindow(QMainWindow):
             self.details_dock.setWindowTitle("Elemento selecionado")
             self.details_stack.setCurrentWidget(self.empty_details_page)
             return
+
+        if selection.kind != "generator":
+            self.generator_virtualizer.set_selected_index(None)
 
         if selection.kind == "bar":
             if not 0 <= selection.index < len(self._model):
@@ -4504,12 +4852,54 @@ class MainWindow(QMainWindow):
             self.equivalent_details_page.verticalScrollBar().setValue(0)
             return
 
+        if selection.kind == "generator":
+            if self._generator_model is None or not 0 <= selection.index < len(
+                self._generator_model
+            ):
+                return
+            self._selected_feature = selection
+            self.virtualizer.set_selected_index(None)
+            self.load_virtualizer.set_selected_index(None)
+            self.equivalent_load_virtualizer.set_selected_index(None)
+            self.segment_selection_overlay.clear()
+            self.generator_virtualizer.set_selected_index(
+                selection.index, reveal_hidden=reveal_hidden
+            )
+            record = self._generator_model.record(selection.index)
+            generator_values = {
+                "generator_id": record.generator_id,
+                "mt_cons_id": record.mt_cons_id,
+                "generator_code": record.generator_code,
+                "nominal_voltage": record.nominal_voltage,
+                "nominal_power": record.nominal_power,
+                "connection": record.connection,
+                "curve_id": record.curve_id,
+                "generation_kwh": record.generation_kwh,
+            }
+            consumer_values = {
+                "consumer_id": record.consumer_id,
+                "load_id": record.load_id,
+                "consumer_code": record.consumer_code,
+                "external_id": record.external_id,
+                "name": record.name,
+                "phases": record.phases,
+            }
+            for key, value in generator_values.items():
+                self.generator_detail_labels[key].setText(value or "—")
+            for key, value in consumer_values.items():
+                self.generator_consumer_detail_labels[key].setText(value or "—")
+            self.details_dock.setWindowTitle("Gerador selecionado")
+            self.details_stack.setCurrentWidget(self.generator_details_page)
+            self.generator_details_page.verticalScrollBar().setValue(0)
+            return
+
         if self._line_model is None or not 0 <= selection.index < len(self._line_model):
             return
         self._selected_feature = selection
         self.virtualizer.set_selected_index(None)
         self.load_virtualizer.set_selected_index(None)
         self.equivalent_load_virtualizer.set_selected_index(None)
+        self.generator_virtualizer.set_selected_index(None)
         self.segment_selection_overlay.bind(self._line_model, selection.index)
         record = self._line_model.record(selection.index)
         values = {
@@ -5085,10 +5475,14 @@ class MainWindow(QMainWindow):
         self._active_equivalent_load_count = int(active)
         self._refresh_active_status()
 
+    def _update_generator_status_counts(self, active: int) -> None:
+        self._active_generator_count = int(active)
+        self._refresh_active_status()
+
     def _refresh_active_status(self) -> None:
         self.active_status.setText(
             "Itens ativos: "
-            f"{self._active_bar_count + self._active_load_count + self._active_equivalent_load_count:n}"
+            f"{self._active_bar_count + self._active_load_count + self._active_equivalent_load_count + self._active_generator_count:n}"
         )
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001, N802

@@ -44,8 +44,8 @@ que continuem fora da faixa UTM válida (easting entre 100.000 e 900.000;
 northing entre 0 e 10.000.000) são aceitas, mas o relatório avisa — nesse caso a
 imagem de satélite não consegue se posicionar corretamente.
 
-Use **Arquivo > Importar CSV…** e escolha entre barras, trechos, cargas, chaves,
-reguladores, circuitos ou cabos. A opção de
+Use **Arquivo > Importar CSV…** e escolha entre barras, trechos, cargas,
+geradores, chaves, reguladores, circuitos ou cabos. A opção de
 trechos fica disponível depois que as barras forem carregadas. O arquivo de
 trechos deve conter `TRECHO_ID`, `CODIGO`, `FASES2`, `BARRA1_ID`, `BARRA2_ID`,
 `ARRANJO_ID`, `CABOF_ID`, `CABON_ID` e `COMPR`. A ordem é livre e colunas
@@ -59,6 +59,24 @@ indicada por `BARRA_ID` e desenhada como um pequeno retângulo com terminal.
 Várias cargas na mesma barra são distribuídas automaticamente. IDs duplicados
 e referências a barras inexistentes são omitidos e incluídos no relatório de
 importação; os demais campos são preservados como texto.
+
+Depois das cargas, **Importar geradores…** abre uma janela dedicada com escolhas
+separadas para `MT_GERADOR_CONS.csv` e `MT_CONS.csv`. Os arquivos podem ser
+escolhidos em qualquer ordem, substituídos individualmente e a importação só é
+confirmada depois que ambos estiverem selecionados.
+`MT_GERADOR_CONS.csv` deve conter `GERADOR_ID`, `MT_CONS_ID`, `CODIGO`, `VNOM`,
+`SNOM`, `LIGACAO`, `CURVA_ID` e `GERACAO_KWH`; `MT_CONS.csv` deve conter `ID`,
+`CARGA_ID`, `CODIGO`, `EXTERN_ID`, `NOME` e `FASES2`. A associação entre eles é
+feita pelo `CODIGO` exato e a posição vem da barra da carga indicada por
+`CARGA_ID`. Códigos ausentes ou ambíguos e cargas inexistentes descartam somente
+o gerador afetado e aparecem no relatório.
+
+Geradores são círculos de tamanho fixo, enquanto cargas continuam quadradas. O
+layout distribui conjuntamente os dois tipos na mesma barra, sem contato entre
+os símbolos. O menu **Visualizar > Mostrar geradores** controla essa camada de
+forma independente. Ao selecionar um círculo, o painel direito mostra duas
+tabelas, uma para cada fonte lógica. Geradores também participam da importação
+MDB; ainda não entram na busca, exportação OpenDSS ou fluxo de potência.
 
 Após importar as cargas, a opção **Importar patamares de carga…** aceita um
 segundo CSV com `CARGA_ID`, `NPAT`, `PD`, `PE`, `PF`, `QD`, `QE` e `QF`. Cada
@@ -127,7 +145,7 @@ invalida nada, e importar qualquer outra entidade não invalida os cabos.
 ## Importação por banco de dados (`.mdb`)
 
 **Arquivo > Importar banco de dados…** lê um banco Microsoft Access e importa as
-oito entidades de uma vez, dispensando exportar cada tabela para CSV. Os dados
+nove entidades lógicas de uma vez, dispensando exportar cada tabela para CSV. Os dados
 são os mesmos e passam pelas mesmas validações — a única diferença é a fonte.
 
 O banco é aberto **somente para leitura**, em quatro camadas: `ReadOnly=1` na
@@ -167,6 +185,11 @@ escolher uma tabela reabilita uma entidade que não foi encontrada. As barras s�
 obrigatórias — sem elas não há o que desenhar — e o botão de confirmação fica
 desabilitado enquanto não estiverem marcadas.
 
+**Geradores** aparecem como uma única entidade lógica, mas sua linha contém dois
+seletores identificados: `MT_GERADOR_CONS` e `MT_CONS`. A opção só inicia
+marcada quando as duas tabelas forem resolvidas, e cada origem pode ser
+substituída manualmente sem afetar a outra.
+
 O mesmo diálogo pede zona, hemisfério e **unidade das coordenadas**, como na
 importação de barras por CSV. A unidade é deduzida de uma amostra da tabela de
 barras e já vem selecionada.
@@ -182,7 +205,7 @@ As entidades são importadas numa passada só, na ordem imposta pelas dependênc
 entre elas:
 
 ```
-barras → cabos → trechos → cargas → patamares → chaves → reguladores → circuitos
+barras → cabos → trechos → cargas → geradores → patamares → chaves → reguladores → circuitos
 ```
 
 As chaves vêm antes dos circuitos porque a topologia energizada depende delas.
@@ -193,6 +216,8 @@ o que dependia dela é pulado com a explicação. Só as barras são fatais.
 Ao final abre-se um relatório único, com uma linha por entidade (tabela de
 origem, lidas, válidas, inválidas, situação) e as ocorrências agrupadas. Sem
 nada a relatar, apenas a barra de status resume a importação.
+Para geradores há uma única linha, nomeando conjuntamente `MT_GERADOR_CONS` e
+`MT_CONS` e consolidando os diagnósticos das duas tabelas.
 
 ### Correspondência entre tabelas e entidades
 
@@ -220,6 +245,9 @@ caminho e o problema na dica.
   consultadas.
 - Colunas extras são simplesmente ignoradas. O `CENARIO_ID` de `MODELO_CARGA` é
   um exemplo: a importação usa exatamente as mesmas colunas do CSV.
+- A entidade `geradores` mapeia `MT_GERADOR_CONS`; sua fonte auxiliar
+  `geradores_mt_cons` mapeia `MT_CONS`. Ambas entregam cabeçalhos e linhas ao
+  mesmo `parse_generator_rows()` usado pelo adaptador CSV.
 
 ### Conversão de tipos
 
@@ -935,7 +963,7 @@ atualizado junto com mudanças relevantes de arquitetura.
 - `circuit_viewer/mdb_engine.py`: único acesso ao `pyodbc` (opcional), leitura
   somente leitura e conversão de tipos.
 - `circuit_viewer/mdb_mapping.py`: correspondência tabela/coluna → entidade.
-- `circuit_viewer/mdb_import.py`: importação encadeada das oito entidades.
+- `circuit_viewer/mdb_import.py`: importação encadeada das nove entidades lógicas.
 - `circuit_viewer/mdb_import_dialog.py`: escolha de tabelas, senha e UTM.
 - `circuit_viewer/mdb_import_report.py`: relatório consolidado da importação.
 - `circuit_viewer/segment_import.py`: importação e vínculo dos trechos.

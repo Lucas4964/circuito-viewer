@@ -7,6 +7,8 @@ from pathlib import Path
 
 from circuit_viewer.mdb_mapping import (
     ENTITY_ORDER,
+    GENERATOR_CONSUMER_ENTITY,
+    MAPPING_ORDER,
     MANDATORY_ENTITIES,
     REQUIRED_COLUMNS,
     EntityMapping,
@@ -40,13 +42,15 @@ class FakeDatabase:
 
 
 def full_database(**extra: list[str]) -> FakeDatabase:
-    """Banco com as oito tabelas da base real, mais o que for pedido."""
+    """Banco com as fontes das nove entidades lógicas, mais o que for pedido."""
 
     tables = {
         "BARRA": [*REQUIRED_COLUMNS["barras"], "BLOCO_ID", "PL_ANO"],
         "CABOS": [*REQUIRED_COLUMNS["cabos"], "K", "COLOR"],
         "TRECHO": [*REQUIRED_COLUMNS["trechos"], "POSBAR1", "INFO"],
         "CARGA": [*REQUIRED_COLUMNS["cargas"], "MC1_TIPO", "FATDEM"],
+        "MT_GERADOR_CONS": [*REQUIRED_COLUMNS["geradores"], "OBS"],
+        "MT_CONS": [*REQUIRED_COLUMNS[GENERATOR_CONSUMER_ENTITY], "TIPO"],
         "MODELO_CARGA": ["CENARIO_ID", *REQUIRED_COLUMNS["patamares"]],
         "CHAVE": [*REQUIRED_COLUMNS["chaves"], "BLOCO1_ID"],
         "REGULADOR": [*REQUIRED_COLUMNS["reguladores"], "FIXO", "VREG_P1"],
@@ -71,7 +75,7 @@ class LoadTableMappingTests(unittest.TestCase):
     def test_the_shipped_mapping_is_valid_and_complete(self) -> None:
         entries = load_table_mapping()
         self.assertEqual(
-            {entry.entity for entry in entries}, set(ENTITY_ORDER)
+            {entry.entity for entry in entries}, set(MAPPING_ORDER)
         )
 
     def test_the_shipped_mapping_matches_the_real_base(self) -> None:
@@ -80,6 +84,8 @@ class LoadTableMappingTests(unittest.TestCase):
         self.assertIn("BARRA", by_entity["barras"].tables)
         self.assertIn("CABOS", by_entity["cabos"].tables)
         self.assertIn("MODELO_CARGA", by_entity["patamares"].tables)
+        self.assertIn("MT_GERADOR_CONS", by_entity["geradores"].tables)
+        self.assertIn("MT_CONS", by_entity[GENERATOR_CONSUMER_ENTITY].tables)
 
     def test_empty_alias_list_means_the_csv_name(self) -> None:
         path = self.write(
@@ -155,7 +161,7 @@ class ResolveMappingTests(unittest.TestCase):
     def test_resolves_every_entity_of_the_real_base(self) -> None:
         result = resolve_mapping(full_database())
         self.assertEqual(
-            {item.entity for item in result.resolved}, set(ENTITY_ORDER)
+            {item.entity for item in result.resolved}, set(MAPPING_ORDER)
         )
         self.assertEqual(result.unavailable, ())
         self.assertTrue(result.has_mandatory)
@@ -163,7 +169,7 @@ class ResolveMappingTests(unittest.TestCase):
     def test_keeps_the_import_order(self) -> None:
         result = resolve_mapping(full_database())
         self.assertEqual(
-            tuple(item.entity for item in result.resolved), ENTITY_ORDER
+            tuple(item.entity for item in result.resolved), MAPPING_ORDER
         )
 
     def test_selects_only_the_required_columns(self) -> None:

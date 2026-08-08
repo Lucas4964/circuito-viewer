@@ -31,6 +31,22 @@
     }
   },
   {
+    "entidade": "geradores",
+    "tabelas": ["MT_GERADOR_CONS"],
+    "colunas": {
+      "GERADOR_ID": [], "MT_CONS_ID": [], "CODIGO": [], "VNOM": [],
+      "SNOM": [], "LIGACAO": [], "CURVA_ID": [], "GERACAO_KWH": []
+    }
+  },
+  {
+    "entidade": "geradores_mt_cons",
+    "tabelas": ["MT_CONS"],
+    "colunas": {
+      "ID": [], "CARGA_ID": [], "CODIGO": [], "EXTERN_ID": [],
+      "NOME": [], "FASES2": []
+    }
+  },
+  {
     "entidade": "patamares",
     "tabelas": ["MODELO_CARGA"],
     "colunas": {

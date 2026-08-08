@@ -1,6 +1,6 @@
 """Relatório consolidado de uma importação por banco de dados.
 
-Uma importação por banco produz oito ``*LoadResult``. Encadear os oito
+Uma importação por banco produz nove resultados lógicos. Encadear os nove
 ``QMessageBox`` dos importadores de CSV seria inaceitável, então o resultado
 inteiro cabe numa tabela: uma linha por entidade, com a tabela de origem e as
 contagens, mais as ocorrências agrupadas abaixo.
@@ -36,6 +36,7 @@ def _result_for(result: MdbImportResult, entity: str):  # noqa: ANN202
         "cabos": result.cables,
         "trechos": result.segments,
         "cargas": result.loads,
+        "geradores": result.generators,
         "patamares": result.patterns,
         "chaves": result.switches,
         "reguladores": result.regulators,
@@ -65,8 +66,11 @@ def issue_lines(result: MdbImportResult) -> tuple[str, ...]:
             if len(lines) >= MAX_REPORTED_LINES:
                 omitted += 1
                 continue
+            source = getattr(issue, "source", None)
+            source_text = f" ({source})" if source else ""
             lines.append(
-                f"{outcome.label}, linha {issue.line_number}: {issue.reason}"
+                f"{outcome.label}{source_text}, linha {issue.line_number}: "
+                f"{issue.reason}"
             )
         omitted += int(getattr(loaded, "omitted_issues", 0))
     if omitted:

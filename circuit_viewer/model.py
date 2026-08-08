@@ -152,6 +152,27 @@ class LoadRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class GeneratorRecord:
+    """Gerador de MT, seu consumidor associado e a barra resolvida."""
+
+    generator_id: str
+    mt_cons_id: str
+    generator_code: str
+    nominal_voltage: str
+    nominal_power: str
+    connection: str
+    curve_id: str
+    generation_kwh: str
+    consumer_id: str
+    load_id: str
+    consumer_code: str
+    external_id: str
+    name: str
+    phases: str
+    bar_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class CableRecord:
     """Atributos de um cabo do catálogo referenciado pelos trechos."""
 
@@ -224,11 +245,17 @@ class CircuitMembership:
 class FeatureSelection:
     """Referência leve para um elemento selecionado em um dos modelos."""
 
-    kind: Literal["bar", "segment", "load", "equivalent_load"]
+    kind: Literal["bar", "segment", "load", "equivalent_load", "generator"]
     index: int
 
     def __post_init__(self) -> None:
-        if self.kind not in {"bar", "segment", "load", "equivalent_load"}:
+        if self.kind not in {
+            "bar",
+            "segment",
+            "load",
+            "equivalent_load",
+            "generator",
+        }:
             raise ValueError(f"Tipo de elemento desconhecido: {self.kind}")
         if self.index < 0:
             raise ValueError("O índice selecionado não pode ser negativo.")
@@ -711,6 +738,165 @@ class LoadModel:
             secondary_line_voltage=self._secondary_line_voltages[index],
             phases=self._phases[index],
             connection_type=self._connection_types[index],
+        )
+
+
+class GeneratorModel:
+    """Geradores associados a cargas e posicionados nas barras dessas cargas."""
+
+    __slots__ = (
+        "loads",
+        "bars",
+        "_generator_ids",
+        "_load_indices",
+        "_bar_indices",
+        "_mt_cons_ids",
+        "_generator_codes",
+        "_nominal_voltages",
+        "_nominal_powers",
+        "_connections",
+        "_curve_ids",
+        "_generation_kwh",
+        "_consumer_ids",
+        "_consumer_codes",
+        "_external_ids",
+        "_names",
+        "_phases",
+        "_by_id",
+        "_spatial_index",
+        "source_paths",
+    )
+
+    def __init__(
+        self,
+        loads: LoadModel,
+        generator_ids: Iterable[str],
+        load_indices: Iterable[int] | IndexArray,
+        mt_cons_ids: Iterable[str],
+        generator_codes: Iterable[str],
+        nominal_voltages: Iterable[str],
+        nominal_powers: Iterable[str],
+        connections: Iterable[str],
+        curve_ids: Iterable[str],
+        generation_kwh: Iterable[str],
+        consumer_ids: Iterable[str],
+        consumer_codes: Iterable[str],
+        external_ids: Iterable[str],
+        names: Iterable[str],
+        phases: Iterable[str],
+        *,
+        source_paths: tuple[str, str] | None = None,
+    ) -> None:
+        ids = tuple(str(value) for value in generator_ids)
+        text_columns = tuple(
+            tuple(str(value) for value in values)
+            for values in (
+                mt_cons_ids,
+                generator_codes,
+                nominal_voltages,
+                nominal_powers,
+                connections,
+                curve_ids,
+                generation_kwh,
+                consumer_ids,
+                consumer_codes,
+                external_ids,
+                names,
+                phases,
+            )
+        )
+        associated_loads = np.ascontiguousarray(load_indices, dtype=np.intp)
+        size = len(ids)
+        if size == 0:
+            raise ValueError("O modelo deve conter ao menos um gerador.")
+        if any(len(values) != size for values in text_columns):
+            raise ValueError("Todos os campos do gerador devem possuir o mesmo tamanho.")
+        if associated_loads.ndim != 1 or associated_loads.size != size:
+            raise ValueError("Os índices de cargas devem formar um vetor compatível.")
+        if (associated_loads < 0).any() or (associated_loads >= len(loads)).any():
+            raise ValueError("Um gerador referencia uma carga inexistente.")
+
+        by_id: dict[str, int] = {}
+        for index, generator_id in enumerate(ids):
+            if not generator_id:
+                raise ValueError("GERADOR_ID não pode ser vazio.")
+            if generator_id in by_id:
+                raise ValueError(f"GERADOR_ID duplicado no modelo: {generator_id}")
+            by_id[generator_id] = index
+
+        bar_indices = np.ascontiguousarray(
+            loads.bar_indices[associated_loads], dtype=np.intp
+        )
+        associated_loads.setflags(write=False)
+        bar_indices.setflags(write=False)
+        self.loads = loads
+        self.bars = loads.bars
+        self._generator_ids = ids
+        self._load_indices = associated_loads
+        self._bar_indices = bar_indices
+        (
+            self._mt_cons_ids,
+            self._generator_codes,
+            self._nominal_voltages,
+            self._nominal_powers,
+            self._connections,
+            self._curve_ids,
+            self._generation_kwh,
+            self._consumer_ids,
+            self._consumer_codes,
+            self._external_ids,
+            self._names,
+            self._phases,
+        ) = text_columns
+        self._by_id = by_id
+        self._spatial_index = StaticPointIndex(
+            self.bars.x[bar_indices], self.bars.y[bar_indices]
+        )
+        self.source_paths = source_paths
+
+    def __len__(self) -> int:
+        return len(self._generator_ids)
+
+    @property
+    def generator_ids(self) -> tuple[str, ...]:
+        return self._generator_ids
+
+    @property
+    def load_indices(self) -> IndexArray:
+        return self._load_indices
+
+    @property
+    def bar_indices(self) -> IndexArray:
+        return self._bar_indices
+
+    @property
+    def spatial_index(self) -> StaticPointIndex:
+        return self._spatial_index
+
+    def index_for_id(self, generator_id: str) -> int | None:
+        return self._by_id.get(generator_id)
+
+    def record(self, index: int) -> GeneratorRecord:
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        load_index = int(self._load_indices[index])
+        load_id = self.loads.load_ids[load_index]
+        return GeneratorRecord(
+            generator_id=self._generator_ids[index],
+            mt_cons_id=self._mt_cons_ids[index],
+            generator_code=self._generator_codes[index],
+            nominal_voltage=self._nominal_voltages[index],
+            nominal_power=self._nominal_powers[index],
+            connection=self._connections[index],
+            curve_id=self._curve_ids[index],
+            generation_kwh=self._generation_kwh[index],
+            consumer_id=self._consumer_ids[index],
+            load_id=load_id,
+            consumer_code=self._consumer_codes[index],
+            external_id=self._external_ids[index],
+            name=self._names[index],
+            phases=self._phases[index],
+            bar_id=self.bars.bar_ids[int(self._bar_indices[index])],
         )
 
 

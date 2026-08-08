@@ -77,13 +77,14 @@ CIRCUITO_VIEWER/
 │   ├── switch_import.py       # importação de chaves
 │   ├── regulator_import.py    # importação de reguladores de tensão
 │   ├── load_import.py         # importação de cargas
+│   ├── generator_import.py    # associação MT_GERADOR_CONS + MT_CONS + cargas
 │   ├── load_pattern_import.py # importação de patamares (NPAT 0–3)
 │   ├── circuit_import.py      # importação de circuitos + build da topologia
 │   ├── cable_import.py        # importação do catálogo de cabos (sem dependência)
 │   │
 │   ├── mdb_engine.py          # único acesso ao pyodbc (opcional) + conversão
 │   ├── mdb_mapping.py         # tabela/coluna → entidade, a partir do JSON
-│   ├── mdb_import.py          # importação encadeada das oito entidades
+│   ├── mdb_import.py          # importação encadeada das nove entidades lógicas
 │   │
 │   ├── curvas.py              # NÚCLEO: curvas de 24 pontos, validação, colagem
 │   ├── curvas_store.py        # NÚCLEO: leitura/gravação atômica de curvas.json
@@ -106,7 +107,7 @@ CIRCUITO_VIEWER/
 │   ├── opendss_export_dialog.py  # seleção dos circuitos a exportar
 │   ├── opendss_settings_dialog.py # Configurações → OpenDSS… + QSettings
 │   ├── mdb_import_dialog.py   # tabelas detectadas, senha e metadados UTM
-│   ├── mdb_import_report.py   # relatório consolidado das oito entidades
+│   ├── mdb_import_report.py   # relatório consolidado das nove entidades lógicas
 │   ├── overlap_report.py      # relatório de trechos sobrepostos
 │   ├── search_palette.py      # janela de busca não modal
 │   ├── curvas_window.py       # Configurações → Curvas… (lista, grade, gráfico)
@@ -219,6 +220,7 @@ arquivo**: é o seam que a importação por banco consome (seção 6).
 | `switch_import.py` | Chave | `LineNetworkModel` | `CHAVE_ID, TIPOCHV_ID, CIRC_ID, TRECHO_ID, CODIGO, ESTADO, ESTADO_NORMAL, CORN, ELO, ELO_TIPO` |
 | `regulator_import.py` | Regulador de tensão | `LineNetworkModel` | `REGU_ID, TRECHO_ID, EXTERN_ID, CODIGO, LIGACAO, SNOM, FAIXA, NPASSOS, TAP, INOM, VNOM` |
 | `load_import.py` | Carga | `CircuitModel` | `CARGA_ID, BARRA_ID, EXTERN_ID, CODIGO, SNOM, SADM, VLINHASEC, FASES2, TIPO_LIG` |
+| `generator_import.py` | Gerador | `LoadModel` | `MT_GERADOR_CONS` associado a `MT_CONS` por `CODIGO`; barra resolvida por `CARGA_ID` |
 | `load_pattern_import.py` | Patamar | `LoadModel` | `CARGA_ID, NPAT, PD, PE, PF, QD, QE, QF` |
 | `circuit_import.py` | Circuito | `LineNetworkModel` + `SwitchModel?` | `CIRC_ID, BARRA_ID, CODIGO, VNOM` |
 | `cable_import.py` | Cabo | — (catálogo raiz) | `CABO_ID, TIPO, CODIGO, IADM, GMR, R, X, QCAP, R0, X0, R1, X1, NOME, EXTERN_ID` |
@@ -234,7 +236,7 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 |---|---|---|
 | `mdb_engine.py` | Único acesso ao `pyodbc`; conexão somente leitura, sniff do formato, detecção de senha, `cell_to_text` | Conhecer entidades do modelo |
 | `mdb_mapping.py` | Ler `mdb_tabelas.json`; casar entidade → tabela → colunas reais | Ler linhas |
-| `mdb_import.py` | Encadear as oito entidades na ordem de dependência | Validar linhas (delega às `parse_*_rows`) |
+| `mdb_import.py` | Encadear as nove entidades lógicas na ordem de dependência | Validar linhas (delega às `parse_*_rows`) |
 
 ### Análise
 
@@ -254,7 +256,7 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | `opendss_engine.py` | Contenção dos efeitos globais do `py_dss_interface`: singleton com trava, diretório corrente preservado, `SystemExit` capturado, pasta temporária ASCII |
 | `workers.py` | 10 workers `QObject` que apenas encapsulam funções puras e emitem `progress/finished/failed/cancelled` |
 | `mdb_import_dialog.py` | Tabelas detectadas com ajuste manual, senha mascarada e metadados UTM; `MdbPasswordDialog` é separado porque a senha só se sabe necessária **depois** da primeira tentativa de conexão |
-| `mdb_import_report.py` | Relatório consolidado das oito entidades — não modal, como o de sobreposições, porque os dois abrem sozinhos ao fim de uma operação |
+| `mdb_import_report.py` | Relatório consolidado das nove entidades lógicas — não modal, como o de sobreposições, porque os dois abrem sozinhos ao fim de uma operação |
 | `main_window.py` | Dono de todo o estado da aplicação; coordena importações, invalidações em cascata, máscaras efetivas, painel de detalhes e menus |
 | `circuits_window.py` | `QAbstractTableModel` fino sobre `CircuitVisibilityController` + delegate de cor |
 | `branch_window.py` | Tabela de ramais com `QSortFilterProxyModel` (ordenação por `UserRole`, filtro por circuito) |
@@ -493,7 +495,7 @@ a inversa, `_set_line_model()` zerando-os quando os trechos mudam.
 
 ### O seam `parse_*_rows`: uma validação, duas fontes
 
-Os oito `_parse_file` tinham a mesma forma — abrir, ler cabeçalho, resolver
+Os adaptadores `_parse_file` têm a mesma forma — abrir, ler cabeçalho, resolver
 posições de coluna, iterar linhas de texto, validar, montar o modelo. **Só os
 três primeiros passos dependem do CSV.** A validação por linha, os `*Issue`, o
 teto de `MAX_REPORTED_ISSUES` e a construção do `*Model` são idênticos venha a
@@ -596,8 +598,23 @@ e como texto, zeros à esquerda e vírgula decimal chegam ao painel exatamente c
 estão no arquivo de origem.
 
 **Cargas** — resolve `BARRA_ID`; todos os demais campos permanecem texto
+
+**Geradores** — dependem do `LoadModel`. O importador indexa `MT_CONS.CODIGO`,
+associa cada linha de `MT_GERADOR_CONS` por igualdade exata e resolve
+`MT_CONS.CARGA_ID` no modelo de cargas. `GeneratorModel` preserva os dois
+registros de origem, o índice da carga e o índice imutável da barra. Substituir
+barras ou cargas invalida os geradores; falha ou cancelamento preserva o modelo
+anterior. Graficamente, `LoadVirtualizer` é parametrizado pelo tipo de símbolo:
+retângulo para carga e círculo para gerador, compartilhando o layout por barra.
 (inclusive `SNOM`/`SADM`, convertidos para `Decimal` só na agregação
 equivalente).
+
+`parse_generator_rows()` é a única implementação da associação e das
+validações. O adaptador CSV fornece dois leitores com fallback independente de
+codificação; o MDB fornece dois iteradores ODBC. No diálogo CSV, uma janela
+dedicada coleta os dois caminhos antes de iniciar o worker. No diálogo MDB,
+`geradores` é uma entidade lógica única com dois seletores, sendo
+`geradores_mt_cons` apenas a fonte auxiliar de `MT_CONS` no mapeamento.
 
 **Patamares** — acumula em `dict[load_index][npat]` e só valida no fim:
 o grupo de uma carga é aceito somente se tiver exatamente NPAT 0,1,2,3, sem
@@ -612,7 +629,7 @@ parsing e sim o BFS; por isso propaga `cancel_check` para dentro do `trace`.
 ### Importação por banco Access
 
 `load_database()` percorre `ENTITY_ORDER` — `barras → cabos → trechos → cargas →
-patamares → chaves → reguladores → circuitos` — e entrega as linhas de cada
+geradores → patamares → chaves → reguladores → circuitos` — e entrega as linhas de cada
 tabela à `parse_*_rows` correspondente. A ordem é a das dependências entre
 modelos, com um caso não óbvio: **as chaves vêm antes dos circuitos** porque
 `parse_circuit_rows` recebe o `SwitchModel` e a topologia energizada depende
@@ -1030,7 +1047,7 @@ simultâneas.
 
 **A importação por banco ocupa o slot `_import_thread`**, como as de CSV. A
 cadeia inteira roda num worker só porque cada importador recebe o modelo do
-anterior: dividir em oito threads exigiria sequenciá-las de qualquer forma, e
+anterior: dividir em nove threads exigiria sequenciá-las de qualquer forma, e
 ainda multiplicaria as revalidações de identidade na chegada. Uma restrição
 física reforça a escolha — **uma conexão ODBC não é segura para atravessar
 threads**, então `MdbImportWorker` abre a sua própria conexão dentro de `run()` e
@@ -1661,7 +1678,7 @@ uma troca de qualquer um deles seria exibir número velho como se fosse novo.
 
 ### 12.5 Leitura de bancos Access (`mdb_engine.py`, `mdb_mapping.py`, `mdb_import.py`)
 
-**Objetivo:** importar as oito entidades direto de um `.mdb`, em modo somente
+**Objetivo:** importar as nove entidades lógicas direto de um `.mdb`, em modo somente
 leitura, sem duplicar nenhuma regra de validação. A mecânica da cadeia está na
 seção 6; aqui ficam as decisões que a sustentam.
 
@@ -1719,6 +1736,13 @@ independentemente e a que não encontra tabela ou coluna vira uma
 `UnavailableEntity` com o motivo. Uma tabela **forçada pelo usuário** que não
 sirva é relatada em vez de cair de volta na detecção: passar por cima de uma
 escolha explícita seria pior do que dizer que não deu.
+
+**Geradores consomem duas tabelas como uma entidade.** `MAPPING_ORDER` inclui a
+fonte auxiliar `geradores_mt_cons`, enquanto `ENTITY_ORDER` mantém apenas a
+linha lógica `geradores`. Assim, detecção e override continuam independentes
+por tabela, mas dependência, instalação, progresso e relatório permanecem uma
+única operação. A leitura contabiliza primeiro `MT_CONS` e depois
+`MT_GERADOR_CONS`, sem regressão na barra global.
 
 ---
 
@@ -1992,7 +2016,7 @@ todo o `LoadVirtualizer` para uma segunda camada de cargas.
 **Uma validação, duas fontes (`parse_*_rows`).** Aceitar uma segunda fonte de
 dados sem duplicar as regras exigia separar "de onde vêm as linhas" de "o que
 faz uma linha ser válida". A alternativa — um importador de banco próprio —
-criaria oito pares de regras capazes de divergir em silêncio, exatamente o modo
+criaria vários pares de regras capazes de divergir em silêncio, exatamente o modo
 de falha que a seção 12.3 evita ao reusar a separação de chaves do `trace()`.
 
 **Conversão de tipos numa função só (`cell_to_text`).** Um banco é tipado e o CSV
@@ -2167,7 +2191,7 @@ lido por uma build anterior.
 | Arquivo | Foco |
 |---|---|
 | `test_model.py` | entidades, índices espaciais, topologia |
-| `test_csv_import.py` · `test_segment_import.py` · `test_switch_import.py` · `test_regulator_import.py` · `test_load_import.py` · `test_load_pattern_import.py` · `test_circuit_import.py` · `test_cable_import.py` | importadores e casos de erro; o de reguladores cobre também as invariantes do `RegulatorModel` independentemente do importador |
+| `test_csv_import.py` · `test_segment_import.py` · `test_switch_import.py` · `test_regulator_import.py` · `test_load_import.py` · `test_generator_import.py` · `test_load_pattern_import.py` · `test_circuit_import.py` · `test_cable_import.py` | importadores e casos de erro; geradores cobrem a associação dos dois CSVs e a resolução por carga |
 | `test_phase_config.py` | validação do `fases2.json` |
 | `test_circuit_colors.py` | paleta e contraste |
 | `test_branch_analysis.py` · `test_equivalent_network.py` | análises topológicas |
@@ -2178,7 +2202,7 @@ lido por uma build anterior.
 | `test_mdb_engine.py` | `cell_to_text` exaustivo (o inteiro sem `.0`, o decimal íntegro, Sim/Não, nulo, binário), sniff de formato por versão do Access, detecção de senha, cadeia de conexão somente leitura **sem chaves em `DBQ` nem em `PWD`** e comparada com a forma comprovadamente funcional, recuo do `SQL_MODE_READ_ONLY`, senha fora das mensagens, e a garantia de que só `SELECT` é emitido |
 | `test_mdb_mapping.py` | apelidos de coluna, casamento sem caixa, tabela de reserva, tabela e coluna ausentes desabilitando só a própria entidade, tabela ilegível reportada, `MSys*` nunca escolhidas, override que não cai de volta na detecção, e o JSON distribuído conferido contra a base real |
 | `test_mdb_import.py` | com um **banco falso**: ordem de dependência (chaves antes de circuitos), identidade encadeada dos modelos, projeção só das colunas obrigatórias, `CENARIO_ID` ignorado, dedução de decímetros, entidade ausente não derrubando as demais, barras fatais, cancelamento nunca virando falha de entidade, progresso único da cadeia, e a **regressão de tipos**: `ESTADO` inteiro e `float` mantendo a chave fechada e a topologia alcançando as três barras |
-| `test_mdb_import_ui.py` | com um `MdbImportResult` injetado: instalação dos oito modelos pelos setters existentes, catálogo sobrevivendo à cascata das chaves, banco parcial, diálogo (pré-seleção, override manual reabilitando entidade, barras obrigatórias), senha mascarada, e o relatório não modal |
+| `test_mdb_import_ui.py` | com um `MdbImportResult` injetado: instalação dos nove modelos pelos setters existentes, catálogo sobrevivendo à cascata das chaves, banco parcial, diálogo (pré-seleção, override manual reabilitando entidade, barras obrigatórias), senha mascarada, e o relatório não modal |
 | `test_search.py` | índice de busca (sem Qt) |
 | `test_curvas.py` | invariantes da curva (24 pontos, sem `nan`/`inf`, negativos e zero aceitos), `curve_id` sobrevivendo à renomeação, unicidade de nome sem caixa, horas faltantes em base 1, e o parser de colagem: `\r\n`/`\r`, linha vazia final descartada mas a do meio preservada, bloco de duas colunas, vírgula decimal e recusa de `1.234,56` |
 | `test_curvas_store.py` | ida e volta preservando id/acentos/negativos, criação do diretório, regravação por cima (regressão de `os.rename` no Windows), nenhum `.tmp` remanescente, e a tolerância de leitura: JSON quebrado, raiz inesperada, entrada inválida entre válidas, versão mais nova, ids/nomes repetidos, id ausente gerado e chaves desconhecidas ignoradas |

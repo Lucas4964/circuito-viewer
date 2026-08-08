@@ -10,6 +10,7 @@ from .branch_analysis import BranchAnalysisResult, analyze_branches
 from .cable_import import load_cables_csv
 from .circuit_import import load_circuits_csv
 from .csv_import import CsvImportCancelled, load_csv
+from .generator_import import load_generators_csv
 from .load_import import load_loads_csv
 from .load_pattern_import import load_load_patterns_csv
 from .equivalent_network import build_equivalent_network
@@ -19,6 +20,7 @@ from .model import (
     CableModel,
     CircuitCatalogModel,
     CircuitModel,
+    GeneratorModel,
     LineNetworkModel,
     LoadModel,
     LoadPatternModel,
@@ -133,6 +135,49 @@ class LoadImportWorker(QObject):
                 progress=lambda rows, current, total: self.progress.emit(
                     rows, current, total
                 ),
+            )
+        except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class GeneratorImportWorker(QObject):
+    progress = pyqtSignal(int, int, int)
+    stageChanged = pyqtSignal(str)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        generator_path: str,
+        consumer_path: str,
+        loads: LoadModel,
+    ) -> None:
+        super().__init__()
+        self.generator_path = generator_path
+        self.consumer_path = consumer_path
+        self.loads = loads
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = load_generators_csv(
+                self.generator_path,
+                self.consumer_path,
+                self.loads,
+                cancel_event=self._cancel_event,
+                progress=lambda rows, current, total: self.progress.emit(
+                    rows, current, total
+                ),
+                stage=self.stageChanged.emit,
             )
         except CsvImportCancelled:
             self.cancelled.emit()
@@ -318,10 +363,10 @@ class CircuitImportWorker(QObject):
 
 
 class MdbImportWorker(QObject):
-    """Importa as oito entidades de um banco Access numa única execução.
+    """Importa as nove entidades lógicas de um banco Access numa única execução.
 
     A cadeia inteira roda num worker só porque cada importador recebe o modelo
-    do anterior: dividir em oito threads exigiria sequenciá-las de qualquer
+    do anterior: dividir em nove threads exigiria sequenciá-las de qualquer
     forma, e ainda multiplicaria as revalidações de identidade na chegada.
 
     A conexão é aberta **aqui dentro**, na thread secundária, e fechada antes de

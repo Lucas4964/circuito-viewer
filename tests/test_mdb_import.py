@@ -95,6 +95,17 @@ def network_database(**overrides) -> FakeDatabase:
             ],
             [(2, 9, 34722450, "CARGA-1", 30.0, 30.0, 220.0, 13, 2, None)],
         ),
+        "MT_CONS": (
+            ["ID", "CARGA_ID", "CODIGO", "EXTERN_ID", "NOME", "FASES2"],
+            [(101, 2, "GEN-COD", "EXT-GEN", "Usina", 13)],
+        ),
+        "MT_GERADOR_CONS": (
+            [
+                "GERADOR_ID", "MT_CONS_ID", "CODIGO", "VNOM", "SNOM",
+                "LIGACAO", "CURVA_ID", "GERACAO_KWH",
+            ],
+            [(201, 101, "GEN-COD", 13.8, 75.0, "Y", "CUR-1", 1000.5)],
+        ),
         "MODELO_CARGA": (
             ["CENARIO_ID", "CARGA_ID", "NPAT", "PD", "PE", "PF", "QD", "QE", "QF"],
             [
@@ -147,6 +158,7 @@ class LoadDatabaseTests(unittest.TestCase):
         self.assertIs(result.segments.model.bars, result.bars.model)
         self.assertIs(result.loads.model.bars, result.bars.model)
         self.assertIs(result.patterns.model.loads, result.loads.model)
+        self.assertIs(result.generators.model.loads, result.loads.model)
         self.assertIs(result.switches.model.segments, result.segments.model)
         self.assertIs(result.regulators.model.segments, result.segments.model)
         self.assertIs(result.circuits.model.segments, result.segments.model)
@@ -162,6 +174,8 @@ class LoadDatabaseTests(unittest.TestCase):
         # energizada depende delas.
         self.assertLess(visited.index("CHAVE"), visited.index("CIRCUITO"))
         self.assertLess(visited.index("CARGA"), visited.index("MODELO_CARGA"))
+        self.assertLess(visited.index("CARGA"), visited.index("MT_CONS"))
+        self.assertLess(visited.index("MT_CONS"), visited.index("MT_GERADOR_CONS"))
 
     def test_only_the_required_columns_are_selected(self) -> None:
         database = network_database()
@@ -170,6 +184,13 @@ class LoadDatabaseTests(unittest.TestCase):
         self.assertNotIn("FATDEM", by_table["CARGA"])
         self.assertNotIn("CENARIO_ID", by_table["MODELO_CARGA"])
         self.assertNotIn("BLOCO_ID", by_table["BARRA"])
+        self.assertEqual(
+            by_table["MT_GERADOR_CONS"],
+            (
+                "GERADOR_ID", "MT_CONS_ID", "CODIGO", "VNOM", "SNOM",
+                "LIGACAO", "CURVA_ID", "GERACAO_KWH",
+            ),
+        )
 
     def test_source_path_records_the_table(self) -> None:
         result = run(network_database())
@@ -179,6 +200,24 @@ class LoadDatabaseTests(unittest.TestCase):
         self.assertEqual(
             result.segments.model.source_path, r"C:\dados\rede.mdb::TRECHO"
         )
+        self.assertEqual(
+            result.generators.model.source_paths,
+            (
+                r"C:\dados\rede.mdb::MT_GERADOR_CONS",
+                r"C:\dados\rede.mdb::MT_CONS",
+            ),
+        )
+
+    def test_generator_association_uses_code_and_load_to_find_the_bar(self) -> None:
+        result = run(network_database())
+        record = result.generators.model.record(0)
+        self.assertEqual(record.generator_id, "201")
+        self.assertEqual(record.mt_cons_id, "101")
+        self.assertEqual(record.consumer_id, "101")
+        self.assertEqual(record.load_id, "2")
+        self.assertEqual(record.bar_id, "9")
+        self.assertEqual(result.generators.model.load_indices.tolist(), [0])
+        self.assertEqual(result.generators.model.bar_indices.tolist(), [2])
 
     def test_encoding_is_not_reported_as_a_legacy_codepage(self) -> None:
         result = run(network_database())
@@ -321,6 +360,21 @@ class PartialDatabaseTests(unittest.TestCase):
         result = run(database)
         self.assertIsNone(result.patterns)
         self.assertIn("Depende de", result.outcome_for("patamares").error)
+        self.assertIsNone(result.generators)
+        self.assertIn("Depende de", result.outcome_for("geradores").error)
+
+    def test_missing_either_generator_table_only_disables_generators(self) -> None:
+        for missing in ("MT_CONS", "MT_GERADOR_CONS"):
+            with self.subTest(missing=missing):
+                database = network_database()
+                del database._tables[missing]
+                result = run(database)
+                self.assertIsNone(result.generators)
+                self.assertIsNotNone(result.patterns)
+                self.assertIsNotNone(result.circuits)
+                outcome = result.outcome_for("geradores")
+                self.assertFalse(outcome.imported)
+                self.assertIsNotNone(outcome.error)
 
     def test_circuits_are_built_without_switches(self) -> None:
         database = network_database()
@@ -385,6 +439,23 @@ class OverrideTests(unittest.TestCase):
         self.assertEqual(result.bars.model.record(0).code, "SE-A")
         # Os trechos apontam para as barras antigas e não resolvem mais.
         self.assertIsNone(result.segments)
+
+    def test_generator_sources_can_be_overridden_independently(self) -> None:
+        database = network_database()
+        database._tables["GEN_ALT"] = database._tables.pop("MT_GERADOR_CONS")
+        database._tables["CONS_ALT"] = database._tables.pop("MT_CONS")
+        result = run(
+            database,
+            overrides={
+                "geradores": "GEN_ALT",
+                "geradores_mt_cons": "CONS_ALT",
+            },
+        )
+        self.assertEqual(
+            result.generators.model.source_paths,
+            (r"C:\dados\rede.mdb::GEN_ALT", r"C:\dados\rede.mdb::CONS_ALT"),
+        )
+        self.assertEqual(result.generators.model.record(0).bar_id, "9")
 
 
 class CancellationTests(unittest.TestCase):

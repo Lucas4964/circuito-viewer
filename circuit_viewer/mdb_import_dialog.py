@@ -1,6 +1,6 @@
 """Diálogo de importação de um banco Access inteiro.
 
-Reúne num passo só o que hoje exige oito importações: o arquivo, a senha
+Reúne num passo só o que hoje exige nove importações: o arquivo, a senha
 opcional, as tabelas detectadas — com ajuste manual quando a detecção não
 serve — e os metadados UTM que o banco não tem.
 
@@ -29,7 +29,12 @@ from PyQt6.QtWidgets import (
 )
 
 from .csv_import import COORDINATE_UNITS
-from .mdb_mapping import ENTITY_LABELS, ENTITY_ORDER, ResolvedMapping
+from .mdb_mapping import (
+    ENTITY_LABELS,
+    ENTITY_ORDER,
+    GENERATOR_CONSUMER_ENTITY,
+    ResolvedMapping,
+)
 from .model import UtmCrs
 
 
@@ -154,12 +159,8 @@ class MdbImportDialog(QDialog):
         self.entity_checks: dict[str, QCheckBox] = {}
         self.entity_combos: dict[str, QComboBox] = {}
 
-        for entity in ENTITY_ORDER:
+        def create_combo(entity: str) -> QComboBox:
             resolved = self._mapping.get(entity)
-            check = QCheckBox(ENTITY_LABELS[entity])
-            check.setChecked(resolved is not None)
-            check.toggled.connect(self._sync_ok_enabled)
-
             combo = QComboBox()
             combo.addItem(AUTOMATIC_LABEL, None)
             for name in self._table_names:
@@ -170,9 +171,40 @@ class MdbImportDialog(QDialog):
                 position = combo.findData(resolved.table)
                 if position >= 0:
                     combo.setCurrentIndex(position)
-                check.setToolTip(f"Tabela detectada: {resolved.table}")
             else:
-                reason = self._mapping.reason_for(entity) or "Não encontrada."
+                combo.setToolTip(
+                    self._mapping.reason_for(entity) or "Não encontrada."
+                )
+            self.entity_combos[entity] = combo
+            return combo
+
+        for entity in ENTITY_ORDER:
+            resolved = self._mapping.get(entity)
+            consumer_resolved = (
+                self._mapping.get(GENERATOR_CONSUMER_ENTITY)
+                if entity == "geradores"
+                else None
+            )
+            fully_resolved = resolved is not None and (
+                entity != "geradores" or consumer_resolved is not None
+            )
+            check = QCheckBox(ENTITY_LABELS[entity])
+            check.setChecked(fully_resolved)
+            check.toggled.connect(self._sync_ok_enabled)
+
+            combo = create_combo(entity)
+            if fully_resolved:
+                tooltip = f"Tabela detectada: {resolved.table}"
+                if entity == "geradores":
+                    tooltip += f"; MT_CONS: {consumer_resolved.table}"
+                check.setToolTip(tooltip)
+            else:
+                reasons = [self._mapping.reason_for(entity)]
+                if entity == "geradores":
+                    reasons.append(
+                        self._mapping.reason_for(GENERATOR_CONSUMER_ENTITY)
+                    )
+                reason = "; ".join(item for item in reasons if item) or "Não encontrada."
                 check.setEnabled(False)
                 check.setToolTip(reason)
                 combo.setToolTip(reason)
@@ -181,8 +213,20 @@ class MdbImportDialog(QDialog):
             )
 
             self.entity_checks[entity] = check
-            self.entity_combos[entity] = combo
-            form.addRow(check, combo)
+            if entity != "geradores":
+                form.addRow(check, combo)
+                continue
+
+            consumer_combo = create_combo(GENERATOR_CONSUMER_ENTITY)
+            consumer_combo.currentIndexChanged.connect(
+                lambda _index: self._on_table_changed("geradores")
+            )
+            compound = QWidget(group)
+            compound_form = QFormLayout(compound)
+            compound_form.setContentsMargins(0, 0, 0, 0)
+            compound_form.addRow("MT_GERADOR_CONS:", combo)
+            compound_form.addRow("MT_CONS:", consumer_combo)
+            form.addRow(check, compound)
 
         self.warning_label = QLabel()
         self.warning_label.setWordWrap(True)
@@ -224,11 +268,25 @@ class MdbImportDialog(QDialog):
     def _on_table_changed(self, entity: str) -> None:
         combo = self.entity_combos[entity]
         check = self.entity_checks[entity]
-        if combo.currentData() is not None:
+
+        def source_available(source: str) -> bool:
+            source_combo = self.entity_combos[source]
+            return (
+                source_combo.currentData() is not None
+                or self._mapping.get(source) is not None
+            )
+
+        selected = source_available(entity)
+        if entity == "geradores":
+            selected = selected and source_available(GENERATOR_CONSUMER_ENTITY)
+        if selected:
             # Escolher a tabela à mão é a forma de reabilitar uma entidade que a
             # detecção não encontrou.
             check.setEnabled(True)
             check.setChecked(True)
+        else:
+            check.setChecked(False)
+            check.setEnabled(False)
         self._sync_ok_enabled()
 
     def _sync_ok_enabled(self, *_args: object) -> None:
@@ -267,12 +325,18 @@ class MdbImportDialog(QDialog):
 
         chosen: dict[str, str] = {}
         for entity in self.selected_entities():
-            table = self.entity_combos[entity].currentData()
-            if table is None:
-                continue
-            resolved = self._mapping.get(entity)
-            if resolved is None or resolved.table != table:
-                chosen[entity] = table
+            sources = (
+                (entity, GENERATOR_CONSUMER_ENTITY)
+                if entity == "geradores"
+                else (entity,)
+            )
+            for source in sources:
+                table = self.entity_combos[source].currentData()
+                if table is None:
+                    continue
+                resolved = self._mapping.get(source)
+                if resolved is None or resolved.table != table:
+                    chosen[source] = table
         return chosen
 
     def coordinate_scale(self) -> float:

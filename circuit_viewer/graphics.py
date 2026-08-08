@@ -46,6 +46,7 @@ from .model import (
     Bounds,
     CircuitModel,
     FeatureSelection,
+    GeneratorModel,
     LineNetworkModel,
     LoadModel,
     RegulatorModel,
@@ -67,7 +68,7 @@ except ModuleNotFoundError:  # pragma: no cover - dependência obrigatória do p
     Transformer = None  # type: ignore[assignment]
 
 
-LoadRenderModel = LoadModel | EquivalentNetworkModel
+LoadRenderModel = LoadModel | EquivalentNetworkModel | GeneratorModel
 
 
 POINT_DIAMETER_PX = 5.0
@@ -110,6 +111,14 @@ LOAD_HORIZONTAL_PITCH_PX = 15.0
 LOAD_VERTICAL_PITCH_PX = 12.0
 LOAD_OVERVIEW_DIAMETER_PX = 7.0
 LOAD_COLOR = QColor("#202020")
+GENERATOR_DIAMETER_PX = 10.0
+ATTACHED_VERTICAL_PITCH_PX = 14.0
+
+
+def _feature_ids(model: LoadRenderModel) -> tuple[str, ...]:
+    if isinstance(model, GeneratorModel):
+        return model.generator_ids
+    return model.load_ids
 
 
 def _scene_point(model: CircuitModel, index: int) -> QPointF:
@@ -164,6 +173,11 @@ def load_layout_offsets_for_models(
 ) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
     """Distribui conjuntamente modelos de cargas na mesma grade por barra."""
 
+    vertical_pitch = (
+        ATTACHED_VERTICAL_PITCH_PX
+        if any(isinstance(model, GeneratorModel) for model in models)
+        else LOAD_VERTICAL_PITCH_PX
+    )
     offsets = [
         (
             np.zeros(len(model), dtype=np.float64),
@@ -178,7 +192,8 @@ def load_layout_offsets_for_models(
     for indices in by_bar.values():
         indices.sort(
             key=lambda value: (
-                models[value[0]].load_ids[value[1]].casefold(),
+                value[0],
+                _feature_ids(models[value[0]])[value[1]].casefold(),
                 value[0],
                 value[1],
             )
@@ -193,7 +208,7 @@ def load_layout_offsets_for_models(
                     column - (row_size - 1) / 2.0
                 ) * LOAD_HORIZONTAL_PITCH_PX
                 y_offsets[index] = (
-                    LOAD_CONNECTOR_LENGTH_PX + row * LOAD_VERTICAL_PITCH_PX
+                    LOAD_CONNECTOR_LENGTH_PX + row * vertical_pitch
                 )
     result: list[tuple[np.ndarray, np.ndarray]] = []
     for x_offsets, y_offsets in offsets:
@@ -286,21 +301,37 @@ class BarsOverviewItem(QGraphicsItem):
 class LoadsOverviewItem(QGraphicsItem):
     """Marcadores agregados de cargas, desenhados sob as barras."""
 
-    def __init__(self, model: LoadRenderModel) -> None:
+    def __init__(
+        self,
+        model: LoadRenderModel,
+        *,
+        symbol_kind: str = "load",
+        x_offsets: Sequence[float] | np.ndarray | None = None,
+        y_offsets: Sequence[float] | np.ndarray | None = None,
+    ) -> None:
         super().__init__()
         self._model = model
+        self._symbol_kind = symbol_kind
         self._visibility_mask = np.ones(len(model), dtype=np.bool_)
-        self._points = QPolygonF()
+        self._indices = np.arange(len(model), dtype=np.intp)
+        self._layout_applied = False
+        self._x_offsets = np.zeros(len(model), dtype=np.float64)
+        self._y_offsets = np.full(
+            len(model), LOAD_CONNECTOR_LENGTH_PX, dtype=np.float64
+        )
         self._rebuild_points()
         bounds = model.bars.bounds
         width = max(bounds.width, 1.0)
         height = max(bounds.height, 1.0)
+        padding = max(width, height, 100.0)
         self._bounds = QRectF(bounds.left, -bounds.bottom, width, height).adjusted(
-            -LOAD_OVERVIEW_DIAMETER_PX,
-            -LOAD_OVERVIEW_DIAMETER_PX,
-            LOAD_OVERVIEW_DIAMETER_PX,
-            LOAD_OVERVIEW_DIAMETER_PX,
+            -padding,
+            -padding,
+            padding,
+            padding,
         )
+        if x_offsets is not None and y_offsets is not None:
+            self.set_layout_offsets(x_offsets, y_offsets)
         self.setZValue(-11.0)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
@@ -311,7 +342,27 @@ class LoadsOverviewItem(QGraphicsItem):
 
     @property
     def visible_point_count(self) -> int:
-        return self._points.size()
+        return int(self._indices.size)
+
+    @property
+    def layout_applied(self) -> bool:
+        return self._layout_applied
+
+    def set_layout_offsets(
+        self,
+        x_offsets: Sequence[float] | np.ndarray,
+        y_offsets: Sequence[float] | np.ndarray,
+    ) -> None:
+        x_values = np.ascontiguousarray(x_offsets, dtype=np.float64)
+        y_values = np.ascontiguousarray(y_offsets, dtype=np.float64)
+        if x_values.shape != (len(self._model),) or y_values.shape != (
+            len(self._model),
+        ):
+            raise ValueError("O layout agregado deve corresponder ao modelo.")
+        self._x_offsets = x_values
+        self._y_offsets = y_values
+        self._layout_applied = True
+        self.update()
 
     def set_visibility_mask(self, mask: BoolArray | None) -> None:
         values = _visibility_mask(mask, len(self._model), "cargas")
@@ -322,16 +373,8 @@ class LoadsOverviewItem(QGraphicsItem):
         self.update()
 
     def _rebuild_points(self) -> None:
-        indices = np.flatnonzero(self._visibility_mask)
-        bars = self._model.bars
-        self._points = QPolygonF(
-            [
-                QPointF(
-                    float(bars.x[int(self._model.bar_indices[index])]),
-                    -float(bars.y[int(self._model.bar_indices[index])]),
-                )
-                for index in indices
-            ]
+        self._indices = np.flatnonzero(self._visibility_mask).astype(
+            np.intp, copy=False
         )
 
     def boundingRect(self) -> QRectF:  # noqa: N802
@@ -340,13 +383,61 @@ class LoadsOverviewItem(QGraphicsItem):
     def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
         del option, widget
         painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        pen = QPen(LOAD_COLOR)
-        pen.setWidthF(LOAD_OVERVIEW_DIAMETER_PX)
-        pen.setCapStyle(Qt.PenCapStyle.SquareCap)
-        pen.setCosmetic(True)
-        painter.setPen(pen)
-        painter.drawPoints(self._points)
+        if not self._layout_applied:
+            points = QPolygonF()
+            bars = self._model.bars
+            for index in self._indices:
+                bar_index = int(self._model.bar_indices[int(index)])
+                points.append(
+                    QPointF(float(bars.x[bar_index]), -float(bars.y[bar_index]))
+                )
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            pen = QPen(LOAD_COLOR)
+            pen.setWidthF(LOAD_OVERVIEW_DIAMETER_PX)
+            pen.setCapStyle(
+                Qt.PenCapStyle.RoundCap
+                if self._symbol_kind == "generator"
+                else Qt.PenCapStyle.SquareCap
+            )
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.drawPoints(points)
+            painter.restore()
+            return
+        world = painter.worldTransform()
+        painter.resetTransform()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(LOAD_COLOR))
+        painter.setRenderHint(
+            QPainter.RenderHint.Antialiasing,
+            self._symbol_kind == "generator",
+        )
+        bars = self._model.bars
+        for index in self._indices:
+            bar_index = int(self._model.bar_indices[int(index)])
+            anchor = world.map(
+                QPointF(float(bars.x[bar_index]), -float(bars.y[bar_index]))
+            )
+            x = anchor.x() + float(self._x_offsets[index])
+            y = anchor.y() + float(self._y_offsets[index])
+            if self._symbol_kind == "generator":
+                painter.drawEllipse(
+                    QRectF(
+                        x - GENERATOR_DIAMETER_PX / 2.0,
+                        y,
+                        GENERATOR_DIAMETER_PX,
+                        GENERATOR_DIAMETER_PX,
+                    )
+                )
+            else:
+                painter.drawRect(
+                    QRectF(
+                        x - LOAD_WIDTH_PX / 2.0,
+                        y,
+                        LOAD_WIDTH_PX,
+                        LOAD_HEIGHT_PX,
+                    )
+                )
         painter.restore()
 
 
@@ -990,8 +1081,11 @@ class SelectionOverlayItem(QGraphicsItem):
 class LoadItem(QGraphicsObject):
     """Símbolo reciclável de uma carga, com geometria fixa em pixels."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, symbol_kind: str = "load") -> None:
         super().__init__()
+        if symbol_kind not in {"load", "generator"}:
+            raise ValueError(f"Símbolo associado desconhecido: {symbol_kind}")
+        self._symbol_kind = symbol_kind
         self.index = -1
         self._x_offset = 0.0
         self._y_offset = LOAD_CONNECTOR_LENGTH_PX
@@ -1015,7 +1109,7 @@ class LoadItem(QGraphicsObject):
         self._y_offset = float(y_offset)
         bar_index = int(model.bar_indices[self.index])
         self.setPos(_scene_point(model.bars, bar_index))
-        tooltip = model.load_ids[self.index]
+        tooltip = _feature_ids(model)[self.index]
         record = model.record(self.index)
         if getattr(record, "origin_kind", None) == "branch_aggregate":
             tooltip += " — carga equivalente de ramal"
@@ -1032,6 +1126,13 @@ class LoadItem(QGraphicsObject):
 
     @property
     def symbol_rect(self) -> QRectF:
+        if self._symbol_kind == "generator":
+            return QRectF(
+                self._x_offset - GENERATOR_DIAMETER_PX / 2.0,
+                self._y_offset,
+                GENERATOR_DIAMETER_PX,
+                GENERATOR_DIAMETER_PX,
+            )
         return _load_rect(self._x_offset, self._y_offset)
 
     def boundingRect(self) -> QRectF:  # noqa: N802
@@ -1042,7 +1143,10 @@ class LoadItem(QGraphicsObject):
 
     def shape(self):  # noqa: ANN201
         path = QPainterPath()
-        path.addRect(self.symbol_rect)
+        if self._symbol_kind == "generator":
+            path.addEllipse(self.symbol_rect)
+        else:
+            path.addRect(self.symbol_rect)
         return path
 
     def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
@@ -1059,15 +1163,19 @@ class LoadItem(QGraphicsObject):
             QPointF(self._x_offset, self._y_offset),
         )
         painter.setBrush(QBrush(SELECTED_COLOR if selected else CANVAS_BACKGROUND))
-        painter.drawRect(self.symbol_rect)
+        if self._symbol_kind == "generator":
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.drawEllipse(self.symbol_rect)
+        else:
+            painter.drawRect(self.symbol_rect)
         painter.restore()
 
 
 class LoadSelectionOverlayItem(LoadItem):
     """Mantém a carga selecionada visível fora da camada materializada."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, symbol_kind: str = "load") -> None:
+        super().__init__(symbol_kind=symbol_kind)
         self.setZValue(110.0)
         self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
@@ -1086,7 +1194,10 @@ class LoadSelectionOverlayItem(LoadItem):
             QPointF(self._x_offset, self._y_offset),
         )
         painter.setBrush(QBrush(SELECTED_COLOR))
-        painter.drawRect(self.symbol_rect)
+        if self._symbol_kind == "generator":
+            painter.drawEllipse(self.symbol_rect)
+        else:
+            painter.drawRect(self.symbol_rect)
         painter.restore()
 
 
@@ -1105,6 +1216,8 @@ class DiagramView(QGraphicsView):
         self._line_model: LineNetworkModel | None = None
         self._load_model: LoadModel | None = None
         self._load_layer: LoadVirtualizer | None = None
+        self._generator_model: GeneratorModel | None = None
+        self._generator_layer: LoadVirtualizer | None = None
         self._equivalent_load_model: EquivalentNetworkModel | None = None
         self._equivalent_load_layer: LoadVirtualizer | None = None
         self._bar_visibility_mask: BoolArray | None = None
@@ -1294,6 +1407,11 @@ class DiagramView(QGraphicsView):
         if self._load_model is not None and self._load_model.bars is not model:
             self._load_model = None
         if (
+            self._generator_model is not None
+            and self._generator_model.bars is not model
+        ):
+            self._generator_model = None
+        if (
             self._equivalent_load_model is not None
             and self._equivalent_load_model.bars is not model
         ):
@@ -1324,6 +1442,14 @@ class DiagramView(QGraphicsView):
 
     def set_load_layer(self, layer: LoadVirtualizer | None) -> None:
         self._load_layer = layer
+
+    def set_generator_model(self, model: GeneratorModel | None) -> None:
+        if model is not None and model.bars is not self._model:
+            raise ValueError("Os geradores devem referenciar as barras exibidas na view.")
+        self._generator_model = model
+
+    def set_generator_layer(self, layer: LoadVirtualizer | None) -> None:
+        self._generator_layer = layer
 
     def set_equivalent_load_model(
         self,
@@ -1617,6 +1743,7 @@ class DiagramView(QGraphicsView):
         scale = abs(self.transform().m11())
         tolerance = CLICK_TOLERANCE_PX / max(scale, 1e-12)
         load_layers = (
+            ("generator", self._generator_layer, self._generator_model),
             (
                 "equivalent_load",
                 self._equivalent_load_layer,
@@ -2374,19 +2501,23 @@ class LoadVirtualizer(QObject):
         view: DiagramView,
         *,
         max_active_items: int = MAX_ACTIVE_ITEMS,
+        symbol_kind: str = "load",
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.scene = scene
         self.view = view
         self.max_active_items = max_active_items
+        if symbol_kind not in {"load", "generator"}:
+            raise ValueError(f"Símbolo associado desconhecido: {symbol_kind}")
+        self.symbol_kind = symbol_kind
         self.model: LoadRenderModel | None = None
         self.overview_item: LoadsOverviewItem | None = None
         self._loads_visible = True
         self._visibility_mask: BoolArray | None = None
         self._x_offsets = np.empty(0, dtype=np.float64)
         self._y_offsets = np.empty(0, dtype=np.float64)
-        self.selection_overlay = LoadSelectionOverlayItem()
+        self.selection_overlay = LoadSelectionOverlayItem(symbol_kind=symbol_kind)
         self.scene.addItem(self.selection_overlay)
 
         self._active: dict[int, LoadItem] = {}
@@ -2446,7 +2577,10 @@ class LoadVirtualizer(QObject):
         self._reveal_hidden_selection = False
         self.selection_overlay.unbind()
         if model is not None:
-            self.overview_item = LoadsOverviewItem(model)
+            self.overview_item = LoadsOverviewItem(
+                model,
+                symbol_kind=self.symbol_kind,
+            )
             self.scene.addItem(self.overview_item)
             self.overview_item.setVisible(self._loads_visible)
         self._mode = "Visão geral"
@@ -2474,6 +2608,8 @@ class LoadVirtualizer(QObject):
         y_values.setflags(write=False)
         self._x_offsets = x_values
         self._y_offsets = y_values
+        if self.overview_item is not None:
+            self.overview_item.set_layout_offsets(x_values, y_values)
         for index, item in self._active.items():
             item.bind(
                 self.model,
@@ -2572,7 +2708,7 @@ class LoadVirtualizer(QObject):
             item = self._pool.pop()
             self.scene.addItem(item)
             return item
-        item = LoadItem()
+        item = LoadItem(symbol_kind=self.symbol_kind)
         self.scene.addItem(item)
         return item
 
@@ -2715,7 +2851,16 @@ class LoadVirtualizer(QObject):
                     float(position.x() - anchor.x()),
                     float(position.y() - anchor.y()),
                 )
-                if item.symbol_rect.contains(local):
+                contains = item.symbol_rect.contains(local)
+                if contains and self.symbol_kind == "generator":
+                    center = item.symbol_rect.center()
+                    radius = item.symbol_rect.width() / 2.0
+                    contains = (
+                        (local.x() - center.x()) ** 2
+                        + (local.y() - center.y()) ** 2
+                        <= radius * radius
+                    )
+                if contains:
                     center = item.symbol_rect.center()
                     distance = (local.x() - center.x()) ** 2 + (
                         local.y() - center.y()
@@ -2726,13 +2871,59 @@ class LoadVirtualizer(QObject):
             return None
         x, y = self.view.model_point_at(position)
         scale = abs(self.view.transform().m11())
-        tolerance = (LOAD_OVERVIEW_DIAMETER_PX / 2.0 + 2.0) / max(scale, 1e-12)
-        return self.model.spatial_index.nearest(
-            x,
-            y,
-            tolerance,
-            self._visibility_mask,
+        if not self.overview_item.layout_applied:
+            tolerance = (LOAD_OVERVIEW_DIAMETER_PX / 2.0 + 2.0) / max(
+                scale, 1e-12
+            )
+            return self.model.spatial_index.nearest(
+                x, y, tolerance, self._visibility_mask
+            )
+        radius = max(LOAD_WIDTH_PX, GENERATOR_DIAMETER_PX) / 2.0
+        max_offset = radius
+        if self._x_offsets.size:
+            max_offset += float(
+                np.max(
+                    np.hypot(self._x_offsets, self._y_offsets)
+                )
+            )
+        tolerance = (max_offset + 2.0) / max(scale, 1e-12)
+        candidates = self.model.spatial_index.query_rect(
+            Bounds(x - tolerance, y - tolerance, x + tolerance, y + tolerance)
         )
+        if self._visibility_mask is not None:
+            candidates = candidates[self._visibility_mask[candidates]]
+        hits: list[tuple[float, int]] = []
+        for candidate in candidates:
+            index = int(candidate)
+            bar_index = int(self.model.bar_indices[index])
+            anchor = self.view.mapFromScene(
+                _scene_point(self.model.bars, bar_index)
+            )
+            local_x = float(position.x() - anchor.x())
+            local_y = float(position.y() - anchor.y())
+            rect = (
+                QRectF(
+                    float(self._x_offsets[index]) - GENERATOR_DIAMETER_PX / 2.0,
+                    float(self._y_offsets[index]),
+                    GENERATOR_DIAMETER_PX,
+                    GENERATOR_DIAMETER_PX,
+                )
+                if self.symbol_kind == "generator"
+                else _load_rect(
+                    float(self._x_offsets[index]),
+                    float(self._y_offsets[index]),
+                )
+            )
+            if not rect.contains(QPointF(local_x, local_y)):
+                continue
+            center = rect.center()
+            distance = (local_x - center.x()) ** 2 + (local_y - center.y()) ** 2
+            if self.symbol_kind == "generator" and distance > (
+                GENERATOR_DIAMETER_PX / 2.0
+            ) ** 2:
+                continue
+            hits.append((distance, index))
+        return None if not hits else min(hits)[1]
 
     def active_indices(self) -> Iterable[int]:
         return self._active.keys()
