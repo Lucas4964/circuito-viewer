@@ -284,6 +284,23 @@ class OpenDssExportUiTests(unittest.TestCase):
         self.app.processEvents()
         return model
 
+    def test_imported_generators_without_update_require_confirmation(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        # Para esta confirmacao basta existir uma fonte importada; o resultado
+        # derivado continua ausente, que e justamente o estado exercitado.
+        window._generator_model = object()
+
+        with patch(
+            "circuit_viewer.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as question, patch.object(OpenDssExportDialog, "exec") as dialog:
+            window._export_opendss()
+
+        dialog.assert_not_called()
+        self.assertIn("Atualizar Geradores", question.call_args.args[2])
+        self.assertIsNone(window._export_thread)
+
     def test_export_includes_the_regulators_of_the_window(self) -> None:
         window = self._window()
         self._load_everything(window)

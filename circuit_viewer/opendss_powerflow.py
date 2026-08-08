@@ -39,7 +39,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
 
 from .model import (
     CableModel,
@@ -59,6 +59,9 @@ from .opendss_export import (
 )
 from .opendss_settings import OpenDssLoadSettings
 from .phase_config import PhaseConfiguration
+
+if TYPE_CHECKING:
+    from .generator_update import GeneratorUpdateModel
 
 
 ProgressCallback = Callable[[int, int], None]
@@ -216,7 +219,7 @@ class BarVoltages:
 class PowerFlowResult:
     """Resultado de uma execução, pronto para ser associado à tela.
 
-    Os seis modelos de entrada viajam no resultado para a interface poder
+    Os modelos de entrada viajam no resultado para a interface poder
     revalidá-los por identidade na chegada, como as demais análises fazem: uma
     reimportação durante a execução torna o resultado obsoleto. Os reguladores
     entram nessa lista desde que passaram a ser exportados: eles mudam a tensão
@@ -230,6 +233,9 @@ class PowerFlowResult:
     patterns: LoadPatternModel | None
     step_count: int
     regulators: RegulatorModel | None = None
+    generator_updates: GeneratorUpdateModel | None = None
+    exported_generators: int = 0
+    discarded_generators: int = 0
     segment_currents: Mapping[int, SegmentCurrents] = field(default_factory=dict)
     segment_powers: Mapping[int, SegmentPowers] = field(default_factory=dict)
     # Trecho → um retrato por patamar, cada um com um RegulatorTap por fase —
@@ -769,6 +775,7 @@ def run_power_flow(
     workspace: Path,
     loads: LoadModel | None = None,
     patterns: LoadPatternModel | None = None,
+    generator_updates: GeneratorUpdateModel | None = None,
     regulators: RegulatorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
     step_count: int = LOAD_PATTERN_COUNT,
@@ -790,6 +797,15 @@ def run_power_flow(
 
     if step_count <= 0:
         raise ValueError("O número de patamares deve ser positivo.")
+    if generator_updates is not None:
+        if generator_updates.circuits is not catalog:
+            raise ValueError(
+                "Os resultados dos geradores pertencem a outros circuitos."
+            )
+        if generator_updates.phase_configuration is not phase_configuration:
+            raise ValueError(
+                "Os resultados dos geradores usam outra configuração de fases."
+            )
 
     selected = _selected_indices(catalog, circuit_indices)
     report = _PowerFlowReport()
@@ -800,6 +816,8 @@ def run_power_flow(
     solved: list[str] = []
     skipped: list[str] = []
     unconverged: list[tuple[str, int]] = []
+    exported_generators = 0
+    discarded_generators = 0
     total = len(selected) * step_count
     completed = 0
 
@@ -814,6 +832,7 @@ def run_power_flow(
             (circuit_index,),
             loads=loads,
             patterns=patterns,
+            generator_updates=generator_updates,
             regulators=regulators,
             load_settings=load_settings,
             cancel_check=cancel_check,
@@ -831,6 +850,16 @@ def run_power_flow(
             if progress is not None:
                 progress(min(completed, total), total)
             continue
+
+        for _, generator_result in bundle.generators_by_phase_count:
+            exported_generators += generator_result.exported_count
+            discarded_generators += generator_result.discarded_count
+            for issue in generator_result.issues:
+                report.add(
+                    issue.segment_id,
+                    f"gerador não exportado: {issue.reason}",
+                )
+            report.total += generator_result.omitted_issues
 
         master_path = _write_circuit_files(
             workspace,
@@ -939,6 +968,9 @@ def run_power_flow(
         loads=loads,
         patterns=patterns,
         regulators=regulators,
+        generator_updates=generator_updates,
+        exported_generators=exported_generators,
+        discarded_generators=discarded_generators,
         step_count=step_count,
         segment_currents=segment_currents,
         segment_powers=segment_powers,

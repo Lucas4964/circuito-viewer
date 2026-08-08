@@ -1,4 +1,4 @@
-"""Importação encadeada das nove entidades lógicas a partir de um banco Access.
+"""Importação encadeada das dez entidades lógicas a partir de um banco Access.
 
 Este módulo não valida nada por conta própria: ele resolve o mapeamento, lê as
 linhas já convertidas em texto e as entrega às funções ``parse_*_rows`` dos
@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterator, Sequence
 
 from .cable_import import CableCsvResult, parse_cable_rows
 from .circuit_import import CircuitLoadResult, parse_circuit_rows
+from .circuit_level_import import CircuitLevelCsvResult, parse_circuit_level_rows
 from .csv_import import (
     DEFAULT_SCALE_SAMPLE_SIZE,
     CsvImportCancelled,
@@ -72,6 +73,7 @@ ENTITY_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "chaves": ("trechos",),
     "reguladores": ("trechos",),
     "circuitos": ("trechos",),
+    "patamares_circuitos": ("circuitos",),
 }
 
 
@@ -109,6 +111,7 @@ class MdbImportResult:
     switches: SwitchLoadResult | None = None
     regulators: RegulatorLoadResult | None = None
     circuits: CircuitLoadResult | None = None
+    circuit_levels: CircuitLevelCsvResult | None = None
     outcomes: tuple[MdbEntityOutcome, ...] = ()
     applied_scale: float = 1.0
 
@@ -146,6 +149,7 @@ class MdbImportResult:
             self.switches,
             self.regulators,
             self.circuits,
+            self.circuit_levels,
         )
         return any(item is not None and item.has_warnings for item in results)
 
@@ -221,7 +225,7 @@ class _ProgressTracker:
     """Converte o progresso por entidade num progresso único da cadeia.
 
     O total é a soma dos ``COUNT(*)`` das tabelas resolvidas, então a barra
-    percorre a importação inteira uma vez só, em vez de reiniciar nove vezes.
+    percorre a importação inteira uma vez só, em vez de reiniciar dez vezes.
     """
 
     def __init__(self, total_rows: int, progress: ProgressCallback | None) -> None:
@@ -279,7 +283,7 @@ def load_database(
     cancel_event: threading.Event | None = None,
     progress: ProgressCallback | None = None,
 ) -> MdbImportResult:
-    """Importa as nove entidades lógicas de um banco, na ordem de dependência.
+    """Importa as dez entidades lógicas de um banco, na ordem de dependência.
 
     ``entities`` restringe a importação ao que o usuário marcou no diálogo; o
     padrão é tudo o que o mapeamento resolveu.
@@ -425,6 +429,7 @@ def load_database(
         switches=results.get("chaves"),
         regulators=results.get("reguladores"),
         circuits=results.get("circuitos"),
+        circuit_levels=results.get("patamares_circuitos"),
         outcomes=tuple(outcomes),
         applied_scale=scale,
     )
@@ -506,6 +511,13 @@ def _import_entity(
             rows,
             results["trechos"].model,
             None if switches is None else switches.model,
+            **common,
+        )
+    if entity == "patamares_circuitos":
+        return parse_circuit_level_rows(
+            header,
+            rows,
+            results["circuitos"].model,
             **common,
         )
     raise CsvImportError(f"Entidade desconhecida: {entity}")  # pragma: no cover

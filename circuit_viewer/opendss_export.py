@@ -3,10 +3,11 @@
 Camada de núcleo: não importa Qt, para poder ser testada headless e executada
 em thread secundária sem cuidados de afinidade.
 
-Cinco arquivos de elementos são gerados — ``trechos.dss`` (``Line``),
-``chaves.dss`` (``Line ... Switch=Yes``) e um de cargas por contagem de fases
-(``Load`` + ``LoadShape``) — mais o par ``<CODIGO>_Master.dss`` e
-``<CODIGO>_Buscoords.csv``, que cria o circuito, chama os demais e resolve.
+Dois arquivos de rede são sempre gerados — ``trechos.dss`` (``Line``) e
+``chaves.dss`` (``Line ... Switch=Yes``). Cargas e geradores acrescentam, cada
+um, um arquivo por contagem de fases (``Load`` + ``LoadShape``). O par
+``<CODIGO>_Master.dss`` e ``<CODIGO>_Buscoords.csv`` cria o circuito, chama os
+demais arquivos existentes e resolve.
 
 Convenções de unidade adotadas, todas amarradas ao ``units=km`` emitido em cada
 linha:
@@ -18,8 +19,8 @@ linha:
   capacitor entre **fase e neutro**, então a tensão da conversão é a tensão de
   fase — e o circuito informa ``VNOM`` como tensão de **linha**.
 
-O ``kV`` das cargas é a mesma tensão de fase, pela mesma razão: a carga é ligada
-entre fase e neutro (``conn=wye``).
+O ``kV`` das cargas e dos geradores é a mesma tensão de fase, pela mesma razão:
+cada ``Load`` é ligada entre fase e neutro (``conn=wye``).
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     # opendss_settings reusa o parse_number deste módulo — de propósito, para
     # não existirem duas regras de leitura de separador decimal no projeto.
     from .opendss_settings import OpenDssLoadSettings
+    from .generator_update import GeneratorUpdateModel
 
 
 FREQUENCY_HZ = 60.0
@@ -53,6 +55,9 @@ REGULATORS_FILENAME = "reguladores.dss"
 SINGLE_PHASE_LOADS_FILENAME = "cargasmonofasicas.dss"
 TWO_PHASE_LOADS_FILENAME = "cargasbifasicas.dss"
 THREE_PHASE_LOADS_FILENAME = "cargastrifasicas.dss"
+SINGLE_PHASE_GENERATORS_FILENAME = "geradoresmonofasicos.dss"
+TWO_PHASE_GENERATORS_FILENAME = "geradoresbifasicos.dss"
+THREE_PHASE_GENERATORS_FILENAME = "geradorestrifasicos.dss"
 # O master e as coordenadas levam o código do circuito no nome, então só o
 # sufixo é constante.
 MASTER_FILENAME_SUFFIX = "_Master.dss"
@@ -71,6 +76,12 @@ _LOAD_FILES = {
     3: (THREE_PHASE_LOADS_FILENAME, "trifasicas"),
 }
 LOAD_PHASE_COUNTS = tuple(sorted(_LOAD_FILES))
+_GENERATOR_FILES = {
+    1: (SINGLE_PHASE_GENERATORS_FILENAME, "monofasicos"),
+    2: (TWO_PHASE_GENERATORS_FILENAME, "bifasicos"),
+    3: (THREE_PHASE_GENERATORS_FILENAME, "trifasicos"),
+}
+GENERATOR_PHASE_COUNTS = tuple(sorted(_GENERATOR_FILES))
 # As letras do NOME em fases2.json dizem quais colunas de patamar a carga
 # consome. "DN" (fase com neutro) usa as mesmas PD/QD de "D", e a bifásica "DE"
 # usa PD/QD em uma fase e PE/QE na outra.
@@ -212,6 +223,23 @@ class OpenDssLoadExportResult:
 
 
 @dataclass(frozen=True, slots=True)
+class OpenDssGeneratorExportResult:
+    """Resultado de um arquivo de geradores agrupado por número de fases."""
+
+    text: str
+    exported_count: int
+    skipped_other_phase_count: int
+    discarded_count: int
+    issues: tuple[OpenDssExportIssue, ...]
+    omitted_issues: int
+    used_names: frozenset[str] = frozenset()
+
+    @property
+    def has_warnings(self) -> bool:
+        return self.discarded_count > 0 or bool(self.issues)
+
+
+@dataclass(frozen=True, slots=True)
 class OpenDssMasterExportResult:
     """Arquivo principal e as coordenadas de barra que ele referencia.
 
@@ -253,6 +281,9 @@ class OpenDssExportBundle:
     single_phase_loads: OpenDssLoadExportResult | None = None
     two_phase_loads: OpenDssLoadExportResult | None = None
     three_phase_loads: OpenDssLoadExportResult | None = None
+    single_phase_generators: OpenDssGeneratorExportResult | None = None
+    two_phase_generators: OpenDssGeneratorExportResult | None = None
+    three_phase_generators: OpenDssGeneratorExportResult | None = None
     master: OpenDssMasterExportResult | None = None
 
     @property
@@ -276,6 +307,24 @@ class OpenDssExportBundle:
         return tuple(result for _, result in self.loads_by_phase_count)
 
     @property
+    def generators_by_phase_count(
+        self,
+    ) -> tuple[tuple[int, OpenDssGeneratorExportResult], ...]:
+        return tuple(
+            (count, result)
+            for count, result in (
+                (1, self.single_phase_generators),
+                (2, self.two_phase_generators),
+                (3, self.three_phase_generators),
+            )
+            if result is not None
+        )
+
+    @property
+    def _generator_results(self) -> tuple[OpenDssGeneratorExportResult, ...]:
+        return tuple(result for _, result in self.generators_by_phase_count)
+
+    @property
     def element_files(self) -> tuple[tuple[str, str], ...]:
         """Arquivos de elementos, na ordem em que o master os chama.
 
@@ -295,6 +344,10 @@ class OpenDssExportBundle:
             *(
                 (_LOAD_FILES[count][0], result.text)
                 for count, result in self.loads_by_phase_count
+            ),
+            *(
+                (_GENERATOR_FILES[count][0], result.text)
+                for count, result in self.generators_by_phase_count
             ),
         )
 
@@ -316,6 +369,11 @@ class OpenDssExportBundle:
             *self.switches.issues,
             *(() if self.regulators is None else self.regulators.issues),
             *(issue for result in self._load_results for issue in result.issues),
+            *(
+                issue
+                for result in self._generator_results
+                for issue in result.issues
+            ),
             *(() if self.master is None else self.master.issues),
         )
 
@@ -324,6 +382,7 @@ class OpenDssExportBundle:
         total = self.lines.omitted_issues + self.switches.omitted_issues
         total += 0 if self.regulators is None else self.regulators.omitted_issues
         total += sum(result.omitted_issues for result in self._load_results)
+        total += sum(result.omitted_issues for result in self._generator_results)
         return total + (0 if self.master is None else self.master.omitted_issues)
 
     @property
@@ -331,6 +390,7 @@ class OpenDssExportBundle:
         total = self.lines.discarded_count + self.switches.discarded_count
         total += 0 if self.regulators is None else self.regulators.discarded_count
         total += sum(result.discarded_count for result in self._load_results)
+        total += sum(result.discarded_count for result in self._generator_results)
         return total + (
             0 if self.master is None else self.master.discarded_count
         )
@@ -342,6 +402,7 @@ class OpenDssExportBundle:
             or self.switches.has_warnings
             or (self.regulators is not None and self.regulators.has_warnings)
             or any(result.has_warnings for result in self._load_results)
+            or any(result.has_warnings for result in self._generator_results)
             or (self.master is not None and self.master.has_warnings)
         )
 
@@ -1497,6 +1558,212 @@ def build_load_export(
         used_names=frozenset(used_names),
     )
 
+
+def build_generator_export(
+    catalog: CircuitCatalogModel,
+    updates: GeneratorUpdateModel,
+    circuit_indices: Sequence[int] | Iterable[int],
+    *,
+    phase_count: int,
+    reserved_names: frozenset[str] = frozenset(),
+    cancel_check: Callable[[], bool] | None = None,
+    progress: ProgressCallback | None = None,
+) -> OpenDssGeneratorExportResult:
+    """Gera geradores como ``Load`` monofásicas com potência ativa negativa.
+
+    O resultado de ``Atualizar Geradores`` já contém as quatro potências de
+    cada fase com a convenção consumo positivo/geração negativa. O exportador
+    apenas as transporta ao ``LoadShape``; inverter novamente faria o gerador
+    voltar a se comportar como carga.
+    """
+
+    if phase_count not in _GENERATOR_FILES:
+        raise ValueError(f"Contagem de fases sem arquivo: {phase_count}")
+    if updates.circuits is not catalog:
+        raise ValueError("Os resultados dos geradores pertencem a outros circuitos.")
+
+    selected = frozenset(_selected_indices(catalog, circuit_indices))
+    generators = updates.generators
+    configuration = updates.phase_configuration
+    entries_by_value = _entries_by_value(configuration)
+    terminals = _terminals_by_phase_letter(configuration)
+    report = _ExportReport()
+    bus_name = bus_namer(catalog)
+    total = len(generators)
+    processed = 0
+    shapes: list[str] = []
+    entries: list[str] = []
+    used_names: dict[str, str] = {}
+    exported = 0
+    skipped_other_phase = 0
+
+    for generator_index in range(total):
+        if cancel_check is not None and processed % 4_096 == 0 and cancel_check():
+            raise InterruptedError("Exportação cancelada.")
+        processed += 1
+        if progress is not None and processed % 1_000 == 0:
+            progress(processed, total)
+
+        circuit_index = updates.circuit_indices[generator_index]
+        powers = updates.phase_power_records_for_generator(generator_index)
+        # Geradores omitidos durante a atualização não são candidatos à
+        # exportação. O relatório da atualização já contém a causa original.
+        if circuit_index is None or not powers or circuit_index not in selected:
+            continue
+
+        record = generators.record(generator_index)
+        raw_phases = record.phases
+        entry = entries_by_value.get(raw_phases.strip().casefold())
+        if entry is None:
+            report.add(
+                record.generator_id,
+                f"FASES2 '{raw_phases.strip() or '<vazio>'}' sem relação "
+                "em fases2.json",
+            )
+            continue
+        if entry.phase_count != phase_count:
+            skipped_other_phase += 1
+            continue
+
+        letters = _phase_letters(entry.name, phase_count)
+        if letters is None:
+            report.add(
+                record.generator_id,
+                f"FASES2 '{entry.fases2}' com NOME "
+                f"'{(entry.name or '').strip() or '<vazio>'}' não resolve "
+                f"{phase_count} fase(s) distinta(s) entre D, E e F",
+            )
+            continue
+        nodes, node_error = _phase_nodes(entry, letters, terminals)
+        if node_error is not None:
+            report.add(record.generator_id, node_error)
+            continue
+
+        definition = catalog.definition(circuit_index)
+        nominal_voltage = parse_number(definition.nominal_voltage)
+        if nominal_voltage is None or nominal_voltage <= 0.0:
+            report.add(
+                record.generator_id,
+                f"circuito {definition.circuit_id} sem VNOM numérica positiva",
+            )
+            continue
+
+        base_value = sanitize_dss_name(record.generator_code)
+        if not base_value:
+            base_value = sanitize_dss_name(record.generator_id)
+            report.add(
+                record.generator_id,
+                "CODIGO vazio ou sem caracteres válidos; o nome do gerador "
+                "usou o GERADOR_ID",
+                discarded=False,
+            )
+        if not base_value:
+            report.add(
+                record.generator_id,
+                "GERADOR_ID não contém caracteres válidos para um nome OpenDSS",
+            )
+            continue
+        base_name = f"GER-{base_value}"
+        phase_names = [
+            f"{base_name}-{phase_count}F-{letter}" for letter in letters
+        ]
+        taken = next(
+            (
+                name
+                for name in phase_names
+                if name in reserved_names or name in used_names
+            ),
+            None,
+        )
+        if taken is not None:
+            owner_note = (
+                f"pelo gerador {used_names[taken]}"
+                if taken in used_names
+                else "por uma carga ou gerador de outro arquivo"
+            )
+            report.add(
+                record.generator_id,
+                f"nome '{taken}' já usado {owner_note}; o gerador inteiro foi "
+                "descartado",
+            )
+            continue
+
+        series: list[tuple[list[float], list[float]]] = []
+        for letter in letters:
+            active_column, reactive_column = _PATTERN_COLUMNS_BY_PHASE[letter]
+            series.append(
+                (
+                    [float(getattr(item, active_column)) for item in powers],
+                    [float(getattr(item, reactive_column)) for item in powers],
+                )
+            )
+
+        bus = bus_name(int(generators.bar_indices[generator_index]))
+        voltage = _format(phase_voltage_kv(nominal_voltage))
+        for name, node, (active, reactive) in zip(
+            phase_names, nodes, series, strict=True
+        ):
+            shape_name = f"{LOAD_SHAPE_PREFIX}{name}"
+            shapes.append(
+                f"New LoadShape.{shape_name}"
+                f" npts={LOAD_PATTERN_COUNT}"
+                " interval=1"
+                f" mult=[{' '.join(_format_pattern(value) for value in active)}]"
+                f" qmult=[{' '.join(_format_pattern(value) for value in reactive)}]"
+            )
+            entries.append(
+                f"New Load.{name}"
+                " phases=1"
+                f" bus1={bus}.{node}"
+                " conn=wye"
+                f" kV={voltage}"
+                " model=1 kW=1 kvar=1"
+                f" daily={shape_name}"
+                f" class={-phase_count}"
+            )
+            used_names[name] = record.generator_id
+        exported += 1
+
+    if cancel_check is not None and cancel_check():
+        raise InterruptedError("Exportação cancelada.")
+    if progress is not None:
+        progress(total, total)
+
+    label = _GENERATOR_FILES[phase_count][1]
+    header = (
+        f"! Geradores {label} exportados pelo Visualizador de Circuitos Eletricos",
+        *(
+            (
+                f"! Cada gerador vira {phase_count} Load monofasicas, uma por "
+                "fase, para preservar o desequilibrio",
+            )
+            if phase_count > 1
+            else ()
+        ),
+        "! Potencia ativa negativa representa geracao; qmult permanece zerado",
+        "! kW=1 e kvar=1 sao fixos: a potencia de cada patamar vem do LoadShape",
+        "! kV e a tensao de fase do circuito (VNOM de linha dividida por raiz de 3)",
+        "! Circuitos: "
+        + ", ".join(
+            sanitize_dss_name(catalog.definition(index).circuit_id)
+            for index in sorted(selected)
+        ),
+        "",
+    )
+    body = (*shapes, *(("",) if shapes and entries else ()), *entries)
+    text = "\n".join((*header, *body))
+    if body:
+        text += "\n"
+    return OpenDssGeneratorExportResult(
+        text=text,
+        exported_count=exported,
+        skipped_other_phase_count=skipped_other_phase,
+        discarded_count=report.discarded,
+        issues=tuple(report.issues),
+        omitted_issues=report.omitted,
+        used_names=frozenset(used_names),
+    )
+
 def _master_base_name(definition) -> str:  # noqa: ANN001
     """Nome do circuito no OpenDSS, com o CIRC_ID de reserva."""
 
@@ -1688,6 +1955,7 @@ def build_export(
     *,
     loads: LoadModel | None = None,
     patterns: LoadPatternModel | None = None,
+    generator_updates: GeneratorUpdateModel | None = None,
     regulators: RegulatorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
     cancel_check: Callable[[], bool] | None = None,
@@ -1696,7 +1964,7 @@ def build_export(
     """Monta todos os arquivos de uma exportação.
 
     Arquivos que compartilham namespace no OpenDSS reservam nomes entre si:
-    trechos e chaves em ``Line.*``, e os três arquivos de carga em ``Load.*``.
+    trechos e chaves em ``Line.*``; cargas e geradores em ``Load.*``.
     Sem a reserva, a segunda definição sobrescreveria a primeira em silêncio.
     Entre os arquivos de carga o infixo ``-1F-``/``-2F-``/``-3F-`` já torna a
     coincidência impossível na prática; a reserva permanece porque essa
@@ -1707,10 +1975,15 @@ def build_export(
     os três, mesmo que algum fique só com o cabeçalho — assim a lista de
     arquivos gerados não depende do conteúdo do CSV.
 
-    ``load_settings`` só chega ao master quando há arquivo de carga a editar. A
+    Os arquivos de geradores só saem com um resultado vigente de sua
+    atualização. Quando saem, também saem os três e usam diretamente a potência
+    por fase já sinalizada no resultado.
+
+    ``load_settings`` só chega ao master quando há algum ``Load`` a editar. A
     DLL trata ``BatchEdit`` sem alvo como no-op (``Elements edited: 0``), mas um
-    comando que edita zero objetos num arquivo sem cargas só confundiria quem o
-    lesse. A divisão de responsabilidade é essa: ``build_master_export`` emite o
+    comando que edita zero objetos num arquivo sem cargas ou geradores só
+    confundiria quem o lesse. A divisão de responsabilidade é essa:
+    ``build_master_export`` emite o
     que recebe, e é aqui que se decide se faz sentido.
 
     Os reguladores são construídos **antes** dos trechos porque cada regulador
@@ -1772,6 +2045,36 @@ def build_export(
             )
             reserved |= result.used_names
             load_results[count] = result
+    generator_results: dict[int, OpenDssGeneratorExportResult] = {}
+    if generator_updates is not None:
+        if generator_updates.circuits is not catalog:
+            raise ValueError(
+                "Os resultados dos geradores pertencem a outros circuitos."
+            )
+        if generator_updates.phase_configuration is not phase_configuration:
+            raise ValueError(
+                "Os resultados dos geradores usam outra configuração de fases."
+            )
+        # ``Load.*`` é um namespace único no OpenDSS. As cargas têm prioridade
+        # por compatibilidade, e cada arquivo de gerador reserva os nomes para
+        # os seguintes.
+        reserved = frozenset(
+            name
+            for result in load_results.values()
+            for name in result.used_names
+        )
+        for count in GENERATOR_PHASE_COUNTS:
+            result = build_generator_export(
+                catalog,
+                generator_updates,
+                selected,
+                phase_count=count,
+                reserved_names=reserved,
+                cancel_check=cancel_check,
+                progress=progress,
+            )
+            reserved |= result.used_names
+            generator_results[count] = result
     bundle = OpenDssExportBundle(
         lines=line_result,
         switches=switch_result,
@@ -1779,6 +2082,9 @@ def build_export(
         single_phase_loads=load_results.get(1),
         two_phase_loads=load_results.get(2),
         three_phase_loads=load_results.get(3),
+        single_phase_generators=generator_results.get(1),
+        two_phase_generators=generator_results.get(2),
+        three_phase_generators=generator_results.get(3),
     )
     # O master vem por último: ele chama os arquivos de elementos e por isso
     # precisa saber quais existem.
@@ -1786,7 +2092,9 @@ def build_export(
         catalog,
         selected,
         redirects=[name for name, _ in bundle.element_files],
-        load_settings=load_settings if load_results else None,
+        load_settings=(
+            load_settings if load_results or generator_results else None
+        ),
     )
     return OpenDssExportBundle(
         lines=line_result,
@@ -1795,5 +2103,8 @@ def build_export(
         single_phase_loads=load_results.get(1),
         two_phase_loads=load_results.get(2),
         three_phase_loads=load_results.get(3),
+        single_phase_generators=generator_results.get(1),
+        two_phase_generators=generator_results.get(2),
+        three_phase_generators=generator_results.get(3),
         master=master_result,
     )

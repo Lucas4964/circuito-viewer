@@ -76,5 +76,13 @@
     "entidade": "circuitos",
     "tabelas": ["CIRCUITO"],
     "colunas": {"CIRC_ID": [], "BARRA_ID": [], "CODIGO": [], "VNOM": []}
+  },
+  {
+    "entidade": "patamares_circuitos",
+    "tabelas": ["CIRCUITO_PATAMARES"],
+    "colunas": {
+      "CIRC_ID": [], "NPAT": [], "NOME": [], "HORARIO_INI": [],
+      "HORARIO_FIM": [], "HORARIO_REF": []
+    }
   }
 ]

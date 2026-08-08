@@ -35,6 +35,12 @@ from PyQt6.QtWidgets import (
 
 from .branch_analysis import BranchAnalysisResult, BranchRecord
 from .branch_window import BranchesWindow, BranchTableModel
+from .calculation_levels import CalculationLevelSchedule
+from .calculation_levels_store import load_calculation_levels
+from .circuit_calculation_levels import (
+    CircuitCalculationLevelsController,
+    CircuitCalculationLevelsModel,
+)
 from .cable_import import CableCsvResult
 from .cables_window import (
     CablesWindow,
@@ -44,15 +50,26 @@ from .cables_window import (
 )
 from .equivalent_network import EquivalentNetworkResult
 from .circuit_import import CircuitLoadResult
+from .circuit_level_import import CircuitLevelCsvResult
 from .circuits_window import CircuitTableModel, CircuitsWindow
 from .csv_import import (
     COORDINATE_UNITS,
     CsvLoadResult,
     detect_coordinate_scale,
 )
-from .curvas import CurveCatalog
+from .curvas import Curve, CurveCatalog
 from .curvas_store import load_curves
 from .curvas_window import CurvesWindow
+from .generator_update import (
+    GeneratorScheduleMode,
+    GeneratorUpdateModel,
+    GeneratorUpdateResult,
+)
+from .generator_update_dialog import UpdateGeneratorsDialog
+from .generator_update_table import (
+    GeneratorDemandTableModel,
+    GeneratorPhasePowerTableModel,
+)
 from .graphics import (
     BranchHighlightOverlayItem,
     DiagramView,
@@ -108,9 +125,12 @@ from .model import (
 from .opendss_export import (
     LINES_FILENAME,
     REGULATORS_FILENAME,
+    SINGLE_PHASE_GENERATORS_FILENAME,
     SINGLE_PHASE_LOADS_FILENAME,
     SWITCHES_FILENAME,
     THREE_PHASE_LOADS_FILENAME,
+    THREE_PHASE_GENERATORS_FILENAME,
+    TWO_PHASE_GENERATORS_FILENAME,
     TWO_PHASE_LOADS_FILENAME,
     OpenDssExportBundle,
     master_filenames,
@@ -135,6 +155,7 @@ from .opendss_settings_dialog import (
     save_opendss_settings,
 )
 from .overlap_report import CircuitOverlapReportWindow, OverlapReportTableModel
+from .patamares_window import PatamaresWindow
 from .power_flow_table import PowerFlowTableModel
 from .phase_config import (
     PHASE_COLORS,
@@ -162,8 +183,10 @@ from .workers import (
     BranchAnalysisWorker,
     CableImportWorker,
     CircuitImportWorker,
+    CircuitLevelImportWorker,
     CsvImportWorker,
     GeneratorImportWorker,
+    GeneratorUpdateWorker,
     LoadImportWorker,
     LoadPatternImportWorker,
     MdbImportWorker,
@@ -182,6 +205,11 @@ _LOAD_EXPORT_FILES: tuple[tuple[int, str, str], ...] = (
     (1, SINGLE_PHASE_LOADS_FILENAME, "monofásicas"),
     (2, TWO_PHASE_LOADS_FILENAME, "bifásicas"),
     (3, THREE_PHASE_LOADS_FILENAME, "trifásicas"),
+)
+_GENERATOR_EXPORT_FILES: tuple[tuple[int, str, str], ...] = (
+    (1, SINGLE_PHASE_GENERATORS_FILENAME, "monofásicos"),
+    (2, TWO_PHASE_GENERATORS_FILENAME, "bifásicos"),
+    (3, THREE_PHASE_GENERATORS_FILENAME, "trifásicos"),
 )
 
 # Grandezas do fluxo de potência oferecidas em cada página de detalhes, como
@@ -306,6 +334,7 @@ class ImportChoiceDialog(QDialog):
         parent=None,  # noqa: ANN001
         *,
         has_loads: bool = False,
+        has_circuits: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Importar dados")
@@ -378,6 +407,18 @@ class ImportChoiceDialog(QDialog):
         self.circuits_button.setEnabled(has_bars and has_segments)
         self.circuits_button.clicked.connect(lambda: self._select("circuits"))
         layout.addWidget(self.circuits_button)
+
+        self.circuit_levels_button = QPushButton(
+            "Importar patamares de circuitos…"
+        )
+        self.circuit_levels_button.setToolTip(
+            "Carregar CIRCUITO_PATAMARES para os circuitos importados"
+        )
+        self.circuit_levels_button.setEnabled(has_circuits)
+        self.circuit_levels_button.clicked.connect(
+            lambda: self._select("circuit_levels")
+        )
+        layout.addWidget(self.circuit_levels_button)
 
         # O catálogo de cabos é uma raiz independente: não depende de barras nem
         # de trechos, então o botão nunca fica desabilitado.
@@ -518,6 +559,7 @@ class MainWindow(QMainWindow):
         phase_configuration_path: str | Path | None = None,
         settings: QSettings | None = None,
         curves_path: str | Path | None = None,
+        patamares_path: str | Path | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Visualizador de Circuitos Elétricos")
@@ -537,12 +579,17 @@ class MainWindow(QMainWindow):
         self._load_model: LoadModel | None = None
         self._load_pattern_model: LoadPatternModel | None = None
         self._generator_model: GeneratorModel | None = None
+        self._generator_update_result: GeneratorUpdateResult | None = None
         self._switch_model: SwitchModel | None = None
         self._switch_item: SwitchNetworkItem | None = None
         self._regulator_model: RegulatorModel | None = None
         self._regulator_item: RegulatorNetworkItem | None = None
         self._cable_model: CableModel | None = None
         self._circuit_catalog: CircuitCatalogModel | None = None
+        self._circuit_level_model: CircuitCalculationLevelsModel | None = None
+        self._circuit_level_controller: (
+            CircuitCalculationLevelsController | None
+        ) = None
         self._circuit_visibility: CircuitVisibilityController | None = None
         self._branch_analysis_result: BranchAnalysisResult | None = None
         self._equivalent_network_result: EquivalentNetworkResult | None = None
@@ -591,6 +638,7 @@ class MainWindow(QMainWindow):
             | SwitchImportWorker
             | RegulatorImportWorker
             | CircuitImportWorker
+            | CircuitLevelImportWorker
             | MdbImportWorker
             | None
         ) = None
@@ -620,6 +668,10 @@ class MainWindow(QMainWindow):
         self._power_flow_snapshot: tuple[object, ...] | None = None
         self._power_flow_result: PowerFlowResult | None = None
         self._close_after_power_flow = False
+        self._generator_update_thread: QThread | None = None
+        self._generator_update_worker: GeneratorUpdateWorker | None = None
+        self._generator_update_progress_dialog: QProgressDialog | None = None
+        self._close_after_generator_update = False
         # Grandezas do elemento selecionado, guardadas para o combobox poder
         # trocar a leitura sem reconsultar o resultado.
         self._segment_power_flow_currents = None
@@ -684,6 +736,7 @@ class MainWindow(QMainWindow):
         # com a janela e sobrevivem a qualquer importação.
         self._curves_path = curves_path
         self._curves_load = load_curves(curves_path)
+        self._saved_curves: tuple[Curve, ...] = self._curves_load.curves
         self.curve_catalog = CurveCatalog.from_curves(self._curves_load.curves)
         self.curves_window = CurvesWindow(
             self.curve_catalog,
@@ -691,6 +744,25 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.curves_window.curvesSaved.connect(self._on_curves_saved)
+        # A grade de horários é configuração global e independente dos
+        # patamares de potência importados para cada carga.
+        self._patamares_path = patamares_path
+        self._calculation_levels_load = load_calculation_levels(patamares_path)
+        self.calculation_level_schedule = self._calculation_levels_load.schedule
+        self.patamares_window = PatamaresWindow(
+            self.calculation_level_schedule,
+            storage_path=patamares_path,
+            parent=self,
+        )
+        self.patamares_window.scheduleSaved.connect(
+            self._on_calculation_levels_saved
+        )
+        self.patamares_window.scheduleReloaded.connect(
+            self._on_calculation_levels_reloaded
+        )
+        self.patamares_window.circuitScheduleSaved.connect(
+            self._on_circuit_calculation_levels_saved
+        )
         self._circuit_visibility_timer = QTimer(self)
         self._circuit_visibility_timer.setSingleShot(True)
         self._circuit_visibility_timer.setInterval(50)
@@ -711,6 +783,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._show_phase_configuration_error)
         if self._curves_load.issue is not None:
             QTimer.singleShot(0, self._show_curves_load_warning)
+        if self._calculation_levels_load.issue is not None:
+            QTimer.singleShot(0, self._show_calculation_levels_load_warning)
 
     def _create_actions(self) -> None:
         self.import_action = QAction("Importar CSV…", self)
@@ -875,6 +949,20 @@ class MainWindow(QMainWindow):
         )
         self.curves_action.triggered.connect(self._show_curves_window)
 
+        self.patamares_action = QAction("Patamares…", self)
+        self.patamares_action.setToolTip(
+            "Definir os períodos horários dos quatro patamares de cálculo"
+        )
+        self.patamares_action.triggered.connect(self._show_patamares_window)
+
+        self.update_generators_action = QAction("Atualizar Geradores…", self)
+        self.update_generators_action.setEnabled(False)
+        self.update_generators_action.setToolTip(
+            "Calcular as demandas dos geradores usando uma curva e os "
+            "patamares efetivos dos circuitos"
+        )
+        self.update_generators_action.triggered.connect(self._update_generators)
+
         self.power_flow_action = QAction("Executar Fluxo de Potência", self)
         self.power_flow_action.setEnabled(False)
         self.power_flow_action.setToolTip(
@@ -957,12 +1045,14 @@ class MainWindow(QMainWindow):
         self.tools_menu = self.menuBar().addMenu("Ferramentas")
         self.tools_menu.addAction(self.branches_action)
         self.tools_menu.addSeparator()
+        self.tools_menu.addAction(self.update_generators_action)
         self.tools_menu.addAction(self.power_flow_action)
 
         # Menu próprio: é estado global da aplicação, e não um passo de uma
         # exportação ou de uma execução.
         self.settings_menu = self.menuBar().addMenu("Configurações")
         self.settings_menu.addAction(self.opendss_settings_action)
+        self.settings_menu.addAction(self.patamares_action)
         self.settings_menu.addAction(self.curves_action)
 
         toolbar = QToolBar("Ferramentas principais", self)
@@ -1292,6 +1382,66 @@ class MainWindow(QMainWindow):
             _,
         ) = create_table(generator_consumer_fields, self.generator_details_body)
         generator_layout.addWidget(self.generator_consumer_details_table)
+
+        def configure_generator_result_table(table: QTableView) -> None:
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            table.setSelectionBehavior(
+                QAbstractItemView.SelectionBehavior.SelectItems
+            )
+            table.setSelectionMode(
+                QAbstractItemView.SelectionMode.ExtendedSelection
+            )
+            table.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+            table.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            table.verticalHeader().hide()
+            table.verticalHeader().setDefaultSectionSize(28)
+            enable_interactive_columns(table, always_refit=True)
+            table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
+            table.setFixedHeight(table_height)
+
+        self.generator_demand_section = QWidget(self.generator_details_body)
+        generator_demand_layout = QVBoxLayout(self.generator_demand_section)
+        generator_demand_layout.setContentsMargins(0, 0, 0, 0)
+        generator_demand_layout.addWidget(QLabel("Demanda por Patamar"))
+        self.generator_demand_table_model = GeneratorDemandTableModel(self)
+        self.generator_demand_table = QTableView(self.generator_demand_section)
+        self.generator_demand_table.setObjectName("generator_demand_table")
+        self.generator_demand_table.setModel(self.generator_demand_table_model)
+        configure_generator_result_table(self.generator_demand_table)
+        generator_demand_layout.addWidget(self.generator_demand_table)
+        self.generator_demand_section.setVisible(False)
+        generator_layout.addWidget(self.generator_demand_section)
+
+        self.generator_phase_power_section = QWidget(self.generator_details_body)
+        generator_phase_layout = QVBoxLayout(self.generator_phase_power_section)
+        generator_phase_layout.setContentsMargins(0, 0, 0, 0)
+        generator_phase_layout.addWidget(QLabel("Potência por Fase"))
+        self.generator_phase_power_table_model = GeneratorPhasePowerTableModel(
+            self
+        )
+        self.generator_phase_power_table = QTableView(
+            self.generator_phase_power_section
+        )
+        self.generator_phase_power_table.setObjectName(
+            "generator_phase_power_table"
+        )
+        self.generator_phase_power_table.setModel(
+            self.generator_phase_power_table_model
+        )
+        configure_generator_result_table(self.generator_phase_power_table)
+        generator_phase_layout.addWidget(self.generator_phase_power_table)
+        self.generator_phase_power_section.setVisible(False)
+        generator_layout.addWidget(self.generator_phase_power_section)
+
+        self.generator_update_note = QLabel(self.generator_details_body)
+        self.generator_update_note.setObjectName("generator_update_note")
+        self.generator_update_note.setWordWrap(True)
+        self.generator_update_note.setVisible(False)
+        generator_layout.addWidget(self.generator_update_note)
         generator_layout.addStretch(1)
         self.generator_details_page.setWidget(self.generator_details_body)
         self.details_stack.addWidget(self.generator_details_page)
@@ -1577,17 +1727,14 @@ class MainWindow(QMainWindow):
         self.cables_window.importRequested.connect(self._choose_cables_csv)
 
     def _choose_import(self) -> None:
-        if (
-            self._import_thread is not None
-            or self._branch_thread is not None
-            or self._equivalent_thread is not None
-        ):
+        if self._busy():
             return
         dialog = ImportChoiceDialog(
             self._model is not None,
             self._line_model is not None,
             self,
             has_loads=self._load_model is not None,
+            has_circuits=self._circuit_catalog is not None,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1607,6 +1754,8 @@ class MainWindow(QMainWindow):
             self._choose_regulators_csv()
         elif dialog.selected_kind == "circuits":
             self._choose_circuits_csv()
+        elif dialog.selected_kind == "circuit_levels":
+            self._choose_circuit_levels_csv()
         elif dialog.selected_kind == "cables":
             self._choose_cables_csv()
 
@@ -1638,6 +1787,8 @@ class MainWindow(QMainWindow):
         )
         if crs_dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        if not self.patamares_window.confirm_pending_changes():
+            return
         self._start_import(path, crs_dialog.crs(), crs_dialog.coordinate_scale())
 
     def _choose_segments_csv(self) -> None:
@@ -1654,7 +1805,7 @@ class MainWindow(QMainWindow):
             "",
             "Arquivos CSV (*.csv);;Todos os arquivos (*)",
         )
-        if path:
+        if path and self.patamares_window.confirm_pending_changes():
             self._start_segment_import(path)
 
     def _choose_switches_csv(self) -> None:
@@ -1671,7 +1822,7 @@ class MainWindow(QMainWindow):
             "",
             "Arquivos CSV (*.csv);;Todos os arquivos (*)",
         )
-        if path:
+        if path and self.patamares_window.confirm_pending_changes():
             self._start_switch_import(path)
 
     def _choose_regulators_csv(self) -> None:
@@ -1770,7 +1921,21 @@ class MainWindow(QMainWindow):
             "Arquivos CSV (*.csv);;Todos os arquivos (*)",
         )
         if path:
+            if not self.patamares_window.confirm_pending_changes():
+                return
             self._start_circuit_import(path)
+
+    def _choose_circuit_levels_csv(self) -> None:
+        if self._busy() or self._circuit_catalog is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importar patamares dos circuitos",
+            "",
+            "Arquivos CSV (*.csv);;Todos os arquivos (*)",
+        )
+        if path and self.patamares_window.confirm_pending_changes():
+            self._start_circuit_level_import(path)
 
     def _busy(self) -> bool:
         """``True`` quando alguma operação pesada já ocupa um dos slots."""
@@ -1780,6 +1945,7 @@ class MainWindow(QMainWindow):
             or self._branch_thread is not None
             or self._equivalent_thread is not None
             or self._power_flow_thread is not None
+            or self._generator_update_thread is not None
         )
 
     def _open_mdb(self, path: str):  # noqa: ANN201
@@ -1865,6 +2031,10 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         selection = dialog.selection()
+        # Toda importação MDB substitui as barras e, por consequência, o
+        # catálogo de circuitos e suas agendas de sessão atuais.
+        if not self.patamares_window.confirm_pending_changes():
+            return
         self._start_mdb_import(path, selection, password)
 
     def _start_mdb_import(self, path: str, selection, password) -> None:  # noqa: ANN001
@@ -1894,6 +2064,7 @@ class MainWindow(QMainWindow):
         self.import_action.setEnabled(False)
         self.mdb_import_action.setEnabled(False)
         self.branches_action.setEnabled(False)
+        self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_import_progress)
@@ -1910,7 +2081,7 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_mdb_import_finished(self, result: MdbImportResult) -> None:
-        """Instala os nove modelos pelos setters existentes, na mesma ordem.
+        """Instala os dez modelos pelos setters existentes, na mesma ordem.
 
         Não há cascata nova aqui: reusar ``_set_*_model`` é o que mantém as
         invalidações exatamente como estão documentadas na seção 6 da
@@ -1953,6 +2124,8 @@ class MainWindow(QMainWindow):
             self._set_regulator_model(result.regulators.model)
         if result.circuits is not None:
             self._set_circuit_catalog(result.circuits.model)
+        if result.circuit_levels is not None:
+            self._set_circuit_level_model(result.circuit_levels.model)
 
         self._sync_search_availability()
         self._sync_export_availability()
@@ -1997,6 +2170,7 @@ class MainWindow(QMainWindow):
         self._progress_entity = "barras"
         self.import_action.setEnabled(False)
         self.branches_action.setEnabled(False)
+        self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_import_progress)
@@ -2033,6 +2207,7 @@ class MainWindow(QMainWindow):
         self._progress_entity = "trechos"
         self.import_action.setEnabled(False)
         self.branches_action.setEnabled(False)
+        self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_import_progress)
@@ -2069,6 +2244,7 @@ class MainWindow(QMainWindow):
         self._progress_entity = "chaves"
         self.import_action.setEnabled(False)
         self.branches_action.setEnabled(False)
+        self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_import_progress)
@@ -2309,6 +2485,7 @@ class MainWindow(QMainWindow):
         self._progress_entity = "circuitos"
         self.import_action.setEnabled(False)
         self.branches_action.setEnabled(False)
+        self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_import_progress)
@@ -2319,6 +2496,45 @@ class MainWindow(QMainWindow):
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_import_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _start_circuit_level_import(self, path: str) -> None:
+        if self._circuit_catalog is None:
+            return
+        thread = QThread(self)
+        worker = CircuitLevelImportWorker(path, self._circuit_catalog)
+        worker.moveToThread(thread)
+
+        progress = QProgressDialog(
+            "Lendo patamares dos circuitos…", "Cancelar", 0, 100, self
+        )
+        progress.setWindowTitle("Importando patamares dos circuitos")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._import_thread = thread
+        self._import_worker = worker
+        self._progress_dialog = progress
+        self._progress_entity = "patamares dos circuitos"
+        self.import_action.setEnabled(False)
+        self.branches_action.setEnabled(False)
+        self.patamares_window.setEnabled(False)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_import_progress)
+        worker.finished.connect(self._on_circuit_level_import_finished)
+        worker.failed.connect(self._on_import_failed)
+        worker.cancelled.connect(self._on_import_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(worker.cancel)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
@@ -2477,6 +2693,25 @@ class MainWindow(QMainWindow):
         self._show_circuits_window()
         self._show_circuit_import_report(result)
 
+    def _on_circuit_level_import_finished(
+        self, result: CircuitLevelCsvResult
+    ) -> None:
+        if self._progress_dialog is not None:
+            self._progress_dialog.setValue(100)
+            self._progress_dialog.close()
+        if (
+            self._circuit_catalog is None
+            or result.model.circuits is not self._circuit_catalog
+        ):
+            QMessageBox.critical(
+                self,
+                "Falha na importação",
+                "Os circuitos foram alterados durante a importação dos patamares.",
+            )
+            return
+        self._set_circuit_level_model(result.model)
+        self._show_circuit_level_import_report(result)
+
     def _set_line_model(self, model: LineNetworkModel | None) -> None:
         self._invalidate_power_flow()
         self._invalidate_branch_analysis()
@@ -2552,6 +2787,8 @@ class MainWindow(QMainWindow):
     def _set_generator_model(self, model: GeneratorModel | None) -> None:
         if model is not None and model.loads is not self._load_model:
             raise ValueError("Os geradores devem pertencer às cargas exibidas.")
+        if model is not self._generator_model:
+            self._invalidate_generator_update()
         if (
             self._selected_feature is not None
             and self._selected_feature.kind == "generator"
@@ -2740,6 +2977,9 @@ class MainWindow(QMainWindow):
                 raise ValueError("Os circuitos devem pertencer aos trechos exibidos.")
             if catalog.switches is not self._switch_model:
                 raise ValueError("Os circuitos devem usar as chaves exibidas.")
+        if catalog is not self._circuit_catalog:
+            self._invalidate_generator_update()
+            self._set_circuit_level_model(None)
         self._circuit_visibility_timer.stop()
         self._circuit_catalog = catalog
         self.search_index.set_circuits(catalog, build_fields=False)
@@ -2772,6 +3012,65 @@ class MainWindow(QMainWindow):
         self._sync_export_availability()
         self._sync_power_flow_availability()
         self._apply_circuit_visibility()
+
+    def _set_circuit_level_model(
+        self, model: CircuitCalculationLevelsModel | None
+    ) -> None:
+        if model is not None and model.circuits is not self._circuit_catalog:
+            raise ValueError(
+                "Os patamares devem pertencer ao catálogo de circuitos exibido."
+            )
+        if model is not self._circuit_level_model:
+            self._invalidate_generator_update()
+        self._circuit_level_model = model
+        self._circuit_level_controller = (
+            None if model is None else CircuitCalculationLevelsController(model)
+        )
+        self.patamares_window.set_circuit_levels(self._circuit_level_controller)
+
+    def _set_generator_update_result(
+        self, result: GeneratorUpdateResult | None
+    ) -> None:
+        if result is not None:
+            if result.model.generators is not self._generator_model:
+                raise ValueError("O resultado deve pertencer aos geradores exibidos.")
+            if result.model.circuits is not self._circuit_catalog:
+                raise ValueError("O resultado deve pertencer aos circuitos exibidos.")
+            if result.model.phase_configuration is not self._phase_configuration:
+                raise ValueError(
+                    "O resultado deve usar a configuração de fases atual."
+                )
+        if result is not self._generator_update_result:
+            self._invalidate_power_flow()
+        self._generator_update_result = result
+        selection = self._selected_feature
+        if selection is not None and selection.kind == "generator":
+            self._set_selection(
+                selection,
+                reveal_hidden=self._search_focus_active,
+            )
+
+    def _invalidate_generator_update(self) -> None:
+        if self._generator_update_worker is not None:
+            self._generator_update_worker.cancel()
+        had_result = self._generator_update_result is not None
+        if had_result:
+            self._invalidate_power_flow()
+        self._generator_update_result = None
+        if hasattr(self, "generator_demand_table_model"):
+            self.generator_demand_table_model.set_records(())
+            self.generator_phase_power_table_model.set_records(())
+            self.generator_demand_section.setVisible(False)
+            self.generator_phase_power_section.setVisible(False)
+            self.generator_update_note.clear()
+            self.generator_update_note.setVisible(False)
+        if (
+            had_result
+            and self._selected_feature is not None
+            and self._selected_feature.kind == "generator"
+            and self._generator_model is not None
+        ):
+            self._set_selection(self._selected_feature)
 
     def _schedule_circuit_visibility_update(self, *args) -> None:  # noqa: ANN002
         del args
@@ -2897,7 +3196,59 @@ class MainWindow(QMainWindow):
         self.curves_window.raise_()
         self.curves_window.activateWindow()
 
+    def _show_patamares_window(self) -> None:
+        self.patamares_window.refresh()
+        self.patamares_window.show()
+        self.patamares_window.raise_()
+        self.patamares_window.activateWindow()
+
+    def _on_calculation_levels_saved(
+        self, schedule: CalculationLevelSchedule
+    ) -> None:
+        # Somente o sinal posterior ao replace atômico atualiza o retrato que
+        # consumidores futuros consultarão.
+        self._invalidate_generator_update()
+        self.calculation_level_schedule = schedule
+        self.statusBar().showMessage("4 patamares salvos.", 6_000)
+
+    def _on_calculation_levels_reloaded(
+        self, schedule: CalculationLevelSchedule
+    ) -> None:
+        if schedule != self.calculation_level_schedule:
+            self._invalidate_generator_update()
+        self.calculation_level_schedule = schedule
+
+    def _on_circuit_calculation_levels_saved(
+        self, _circuit_id: str, _schedule: CalculationLevelSchedule
+    ) -> None:
+        self._invalidate_generator_update()
+        self.statusBar().showMessage(
+            "Patamares do circuito salvos; atualize os geradores novamente.",
+            6_000,
+        )
+
+    def _show_calculation_levels_load_warning(self) -> None:
+        issue = self._calculation_levels_load.issue
+        if issue is not None:
+            QMessageBox.warning(self, "Patamares", issue)
+
     def _on_curves_saved(self, count: int) -> None:
+        loaded = load_curves(self._curves_path)
+        previous_result = self._generator_update_result
+        self._saved_curves = loaded.curves
+        if previous_result is not None:
+            used = previous_result.model.curve
+            replacement = next(
+                (
+                    curve
+                    for curve in self._saved_curves
+                    if curve.curve_id == used.curve_id
+                ),
+                None,
+            )
+            if replacement != used:
+                self._invalidate_generator_update()
+        self._sync_generator_update_availability()
         self.statusBar().showMessage(f"{count:n} curva(s) salva(s).", 6_000)
 
     def _show_curves_load_warning(self) -> None:
@@ -2939,6 +3290,7 @@ class MainWindow(QMainWindow):
             and self._branch_thread is None
             and self._equivalent_thread is None
             and self._power_flow_thread is None
+            and self._generator_update_thread is None
         )
         self.branches_action.setEnabled(available)
         self.simplified_network_action.setEnabled(available)
@@ -2955,6 +3307,7 @@ class MainWindow(QMainWindow):
             and self._phase_configuration is not None
             and self._import_thread is None
             and self._export_thread is None
+            and self._generator_update_thread is None
         )
 
     def _visible_circuit_indices(self) -> tuple[int, ...]:
@@ -2989,7 +3342,213 @@ class MainWindow(QMainWindow):
             and self._branch_thread is None
             and self._equivalent_thread is None
             and self._power_flow_thread is None
+            and self._generator_update_thread is None
         )
+        self._sync_generator_update_availability()
+
+    def _sync_generator_update_availability(self) -> None:
+        self.update_generators_action.setEnabled(
+            self._generator_model is not None
+            and self._circuit_catalog is not None
+            and self._phase_configuration is not None
+            and bool(self._saved_curves)
+            and self._import_thread is None
+            and self._branch_thread is None
+            and self._equivalent_thread is None
+            and self._power_flow_thread is None
+            and self._generator_update_thread is None
+        )
+
+    def _update_generators(self) -> None:
+        generators = self._generator_model
+        circuits = self._circuit_catalog
+        configuration = self._phase_configuration
+        if (
+            self._busy()
+            or generators is None
+            or circuits is None
+            or configuration is None
+        ):
+            return
+        if not self.curves_window.confirm_pending_changes():
+            return
+        if not self.patamares_window.confirm_pending_changes():
+            return
+        if not self._saved_curves:
+            QMessageBox.information(
+                self,
+                "Atualizar Geradores",
+                "Cadastre e salve ao menos uma curva antes de atualizar os geradores.",
+            )
+            self._sync_generator_update_availability()
+            return
+        dialog = UpdateGeneratorsDialog(
+            self._saved_curves,
+            circuits,
+            self.calculation_level_schedule,
+            self._circuit_level_controller,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            curve = dialog.selected_curve()
+            schedules = dialog.effective_schedules()
+            modes = dialog.schedule_modes()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Atualizar Geradores", str(exc))
+            return
+        self._start_generator_update(curve, schedules, modes)
+
+    def _start_generator_update(
+        self,
+        curve: Curve,
+        effective_schedules: tuple[CalculationLevelSchedule, ...],
+        schedule_modes: tuple[GeneratorScheduleMode, ...],
+    ) -> None:
+        generators = self._generator_model
+        circuits = self._circuit_catalog
+        configuration = self._phase_configuration
+        if generators is None or circuits is None or configuration is None:
+            return
+        thread = QThread(self)
+        worker = GeneratorUpdateWorker(
+            generators,
+            circuits,
+            configuration,
+            curve,
+            effective_schedules,
+            tuple(schedule_modes),
+        )
+        worker.moveToThread(thread)
+
+        progress = QProgressDialog(
+            "Calculando demandas dos geradores…",
+            "Cancelar",
+            0,
+            len(circuits) + len(generators),
+            self,
+        )
+        progress.setWindowTitle("Atualizando geradores")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._generator_update_thread = thread
+        self._generator_update_worker = worker
+        self._generator_update_progress_dialog = progress
+        self.import_action.setEnabled(False)
+        self.mdb_import_action.setEnabled(False)
+        self.cables_window.setEnabled(False)
+        self.curves_window.setEnabled(False)
+        self.patamares_window.setEnabled(False)
+        self._sync_branches_availability()
+        self._sync_export_availability()
+        self._sync_power_flow_availability()
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_generator_update_progress)
+        worker.finished.connect(self._on_generator_update_finished)
+        worker.failed.connect(self._on_generator_update_failed)
+        worker.cancelled.connect(self._on_generator_update_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(worker.cancel)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_generator_update_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_generator_update_progress(self, current: int, total: int) -> None:
+        progress = self._generator_update_progress_dialog
+        if progress is None:
+            return
+        progress.setRange(0, max(total, 1))
+        progress.setValue(min(current, max(total, 1)))
+        progress.setLabelText(
+            f"Calculando demandas dos geradores… ({current:n}/{total:n})"
+        )
+
+    def _close_generator_update_progress(self) -> None:
+        if self._generator_update_progress_dialog is not None:
+            self._generator_update_progress_dialog.close()
+
+    def _on_generator_update_finished(self, result: GeneratorUpdateResult) -> None:
+        self._close_generator_update_progress()
+        if (
+            result.model.generators is not self._generator_model
+            or result.model.circuits is not self._circuit_catalog
+            or result.model.phase_configuration is not self._phase_configuration
+        ):
+            QMessageBox.critical(
+                self,
+                "Falha ao atualizar geradores",
+                "Os geradores, circuitos ou a configuração de fases foram "
+                "alterados durante o cálculo. O resultado anterior foi mantido.",
+            )
+            return
+        self._set_generator_update_result(result)
+        self._show_generator_update_report(result)
+
+    def _on_generator_update_failed(self, reason: str) -> None:
+        self._close_generator_update_progress()
+        QMessageBox.critical(self, "Falha ao atualizar geradores", reason)
+
+    def _on_generator_update_cancelled(self) -> None:
+        self._close_generator_update_progress()
+        self.statusBar().showMessage(
+            "Atualização cancelada; o resultado anterior foi mantido.",
+            5_000,
+        )
+
+    def _on_generator_update_thread_finished(self) -> None:
+        self._generator_update_thread = None
+        self._generator_update_worker = None
+        self._generator_update_progress_dialog = None
+        self.cables_window.setEnabled(True)
+        self.curves_window.setEnabled(True)
+        self.patamares_window.setEnabled(True)
+        self.import_action.setEnabled(True)
+        self.mdb_import_action.setEnabled(self._mdb_error is None)
+        self._sync_branches_availability()
+        self._sync_export_availability()
+        self._sync_power_flow_availability()
+        if self._close_after_generator_update:
+            self._close_after_generator_update = False
+            self.close()
+
+    def _show_generator_update_report(self, result: GeneratorUpdateResult) -> None:
+        if not result.has_warnings:
+            self.statusBar().showMessage(
+                f"{result.valid_generators:n} geradores atualizados com a curva "
+                f'"{result.model.curve.name}".',
+                6_000,
+            )
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle("Geradores atualizados com avisos")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText(
+            f"{result.valid_generators:n} de {result.total_generators:n} "
+            "geradores foram atualizados."
+        )
+        message.setInformativeText(
+            f"Curva: {result.model.curve.name}\n"
+            f"Calculados: {result.valid_generators:n}\n"
+            f"Omitidos: {result.invalid_generators:n}"
+        )
+        details = [
+            f"Gerador {issue.generator_id}: {issue.reason}"
+            for issue in result.issues
+        ]
+        if result.omitted_issues:
+            details.append(f"… e mais {result.omitted_issues:n} ocorrências.")
+        if details:
+            message.setDetailedText("\n".join(details))
+        message.exec()
 
     def _invalidate_power_flow(self) -> None:
         """Descarta o resultado: ele deriva de todos os modelos importados."""
@@ -3026,16 +3585,31 @@ class MainWindow(QMainWindow):
             return None
         return loads, patterns
 
+    def _exportable_generators(self) -> GeneratorUpdateModel | None:
+        """Resultado vigente e coerente de ``Atualizar Geradores``."""
+
+        result = self._generator_update_result
+        if result is None:
+            return None
+        model = result.model
+        if (
+            model.generators is not self._generator_model
+            or model.circuits is not self._circuit_catalog
+            or model.phase_configuration is not self._phase_configuration
+        ):
+            return None
+        return model
+
     def _expected_export_filenames(
         self,
         circuit_indices: tuple[int, ...],
     ) -> tuple[str, ...]:
         """Arquivos que a exportação vai gravar para esta seleção.
 
-        Sem cargas e patamares os arquivos de carga não são gerados, então eles
-        também não podem aparecer na confirmação de substituição. O master e as
-        coordenadas dependem do circuito escolhido, por isso vêm de
-        ``master_filenames``.
+        Arquivos de carga exigem cargas e patamares; os de geradores exigem um
+        resultado vigente de sua atualização. Só os grupos que serão gravados
+        podem aparecer na confirmação de substituição. O master e as coordenadas
+        dependem do circuito escolhido, por isso vêm de ``master_filenames``.
         """
 
         names = [LINES_FILENAME, SWITCHES_FILENAME]
@@ -3047,6 +3621,8 @@ class MainWindow(QMainWindow):
             names.append(REGULATORS_FILENAME)
         if self._exportable_loads() is not None:
             names.extend(filename for _, filename, _ in _LOAD_EXPORT_FILES)
+        if self._exportable_generators() is not None:
+            names.extend(filename for _, filename, _ in _GENERATOR_EXPORT_FILES)
         catalog = self._circuit_catalog
         if catalog is not None:
             master = master_filenames(catalog, circuit_indices)
@@ -3065,6 +3641,21 @@ class MainWindow(QMainWindow):
             or self._export_thread is not None
         ):
             return
+        if (
+            self._generator_model is not None
+            and self._exportable_generators() is None
+        ):
+            answer = QMessageBox.question(
+                self,
+                "Exportar sem geradores",
+                "Há geradores importados, mas eles ainda não possuem um "
+                "resultado válido de ‘Atualizar Geradores’. Eles serão "
+                "omitidos da exportação.\nDeseja continuar?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         dialog = OpenDssExportDialog(catalog, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -3108,6 +3699,7 @@ class MainWindow(QMainWindow):
         if catalog is None or cables is None or configuration is None:
             return
         exportable_loads = self._exportable_loads()
+        generator_updates = self._exportable_generators()
         thread = QThread(self)
         # Os modelos são imutáveis: o worker guarda as próprias referências e o
         # arquivo sai como um retrato consistente do estado atual, mesmo que uma
@@ -3120,6 +3712,7 @@ class MainWindow(QMainWindow):
             circuit_indices,
             loads=loads,
             patterns=patterns,
+            generator_updates=generator_updates,
             regulators=self._regulator_model,
             load_settings=self._opendss_load_settings,
         )
@@ -3220,6 +3813,9 @@ class MainWindow(QMainWindow):
         destination: Path,
     ) -> None:
         captions = {count: caption for count, _, caption in _LOAD_EXPORT_FILES}
+        generator_captions = {
+            count: caption for count, _, caption in _GENERATOR_EXPORT_FILES
+        }
         regulators = result.regulators
         parts = [
             f"{result.lines.exported_count:n} trechos",
@@ -3232,6 +3828,11 @@ class MainWindow(QMainWindow):
             *(
                 f"{load_result.exported_count:n} cargas {captions[count]}"
                 for count, load_result in result.loads_by_phase_count
+            ),
+            *(
+                f"{generator_result.exported_count:n} geradores "
+                f"{generator_captions[count]}"
+                for count, generator_result in result.generators_by_phase_count
             ),
         ]
         summary = ", ".join(parts[:-1]) + f" e {parts[-1]}"
@@ -3284,6 +3885,18 @@ class MainWindow(QMainWindow):
                 f"ignoradas), "
                 f"{load_result.discarded_count:n} descartadas"
             )
+        generator_filenames = {
+            count: filename for count, filename, _ in _GENERATOR_EXPORT_FILES
+        }
+        for count, generator_result in result.generators_by_phase_count:
+            lines.append(
+                f"{generator_filenames[count]}: "
+                f"{generator_result.exported_count:n} geradores "
+                f"{generator_captions[count]} "
+                f"({generator_result.skipped_other_phase_count:n} de outras "
+                "fases ignorados), "
+                f"{generator_result.discarded_count:n} descartados"
+            )
         master = result.master
         if master is not None and master.text:
             lines.append(
@@ -3321,6 +3934,7 @@ class MainWindow(QMainWindow):
             or self._branch_thread is not None
             or self._equivalent_thread is not None
             or self._power_flow_thread is not None
+            or self._generator_update_thread is not None
         ):
             return
         circuit_indices = self._visible_circuit_indices()
@@ -3332,13 +3946,25 @@ class MainWindow(QMainWindow):
             return
         exportable_loads = self._exportable_loads()
         loads, patterns = exportable_loads or (None, None)
+        generator_updates = self._exportable_generators()
+        missing_parts: list[str] = []
         if exportable_loads is None:
+            missing_parts.append(
+                "cargas e patamares não estão ambos importados; as cargas "
+                "de consumo serão omitidas"
+            )
+        if self._generator_model is not None and generator_updates is None:
+            missing_parts.append(
+                "há geradores importados sem resultado válido de ‘Atualizar "
+                "Geradores’; eles serão omitidos"
+            )
+        if missing_parts:
             answer = QMessageBox.question(
                 self,
-                "Executar sem cargas",
-                "Cargas e patamares não estão os dois importados, então o "
-                "modelo sairá sem carga alguma e as correntes tenderão a zero."
-                "\nDeseja executar mesmo assim?",
+                "Executar com dados incompletos",
+                "O fluxo será executado com as seguintes limitações:\n\n- "
+                + "\n- ".join(missing_parts)
+                + "\n\nDeseja continuar?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
@@ -3353,6 +3979,7 @@ class MainWindow(QMainWindow):
             circuit_indices,
             loads=loads,
             patterns=patterns,
+            generator_updates=generator_updates,
             regulators=self._regulator_model,
             load_settings=self._opendss_load_settings,
         )
@@ -3381,6 +4008,7 @@ class MainWindow(QMainWindow):
             configuration,
             loads,
             patterns,
+            generator_updates,
         )
         self.import_action.setEnabled(False)
         self._sync_power_flow_availability()
@@ -3421,14 +4049,21 @@ class MainWindow(QMainWindow):
         # durante a execução torna o resultado um retrato de dados que já não
         # estão na tela.
         loads, patterns = self._exportable_loads() or (None, None)
+        generator_updates = self._exportable_generators()
         current = (
             self._circuit_catalog,
             self._cable_model,
             self._phase_configuration,
             loads,
             patterns,
+            generator_updates,
         )
         snapshot = self._power_flow_snapshot
+        # Resultados produzidos antes da inclusão dos geradores (e alguns
+        # doubles de teste) possuem o retrato histórico de cinco modelos. Eles
+        # continuam válidos somente quando não há resultado de geradores.
+        if snapshot is not None and len(snapshot) == 5:
+            snapshot = (*snapshot, None)
         if snapshot is None or any(
             expected is not actual
             for expected, actual in zip(snapshot, current, strict=True)
@@ -3477,6 +4112,11 @@ class MainWindow(QMainWindow):
             f"{len(result.solved_circuits):n} circuito(s) resolvido(s): "
             f"{len(result.segment_currents):n} trechos com corrente e "
             f"{len(result.bar_voltages):n} barras com tensão"
+            + (
+                ""
+                if result.generator_updates is None
+                else f"; {result.exported_generators:n} gerador(es) no modelo"
+            )
         )
         if not result.has_warnings:
             limits = (
@@ -3492,6 +4132,14 @@ class MainWindow(QMainWindow):
         message.setText(f"{summary}.")
         lines = [
             f"Patamares por circuito: {result.step_count:n}",
+            *(
+                ()
+                if result.generator_updates is None
+                else (
+                    f"Geradores exportados: {result.exported_generators:n}; "
+                    f"descartados: {result.discarded_generators:n}",
+                )
+            ),
             *(
                 ()
                 if self._opendss_load_settings.is_default
@@ -4305,6 +4953,41 @@ class MainWindow(QMainWindow):
             message.setDetailedText("\n".join(details))
         message.exec()
 
+    def _show_circuit_level_import_report(
+        self, result: CircuitLevelCsvResult
+    ) -> None:
+        if not result.has_warnings:
+            self.statusBar().showMessage(
+                f"Patamares importados para {result.valid_rows:n} circuitos.",
+                5_000,
+            )
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle(
+            "Importação de patamares dos circuitos concluída com avisos"
+        )
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText(
+            f"Patamares de {result.valid_rows:n} circuitos foram importados."
+        )
+        lines = [
+            f"Codificação: {result.encoding}",
+            f"Linhas de dados: {result.total_rows:n}",
+            f"Circuitos válidos: {result.valid_rows:n}",
+            f"Circuitos ignorados: {result.invalid_rows:n}",
+        ]
+        if result.encoding.lower() == "cp1252":
+            lines.append("O arquivo não era UTF-8 e foi lido como CP-1252.")
+        message.setInformativeText("\n".join(lines))
+        details = [
+            f"Linha {issue.line_number}: {issue.reason}" for issue in result.issues
+        ]
+        if result.omitted_issues:
+            details.append(f"… e mais {result.omitted_issues:n} ocorrências.")
+        if details:
+            message.setDetailedText("\n".join(details))
+        message.exec()
+
     def _on_import_failed(self, reason: str) -> None:
         if self._progress_dialog is not None:
             self._progress_dialog.close()
@@ -4321,6 +5004,7 @@ class MainWindow(QMainWindow):
         self._progress_dialog = None
         self.import_action.setEnabled(True)
         self.mdb_import_action.setEnabled(self._mdb_error is None)
+        self.patamares_window.setEnabled(True)
         self._sync_branches_availability()
         self._sync_export_availability()
         self._sync_power_flow_availability()
@@ -4888,6 +5572,52 @@ class MainWindow(QMainWindow):
                 self.generator_detail_labels[key].setText(value or "—")
             for key, value in consumer_values.items():
                 self.generator_consumer_detail_labels[key].setText(value or "—")
+            update_model = (
+                None
+                if self._generator_update_result is None
+                else self._generator_update_result.model
+            )
+            demand_records = (
+                ()
+                if update_model is None
+                or update_model.generators is not self._generator_model
+                else update_model.demand_records_for_generator(selection.index)
+            )
+            phase_records = (
+                ()
+                if update_model is None
+                or update_model.generators is not self._generator_model
+                else update_model.phase_power_records_for_generator(
+                    selection.index
+                )
+            )
+            self.generator_demand_table_model.set_records(demand_records)
+            self.generator_phase_power_table_model.set_records(phase_records)
+            has_update = bool(demand_records and phase_records)
+            self.generator_demand_section.setVisible(has_update)
+            self.generator_phase_power_section.setVisible(has_update)
+            issue = (
+                None
+                if self._generator_update_result is None
+                else next(
+                    (
+                        item.reason
+                        for item in self._generator_update_result.issues
+                        if item.generator_id == record.generator_id
+                    ),
+                    None,
+                )
+            )
+            if (
+                issue is None
+                and self._generator_update_result is not None
+                and not has_update
+            ):
+                issue = "não foi calculado; consulte o relatório da atualização"
+            self.generator_update_note.setText(
+                "Gerador não calculado: " + issue if issue else ""
+            )
+            self.generator_update_note.setVisible(bool(issue and not has_update))
             self.details_dock.setWindowTitle("Gerador selecionado")
             self.details_stack.setCurrentWidget(self.generator_details_page)
             self.generator_details_page.verticalScrollBar().setValue(0)
@@ -5526,10 +6256,22 @@ class MainWindow(QMainWindow):
             self._close_after_power_flow = True
             event.ignore()
             return
+        if (
+            self._generator_update_thread is not None
+            and self._generator_update_thread.isRunning()
+        ):
+            if self._generator_update_worker is not None:
+                self._generator_update_worker.cancel()
+            self._close_after_generator_update = True
+            event.ignore()
+            return
         # Última guarda, e depois das de thread: fechar a janela de curvas
         # dispara o próprio aviso de alterações pendentes, e close() devolve
         # False quando o usuário cancela. Sem pendências é inerte.
         if not self.curves_window.close():
+            event.ignore()
+            return
+        if not self.patamares_window.close():
             event.ignore()
             return
         self.search_palette.shutdown()

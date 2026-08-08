@@ -42,7 +42,7 @@ class FakeDatabase:
 
 
 def full_database(**extra: list[str]) -> FakeDatabase:
-    """Banco com as fontes das nove entidades lógicas, mais o que for pedido."""
+    """Banco com as fontes das dez entidades lógicas, mais o que for pedido."""
 
     tables = {
         "BARRA": [*REQUIRED_COLUMNS["barras"], "BLOCO_ID", "PL_ANO"],
@@ -55,6 +55,9 @@ def full_database(**extra: list[str]) -> FakeDatabase:
         "CHAVE": [*REQUIRED_COLUMNS["chaves"], "BLOCO1_ID"],
         "REGULADOR": [*REQUIRED_COLUMNS["reguladores"], "FIXO", "VREG_P1"],
         "CIRCUITO": [*REQUIRED_COLUMNS["circuitos"], "SE_ID", "NOME"],
+        "CIRCUITO_PATAMARES": [
+            *REQUIRED_COLUMNS["patamares_circuitos"], "PONTA", "HORARIO_OPC"
+        ],
         "MSysObjects": ["Id", "Name"],
     }
     tables.update(extra)
@@ -86,6 +89,9 @@ class LoadTableMappingTests(unittest.TestCase):
         self.assertIn("MODELO_CARGA", by_entity["patamares"].tables)
         self.assertIn("MT_GERADOR_CONS", by_entity["geradores"].tables)
         self.assertIn("MT_CONS", by_entity[GENERATOR_CONSUMER_ENTITY].tables)
+        self.assertIn(
+            "CIRCUITO_PATAMARES", by_entity["patamares_circuitos"].tables
+        )
 
     def test_empty_alias_list_means_the_csv_name(self) -> None:
         path = self.write(

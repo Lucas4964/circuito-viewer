@@ -1,6 +1,6 @@
 """Diálogo de importação de um banco Access inteiro.
 
-Reúne num passo só o que hoje exige nove importações: o arquivo, a senha
+Reúne num passo só o que hoje exige dez importações: o arquivo, a senha
 opcional, as tabelas detectadas — com ajuste manual quando a detecção não
 serve — e os metadados UTM que o banco não tem.
 

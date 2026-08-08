@@ -9,8 +9,16 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from .branch_analysis import BranchAnalysisResult, analyze_branches
 from .cable_import import load_cables_csv
 from .circuit_import import load_circuits_csv
+from .circuit_level_import import load_circuit_levels_csv
 from .csv_import import CsvImportCancelled, load_csv
 from .generator_import import load_generators_csv
+from .generator_update import (
+    GeneratorScheduleMode,
+    GeneratorUpdateModel,
+    calculate_generator_demands,
+)
+from .curvas import Curve
+from .calculation_levels import CalculationLevelSchedule
 from .load_import import load_loads_csv
 from .load_pattern_import import load_load_patterns_csv
 from .equivalent_network import build_equivalent_network
@@ -362,11 +370,45 @@ class CircuitImportWorker(QObject):
             self.finished.emit(result)
 
 
+class CircuitLevelImportWorker(QObject):
+    progress = pyqtSignal(int, int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, path: str, circuits: CircuitCatalogModel) -> None:
+        super().__init__()
+        self.path = path
+        self.circuits = circuits
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = load_circuit_levels_csv(
+                self.path,
+                self.circuits,
+                cancel_event=self._cancel_event,
+                progress=lambda rows, current, total: self.progress.emit(
+                    rows, current, total
+                ),
+            )
+        except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
 class MdbImportWorker(QObject):
-    """Importa as nove entidades lógicas de um banco Access numa única execução.
+    """Importa as dez entidades lógicas de um banco Access numa única execução.
 
     A cadeia inteira roda num worker só porque cada importador recebe o modelo
-    do anterior: dividir em nove threads exigiria sequenciá-las de qualquer
+    do anterior: dividir em dez threads exigiria sequenciá-las de qualquer
     forma, e ainda multiplicaria as revalidações de identidade na chegada.
 
     A conexão é aberta **aqui dentro**, na thread secundária, e fechada antes de
@@ -425,6 +467,54 @@ class MdbImportWorker(QObject):
             self.finished.emit(result)
 
 
+class GeneratorUpdateWorker(QObject):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        generators: GeneratorModel,
+        circuits: CircuitCatalogModel,
+        phase_configuration: PhaseConfiguration,
+        curve: Curve,
+        effective_schedules: tuple[CalculationLevelSchedule, ...],
+        schedule_modes: tuple[GeneratorScheduleMode, ...],
+    ) -> None:
+        super().__init__()
+        self.generators = generators
+        self.circuits = circuits
+        self.phase_configuration = phase_configuration
+        self.curve = curve
+        self.effective_schedules = effective_schedules
+        self.schedule_modes = schedule_modes
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = calculate_generator_demands(
+                self.generators,
+                self.circuits,
+                self.phase_configuration,
+                self.curve,
+                self.effective_schedules,
+                self.schedule_modes,
+                cancel_check=self._cancel_event.is_set,
+                progress=lambda current, total: self.progress.emit(current, total),
+            )
+        except InterruptedError:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
 class OpenDssExportWorker(QObject):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(object)
@@ -439,6 +529,7 @@ class OpenDssExportWorker(QObject):
         circuit_indices: tuple[int, ...],
         loads: LoadModel | None = None,
         patterns: LoadPatternModel | None = None,
+        generator_updates: GeneratorUpdateModel | None = None,
         regulators: RegulatorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
     ) -> None:
@@ -449,6 +540,7 @@ class OpenDssExportWorker(QObject):
         self.circuit_indices = tuple(circuit_indices)
         self.loads = loads
         self.patterns = patterns
+        self.generator_updates = generator_updates
         self.regulators = regulators
         self.load_settings = load_settings
         self._cancel_event = threading.Event()
@@ -466,6 +558,7 @@ class OpenDssExportWorker(QObject):
                 self.circuit_indices,
                 loads=self.loads,
                 patterns=self.patterns,
+                generator_updates=self.generator_updates,
                 regulators=self.regulators,
                 load_settings=self.load_settings,
                 cancel_check=self._cancel_event.is_set,
@@ -501,6 +594,7 @@ class PowerFlowWorker(QObject):
         circuit_indices: tuple[int, ...],
         loads: LoadModel | None = None,
         patterns: LoadPatternModel | None = None,
+        generator_updates: GeneratorUpdateModel | None = None,
         regulators: RegulatorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
     ) -> None:
@@ -511,6 +605,7 @@ class PowerFlowWorker(QObject):
         self.circuit_indices = tuple(circuit_indices)
         self.loads = loads
         self.patterns = patterns
+        self.generator_updates = generator_updates
         self.regulators = regulators
         self.load_settings = load_settings
         self._cancel_event = threading.Event()
@@ -533,6 +628,7 @@ class PowerFlowWorker(QObject):
                     workspace=workspace,
                     loads=self.loads,
                     patterns=self.patterns,
+                    generator_updates=self.generator_updates,
                     regulators=self.regulators,
                     load_settings=self.load_settings,
                     cancel_check=self._cancel_event.is_set,

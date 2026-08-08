@@ -22,6 +22,7 @@ from typing import Mapping, Sequence
 
 from .cable_import import EXPECTED_CABLE_HEADER
 from .circuit_import import EXPECTED_CIRCUIT_HEADER
+from .circuit_level_import import EXPECTED_CIRCUIT_LEVEL_HEADER
 from .csv_import import EXPECTED_HEADER as EXPECTED_BAR_HEADER
 from .generator_import import CONSUMER_HEADER, GENERATOR_HEADER
 from .load_import import EXPECTED_LOAD_HEADER
@@ -46,6 +47,7 @@ ENTITY_ORDER: tuple[str, ...] = (
     "chaves",
     "reguladores",
     "circuitos",
+    "patamares_circuitos",
 )
 
 # ``geradores_mt_cons`` é uma fonte auxiliar da entidade lógica ``geradores``.
@@ -71,6 +73,7 @@ REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "chaves": EXPECTED_SWITCH_HEADER,
     "reguladores": EXPECTED_REGULATOR_HEADER,
     "circuitos": EXPECTED_CIRCUIT_HEADER,
+    "patamares_circuitos": EXPECTED_CIRCUIT_LEVEL_HEADER,
 }
 
 # Rótulos para relatórios e para o diálogo.
@@ -85,6 +88,7 @@ ENTITY_LABELS: Mapping[str, str] = {
     "chaves": "Chaves",
     "reguladores": "Reguladores",
     "circuitos": "Circuitos",
+    "patamares_circuitos": "Patamares dos circuitos",
 }
 
 # Entidades sem as quais não há o que desenhar; as demais são complementares.

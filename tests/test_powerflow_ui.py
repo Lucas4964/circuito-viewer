@@ -802,6 +802,20 @@ class PowerFlowUiTests(unittest.TestCase):
         self.assertIsNone(window._power_flow_thread)
         self.assertIn("Marque ao menos um circuito", window.statusBar().currentMessage())
 
+    def test_run_without_updated_generators_asks_before_proceeding(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        window._generator_model = object()
+
+        with patch(
+            "circuit_viewer.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as question:
+            window._run_power_flow()
+
+        self.assertIn("Atualizar Geradores", question.call_args.args[2])
+        self.assertIsNone(window._power_flow_thread)
+
 
 if __name__ == "__main__":
     unittest.main()

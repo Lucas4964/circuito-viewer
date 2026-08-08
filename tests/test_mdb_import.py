@@ -50,7 +50,7 @@ class FakeDatabase:
 
 
 def network_database(**overrides) -> FakeDatabase:
-    """Uma rede mínima com as oito entidades, em tipos nativos do Access.
+    """Uma rede mínima com as dez entidades, em tipos nativos do Access.
 
     Os tipos imitam a base real: identificadores inteiros, FASES2 e ESTADO
     inteiros, COMPR e VNOM em ponto flutuante.
@@ -133,6 +133,18 @@ def network_database(**overrides) -> FakeDatabase:
             ["CIRC_ID", "SE_ID", "BARRA_ID", "CODIGO", "VNOM", "NOME"],
             [(2, 2, 7, "004001", 13.800000190734863, "")],
         ),
+        "CIRCUITO_PATAMARES": (
+            [
+                "CIRC_ID", "NPAT", "NOME", "HORARIO_INI", "HORARIO_FIM",
+                "HORARIO_REF", "PONTA", "HORARIO_OPC",
+            ],
+            [
+                (2, 0, "Madrugada", 22, 5, 23, 0, 0),
+                (2, 1, "Manhã", 5, 11, 11, 0, 0),
+                (2, 2, "Tarde", 11, 18, 12, 0, 0),
+                (2, 3, "Noite", 18, 22, 22, 1, 0),
+            ],
+        ),
         "MSysObjects": (["Id", "Name"], []),
     }
     tables.update(overrides)
@@ -163,6 +175,7 @@ class LoadDatabaseTests(unittest.TestCase):
         self.assertIs(result.regulators.model.segments, result.segments.model)
         self.assertIs(result.circuits.model.segments, result.segments.model)
         self.assertIs(result.circuits.model.switches, result.switches.model)
+        self.assertIs(result.circuit_levels.model.circuits, result.circuits.model)
 
     def test_entities_are_imported_in_dependency_order(self) -> None:
         database = network_database()
@@ -173,6 +186,9 @@ class LoadDatabaseTests(unittest.TestCase):
         # As chaves precisam existir antes dos circuitos: a topologia
         # energizada depende delas.
         self.assertLess(visited.index("CHAVE"), visited.index("CIRCUITO"))
+        self.assertLess(
+            visited.index("CIRCUITO"), visited.index("CIRCUITO_PATAMARES")
+        )
         self.assertLess(visited.index("CARGA"), visited.index("MODELO_CARGA"))
         self.assertLess(visited.index("CARGA"), visited.index("MT_CONS"))
         self.assertLess(visited.index("MT_CONS"), visited.index("MT_GERADOR_CONS"))
@@ -183,6 +199,8 @@ class LoadDatabaseTests(unittest.TestCase):
         by_table = dict(database.statements)
         self.assertNotIn("FATDEM", by_table["CARGA"])
         self.assertNotIn("CENARIO_ID", by_table["MODELO_CARGA"])
+        self.assertNotIn("PONTA", by_table["CIRCUITO_PATAMARES"])
+        self.assertNotIn("HORARIO_OPC", by_table["CIRCUITO_PATAMARES"])
         self.assertNotIn("BLOCO_ID", by_table["BARRA"])
         self.assertEqual(
             by_table["MT_GERADOR_CONS"],

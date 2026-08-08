@@ -1,6 +1,6 @@
 """Relatório consolidado de uma importação por banco de dados.
 
-Uma importação por banco produz nove resultados lógicos. Encadear os nove
+Uma importação por banco produz dez resultados lógicos. Encadear os dez
 ``QMessageBox`` dos importadores de CSV seria inaceitável, então o resultado
 inteiro cabe numa tabela: uma linha por entidade, com a tabela de origem e as
 contagens, mais as ocorrências agrupadas abaixo.
@@ -41,6 +41,7 @@ def _result_for(result: MdbImportResult, entity: str):  # noqa: ANN202
         "chaves": result.switches,
         "reguladores": result.regulators,
         "circuitos": result.circuits,
+        "patamares_circuitos": result.circuit_levels,
     }.get(entity)
 
 

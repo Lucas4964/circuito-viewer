@@ -66,7 +66,8 @@ CIRCUITO_VIEWER/
 │   │   ├── fases2.json        # mapeamento FASES2 → NUMERO_FASES (dado externo)
 │   │   └── mdb_tabelas.json   # mapeamento tabela/coluna → entidade (dado externo)
 │   ├── dados/                 # DADO DO USUÁRIO (gitignored, criado em runtime)
-│   │   └── curvas.json        # curvas horárias cadastradas na interface
+│   │   ├── curvas.json        # curvas horárias cadastradas na interface
+│   │   └── patamares.json     # agenda dos quatro patamares de cálculo
 │   │
 │   ├── model.py               # NÚCLEO: entidades, índices espaciais, topologia
 │   ├── circuit_colors.py      # paleta OKLCH contrastante
@@ -84,10 +85,15 @@ CIRCUITO_VIEWER/
 │   │
 │   ├── mdb_engine.py          # único acesso ao pyodbc (opcional) + conversão
 │   ├── mdb_mapping.py         # tabela/coluna → entidade, a partir do JSON
-│   ├── mdb_import.py          # importação encadeada das nove entidades lógicas
+│   ├── mdb_import.py          # importação encadeada das dez entidades lógicas
+│   ├── circuit_level_import.py # parser CSV/MDB dos patamares por circuito
+│   ├── circuit_calculation_levels.py # fonte imutável e cópia de sessão
 │   │
 │   ├── curvas.py              # NÚCLEO: curvas de 24 pontos, validação, colagem
 │   ├── curvas_store.py        # NÚCLEO: leitura/gravação atômica de curvas.json
+│   ├── calculation_levels.py  # NÚCLEO: agenda imutável + rascunhos editáveis
+│   ├── calculation_levels_store.py # leitura/gravação atômica de patamares.json
+│   ├── generator_update.py    # cálculo derivado das demandas dos geradores
 │   │
 │   ├── opendss_export.py      # geração dos .dss de rede e de cargas
 │   ├── opendss_settings.py    # parâmetros globais das cargas (Vminpu/Vmaxpu)
@@ -107,18 +113,22 @@ CIRCUITO_VIEWER/
 │   ├── opendss_export_dialog.py  # seleção dos circuitos a exportar
 │   ├── opendss_settings_dialog.py # Configurações → OpenDSS… + QSettings
 │   ├── mdb_import_dialog.py   # tabelas detectadas, senha e metadados UTM
-│   ├── mdb_import_report.py   # relatório consolidado das nove entidades lógicas
+│   ├── mdb_import_report.py   # relatório consolidado das dez entidades lógicas
 │   ├── overlap_report.py      # relatório de trechos sobrepostos
 │   ├── search_palette.py      # janela de busca não modal
 │   ├── curvas_window.py       # Configurações → Curvas… (lista, grade, gráfico)
 │   ├── curvas_table.py        # grade editável das 24 horas + colar/copiar
 │   ├── curva_chart.py         # gráfico da curva, desenhado com QPainter
+│   ├── patamares_window.py     # Configurações → Patamares…
+│   ├── patamares_table.py      # grade editável fixa de quatro linhas
+│   ├── generator_update_dialog.py # curva + origem dos patamares por circuito
+│   ├── generator_update_table.py  # resultados do gerador no painel lateral
 │   ├── load_pattern_table.py  # tabela de patamares no painel lateral
 │   ├── power_flow_table.py    # tabela de grandezas do fluxo no painel lateral
 │   ├── phase_legend.py        # legenda flutuante do modo por fases
 │   └── theme.py               # tema claro/escuro escolhido manualmente
 │
-├── tests/                     # 43 arquivos de teste (unittest + pytest-qt)
+├── tests/                     # 53 arquivos de teste (unittest + pytest-qt)
 ├── benchmarks/                # 8 benchmarks com modo --enforce
 ├── README.md                  # documentação de uso
 ├── ARQUITETURA.md             # este documento
@@ -200,6 +210,9 @@ Exceções conhecidas e deliberadas:
 | `phase_config.py` | Ler/validar `fases2.json`; classificar `FASES2` em categorias de renderização | Definir cores da UI (só as constantes) |
 | `curvas.py` | `Curve`/`CurveDraft`/`CurveCatalog`, validação de nome e das 24 horas, interpretação do bloco colado | I/O, Qt |
 | `curvas_store.py` | Ler/gravar `dados/curvas.json` de forma atômica e tolerante a arquivo corrompido | Qt, validar regras de negócio |
+| `calculation_levels.py` | Agenda imutável dos NPAT 0–3, rascunhos isolados e validação do ciclo contínuo de 24 horas | I/O, Qt, executar cálculos |
+| `calculation_levels_store.py` | Ler/gravar `dados/patamares.json` atomicamente; arquivo inválido recua integralmente aos padrões | Qt |
+| `generator_update.py` | Resolver circuito/fases, aplicar curva e agenda e produzir demandas e potências por fase imutáveis | Qt, I/O, mutar geradores/curvas/patamares |
 | `circuit_colors.py` | Gerar paleta contrastante em OKLCH; normalizar `#RRGGBB` | Aplicar cores |
 | `search.py` | Índice por `CODIGO` e índice por todas as colunas; consultas canceláveis | Widgets |
 
@@ -236,16 +249,19 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 |---|---|---|
 | `mdb_engine.py` | Único acesso ao `pyodbc`; conexão somente leitura, sniff do formato, detecção de senha, `cell_to_text` | Conhecer entidades do modelo |
 | `mdb_mapping.py` | Ler `mdb_tabelas.json`; casar entidade → tabela → colunas reais | Ler linhas |
-| `mdb_import.py` | Encadear as nove entidades lógicas na ordem de dependência | Validar linhas (delega às `parse_*_rows`) |
+| `mdb_import.py` | Encadear as dez entidades lógicas na ordem de dependência | Validar linhas (delega às `parse_*_rows`) |
+| `circuit_level_import.py` | Compartilhar leitura e validação de `CIRCUITO_PATAMARES` entre CSV e MDB | Manter estado editável da sessão |
+| `circuit_calculation_levels.py` | Vincular agendas importadas ao `CircuitCatalogModel` e manter a cópia virtual | Persistir dados em disco |
 
 ### Análise
 
 | Módulo | Entrada | Saída |
 |---|---|---|
 | `branch_analysis.py` | `CircuitCatalogModel`, `PhaseConfiguration`, `LoadModel?` | `BranchAnalysisResult` (ramais + diagnósticos) |
-| `opendss_export.py` | `CircuitCatalogModel`, `CableModel`, `PhaseConfiguration`, índices dos circuitos, `LoadModel?` + `LoadPatternModel?` | `OpenDssExportBundle` (textos de `trechos.dss`, `chaves.dss`, dos três arquivos de carga, do master e das coordenadas + diagnósticos) |
+| `opendss_export.py` | `CircuitCatalogModel`, `CableModel`, `PhaseConfiguration`, índices dos circuitos, cargas/patamares opcionais e `GeneratorUpdateModel?` | `OpenDssExportBundle` (rede, três arquivos de carga, três de geradores, master, coordenadas e diagnósticos) |
 | `opendss_powerflow.py` | motor OpenDSS injetado + as mesmas entradas da exportação + pasta de trabalho | `PowerFlowResult` (correntes por trecho e tensões por barra, um retrato por patamar + diagnósticos) |
 | `equivalent_network.py` | `BranchAnalysisResult`, `LoadModel?`, `LoadPatternModel?` | `EquivalentNetworkResult` (cargas equivalentes + máscaras) |
+| `generator_update.py` | `GeneratorModel`, `CircuitCatalogModel`, `PhaseConfiguration`, uma `Curve` e agendas efetivas | `GeneratorUpdateResult` (demanda média, quatro demandas totais e quatro potências por fase com sinal elétrico + diagnósticos) |
 
 ### Gráfico e UI
 
@@ -254,9 +270,9 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | `graphics.py` | Toda a pintura, virtualização, hit-test geométrico, zoom/pan, desenho do fundo de satélite |
 | `opendss_settings.py` | Valor imutável dos parâmetros globais das cargas (`Vminpu`/`Vmaxpu`), com a invariante que o OpenDSS não impõe e a tradução para os comandos `BatchEdit` |
 | `opendss_engine.py` | Contenção dos efeitos globais do `py_dss_interface`: singleton com trava, diretório corrente preservado, `SystemExit` capturado, pasta temporária ASCII |
-| `workers.py` | 10 workers `QObject` que apenas encapsulam funções puras e emitem `progress/finished/failed/cancelled` |
+| `workers.py` | 16 workers `QObject` que apenas encapsulam funções puras e emitem `progress/finished/failed/cancelled` |
 | `mdb_import_dialog.py` | Tabelas detectadas com ajuste manual, senha mascarada e metadados UTM; `MdbPasswordDialog` é separado porque a senha só se sabe necessária **depois** da primeira tentativa de conexão |
-| `mdb_import_report.py` | Relatório consolidado das nove entidades lógicas — não modal, como o de sobreposições, porque os dois abrem sozinhos ao fim de uma operação |
+| `mdb_import_report.py` | Relatório consolidado das dez entidades lógicas — não modal, como o de sobreposições, porque os dois abrem sozinhos ao fim de uma operação |
 | `main_window.py` | Dono de todo o estado da aplicação; coordena importações, invalidações em cascata, máscaras efetivas, painel de detalhes e menus |
 | `circuits_window.py` | `QAbstractTableModel` fino sobre `CircuitVisibilityController` + delegate de cor |
 | `branch_window.py` | Tabela de ramais com `QSortFilterProxyModel` (ordenação por `UserRole`, filtro por circuito) |
@@ -267,6 +283,10 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | `curvas_window.py` | Mestre-detalhe das curvas: lista, nome, grade e gráfico; estado sujo e confirmação ao fechar. A persistência **não** mora aqui, porque JSON não é Qt — ao contrário do `QSettings`, ela fica no núcleo (`curvas_store.py`) |
 | `curvas_table.py` | `QAbstractTableModel` fino sobre um `CurveDraft` (coluna "Hora" sintética, só "Valor" editável) + a única `QTableView` do projeto com colar/copiar |
 | `curva_chart.py` | Gráfico das 24 horas com `QPainter`: um `QPainterPath` único, cores lidas da paleta a cada pintura, lacuna interrompe o traço |
+| `patamares_window.py` | Rascunho privado, validação conjunta, salvamento e confirmação ao fechar; só emite o novo retrato após a gravação atômica |
+| `patamares_table.py` | Quatro linhas e cinco campos editáveis, com delegates limitando NPAT a 0–3 e horários a 0–23 |
+| `generator_update_dialog.py` | Escolha modal de uma curva e de `DEFAULT`/`Próprios` para cada circuito; entrega um retrato completo ao worker |
+| `generator_update_table.py` | Duas grades somente leitura de quatro linhas para demanda total e potência por fase do gerador selecionado |
 | `search_palette.py` | Diálogo não modal; roda indexação e consultas em `QThreadPool` com tokens de cancelamento |
 | `load_pattern_table.py` | Modelo somente leitura de exatamente 4 linhas (NPAT 0–3) |
 | `power_flow_table.py` | Modelo somente leitura da matriz `[patamar][nó]`; não sabe qual grandeza exibe, recebe a matriz já escolhida pelo combobox |
@@ -477,13 +497,16 @@ donos — é isso que resolve a cor de um trecho sobreposto.
           │   │    │                                       │
           ▼   ▼    ▼                                       ▼
  Reguladores Chaves Circuitos                          Patamares
+                  │
+                  ▼
+          Patamares dos circuitos
                   ▲
-                  └─ usa Chaves (opcional) para a topologia energizada
+                  └─ Circuitos usa Chaves (opcional) na topologia energizada
 ```
 
 O `ImportChoiceDialog` habilita cada botão conforme o estado:
 `segments/loads` exigem barras; `switches/regulators/circuits` exigem trechos;
-`load_patterns` exige cargas. `cables` é um catálogo isolado — o botão nunca
+`load_patterns` exige cargas; `circuit_levels` exige circuitos. `cables` é um catálogo isolado — o botão nunca
 fica desabilitado e não aparece no diagrama acima.
 
 **Reguladores são a única importação sem cascata.** Todas as demais invalidam
@@ -1047,7 +1070,7 @@ simultâneas.
 
 **A importação por banco ocupa o slot `_import_thread`**, como as de CSV. A
 cadeia inteira roda num worker só porque cada importador recebe o modelo do
-anterior: dividir em nove threads exigiria sequenciá-las de qualquer forma, e
+anterior: dividir em dez threads exigiria sequenciá-las de qualquer forma, e
 ainda multiplicaria as revalidações de identidade na chegada. Uma restrição
 física reforça a escolha — **uma conexão ODBC não é segura para atravessar
 threads**, então `MdbImportWorker` abre a sua própria conexão dentro de `run()` e
@@ -1204,7 +1227,9 @@ ou seja, é **duck-type compatível com `LoadModel`** — por isso o mesmo
 (uma `Line ... Switch=Yes` por trecho-chave), `reguladores.dss` (três
 `Transformer` + três `RegControl` por regulador trifásico) e um arquivo de cargas
 por contagem de fases — `cargasmonofasicas.dss`, `cargasbifasicas.dss` e
-`cargastrifasicas.dss`, com `N` `Load` + `N` `LoadShape` por carga — mais o par
+`cargastrifasicas.dss`, com `N` `Load` + `N` `LoadShape` por carga — mais o trio
+de geradores `geradoresmonofasicos.dss`, `geradoresbifasicos.dss` e
+`geradorestrifasicos.dss`, quando existir um `GeneratorUpdateModel`, e o par
 `<CODIGO>_Master.dss` e `<CODIGO>_Buscoords.csv`, que cria o circuito, chama os
 demais e resolve. `build_export()` monta tudo em sequência e devolve um
 `OpenDssExportBundle`; a pasta escolhida na UI recebe todos.
@@ -1217,6 +1242,12 @@ carga é gerado e `files` volta a ter dois elementos; havendo os dois modelos,
 saem os cinco arquivos, mesmo que algum dos de carga fique só com o cabeçalho —
 assim a lista de arquivos gerados não depende do conteúdo do CSV, e a
 confirmação de substituição na UI pode ser montada antes de exportar.
+
+Os três resultados de gerador também são opcionais e andam juntos. Havendo um
+retrato vigente de **Atualizar Geradores**, os três arquivos são montados mesmo
+quando uma contagem de fases não tem elementos. Geradores importados sem esse
+retrato não são recalculados implicitamente: a UI confirma a operação e segue
+sem eles ou cancela sem iniciar o worker.
 
 `OpenDssLoadExportResult` é compartilhado pelos três arquivos de carga. Nele,
 `exported_count` conta **cargas de origem**, não linhas `Load`: uma trifásica
@@ -1424,13 +1455,37 @@ magnitudes pequenas.
 para o usuário identificar, ao abrir o arquivo, de que contagem de fases aquela
 `Load` veio. Por isso vem por último na linha, depois de `daily`.
 
+#### Geradores como `Load` de potência negativa
+
+`build_generator_export()` recebe somente o `GeneratorUpdateModel` vigente e é
+parameterizado por `phase_count`, como o builder de cargas. O retrato já traz o
+circuito resolvido, as letras de fase e quatro `GeneratorPhasePowerRecord` por
+equipamento; uma posição omitida na atualização nunca chega ao arquivo. Cada
+fase vira uma `Load` monofásica e um `LoadShape`, com `kW=1`, `kvar=1`,
+`model=1`, `conn=wye` e `qmult` zerado.
+
+O sinal não é transformado no exportador. `generator_update.py` armazena
+`PD`/`PE`/`PF = -(DEMANDA/N)`, e esses valores seguem diretamente para `mult`.
+Isso garante a convenção consumo positivo/geração negativa e preserva também o
+caso de curva negativa, que resulta em potência por fase positiva. A demanda
+total por NPAT permanece antes da inversão e continua disponível no painel.
+
+Os nomes `GER-<CODIGO>-<N>F-<FASE>` usam `GERADOR_ID` como fallback e as classes
+são `-1`, `-2` e `-3`. `build_export()` monta primeiro as cargas, reúne todos os
+seus `used_names` e entrega essa reserva aos geradores; depois encadeia a reserva
+entre os três arquivos de geração. Assim o namespace `Load.*` é único e uma
+colisão descarta o gerador inteiro antes de emitir qualquer uma de suas fases.
+No `element_files`, os três geradores aparecem depois dos três arquivos de
+carga, fixando a mesma ordem nos `Redirect` do master.
+
 #### Master e coordenadas (`<CODIGO>_Master.dss`, `<CODIGO>_Buscoords.csv`)
 
-**O único arquivo executável.** Os cinco anteriores só definem elementos; o
+**O único arquivo executável.** Os arquivos anteriores só definem elementos; o
 master cria o circuito, chama os demais por `Redirect` e resolve. É o último a
 ser montado por `build_export()`, porque a lista de `Redirect` precisa refletir
-os arquivos que de fato existem — sem cargas importadas, só os dois de rede
-entram.
+os arquivos que de fato existem. Um retrato de geradores acrescenta seus três
+arquivos mesmo sem cargas de consumo; sem nenhum dos dois, entram somente os
+arquivos de rede e os reguladores que existirem.
 
 **A ordem das seções é obrigatória, não estética.**
 `Set DefaultBaseFrequency` precede o `New Circuit` porque a frequência base é
@@ -1525,6 +1580,15 @@ master. Não há um segundo gerador de `.dss`, e é isso que garante a equivalê
 entre o que a aplicação mostra e o que o usuário obteria à mão — o roteiro de
 verificação inclui a prova: o estado após o `Compile` do master coincide, com
 divergência zero, com o último patamar colhido.
+
+O `GeneratorUpdateModel` atravessa `PowerFlowWorker`, `run_power_flow()` e o
+`PowerFlowResult` por identidade. A `MainWindow` também o inclui no snapshot da
+execução: instalar, substituir ou invalidar a atualização de geradores cancela
+o worker em andamento e descarta um resultado já exibido. Se há geradores
+importados sem atualização vigente, o fluxo pede confirmação e pode executar a
+rede sem eles; não existe atualização automática escondida nesse caminho. O
+resultado acumula `exported_generators` e `discarded_generators`, e o relatório
+apresenta essas contagens junto aos diagnósticos dos três builders de geração.
 
 **`Compile`, não `Redirect`.** É a inversão exata da regra do master, que usa
 `Redirect` internamente para não perder o `Buscoords` relativo. Aqui o `Compile`
@@ -1678,7 +1742,7 @@ uma troca de qualquer um deles seria exibir número velho como se fosse novo.
 
 ### 12.5 Leitura de bancos Access (`mdb_engine.py`, `mdb_mapping.py`, `mdb_import.py`)
 
-**Objetivo:** importar as nove entidades lógicas direto de um `.mdb`, em modo somente
+**Objetivo:** importar as dez entidades lógicas direto de um `.mdb`, em modo somente
 leitura, sem duplicar nenhuma regra de validação. A mecânica da cadeia está na
 seção 6; aqui ficam as decisões que a sustentam.
 
@@ -2146,31 +2210,69 @@ execução atual. Um ponto natural seria serializar
 `circuit_id` no mesmo `QSettings` injetado em `MainWindow`, reaproveitando o
 mecanismo de remapeamento já usado em `_set_switch_model`.
 
+O `DEFAULT` dos patamares é dado estruturado, não preferência: vive em
+`dados/patamares.json`. `MainWindow` mantém somente o último
+`CalculationLevelSchedule` global salvo; a janela edita uma cópia em rascunho,
+para que consumidores futuros nunca observem valores ainda não confirmados.
+
+As agendas de `CIRCUITO_PATAMARES` seguem outra regra. O parser CSV/MDB monta
+um `CircuitCalculationLevelsModel` imutável, denso e vinculado por identidade
+ao `CircuitCatalogModel`. Cada posição é uma agenda completa ou `None`; apenas
+grupos com `CIRC_ID` existente e os NPAT 0–3 válidos entram na lista da janela.
+Ao instalar a fonte, a `MainWindow` cria um
+`CircuitCalculationLevelsController`, cuja lista mutável é a cópia virtual da
+sessão. Salvar um circuito troca uma posição dessa lista e não chama nenhuma
+função de persistência. Uma nova importação bem-sucedida cria outro
+controlador; falha ou cancelamento mantém o anterior. Substituir o catálogo
+zera ambos por dependência de identidade.
+
+Os dois cadastros de horários permanecem separados do `LoadPatternModel`, que
+contém as potências importadas por carga para cada NPAT. As agendas alimentam
+somente `generator_update.py`; a exportação e o fluxo consomem o resultado
+derivado, nunca as agendas diretamente.
+
 ### Exportar dados
 
 `BranchTableModel._raw_values()` e `OverlapReportTableModel` já expõem os dados
 em forma tabular — um exportador CSV/XLSX é um consumidor direto desses modelos,
 sem tocar no núcleo.
 
-### Associar curvas horárias a cargas e geradores
+### Curvas e patamares no cálculo dos geradores
 
-O cadastro de curvas (`curvas.py`, `curvas_store.py`) foi desenhado para receber
-esse vínculo sem alteração. Três encaixes já estão prontos:
+`generator_update.py` cria um retrato derivado sem tocar em `GeneratorModel`, no
+`CURVA_ID` importado ou nos cadastros. `GeneratorUpdateModel` guarda por
+identidade os geradores, circuitos e a configuração de fases usados, além da
+curva escolhida, da agenda efetiva e da origem (`DEFAULT`/`circuit`) de cada
+circuito. Arrays densos por índice de gerador guardam demanda média, circuito e
+os dois grupos de quatro registros; uma posição `None` representa um gerador
+omitido.
 
-1. **A chave é o `Curve.curve_id`**, um `uuid4` estável que a renomeação não
-   toca. A carga guarda esse identificador, nunca o nome — se o vínculo fosse
-   pelo nome, renomear uma curva o quebraria em silêncio, e trocar os nomes de
-   duas curvas trocaria as associações sem aviso. `CurveCatalog.index_for_id`
-   resolve a busca.
-2. **A forma do vínculo já existe no projeto**: espelhar `LoadPatternModel`, com
-   um array paralelo denso indexado pelo índice da carga
-   (`curve_ids: tuple[str | None, ...]`, `len == len(loads)`, validado no
-   construtor). O vínculo mora do lado da carga, em estrutura própria — nem
-   `Curve` nem `curvas.json` precisam mudar.
-3. **A emissão para o OpenDSS é direta**: `Curve.values` são 24 `float`, que é
-   exatamente o que `New LoadShape.{nome} npts=24 interval=1 mult=[…]` consome,
-   com `sanitize_dss_name` no nome e `_format_pattern` nos valores — a mesma
-   linha que já emite os patamares, só com `npts` diferente.
+A associação gerador→circuito é invertida das `CircuitMembership.bar_indices`.
+Exatamente um proprietário é obrigatório: zero ou mais de um gera diagnóstico.
+`PhaseConfiguration.phase_letters_for_value()` interpreta o `NOME` de
+`fases2.json`, extrai D/E/F e confere a quantidade declarada. A potência ativa é
+dividida somente entre essas letras e invertida (`-(DEMANDA/N)`); as posições de
+fases ausentes e todas as reativas começam em zero. A demanda total conserva o
+sinal anterior à inversão, portanto o resultado já tem as duas formas tabulares
+exibidas no painel e a convenção elétrica pronta para o OpenDSS.
+
+O cálculo usa `parse_number(GERACAO_KWH) / 720` e multiplica pela curva na
+`HORARIO_REF`. Como a grade de curvas é visualmente 1–24 e os patamares usam
+0–23, `curve_value_at_reference()` concentra a convenção: 1–23 mantêm o mesmo
+número e 0 consulta o ponto visual 24. Não há arredondamento no núcleo; quatro
+casas são apenas apresentação no painel.
+
+O resultado vive somente na `MainWindow`. O worker recebe todos os retratos
+antes de começar e o novo valor só é instalado no sinal de sucesso. Cancelar,
+falhar ou terminar sem geradores válidos mantém o anterior. Trocar geradores,
+circuitos ou agendas invalida o resultado; ao salvar curvas, a janela compara
+por `curve_id` e conteúdo e invalida somente se a curva usada mudou ou sumiu.
+Uma edição ainda não salva não participa do cálculo.
+
+O resultado continua exclusivamente em memória, mas agora é uma entrada
+opcional de `build_export()` e `run_power_flow()`. O exportador não recalcula nem
+inverte valores: ele transporta `PD`/`PE`/`PF` ao `LoadShape`, preservando o
+retrato transacional produzido pelo worker.
 
 Atenção a uma armadilha: `LOAD_PATTERN_COUNT` (=4) descreve os patamares NPAT
 importados e é usado em laço na exportação e importado por `opendss_powerflow`.
@@ -2186,28 +2288,34 @@ lido por uma build anterior.
 
 ## 18. Testes e benchmarks
 
-### Testes (`tests/`, 43 arquivos)
+### Testes (`tests/`, 53 arquivos)
 
 | Arquivo | Foco |
 |---|---|
 | `test_model.py` | entidades, índices espaciais, topologia |
-| `test_csv_import.py` · `test_segment_import.py` · `test_switch_import.py` · `test_regulator_import.py` · `test_load_import.py` · `test_generator_import.py` · `test_load_pattern_import.py` · `test_circuit_import.py` · `test_cable_import.py` | importadores e casos de erro; geradores cobrem a associação dos dois CSVs e a resolução por carga |
+| `test_csv_import.py` · `test_segment_import.py` · `test_switch_import.py` · `test_regulator_import.py` · `test_load_import.py` · `test_generator_import.py` · `test_load_pattern_import.py` · `test_circuit_import.py` · `test_circuit_level_import.py` · `test_cable_import.py` | importadores e casos de erro; geradores cobrem a associação dos dois CSVs e patamares por circuito cobrem grupos completos, identidade, CSV/MDB e cópia de sessão |
+| `test_calculation_levels.py` · `test_calculation_levels_store.py` · `test_patamares_ui.py` · `test_circuit_levels_ui.py` | validação horária, JSON atômico do DEFAULT, combo por circuito e garantia de salvamento exclusivamente em memória |
 | `test_phase_config.py` | validação do `fases2.json` |
 | `test_circuit_colors.py` | paleta e contraste |
 | `test_branch_analysis.py` · `test_equivalent_network.py` | análises topológicas |
 | `test_opendss_export.py` | linhas de trecho, de chave e das cargas de uma, duas e três fases, conversão de `C1` e do `kV` pela tensão de fase, ordem `New`/`Open` e `LoadShape`/`Load`, nomenclatura `-NF-<FASE>`, terminal por letra, neutro preservado só na monofásica, colunas de patamar por fase, patamar zerado, descarte integral da carga, reserva de nomes entre os arquivos, arredondamento, saneamento, master (ordem das seções, `Redirect` conforme os arquivos gerados, coordenadas em casas fixas) e diagnósticos |
+| `test_opendss_generator_export.py` | três arquivos de geradores, perfis ativos negativos sem dupla inversão, classes negativas, terminais e tensão de fase, seleção por circuito, fallback, descarte integral, namespace `Load.*` compartilhado e ordem dos `Redirect` |
 | `test_opendss_settings.py` | invariante da faixa (`0 < vminpu <= 1 <= vmaxpu`), comandos `BatchEdit` exatos e sem vírgula decimal, desabilitado não emite nada, ida e volta pelo mapeamento e recuperação de preferência corrompida |
 | `test_opendss_engine.py` | detecção da biblioteca opcional, memoização do erro de import, reuso do motor único, diretório corrente restaurado (inclusive após falha) e escolha da pasta ASCII |
-| `test_opendss_powerflow.py` | com um **motor falso**: arquivos gravados iguais aos da exportação, ordem `Clear`/`Compile`/`Set …`, um `Solve` por patamar, corrente no trecho certo (inclusive em chaves), só o terminal 1, tensões e pu por nó, neutro descartado, `IADM` ausente, patamar não convergido, colisão de caixa em nome de linha e de barra, circuito sem master, sobreposição resolvida pelo primeiro circuito, progresso e cancelamento |
+| `test_opendss_powerflow.py` | com um **motor falso**: arquivos gravados iguais aos da exportação, inclusão e identidade do retrato de geradores, ordem `Clear`/`Compile`/`Set …`, um `Solve` por patamar, corrente no trecho certo (inclusive em chaves), só o terminal 1, tensões e pu por nó, neutro descartado, `IADM` ausente, patamar não convergido, colisão de caixa em nome de linha e de barra, circuito sem master, sobreposição resolvida pelo primeiro circuito, progresso e cancelamento |
 | `test_mdb_engine.py` | `cell_to_text` exaustivo (o inteiro sem `.0`, o decimal íntegro, Sim/Não, nulo, binário), sniff de formato por versão do Access, detecção de senha, cadeia de conexão somente leitura **sem chaves em `DBQ` nem em `PWD`** e comparada com a forma comprovadamente funcional, recuo do `SQL_MODE_READ_ONLY`, senha fora das mensagens, e a garantia de que só `SELECT` é emitido |
 | `test_mdb_mapping.py` | apelidos de coluna, casamento sem caixa, tabela de reserva, tabela e coluna ausentes desabilitando só a própria entidade, tabela ilegível reportada, `MSys*` nunca escolhidas, override que não cai de volta na detecção, e o JSON distribuído conferido contra a base real |
 | `test_mdb_import.py` | com um **banco falso**: ordem de dependência (chaves antes de circuitos), identidade encadeada dos modelos, projeção só das colunas obrigatórias, `CENARIO_ID` ignorado, dedução de decímetros, entidade ausente não derrubando as demais, barras fatais, cancelamento nunca virando falha de entidade, progresso único da cadeia, e a **regressão de tipos**: `ESTADO` inteiro e `float` mantendo a chave fechada e a topologia alcançando as três barras |
-| `test_mdb_import_ui.py` | com um `MdbImportResult` injetado: instalação dos nove modelos pelos setters existentes, catálogo sobrevivendo à cascata das chaves, banco parcial, diálogo (pré-seleção, override manual reabilitando entidade, barras obrigatórias), senha mascarada, e o relatório não modal |
+| `test_mdb_import_ui.py` | com um `MdbImportResult` injetado: instalação dos dez modelos pelos setters existentes, catálogo sobrevivendo à cascata das chaves, banco parcial, diálogo (pré-seleção, override manual reabilitando entidade, barras obrigatórias), senha mascarada, e o relatório não modal |
 | `test_search.py` | índice de busca (sem Qt) |
 | `test_curvas.py` | invariantes da curva (24 pontos, sem `nan`/`inf`, negativos e zero aceitos), `curve_id` sobrevivendo à renomeação, unicidade de nome sem caixa, horas faltantes em base 1, e o parser de colagem: `\r\n`/`\r`, linha vazia final descartada mas a do meio preservada, bloco de duas colunas, vírgula decimal e recusa de `1.234,56` |
 | `test_curvas_store.py` | ida e volta preservando id/acentos/negativos, criação do diretório, regravação por cima (regressão de `os.rename` no Windows), nenhum `.tmp` remanescente, e a tolerância de leitura: JSON quebrado, raiz inesperada, entrada inválida entre válidas, versão mais nova, ids/nomes repetidos, id ausente gerado e chaves desconhecidas ignoradas |
 | `test_curvas_table.py` | coluna "Hora" sintética e não editável, `EditRole` sem truncar a precisão, `setData` com ponto e vírgula, texto recusado sem apagar o valor anterior, célula esvaziada, colagem com âncora, truncamento na hora 24 e a **regressão de alinhamento** (um texto não numérico no meio não desloca as horas seguintes) |
 | `test_curvas_ui.py` | estado vazio, criação/renomeação/exclusão com confirmação, recusa de salvar incompleta sem criar o arquivo, gravação e `curvesSaved`, fechar com Salvar/Descartar/Cancelar (Descartar relê o disco), gráfico acompanhando a edição, os casos-limite de pintura (vazio, todos iguais, todos zero, faixa negativa, lacunas) e a entrada de menu **Configurações → Curvas…** |
+| `test_calculation_levels.py` · `test_calculation_levels_store.py` | padrões, invariantes do ciclo de 24 horas, referência nos limites, isolamento do rascunho, round-trip JSON, fallback integral e gravação atômica |
+| `test_patamares_ui.py` | cinco colunas totalmente editáveis, limites dos delegates, estado sujo, validação conjunta, salvamento, ordenação, descarte/cancelamento, menu e persistência entre janelas principais |
+| `test_generator_update.py` | fórmula e precisão, ponto/vírgula, hora 0→24, DEFAULT/próprios, inversão somente da potência por fase, curva negativa, omissões, identidade, progresso e cancelamento |
+| `test_generator_update_ui.py` | diálogo por circuito, seleção inicial DEFAULT, demanda total positiva e potência por fase negativa no painel, mensagem de omissão, ação em Ferramentas, resolução de rascunhos e invalidação do fluxo |
 | `test_graphics.py` · `test_main_window.py` · `test_branches_ui.py` · `test_circuits_ui.py` · `test_phase_ui.py` · `test_search_ui.py` · `test_map_tiles.py` · `test_satellite_ui.py` · `test_theme_ui.py` · `test_cables_ui.py` · `test_opendss_export_ui.py` · `test_powerflow_ui.py` · `test_opendss_settings_ui.py` · `test_regulators_ui.py` | camadas Qt (exigem PyQt6) |
 
 Os testes do núcleo usam apenas a biblioteca padrão e NumPy; os gráficos rodam

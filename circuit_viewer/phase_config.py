@@ -100,6 +100,30 @@ class PhaseConfiguration:
             unknown_values,
         )
 
+    def phase_letters_for_value(self, value: object) -> tuple[str, ...] | None:
+        """Resolve as fases elétricas D/E/F de um valor ``FASES2``.
+
+        O ``NOME`` é a fonte da ordem e das letras, enquanto ``NUMERO_FASES``
+        confirma que a entrada não está semanticamente incompleta. O neutro
+        presente em nomes como ``DN``/``DEFN`` é ignorado.
+        """
+
+        try:
+            key = normalize_phase_value(value)
+        except ValueError:
+            return None
+        entry = next((item for item in self.entries if item.fases2 == key), None)
+        if entry is None:
+            return None
+        letters = tuple(
+            letter
+            for letter in (entry.name or "").strip().upper()
+            if letter in {"D", "E", "F"}
+        )
+        if len(letters) != entry.phase_count or len(set(letters)) != len(letters):
+            return None
+        return letters
+
 
 def normalize_phase_value(value: object) -> str:
     if isinstance(value, bool) or value is None:

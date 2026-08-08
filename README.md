@@ -76,7 +76,9 @@ layout distribui conjuntamente os dois tipos na mesma barra, sem contato entre
 os símbolos. O menu **Visualizar > Mostrar geradores** controla essa camada de
 forma independente. Ao selecionar um círculo, o painel direito mostra duas
 tabelas, uma para cada fonte lógica. Geradores também participam da importação
-MDB; ainda não entram na busca, exportação OpenDSS ou fluxo de potência.
+MDB e continuam fora da busca global. Para entrar na exportação OpenDSS e no
+fluxo de potência, precisam primeiro de um resultado vigente de **Atualizar
+Geradores…**, descrito adiante.
 
 Após importar as cargas, a opção **Importar patamares de carga…** aceita um
 segundo CSV com `CARGA_ID`, `NPAT`, `PD`, `PE`, `PF`, `QD`, `QE` e `QF`. Cada
@@ -134,6 +136,13 @@ a partir da barra inicial. Trechos-chave são associados diretamente pelo
 `CIRC_ID`: `ESTADO=0` bloqueia a passagem e `ESTADO=1` permite a passagem apenas
 para o mesmo circuito.
 
+Com o catálogo de circuitos carregado, **Importar patamares de circuitos…**
+aceita `CIRCUITO_PATAMARES.csv` com `CIRC_ID`, `NPAT`, `NOME`, `HORARIO_INI`,
+`HORARIO_FIM` e `HORARIO_REF`; `PONTA`, `HORARIO_OPC` e quaisquer outras colunas
+são ignoradas. Cada `CIRC_ID` precisa existir no catálogo e possuir os quatro
+`NPAT` completos e válidos. Grupos incompletos ou inválidos são omitidos sem
+impedir os demais circuitos.
+
 O item **Importar cabos…** está sempre disponível: o catálogo de cabos não
 depende de barras nem de trechos. O CSV deve conter `CABO_ID`, `TIPO`, `CODIGO`,
 `IADM`, `GMR`, `R`, `X`, `QCAP`, `R0`, `X0`, `R1`, `X1`, `NOME` e `EXTERN_ID`.
@@ -145,7 +154,7 @@ invalida nada, e importar qualquer outra entidade não invalida os cabos.
 ## Importação por banco de dados (`.mdb`)
 
 **Arquivo > Importar banco de dados…** lê um banco Microsoft Access e importa as
-nove entidades lógicas de uma vez, dispensando exportar cada tabela para CSV. Os dados
+dez entidades lógicas de uma vez, dispensando exportar cada tabela para CSV. Os dados
 são os mesmos e passam pelas mesmas validações — a única diferença é a fonte.
 
 O banco é aberto **somente para leitura**, em quatro camadas: `ReadOnly=1` na
@@ -190,6 +199,10 @@ seletores identificados: `MT_GERADOR_CONS` e `MT_CONS`. A opção só inicia
 marcada quando as duas tabelas forem resolvidas, e cada origem pode ser
 substituída manualmente sem afetar a outra.
 
+**Patamares dos circuitos** é uma entidade independente, lida de
+`CIRCUITO_PATAMARES` depois de Circuitos. Uma falha nessa tabela não invalida o
+catálogo nem qualquer outra entidade.
+
 O mesmo diálogo pede zona, hemisfério e **unidade das coordenadas**, como na
 importação de barras por CSV. A unidade é deduzida de uma amostra da tabela de
 barras e já vem selecionada.
@@ -205,7 +218,7 @@ As entidades são importadas numa passada só, na ordem imposta pelas dependênc
 entre elas:
 
 ```
-barras → cabos → trechos → cargas → geradores → patamares → chaves → reguladores → circuitos
+barras → cabos → trechos → cargas → geradores → patamares → chaves → reguladores → circuitos → patamares dos circuitos
 ```
 
 As chaves vêm antes dos circuitos porque a topologia energizada depende delas.
@@ -406,14 +419,19 @@ e patamares importados, um arquivo de cargas por contagem de fases:
 `cargasmonofasicas.dss`, `cargasbifasicas.dss` e `cargastrifasicas.dss`. Por
 cima deles saem `<CODIGO>_Master.dss` e `<CODIGO>_Buscoords.csv`, o arquivo
 principal que cria o circuito, chama os demais e resolve, mais as coordenadas
-das barras.
+das barras. Se houver um resultado vigente de **Atualizar Geradores…**, também
+saem `geradoresmonofasicos.dss`, `geradoresbifasicos.dss` e
+`geradorestrifasicos.dss`.
 
 A opção só fica disponível com barras, trechos, chaves, circuitos e cabos
 importados e um `fases2.json` válido — são as cinco fontes que os dois arquivos
 de rede consomem. Cargas e patamares **não** entram nessa lista: sem eles a
 exportação continua funcionando e apenas os arquivos de carga deixam de ser
 gerados. Quando são gerados, saem os três, mesmo que algum fique só com o
-cabeçalho.
+cabeçalho. Geradores também não são precondição: se estiverem importados sem um
+resultado atualizado, a aplicação pede confirmação explícita antes de continuar
+sem eles. Com resultado vigente, os três arquivos de geradores sempre saem,
+inclusive os que contiverem somente o cabeçalho.
 
 Ao acionar, uma janela lista os circuitos do catálogo para você escolher **um**
 — marcar outro desmarca o anterior, porque o master cria um `New Circuit`, que
@@ -620,6 +638,36 @@ nomes são verificados em conjunto, como acontece entre `trechos.dss` e
 entre arquivos: duas cargas de contagens diferentes nunca geram o mesmo nome,
 mesmo com o mesmo `CODIGO`.
 
+### Arquivos de geradores
+
+Os três arquivos de geradores seguem a decomposição das cargas: cada equipamento
+vira uma `Load` monofásica por fase real, ligada em `wye`, com a tensão de fase
+derivada da `VNOM` do circuito e os terminais de `fases2.json`. A fonte é
+exclusivamente o último resultado válido de **Atualizar Geradores…**; geradores
+omitidos nesse cálculo ou pertencentes a outro circuito não são exportados.
+
+Um gerador bifásico `DE` de código `SOLAR-1` produz, por exemplo:
+
+```text
+New LoadShape.PERFIL-GER-SOLAR-1-2F-D npts=4 interval=1 mult=[<PD por NPAT>] qmult=[0 0 0 0]
+New LoadShape.PERFIL-GER-SOLAR-1-2F-E npts=4 interval=1 mult=[<PE por NPAT>] qmult=[0 0 0 0]
+
+New Load.GER-SOLAR-1-2F-D phases=1 bus1=COD-B.1 conn=wye kV=7.96743 model=1 kW=1 kvar=1 daily=PERFIL-GER-SOLAR-1-2F-D class=-2
+New Load.GER-SOLAR-1-2F-E phases=1 bus1=COD-B.2 conn=wye kV=7.96743 model=1 kW=1 kvar=1 daily=PERFIL-GER-SOLAR-1-2F-E class=-2
+```
+
+`PD`, `PE` e `PF` já chegam negativos para uma curva positiva. O exportador usa
+esses valores diretamente no `mult`, sem uma segunda inversão; `QD`, `QE` e
+`QF` permanecem zero. Assim o elemento `Load` representa geração no OpenDSS.
+Uma curva negativa conserva sua demanda total negativa e produz potência ativa
+por fase positiva, conforme a mesma convenção algébrica.
+
+O nome é `GER-<CODIGO>-<N>F-<FASE>`, com `GERADOR_ID` como reserva quando o
+código não gera um nome válido. `class=-1`, `-2` ou `-3` identifica a contagem
+original de fases. Cargas e geradores compartilham o namespace `Load.*`: as
+cargas reservam seus nomes primeiro, e qualquer colisão descarta o gerador
+inteiro e entra no relatório.
+
 Em todos os arquivos os nomes são saneados para `[A-Za-z0-9_-]` com acentos
 reduzidos a ASCII, porque no OpenDSS o ponto separa nós de barra e o espaço
 separa propriedades.
@@ -643,6 +691,9 @@ Redirect chaves.dss
 Redirect cargasmonofasicas.dss
 Redirect cargasbifasicas.dss
 Redirect cargastrifasicas.dss
+Redirect geradoresmonofasicos.dss
+Redirect geradoresbifasicos.dss
+Redirect geradorestrifasicos.dss
 
 Set Voltagebases=[13.8]
 calcvoltagebases
@@ -662,8 +713,8 @@ A ordem das seções não é estética:
 - Os `Redirect` vêm **antes** do `calcvoltagebases`, que precisa de todas as
   barras já definidas. São `Redirect`, não `Compile`, porque o `Compile` trocaria
   o diretório corrente e quebraria o `Buscoords` relativo do fim. A lista reflete
-  exatamente os arquivos gerados: sem cargas importadas, só os dois de rede
-  aparecem.
+  exatamente os arquivos gerados. Os arquivos de geradores, quando houver
+  resultado vigente, aparecem depois dos três arquivos de cargas.
 - `basekv` e `Set Voltagebases` são tensões de **linha** (o `VNOM` do circuito),
   enquanto as cargas `conn=wye` usam `kV` de **fase**. As duas convenções
   convivem: é assim que o OpenDSS espera cada grandeza.
@@ -688,9 +739,10 @@ sobrescreveria a primeira.
 
 ## Configurações do OpenDSS
 
-O menu **Configurações → OpenDSS…** define parâmetros globais aplicados a **todas
-as cargas** do modelo, tanto na exportação quanto no fluxo de potência — os dois
-caminhos geram o mesmo arquivo master.
+O menu **Configurações → OpenDSS…** define parâmetros globais aplicados a **todos
+os elementos `Load`** do modelo — cargas de consumo e geradores — tanto na
+exportação quanto no fluxo de potência. Os dois caminhos geram o mesmo arquivo
+master.
 
 | Parâmetro | Padrão do OpenDSS | Efeito |
 |---|---|---|
@@ -727,6 +779,41 @@ verificação: ele aceita `vminpu=-1` em silêncio, e é a aplicação que imped
 Os valores ficam guardados entre sessões, como a preferência de tema. Alterá-los
 descarta um resultado de fluxo de potência já calculado, porque ele descreveria o
 modelo anterior.
+
+## Patamares de cálculo
+
+O menu **Configurações → Patamares…** abre uma grade editável com as colunas
+`NPAT`, `NOME`, `HORARIO_INI`, `HORARIO_FIM` e `HORARIO_REF`. São sempre quatro
+linhas, correspondentes aos `NPAT` 0 a 3, e a primeira execução parte de
+Madrugada (22–5), Manhã (5–11), Tarde (11–18) e Noite (18–22).
+
+Os horários são horas inteiras de 0 a 23. Os períodos precisam formar um ciclo
+contínuo de exatamente 24 horas, sem lacunas ou sobreposições, seguindo a ordem
+dos `NPAT`; intervalos que atravessam a meia-noite são aceitos. O horário de
+referência deve pertencer ao período e pode coincidir com o início ou o fim.
+Nomes são obrigatórios e não podem se repetir.
+
+No topo, a lista **Configuração** sempre oferece `DEFAULT` e acrescenta apenas
+os circuitos que receberam quatro patamares importados válidos, identificados
+por `CIRC_ID` e `CODIGO`. O `DEFAULT` é permanente: salvar grava exclusivamente
+`circuit_viewer/dados/patamares.json`, com UTF-8 e substituição atômica. Arquivo
+ausente usa os valores iniciais; arquivo corrompido recua integralmente para
+eles e apresenta um aviso.
+
+Cada circuito começa como uma cópia virtual de `CIRCUITO_PATAMARES`. Salvar uma
+edição de circuito altera somente a memória da sessão: não grava JSON, CSV,
+MDB nem o banco. Fechar e reabrir a janela preserva essa cópia enquanto a
+aplicação estiver aberta; encerrar a aplicação ou reimportar com sucesso
+descarta as edições virtuais e recria as agendas a partir da fonte. Cancelar ou
+falhar uma importação mantém o estado atual.
+
+As edições ficam pendentes até **Salvar**. Trocar a configuração ou fechar com
+alterações oferece salvar, descartar ou continuar editando; descartar restaura
+a última versão salva daquela opção.
+
+Este cadastro define a agenda usada por **Atualizar Geradores**. Ele continua
+independente dos patamares de potência importados por carga e não altera a
+exportação OpenDSS nem o fluxo de potência.
 
 ## Curvas horárias
 
@@ -775,9 +862,57 @@ editado à mão e ficar inválido, a aplicação **abre mesmo assim** — o que 
 puder ser lido é descartado e um aviso explica o que aconteceu, em vez de
 impedir o programa de iniciar.
 
-Cada curva guarda um identificador interno que a renomeação não altera. É esse
-identificador que permitirá associá-las a cargas e geradores nos cálculos, sem
-que trocar o nome de uma curva quebre o vínculo.
+Cada curva guarda um identificador interno que a renomeação não altera. A
+atualização dos geradores registra esse identificador no resultado da sessão,
+sem modificar o `CURVA_ID` que veio de `MT_GERADOR_CONS`.
+
+## Atualização dos geradores
+
+Com geradores, circuitos, `fases2.json` válido e ao menos uma curva salva, o
+menu **Ferramentas → Atualizar Geradores…** abre uma janela modal. Uma única
+curva é escolhida para todos os geradores. Para cada circuito, a coluna
+**PATAMARES** começa em `DEFAULT` e permite `Próprios` somente quando aquele
+circuito possui uma agenda importada válida na cópia da sessão.
+
+Alterações ainda pendentes nas janelas **Curvas** ou **Patamares** precisam ser
+salvas ou descartadas antes do cálculo. Assim, o worker recebe somente retratos
+confirmados e imutáveis. O processamento é cancelável e transacional: cancelar,
+falhar ou não encontrar nenhum gerador válido preserva o resultado anterior.
+
+Para cada gerador válido, a demanda média é:
+
+```text
+D_MED = GERACAO_KWH / (30 × 24) = GERACAO_KWH / 720
+```
+
+Cada um dos quatro patamares usa sua `HORARIO_REF`:
+
+```text
+DEMANDA_NPAT = D_MED × CURVA(HORARIO_REF)
+```
+
+As curvas são exibidas nas horas 1 a 24, enquanto `HORARIO_REF` usa 0 a 23. A
+correspondência adotada é direta para 1–23; a referência 0 consulta a hora
+visual 24. Energia zero e valores negativos da curva são válidos. Energia
+inválida ou negativa omite somente o gerador afetado.
+
+O `FASES2` é resolvido pelo arquivo de configuração. A demanda total é dividida
+pelo número de fases e recebe sinal invertido antes de ser aplicada somente às
+letras D/E/F presentes: `P_FASE = -(DEMANDA / número_de_fases)`. Essa é a
+convenção elétrica da aplicação — potência positiva representa consumo e
+potência negativa representa geração. Fases ausentes e `QD`, `QE`, `QF`
+recebem zero. Geradores em barra sem circuito, em barra pertencente a mais de um
+circuito ou com `FASES2` desconhecido também são omitidos e aparecem no
+relatório.
+
+Depois do cálculo, o painel **Gerador selecionado** mostra **Demanda por
+Patamar** (`NPAT`, `DEMANDA`) e **Potência por Fase** (`GERADOR_ID`, `NPAT`,
+`PD`, `PE`, `PF`, `QD`, `QE`, `QF`). Os valores existem somente na sessão e são
+descartados quando geradores, circuitos ou patamares mudam, ou quando a curva
+usada é alterada ou excluída. **Demanda por Patamar** conserva o sinal do
+cálculo; somente `PD`, `PE` e `PF` recebem a inversão. Um resultado vigente é
+consumido pela exportação OpenDSS e pelo fluxo de potência interno sem alterar
+CSV, MDB, JSON, `GERACAO_KWH` ou `CURVA_ID`.
 
 ## Fluxo de potência
 
@@ -786,6 +921,13 @@ O botão **Executar Fluxo de Potência** (na barra de ferramentas e em
 exatamente os mesmos arquivos da exportação acima, compila o master no OpenDSS e
 traz as grandezas de volta para o painel lateral — o passo de exportar, abrir o
 OpenDSS e ler os resultados por fora deixa de ser necessário.
+
+O fluxo usa o mesmo retrato de geradores da exportação. Se houver geradores
+importados sem **Atualizar Geradores…**, pede confirmação para executar sem
+eles. Atualizar, substituir ou invalidar esse retrato descarta qualquer fluxo já
+calculado, evitando exibir grandezas de um modelo elétrico anterior. O relatório
+do fluxo informa quantos geradores entraram no modelo e quantos foram descartados
+durante a exportação interna.
 
 ### Instalação do motor
 
@@ -963,7 +1105,12 @@ atualizado junto com mudanças relevantes de arquitetura.
 - `circuit_viewer/mdb_engine.py`: único acesso ao `pyodbc` (opcional), leitura
   somente leitura e conversão de tipos.
 - `circuit_viewer/mdb_mapping.py`: correspondência tabela/coluna → entidade.
-- `circuit_viewer/mdb_import.py`: importação encadeada das nove entidades lógicas.
+- `circuit_viewer/mdb_import.py`: importação encadeada das dez entidades lógicas.
+- `circuit_viewer/circuit_level_import.py`: parser compartilhado dos patamares por circuito.
+- `circuit_viewer/circuit_calculation_levels.py`: fonte imutável e cópia virtual da sessão.
+- `circuit_viewer/generator_update.py`: cálculo puro das demandas e potências por fase dos geradores.
+- `circuit_viewer/generator_update_dialog.py`: escolha da curva e da agenda efetiva por circuito.
+- `circuit_viewer/generator_update_table.py`: tabelas do resultado no painel lateral.
 - `circuit_viewer/mdb_import_dialog.py`: escolha de tabelas, senha e UTM.
 - `circuit_viewer/mdb_import_report.py`: relatório consolidado da importação.
 - `circuit_viewer/segment_import.py`: importação e vínculo dos trechos.

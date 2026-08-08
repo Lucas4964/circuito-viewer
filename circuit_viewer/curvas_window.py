@@ -227,6 +227,27 @@ class CurvesWindow(QDialog):
         self._sync_visibility()
         self._load_selected()
 
+    def confirm_pending_changes(self) -> bool:
+        """Resolve o rascunho antes de um consumidor usar as curvas salvas."""
+
+        if not self._dirty:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Alterações não salvas",
+            "Há alterações não salvas nas curvas. Salvar agora?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+        if answer == QMessageBox.StandardButton.Save:
+            return self._save()
+        self._reload_from_disk()
+        return True
+
     def _sync_visibility(self) -> None:
         has_curves = len(self.catalog) > 0
         self.empty_label.setVisible(not has_curves)
@@ -410,27 +431,7 @@ class CurvesWindow(QDialog):
     # ------------------------------------------------------------ fechamento --
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        if not self._dirty:
+        if self.confirm_pending_changes():
             event.accept()
-            return
-        answer = QMessageBox.question(
-            self,
-            "Alterações não salvas",
-            "Há alterações não salvas nas curvas. Salvar antes de fechar?",
-            QMessageBox.StandardButton.Save
-            | QMessageBox.StandardButton.Discard
-            | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Save,
-        )
-        if answer == QMessageBox.StandardButton.Cancel:
-            event.ignore()
-            return
-        if answer == QMessageBox.StandardButton.Save:
-            if not self._save():
-                # A validação recusou: manter a janela aberta é a única forma
-                # de o usuário corrigir o que falta.
-                event.ignore()
-                return
         else:
-            self._reload_from_disk()
-        event.accept()
+            event.ignore()

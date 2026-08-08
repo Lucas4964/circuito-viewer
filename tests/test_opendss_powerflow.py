@@ -12,11 +12,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from circuit_viewer.calculation_levels import default_calculation_levels
+from circuit_viewer.curvas import Curve
+from circuit_viewer.generator_update import (
+    GeneratorScheduleMode,
+    calculate_generator_demands,
+)
 from circuit_viewer.model import (
     CableModel,
     CircuitCatalogModel,
     CircuitDefinition,
     CircuitModel,
+    GeneratorModel,
     LineNetworkModel,
     LoadModel,
     LoadPatternModel,
@@ -25,7 +32,13 @@ from circuit_viewer.model import (
     SwitchModel,
     UtmCrs,
 )
-from circuit_viewer.opendss_export import LINES_FILENAME, build_export
+from circuit_viewer.opendss_export import (
+    LINES_FILENAME,
+    SINGLE_PHASE_GENERATORS_FILENAME,
+    THREE_PHASE_GENERATORS_FILENAME,
+    TWO_PHASE_GENERATORS_FILENAME,
+    build_export,
+)
 from circuit_viewer.opendss_powerflow import (
     PowerFlowIssue,
     RegulatorTap,
@@ -140,6 +153,50 @@ def make_regulators(
         ["200"],
         [vnom],
     )
+
+
+def make_generator_updates(catalog: CircuitCatalogModel):  # noqa: ANN201
+    """Um gerador monofasico calculado, pronto para entrar no OpenDSS."""
+
+    bars = catalog.segments.bars
+    loads = LoadModel(
+        bars,
+        ["LG0"],
+        [1],
+        [""],
+        ["CARGA-GERADOR"],
+        [""],
+        [""],
+        [""],
+        ["1"],
+        [""],
+    )
+    generators = GeneratorModel(
+        loads,
+        ["G0"],
+        [0],
+        [""],
+        ["SOLAR"],
+        [""],
+        [""],
+        [""],
+        ["CURVA-ORIGINAL"],
+        ["720"],
+        ["CONS0"],
+        ["SOLAR"],
+        [""],
+        ["Gerador solar"],
+        ["1"],
+    )
+    schedule = default_calculation_levels()
+    return calculate_generator_demands(
+        generators,
+        catalog,
+        PHASES,
+        Curve("CURVA", "Constante", (2.0,) * 24),
+        (schedule,),
+        (GeneratorScheduleMode.DEFAULT,),
+    ).model
 
 
 class FakeSolution:
@@ -439,6 +496,35 @@ class PowerFlowRunTests(unittest.TestCase):
         }
         self.assertEqual(written, expected)
         self.assertIn(LINES_FILENAME, written)
+
+    def test_generator_snapshot_is_written_and_compiled_with_the_power_flow(self) -> None:
+        engine = FakeEngine()
+        updates = make_generator_updates(self.catalog)
+
+        result = self._run(engine, generator_updates=updates)
+
+        self.assertIs(result.generator_updates, updates)
+        self.assertEqual(result.exported_generators, 1)
+        self.assertEqual(result.discarded_generators, 0)
+        written = {
+            path.name: path
+            for path in self.workspace.rglob("*")
+            if path.is_file()
+        }
+        for filename in (
+            SINGLE_PHASE_GENERATORS_FILENAME,
+            TWO_PHASE_GENERATORS_FILENAME,
+            THREE_PHASE_GENERATORS_FILENAME,
+        ):
+            self.assertIn(filename, written)
+        mono = written[SINGLE_PHASE_GENERATORS_FILENAME].read_text(encoding="utf-8")
+        self.assertIn(
+            "mult=[-2.000000 -2.000000 -2.000000 -2.000000]",
+            mono,
+        )
+        master_path = Path(engine.commands[1].removeprefix("Compile [").removesuffix("]"))
+        master = master_path.read_text(encoding="utf-8")
+        self.assertIn(f"Redirect {SINGLE_PHASE_GENERATORS_FILENAME}", master)
 
     def test_compiles_the_master_and_steps_one_patamar_at_a_time(self) -> None:
         engine = FakeEngine()
