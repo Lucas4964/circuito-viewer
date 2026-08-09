@@ -113,6 +113,18 @@ class GeneratorUiTests(unittest.TestCase):
             for second in rects[index + 1 :]:
                 self.assertFalse(first.adjusted(-1.49, -1.49, 1.49, 1.49).intersects(second))
 
+    def test_layout_mask_does_not_reserve_space_for_hidden_zero_equivalents(self) -> None:
+        _, loads, generators = self.make_models()
+        baseline = load_layout_offsets_for_models((loads,))[0]
+
+        load_layout, _ = load_layout_offsets_for_models(
+            (loads, generators),
+            (None, (False, False)),
+        )
+
+        self.assertEqual(tuple(load_layout[0]), tuple(baseline[0]))
+        self.assertEqual(tuple(load_layout[1]), tuple(baseline[1]))
+
     def test_details_visibility_and_load_reimport_invalidation(self) -> None:
         bars, loads, generators = self.make_models()
         window = MainWindow()

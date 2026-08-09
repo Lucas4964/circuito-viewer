@@ -101,6 +101,8 @@ CIRCUITO_VIEWER/
 │   ├── opendss_powerflow.py   # execução do fluxo e associação dos resultados
 │   ├── branch_analysis.py     # análise topológica de ramais
 │   ├── equivalent_network.py  # projeção simplificada / cargas equivalentes
+│   ├── branch_json_export.py  # snapshot filtrado dos ramais em JSON atômico
+│   ├── branch_table_export.py # colunas canônicas + CSV pt-BR atômico
 │   ├── search.py              # índice de busca global (sem Qt)
 │   ├── mapa_tiles.py          # matemática XYZ + gerenciador de tiles
 │   │
@@ -261,6 +263,8 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | `opendss_export.py` | `CircuitCatalogModel`, `CableModel`, `PhaseConfiguration`, índices dos circuitos, cargas/patamares opcionais e `GeneratorUpdateModel?` | `OpenDssExportBundle` (rede, três arquivos de carga, três de geradores, master, coordenadas e diagnósticos) |
 | `opendss_powerflow.py` | motor OpenDSS injetado + as mesmas entradas da exportação + pasta de trabalho | `PowerFlowResult` (correntes por trecho e tensões por barra, um retrato por patamar + diagnósticos) |
 | `equivalent_network.py` | `BranchAnalysisResult`, `LoadModel?`, `LoadPatternModel?` | `EquivalentNetworkResult` (cargas equivalentes + máscaras) |
+| `branch_json_export.py` | ramais, equivalentes e índices filtrados | objeto JSON validado e `BranchJsonExportResult` gravado atomicamente |
+| `branch_table_export.py` | ramais, equivalente opcional e índices na ordem visual | 21 colunas canônicas e `BranchCsvExportResult` pt-BR gravado atomicamente |
 | `generator_update.py` | `GeneratorModel`, `CircuitCatalogModel`, `PhaseConfiguration`, uma `Curve` e agendas efetivas | `GeneratorUpdateResult` (demanda média, quatro demandas totais e quatro potências por fase com sinal elétrico + diagnósticos) |
 
 ### Gráfico e UI
@@ -270,12 +274,12 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | `graphics.py` | Toda a pintura, virtualização, hit-test geométrico, zoom/pan, desenho do fundo de satélite |
 | `opendss_settings.py` | Valor imutável dos parâmetros globais das cargas (`Vminpu`/`Vmaxpu`), com a invariante que o OpenDSS não impõe e a tradução para os comandos `BatchEdit` |
 | `opendss_engine.py` | Contenção dos efeitos globais do `py_dss_interface`: singleton com trava, diretório corrente preservado, `SystemExit` capturado, pasta temporária ASCII |
-| `workers.py` | 16 workers `QObject` que apenas encapsulam funções puras e emitem `progress/finished/failed/cancelled` |
+| `workers.py` | 19 workers `QObject` que apenas encapsulam funções puras e emitem `progress/finished/failed/cancelled` |
 | `mdb_import_dialog.py` | Tabelas detectadas com ajuste manual, senha mascarada e metadados UTM; `MdbPasswordDialog` é separado porque a senha só se sabe necessária **depois** da primeira tentativa de conexão |
 | `mdb_import_report.py` | Relatório consolidado das dez entidades lógicas — não modal, como o de sobreposições, porque os dois abrem sozinhos ao fim de uma operação |
 | `main_window.py` | Dono de todo o estado da aplicação; coordena importações, invalidações em cascata, máscaras efetivas, painel de detalhes e menus |
 | `circuits_window.py` | `QAbstractTableModel` fino sobre `CircuitVisibilityController` + delegate de cor |
-| `branch_window.py` | Tabela de ramais com `QSortFilterProxyModel` (ordenação por `UserRole`, filtro por circuito) |
+| `branch_window.py` | Tabela de ramais com `QSortFilterProxyModel` (ordenação por `UserRole`, filtro por circuito), demanda máxima cacheada e exportações JSON/CSV das linhas visíveis |
 | `overlap_report.py` | Tabela derivada de `overlapping_segment_indices` |
 | `cables_window.py` | Tabela do catálogo de cabos (ordenação numérica por `UserRole`) + rótulos `cable_summary`/`cable_tooltip` reutilizados no painel de trechos |
 | `opendss_export_dialog.py` | Lista de circuitos com caixas de seleção **mutuamente exclusivas**; devolve o índice escolhido para a exportação |
@@ -1178,7 +1182,13 @@ interrompem; só chaves fechadas do próprio circuito são atravessadas).
 com o tronco para obter `POS_PRIMEIRA_CHAVE`; `REMANEJAVEL = posição ≤ 5`;
 comprimento total (`None` se algum `COMPR` faltar); cargas coletadas via CSR
 `bar → cargas`; topologia classificada em `Linear` / `Bifurcado` / `Cíclico`
-(+ `Múltiplas conexões`).
+(+ `Múltiplas conexões`). Os índices das chaves identificadas são persistidos em
+`BranchRecord.switch_indices`; consumidores posteriores não percorrem novamente
+a topologia para recuperar essas chaves.
+`BranchRecord.topological_level` copia `trunk_depths` da conexão primária: é a
+distância mínima em quantidade de trechos trifásicos energizados desde a raiz,
+com nível zero na própria fonte. Em ciclos, a BFS fornece o menor caminho; em
+múltiplas conexões, a ordenação dos candidatos escolhe a primária mais próxima.
 
 **Saída:** `BranchAnalysisResult` com `records` ordenados por
 `(circuit_id, first_segment_id)` e `branch_id` reatribuído como sequência global
@@ -1195,9 +1205,14 @@ Para cada ramal gera um `EquivalentLoadRecord`:
 - `origin_kind = "branch_aggregate"`; `bar_index` = conexão com o tronco;
 - `snom`/`sadm` somados com `Decimal` em contexto de precisão 50 — qualquer
   parcela inválida torna **aquele total** `None` e gera diagnóstico, sem abortar;
-- patamares: soma `PD, PE, PF, QD, QE, QF` por `NPAT`; a tabela equivalente só
-  existe se **todas** as cargas do ramal tiverem os 4 patamares completos e
-  numéricos.
+- patamares: soma `PD, PE, PF, QD, QE, QF` por `NPAT` para cargas e geradores;
+  as potências do `GeneratorUpdateModel` entram diretamente com sinal negativo;
+- `maximum_active_demand`: maior valor algébrico individual entre `PD`, `PE` e
+  `PF`, considerando somente as fases reais do ramal e os quatro NPAT. É
+  calculado uma vez durante a agregação, ignora Q, preserva negativos e vale
+  `None` quando os patamares estão incompletos;
+- proveniência: `source_load_indices` e `source_generator_indices`, mais o
+  estado `valid`, `incomplete` ou `zero` da agregação elétrica.
 
 `_parse_decimal` aceita ponto ou vírgula decimal (não ambos) e notação
 científica; `Decimal` foi escolhido em vez de `float` porque os totais são
@@ -1209,13 +1224,20 @@ exibidos ao usuário e somas de float acumulariam ruído visível.
 _retained_segments  = membership.segment_indices − trechos absorvidos por ramais
 _retained_bars      = barras dos trechos retidos ∪ conexões ∪ barra raiz
 _reduced_loads      = cargas absorvidas pelos ramais
+_reduced_generators = geradores absorvidos pelos ramais
 _equivalents_by_circuit = índices das cargas equivalentes
 ```
 
 `visibility_masks(checked)` combina essas listas com contadores por circuito e
-devolve as quatro máscaras da projeção. Como usa contagem, um elemento continua
+devolve também a máscara dos geradores originais. Como usa contagem, um elemento continua
 visível enquanto **algum** circuito visível precisar dele — o comportamento
 correto para circuitos sobrepostos.
+
+Geradores são associados pelo par circuito/barra às barras internas do ramal;
+a barra de conexão permanece no tronco. Gerador interno omitido na atualização,
+associação múltipla ou potência em fase incompatível torna a equivalência
+incompleta. Quando todos os 24 valores P/Q têm módulo `<= 1e-9`, o ramal é
+`zero`: sua infraestrutura continua reduzida, mas a máscara não mostra símbolo.
 
 O modelo expõe `bars`, `bar_indices`, `load_ids`, `spatial_index` e `record()`,
 ou seja, é **duck-type compatível com `LoadModel`** — por isso o mesmo
@@ -1566,6 +1588,60 @@ segunda barra de um nome repetido é descartada com diagnóstico, já que no
 arquivo ela apenas sobrescreveria a primeira. A função é pública exatamente por
 ser essa definição única: a leitura dos resultados do fluxo de potência
 (seção 12.4) precisa concordar com ela.
+
+#### Exportação da projeção simplificada (`opendss_simplified_export.py`)
+
+É um pipeline separado: `build_simplified_export()` devolve
+`SimplifiedOpenDssExportBundle` e roda em `SimplifiedOpenDssExportWorker`.
+`build_export()` e `OpenDssExportWorker` convencionais não participam desse
+fluxo. Os helpers de elementos aceitam filtros opcionais, cujo padrão `None`
+preserva byte a byte o comportamento convencional.
+
+O exportador exige um `EquivalentNetworkResult` ligado por identidade aos
+modelos atuais e exatamente um circuito. Os acessores `retained_*` definem
+linhas, chaves, reguladores e coordenadas; `reduced_load_indices` e
+`reduced_generator_indices` retiram as fontes internas dos seis arquivos
+normais. Os equivalentes válidos e não zerados são emitidos em
+`ramalmonofasico.dss` e `ramalbifasico.dss`, como `Load` monofásicas por fase,
+com `LoadShape` de quatro NPAT e potência líquida sem inversão adicional.
+
+O namespace `Load.*` é reservado na ordem cargas externas, geradores externos e
+ramais. Qualquer equivalência incompleta, colisão ou erro de fase bloqueia o
+bundle inteiro antes da gravação. A UI cria somente após sucesso a subpasta
+`<CODIGO>_Rede_Simplificada`; o master redireciona rede retida, fontes externas
+e os dois arquivos de ramais nessa ordem. O fluxo de potência interno continua
+usando exclusivamente o bundle convencional.
+
+#### Exportação JSON dos ramais (`branch_json_export.py`)
+
+O botão da janela de ramais entrega ao worker apenas os índices das linhas
+aceitas pelo filtro. O exportador ordena esses índices por `branch_id` e monta o
+documento diretamente de `BranchRecord` e `EquivalentLoadRecord`: barras,
+trechos, cargas, geradores e chaves vêm dos índices imutáveis já associados.
+Não há nova BFS nem recálculo dos patamares.
+Antes da serialização, `SwitchModel.record_indices_by_segment` separa em tempo
+linear os trechos comuns daqueles que modelam chaves; estes aparecem somente em
+`chaves` e nunca também em `trechos`.
+
+Cada entrada `RAMAL-<ID>` preserva a topologia mesmo quando a equivalência é
+zerada ou incompleta. Antes de tocar no destino, a validação acumula todas as
+ocorrências de `CODIGO` vazio; qualquer ocorrência bloqueia o arquivo inteiro.
+A serialização usa UTF-8 com `ensure_ascii=False`, indentação e arquivo
+temporário no mesmo diretório, seguido de `fsync` e `os.replace`. Assim,
+cancelamento, validação ou falha anterior à substituição preservam o destino.
+
+#### Exportação CSV da tabela (`branch_table_export.py`)
+
+`BRANCH_TABLE_HEADERS` e `branch_table_values()` são a definição única das 21
+colunas consumidas pelo modelo Qt e pelo exportador. A interface captura os
+índices na ordem atual do `QSortFilterProxyModel`; o núcleo não reordena nem
+refaz a análise. O equivalente é opcional e sua ausência produz apenas uma
+célula vazia em `DEMANDA_MAXIMA`.
+
+O serializador usa `csv.writer` com `;`, vírgula decimal, sem agrupamento de
+milhares, precisão interna completa, `UTF-8-SIG` e `CRLF`. O conteúdo inteiro é
+construído antes de criar o temporário; depois segue o mesmo contrato de
+`fsync` + `os.replace`, preservando o destino em cancelamentos e falhas.
 
 ### 12.4 Fluxo de potência (`opendss_powerflow.py`, `opendss_engine.py`)
 
@@ -2288,7 +2364,7 @@ lido por uma build anterior.
 
 ## 18. Testes e benchmarks
 
-### Testes (`tests/`, 53 arquivos)
+### Testes (`tests/`, 57 arquivos)
 
 | Arquivo | Foco |
 |---|---|
@@ -2297,7 +2373,7 @@ lido por uma build anterior.
 | `test_calculation_levels.py` · `test_calculation_levels_store.py` · `test_patamares_ui.py` · `test_circuit_levels_ui.py` | validação horária, JSON atômico do DEFAULT, combo por circuito e garantia de salvamento exclusivamente em memória |
 | `test_phase_config.py` | validação do `fases2.json` |
 | `test_circuit_colors.py` | paleta e contraste |
-| `test_branch_analysis.py` · `test_equivalent_network.py` | análises topológicas |
+| `test_branch_analysis.py` · `test_equivalent_network.py` · `test_branch_json_export.py` · `test_branch_table_export.py` | análise e nível topológico, demanda ativa máxima, JSON estrutural e CSV pt-BR filtrado/atômico |
 | `test_opendss_export.py` | linhas de trecho, de chave e das cargas de uma, duas e três fases, conversão de `C1` e do `kV` pela tensão de fase, ordem `New`/`Open` e `LoadShape`/`Load`, nomenclatura `-NF-<FASE>`, terminal por letra, neutro preservado só na monofásica, colunas de patamar por fase, patamar zerado, descarte integral da carga, reserva de nomes entre os arquivos, arredondamento, saneamento, master (ordem das seções, `Redirect` conforme os arquivos gerados, coordenadas em casas fixas) e diagnósticos |
 | `test_opendss_generator_export.py` | três arquivos de geradores, perfis ativos negativos sem dupla inversão, classes negativas, terminais e tensão de fase, seleção por circuito, fallback, descarte integral, namespace `Load.*` compartilhado e ordem dos `Redirect` |
 | `test_opendss_settings.py` | invariante da faixa (`0 < vminpu <= 1 <= vmaxpu`), comandos `BatchEdit` exatos e sem vírgula decimal, desabilitado não emite nada, ida e volta pelo mapeamento e recuperação de preferência corrompida |

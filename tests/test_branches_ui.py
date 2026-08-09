@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+from decimal import Decimal
 import json
 import os
 from pathlib import Path
@@ -17,6 +19,7 @@ try:
     from PyQt6.QtWidgets import QApplication, QMessageBox
 
     from circuit_viewer.branch_analysis import analyze_branches
+    from circuit_viewer.equivalent_network import build_equivalent_network
     from circuit_viewer.csv_import import CsvLoadResult
     from circuit_viewer.main_window import MainWindow
     from circuit_viewer.model import (
@@ -140,6 +143,22 @@ class BranchesUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertIsNone(window._equivalent_thread)
 
+    def wait_for_json_export(self, window: MainWindow) -> None:
+        deadline = time.monotonic() + 3.0
+        while window._branch_json_thread is not None and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        self.app.processEvents()
+        self.assertIsNone(window._branch_json_thread)
+
+    def wait_for_csv_export(self, window: MainWindow) -> None:
+        deadline = time.monotonic() + 3.0
+        while window._branch_csv_thread is not None and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        self.app.processEvents()
+        self.assertIsNone(window._branch_csv_thread)
+
     def test_tools_menu_runs_background_analysis_and_populates_table(self) -> None:
         empty = MainWindow(self.config_path)
         self.addCleanup(empty.close)
@@ -156,27 +175,157 @@ class BranchesUiTests(unittest.TestCase):
 
         window._show_or_analyze_branches()
         self.wait_for_analysis(window)
+        self.wait_for_equivalent(window)
 
         self.assertIsNotNone(window._branch_analysis_result)
         self.assertTrue(window.branches_window.isVisible())
         self.assertFalse(window.branches_window.isModal())
+        self.assertFalse(window.simplified_network_action.isChecked())
+        self.assertTrue(window.branches_window.export_json_button.isEnabled())
+        self.assertTrue(window.branches_window.export_csv_button.isEnabled())
         model = window.branch_table_model
         self.assertEqual(model.rowCount(), 1)
-        self.assertEqual(model.columnCount(), 19)
+        self.assertEqual(model.columnCount(), 21)
+        self.assertEqual(
+            model.headerData(5, Qt.Orientation.Horizontal),
+            "NIVEL_TOPOLOGICO",
+        )
+        self.assertEqual(model.headerData(11, Qt.Orientation.Horizontal), "DEMANDA_MAXIMA")
         self.assertEqual(model.data(model.index(0, 0)), "1")
         self.assertEqual(model.data(model.index(0, 1)), "MONOFASICO")
         self.assertEqual(model.data(model.index(0, 2)), "C1")
         self.assertEqual(model.data(model.index(0, 3)), "B1")
-        self.assertEqual(model.data(model.index(0, 5)), "T2")
-        self.assertEqual(model.data(model.index(0, 7)), "2")
-        self.assertEqual(model.data(model.index(0, 8)), "200.000")
-        self.assertEqual(model.data(model.index(0, 10)), "D")
-        self.assertEqual(model.data(model.index(0, 11)), "D")
+        self.assertEqual(model.data(model.index(0, 5)), "1")
+        self.assertEqual(model.data(model.index(0, 6)), "T2")
+        self.assertEqual(model.data(model.index(0, 8)), "2")
+        self.assertEqual(model.data(model.index(0, 9)), "200.000")
+        self.assertEqual(model.data(model.index(0, 11)), "0.0000")
+        self.assertEqual(model.data(model.index(0, 12)), "D")
+        self.assertEqual(model.data(model.index(0, 13)), "D")
 
         cached = window._branch_analysis_result
         window._show_or_analyze_branches()
         self.assertIs(window._branch_analysis_result, cached)
         self.assertIsNone(window._branch_thread)
+
+    def test_json_button_exports_only_the_filtered_circuit(self) -> None:
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        equivalent = build_equivalent_network(branches, None)
+        window._branch_analysis_result = branches
+        window._equivalent_network_result = equivalent
+        window.branches_window.set_result(branches)
+        window.branches_window.set_equivalent_result(equivalent)
+        window._show_branches_window()
+        window.branches_window.circuit_filter.setCurrentIndex(1)
+        self.app.processEvents()
+        target = Path(self.temp.name) / "circuito.json"
+
+        with patch(
+            "circuit_viewer.main_window.QFileDialog.getSaveFileName",
+            return_value=(str(target), "Arquivos JSON (*.json)"),
+        ):
+            window.branches_window.export_json_button.click()
+            self.wait_for_json_export(window)
+
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(list(payload), ["RAMAL-1"])
+        self.assertEqual(payload["RAMAL-1"]["barra_inicio"], "CB1")
+
+    def test_all_circuits_filter_exposes_every_branch_for_json(self) -> None:
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        equivalent = build_equivalent_network(branches, None)
+        window._branch_analysis_result = branches
+        window._equivalent_network_result = equivalent
+        window.branches_window.set_result(branches)
+        window.branches_window.set_equivalent_result(equivalent)
+
+        self.assertIsNone(window.branches_window.selected_circuit_id())
+        self.assertEqual(window.branches_window.visible_source_rows(), (0, 1))
+        self.assertTrue(window.branches_window.export_json_button.isEnabled())
+        self.assertTrue(window.branches_window.export_csv_button.isEnabled())
+
+        window.branches_window.set_csv_export_pending(True)
+        self.assertFalse(window.branches_window.export_json_button.isEnabled())
+        self.assertFalse(window.branches_window.export_csv_button.isEnabled())
+        window.branches_window.set_csv_export_pending(False)
+        self.assertTrue(window.branches_window.export_json_button.isEnabled())
+        self.assertTrue(window.branches_window.export_csv_button.isEnabled())
+
+    def test_csv_button_preserves_visual_filter_and_sort_order(self) -> None:
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        window._branch_analysis_result = branches
+        window.branches_window.set_result(branches)
+        proxy = window.branches_window.proxy_model
+        proxy.sort(0, Qt.SortOrder.DescendingOrder)
+        self.app.processEvents()
+        target = Path(self.temp.name) / "todos.csv"
+
+        with patch(
+            "circuit_viewer.main_window.QFileDialog.getSaveFileName",
+            return_value=(str(target), "Arquivos CSV (*.csv)"),
+        ):
+            window.branches_window.export_csv_button.click()
+            self.wait_for_csv_export(window)
+
+        with target.open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.reader(stream, delimiter=";"))
+        self.assertEqual([row[0] for row in rows[1:]], ["2", "1"])
+
+        window.branches_window.circuit_filter.setCurrentIndex(1)
+        self.app.processEvents()
+        filtered_target = Path(self.temp.name) / "filtrado.csv"
+        with patch(
+            "circuit_viewer.main_window.QFileDialog.getSaveFileName",
+            return_value=(str(filtered_target), "Arquivos CSV (*.csv)"),
+        ):
+            window.branches_window.export_csv_button.click()
+            self.wait_for_csv_export(window)
+
+        with filtered_target.open(encoding="utf-8-sig", newline="") as stream:
+            filtered_rows = list(csv.reader(stream, delimiter=";"))
+        self.assertEqual(len(filtered_rows), 2)
+        self.assertEqual(filtered_rows[1][2], "C1")
+
+    def test_maximum_demand_formats_tooltip_and_sorts_numerically(self) -> None:
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        window.branches_window.set_result(branches)
+        model = window.branch_table_model
+        model._maximum_demand_by_branch = {  # índice derivado já calculado
+            1: Decimal("10.123456789"),
+            2: Decimal("2.5"),
+        }
+        model.dataChanged.emit(model.index(0, 11), model.index(1, 11))
+
+        self.assertEqual(model.data(model.index(0, 11)), "10.1235")
+        self.assertEqual(
+            model.data(model.index(0, 11), Qt.ItemDataRole.ToolTipRole),
+            "10.123456789",
+        )
+        proxy = window.branches_window.proxy_model
+        proxy.sort(11, Qt.SortOrder.AscendingOrder)
+        self.app.processEvents()
+
+        ordered_ids = tuple(
+            model.record(proxy.mapToSource(proxy.index(row, 0)).row()).branch_id
+            for row in range(proxy.rowCount())
+        )
+        self.assertEqual(ordered_ids, (2, 1))
 
     def test_filter_selection_reactivates_circuit_and_highlights_whole_branch(self) -> None:
         window, _, segments, catalog = self.make_window(two_circuits=True)

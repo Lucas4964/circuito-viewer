@@ -439,6 +439,36 @@ energiza um alimentador só. Em seguida é pedida **uma única pasta de destino*
 que recebe todos os arquivos gerados; se algum deles já existir, a substituição
 é confirmada antes.
 
+### Exportação da rede simplificada por ramais
+
+**Exportar > OpenDSS — Rede simplificada por ramais…** é uma modalidade
+independente. Ela exige que **Ramais** tenha sido processado com os modelos
+atuais; a projeção é construída automaticamente se ainda não existir, sem
+ativar o modo visual. Se houver geradores
+importados, também exige um resultado vigente de **Atualizar Geradores…**; não
+há recálculo nem omissão silenciosa de geração interna.
+
+A pasta escolhida recebe uma subpasta
+`<CODIGO>_Rede_Simplificada`. Nela, `trechos.dss`, `chaves.dss`, reguladores e
+coordenadas contêm somente a infraestrutura retida pela mesma projeção mostrada
+na tela. Cargas e geradores fora de ramais usam os arquivos e regras normais.
+Fontes internas não são exportadas individualmente: são substituídas pela
+potência líquida do ramal em `ramalmonofasico.dss` ou `ramalbifasico.dss`.
+
+Cada equivalente soma `PD`, `PE`, `PF`, `QD`, `QE` e `QF` por NPAT. A geração
+entra diretamente com potência ativa negativa; portanto, um ramal somente com
+geração ou com geração superior ao consumo produz `mult` negativo. Um ramal
+cujos 24 valores P/Q tenham módulo de no máximo `1e-9` continua recolhido na
+topologia, mas não cria símbolo nem `Load` no OpenDSS. Equivalência incompleta,
+associação ambígua, colisão de nome ou fase incompatível bloqueia toda a
+exportação antes da gravação.
+
+Os equivalentes usam uma `Load` monofásica por fase, `LoadShape` de quatro
+NPAT, `kW=1`, `kvar=1`, `conn=wye`, `class=1` ou `class=2` e nomes
+`RAMAL-<ID>-<N>F-<FASE>`. Cargas, geradores e ramais compartilham o namespace
+`Load.*`. Esta opção não altera **Exportar > OpenDSS…** nem o fluxo de potência
+interno da aplicação.
+
 ### `trechos.dss`
 
 Um elemento `Line` por trecho que **não** representa chave. Cada trecho vira uma
@@ -1034,7 +1064,16 @@ distintos também interrompem o ramal e são reportadas.
 
 Além da conexão, primeiro trecho, quantidade, comprimento, cargas e fase, a
 tabela informa barras, chaves, posição da primeira chave, conexões adicionais,
-comprimentos ausentes e classificação da topologia. `REMANEJAVEL=1` significa
+comprimentos ausentes e classificação da topologia. `DEMANDA_MAXIMA` é o maior
+valor algébrico de potência ativa encontrado entre as fases reais do ramal e os
+quatro NPAT; mantém o sinal, ignora integralmente potência reativa e aparece
+como `—` quando a equivalência estiver indisponível ou incompleta.
+`NIVEL_TOPOLOGICO` conta os trechos trifásicos energizados no menor caminho
+entre a barra fonte do circuito e a conexão do ramal: a própria fonte é nível
+zero. Em troncos bifurcados, o nível expressa proximidade relativa da fonte;
+ramais de ramos diferentes não se tornam pai e filho apenas por terem níveis
+distintos.
+`REMANEJAVEL=1` significa
 que há uma chave em até cinco níveis do início do conjunto completo do ramal,
 inclusive em uma subárvore monofásica incorporada. Se algum `COMPR` estiver
 vazio, o total é exibido como `—`.
@@ -1043,6 +1082,31 @@ A tabela pode ser ordenada e filtrada por circuito. Selecionar um ramal reativa
 seu circuito caso ele esteja oculto, sem alterar o modo de coloração por fases.
 Resultados são descartados automaticamente quando barras, trechos, cargas,
 chaves ou circuitos forem substituídos.
+
+Ao concluir **Ferramentas → Ramais…**, a agregação elétrica é iniciada em
+segundo plano para preencher `DEMANDA_MAXIMA`, sem ativar a visualização da rede
+simplificada. O resultado é um snapshot reutilizado pela tabela e pelas
+exportações; ordenar, filtrar ou reabrir a janela não recalcula a topologia nem
+os patamares. Se houver geradores importados, é necessário executar antes
+**Atualizar Geradores…**.
+
+O botão **Exportar JSON** grava os ramais atualmente aceitos pelo filtro do
+ComboBox: um circuito específico ou todos os circuitos exibidos. O objeto raiz
+usa chaves `RAMAL-<ID>` e cada entrada contém `barra_inicio`, `barras`, `trechos`,
+`cargas`, `geradores`, `chaves`, `fase` e o booleano `remanejavel`. A ordem é
+determinística e ramais zerados ou eletricamente incompletos continuam presentes,
+pois o arquivo descreve a topologia. Qualquer `CODIGO` vazio bloqueia o arquivo
+inteiro, sem substituição por IDs. A escrita usa UTF-8 e substituição atômica;
+cancelamento ou erro preserva um arquivo anterior.
+Trechos que possuem chave associada são excluídos de `trechos` e aparecem
+exclusivamente em `chaves`, evitando duplicidade lógica entre as duas listas.
+
+O botão **Exportar CSV (Excel)** grava exatamente as linhas aceitas pelo filtro
+e na ordem atualmente exibida na tabela. O arquivo usa `;`, vírgula decimal,
+precisão numérica interna completa, células vazias para valores indisponíveis,
+UTF-8 com BOM e linhas CRLF. A gravação também é atômica; se a demanda máxima
+não estiver disponível, somente essa célula fica vazia e os demais dados do
+ramal continuam sendo exportados.
 
 ### Rede simplificada e cargas equivalentes
 
@@ -1054,10 +1118,19 @@ valores inválidos tornam somente o total correspondente indisponível e geram u
 diagnóstico.
 
 Quando os patamares estiverem carregados, a aplicação agrega `PD`, `PE`, `PF`,
-`QD`, `QE` e `QF` por `NPAT`. A tabela equivalente é apresentada apenas quando
-todas as cargas do ramal possuem os quatro patamares completos e numéricos. A
+`QD`, `QE` e `QF` por `NPAT` para cargas e geradores internos. As potências dos
+geradores vêm do último **Atualizar Geradores…** e já são negativas, reduzindo
+naturalmente a demanda líquida. A tabela equivalente é apresentada somente
+quando todas as parcelas possuem quatro patamares completos e numéricos. A
 carga derivada é selecionável e o painel lateral informa sua origem, ramal,
-`TIPO_RAMAL`, `REMANEJAVEL`, circuito, conexão, cargas de origem e totais.
+`TIPO_RAMAL`, `REMANEJAVEL`, circuito, conexão, quantidades de cargas e
+geradores de origem e totais.
+
+Geradores internos são ocultados pela mesma máscara das cargas. Ramais líquidos
+zerados (tolerância `1e-9` em todos os valores P/Q) continuam estruturalmente
+reduzidos, mas não exibem carga equivalente. Associação ambígua ou gerador
+interno sem cálculo válido deixa o ramal incompleto e é apresentada nos
+diagnósticos.
 
 Filtros de circuito também se aplicam à projeção. Em circuitos sobrepostos, um
 elemento original permanece visível enquanto for necessário por outro circuito

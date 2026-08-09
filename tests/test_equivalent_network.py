@@ -19,11 +19,18 @@ from circuit_viewer.model import (
     CircuitCatalogModel,
     CircuitDefinition,
     CircuitModel,
+    GeneratorModel,
     LineNetworkModel,
     LoadModel,
     LoadPatternModel,
     LoadPatternRecord,
     UtmCrs,
+)
+from circuit_viewer.calculation_levels import default_calculation_levels
+from circuit_viewer.curvas import Curve
+from circuit_viewer.generator_update import (
+    GeneratorScheduleMode,
+    calculate_generator_demands,
 )
 from circuit_viewer.phase_config import PhaseConfiguration, PhaseMappingEntry
 
@@ -97,6 +104,104 @@ def pattern_group(load_id: str, factor: int) -> tuple[LoadPatternRecord, ...]:
 
 
 class EquivalentNetworkTests(unittest.TestCase):
+    def test_generators_reduce_branch_power_and_are_hidden_with_the_branch(self) -> None:
+        _, _, catalog, loads = make_sources()
+        patterns = LoadPatternModel(
+            loads,
+            [pattern_group("L0", 9), pattern_group("L1", 1), pattern_group("L2", 2)],
+        )
+        generators = GeneratorModel(
+            loads,
+            ["G1"],
+            [1],
+            ["MC1"],
+            ["GEN-1"],
+            ["13.8"],
+            ["75"],
+            ["Y"],
+            ["CURVA"],
+            ["720"],
+            ["CONS-1"],
+            ["GEN-1"],
+            [""],
+            ["Gerador"],
+            ["d"],
+        )
+        schedule = default_calculation_levels()
+        updates = calculate_generator_demands(
+            generators,
+            catalog,
+            PHASES,
+            Curve("C", "Constante", (1.0,) * 24),
+            (schedule,),
+            (GeneratorScheduleMode.DEFAULT,),
+        ).model
+        branches = analyze_branches(catalog, PHASES, loads)
+
+        result = build_equivalent_network(branches, loads, patterns, updates)
+
+        record = result.model.record(0)
+        self.assertEqual(record.source_generator_count, 1)
+        self.assertEqual(set(record.source_generator_indices), {0})
+        self.assertEqual(record.aggregation_state, "valid")
+        group = result.model.records_for_load(0)
+        self.assertEqual(group[0].pd, Decimal("2"))
+        self.assertEqual(group[3].pd, Decimal("11"))
+        self.assertEqual(record.maximum_active_demand, Decimal("11"))
+        masks = result.model.visibility_masks((True,))
+        self.assertTrue(np.array_equal(masks.source_generator_mask, [False]))
+
+    def test_exact_net_zero_branch_has_no_visible_equivalent(self) -> None:
+        _, _, catalog, loads = make_sources()
+
+        def active_group(load_id: str, value: str):
+            return tuple(
+                LoadPatternRecord(load_id, npat, value, "0", "0", "0", "0", "0")
+                for npat in range(4)
+            )
+
+        patterns = LoadPatternModel(
+            loads,
+            [active_group("L0", "0"), active_group("L1", "1"), active_group("L2", "0")],
+        )
+        generators = GeneratorModel(
+            loads,
+            ["G1"],
+            [1],
+            ["MC1"],
+            ["GEN-1"],
+            ["13.8"],
+            ["75"],
+            ["Y"],
+            ["CURVA"],
+            ["720"],
+            ["CONS-1"],
+            ["GEN-1"],
+            [""],
+            ["Gerador"],
+            ["d"],
+        )
+        schedule = default_calculation_levels()
+        updates = calculate_generator_demands(
+            generators,
+            catalog,
+            PHASES,
+            Curve("C", "Constante", (1.0,) * 24),
+            (schedule,),
+            (GeneratorScheduleMode.DEFAULT,),
+        ).model
+        branches = analyze_branches(catalog, PHASES, loads)
+
+        result = build_equivalent_network(branches, loads, patterns, updates)
+
+        self.assertTrue(result.model.record(0).is_zero)
+        self.assertTrue(
+            np.array_equal(
+                result.model.visibility_masks((True,)).equivalent_load_mask,
+                [False],
+            )
+        )
+
     def test_public_types_and_global_ids_with_original_phases2(self) -> None:
         self.assertTrue(EquivalentLoadRecord.__dataclass_fields__)
         self.assertTrue(EquivalentLoadPatternRecord.__dataclass_fields__)
@@ -145,6 +250,7 @@ class EquivalentNetworkTests(unittest.TestCase):
         self.assertEqual(len(group), 4)
         self.assertEqual(group[0].pd, Decimal("3"))
         self.assertEqual(group[3].pd, Decimal("12"))
+        self.assertEqual(record.maximum_active_demand, Decimal("12"))
         self.assertEqual(result.model.index_for_id("RAMAL-1"), 0)
         self.assertEqual(result.model.index_for_branch_id(1), 0)
         self.assertEqual(result.issues, ())
@@ -233,6 +339,7 @@ class EquivalentNetworkTests(unittest.TestCase):
         self.assertIsNone(record.snom)
         self.assertEqual(record.sadm, Decimal("3"))
         self.assertEqual(result.model.records_for_load(0), ())
+        self.assertIsNone(record.maximum_active_demand)
         self.assertTrue(any(issue.field == "SNOM" for issue in result.issues))
         self.assertTrue(any(issue.field == "PATAMARES" for issue in result.issues))
 
@@ -259,8 +366,44 @@ class EquivalentNetworkTests(unittest.TestCase):
         self.assertEqual(record.source_load_count, 0)
         self.assertEqual(record.snom, Decimal(0))
         self.assertEqual(record.sadm, Decimal(0))
+        self.assertEqual(record.maximum_active_demand, Decimal(0))
         self.assertTrue(
             all(value == 0 for row in result.model.records_for_load(0) for value in row.values)
+        )
+
+    def test_maximum_demand_uses_only_real_active_phases_and_preserves_sign(self) -> None:
+        _, _, catalog, loads = make_sources()
+
+        def group(load_id: str, values: tuple[str, str, str, str]):
+            return tuple(
+                LoadPatternRecord(
+                    load_id,
+                    npat,
+                    value,
+                    "999",
+                    "888",
+                    "7777",
+                    "6666",
+                    "5555",
+                )
+                for npat, value in enumerate(values)
+            )
+
+        patterns = LoadPatternModel(
+            loads,
+            [
+                group("L0", ("0", "0", "0", "0")),
+                group("L1", ("-10", "-20", "-30", "-40")),
+                group("L2", ("-1", "-2", "-3", "-4")),
+            ],
+        )
+        branches = analyze_branches(catalog, PHASES, loads)
+
+        result = build_equivalent_network(branches, loads, patterns)
+
+        self.assertEqual(
+            result.model.record(0).maximum_active_demand,
+            Decimal("-11"),
         )
 
     def test_visibility_reduces_branch_and_restores_it_for_overlapping_owner(self) -> None:

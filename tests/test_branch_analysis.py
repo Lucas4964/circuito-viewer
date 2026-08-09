@@ -135,6 +135,7 @@ class BranchAnalysisTests(unittest.TestCase):
         self.assertEqual(record.branch_type, BranchType.MONOPHASIC)
         self.assertEqual(record.connection_bar_id, "B1")
         self.assertEqual(record.connection_bar_code, "CB1")
+        self.assertEqual(record.topological_level, 1)
         self.assertEqual(record.first_segment_id, "T2")
         self.assertEqual(record.first_segment_code, "CT2")
         self.assertEqual(set(record.segment_indices), {2, 3, 4})
@@ -171,6 +172,67 @@ class BranchAnalysisTests(unittest.TestCase):
 
         self.assertIsNone(record.total_length)
         self.assertEqual(record.missing_length_count, 1)
+
+    def test_topological_level_counts_trunk_segments_from_source(self) -> None:
+        bars = make_bars(5)
+        network = make_network(
+            bars,
+            [0, 1, 0, 1],
+            [1, 2, 3, 4],
+            ["DEF", "DEF", "D", "E"],
+        )
+        catalog = CircuitCatalogModel.build(
+            network,
+            None,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+
+        records = analyze_branches(catalog, PHASES).records
+
+        levels_by_connection = {
+            record.connection_bar_id: record.topological_level
+            for record in records
+        }
+        self.assertEqual(levels_by_connection, {"B0": 0, "B1": 1})
+
+    def test_topological_level_uses_shortest_path_in_cyclic_trunk(self) -> None:
+        bars = make_bars(4)
+        network = make_network(
+            bars,
+            [0, 1, 0, 2],
+            [1, 2, 2, 3],
+            ["DEF", "DEF", "DEF", "D"],
+        )
+        catalog = CircuitCatalogModel.build(
+            network,
+            None,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+
+        record = analyze_branches(catalog, PHASES).records[0]
+
+        self.assertEqual(record.connection_bar_id, "B2")
+        self.assertEqual(record.topological_level, 1)
+
+    def test_closed_three_phase_switch_counts_as_a_topological_hop(self) -> None:
+        bars = make_bars(4)
+        network = make_network(
+            bars,
+            [0, 1, 1],
+            [1, 2, 3],
+            ["DEF", "DEF", "D"],
+        )
+        switches = make_switch(network, 0)
+        catalog = CircuitCatalogModel.build(
+            network,
+            switches,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+
+        record = analyze_branches(catalog, PHASES).records[0]
+
+        self.assertEqual(record.connection_bar_id, "B1")
+        self.assertEqual(record.topological_level, 1)
 
     def test_biphasic_branch_incorporates_every_single_phase_subtree(self) -> None:
         bars = make_bars(7)
@@ -345,6 +407,7 @@ class BranchAnalysisTests(unittest.TestCase):
         record = result.records[0]
         self.assertEqual(record.first_segment_id, "T2")
         self.assertEqual(record.connection_bar_id, "B1")
+        self.assertEqual(record.topological_level, 1)
         self.assertEqual(record.trunk_connection_count, 2)
         self.assertIn("Múltiplas conexões", record.topology)
         self.assertTrue(
@@ -427,13 +490,14 @@ class BranchAnalysisTests(unittest.TestCase):
             None,
             [
                 CircuitDefinition("C1", "B0", "", ""),
-                CircuitDefinition("C2", "B0", "", ""),
+                CircuitDefinition("C2", "B2", "", ""),
             ],
         )
 
         result = analyze_branches(catalog, PHASES)
 
         self.assertEqual([record.circuit_id for record in result.records], ["C1", "C2"])
+        self.assertEqual([record.topological_level for record in result.records], [2, 0])
 
     def test_missing_trunk_and_cancellation(self) -> None:
         bars = make_bars(3)

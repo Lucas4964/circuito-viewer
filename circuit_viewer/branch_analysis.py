@@ -72,12 +72,14 @@ class BranchRecord:
     connection_bar_index: int
     connection_bar_id: str
     connection_bar_code: str
+    topological_level: int
     first_segment_index: int
     first_segment_id: str
     first_segment_code: str
     segment_indices: IndexArray
     bar_indices: IndexArray
     load_indices: IndexArray
+    switch_indices: IndexArray
     total_length: float | None
     load_count: int
     phases2: str
@@ -93,7 +95,12 @@ class BranchRecord:
     def __post_init__(self) -> None:
         if not isinstance(self.branch_type, BranchType):
             raise ValueError("TIPO_RAMAL deve ser uma classificação conhecida.")
-        for values in (self.segment_indices, self.bar_indices, self.load_indices):
+        for values in (
+            self.segment_indices,
+            self.bar_indices,
+            self.load_indices,
+            self.switch_indices,
+        ):
             if values.dtype != np.dtype(np.intp) or values.ndim != 1:
                 raise ValueError("Os índices do ramal devem ser vetores inteiros.")
             if values.flags.writeable:
@@ -104,6 +111,8 @@ class BranchRecord:
             raise ValueError("O índice do circuito não pode ser negativo.")
         if self.connection_bar_index < 0 or self.first_segment_index < 0:
             raise ValueError("A conexão do ramal deve possuir índices válidos.")
+        if self.topological_level < 0:
+            raise ValueError("O nível topológico não pode ser negativo.")
         for count in (
             self.load_count,
             self.switch_count,
@@ -114,6 +123,8 @@ class BranchRecord:
                 raise ValueError("As contagens do ramal não podem ser negativas.")
         if self.load_count != int(self.load_indices.size):
             raise ValueError("NUM_CARGAS deve corresponder aos índices das cargas.")
+        if self.switch_count != int(self.switch_indices.size):
+            raise ValueError("NUM_CHAVES deve corresponder aos índices das chaves.")
 
     @property
     def segment_count(self) -> int:
@@ -637,15 +648,20 @@ def analyze_branches(
                         bar_distances[neighbor] = int(segment_distances[segment_index])
                         distance_queue.append(neighbor)
 
-            switch_indices = (
+            switch_segment_indices = (
                 np.empty(0, dtype=np.intp)
                 if switch_by_segment is None
                 else branch_array[switch_by_segment[branch_array] >= 0]
             )
             first_switch_position = (
                 None
-                if switch_indices.size == 0
-                else int(segment_distances[switch_indices].min())
+                if switch_segment_indices.size == 0
+                else int(segment_distances[switch_segment_indices].min())
+            )
+            switch_record_indices = (
+                np.empty(0, dtype=np.intp)
+                if switch_by_segment is None
+                else switch_by_segment[switch_segment_indices]
             )
             lengths = segments.lengths[branch_array]
             missing_length_count = int(np.count_nonzero(np.isnan(lengths)))
@@ -711,12 +727,14 @@ def analyze_branches(
                     connection_bar_index=primary_trunk_bar,
                     connection_bar_id=bars.bar_ids[primary_trunk_bar],
                     connection_bar_code=bars.codes[primary_trunk_bar],
+                    topological_level=int(trunk_depths[primary_trunk_bar]),
                     first_segment_index=first_segment,
                     first_segment_id=segments.segment_ids[first_segment],
                     first_segment_code=segments.codes[first_segment],
                     segment_indices=_readonly_indices(branch_array),
                     bar_indices=_readonly_indices(downstream_array),
                     load_indices=_readonly_indices(load_array),
+                    switch_indices=_readonly_indices(switch_record_indices),
                     total_length=total_length,
                     load_count=load_count,
                     phases2=segments.phases[first_segment].strip(),
@@ -726,7 +744,7 @@ def analyze_branches(
                         first_switch_position is not None
                         and first_switch_position <= 5
                     ),
-                    switch_count=int(switch_indices.size),
+                    switch_count=int(switch_record_indices.size),
                     first_switch_position=first_switch_position,
                     trunk_connection_count=len(connections),
                     missing_length_count=missing_length_count,

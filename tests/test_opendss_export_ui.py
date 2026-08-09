@@ -205,14 +205,48 @@ class OpenDssExportUiTests(unittest.TestCase):
             if entry.text() == "Exportar"
         )
         self.assertIn(window.opendss_export_action, export_menu.actions())
+        self.assertIn(window.simplified_opendss_export_action, export_menu.actions())
         self.assertFalse(window.opendss_export_action.isEnabled())
+        self.assertFalse(window.simplified_opendss_export_action.isEnabled())
 
         self._load_everything(window)
         self.assertTrue(window.opendss_export_action.isEnabled())
+        self.assertTrue(window.simplified_opendss_export_action.isEnabled())
 
         # Sem o catálogo de cabos a exportação volta a ficar indisponível.
         window._set_cable_model(None)
         self.assertFalse(window.opendss_export_action.isEnabled())
+        self.assertFalse(window.simplified_opendss_export_action.isEnabled())
+
+    def test_simplified_export_requires_processed_branch_projection(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+
+        with patch(
+            "circuit_viewer.main_window.QMessageBox.information"
+        ) as information, patch.object(OpenDssExportDialog, "exec") as dialog:
+            window._export_simplified_opendss()
+
+        dialog.assert_not_called()
+        self.assertIn("Ramais", information.call_args.args[2])
+        self.assertIsNone(window._export_thread)
+
+    def test_simplified_export_builds_projection_without_activating_view(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        window._branch_analysis_result = object()
+
+        with patch.object(window, "_start_equivalent_build") as start, patch.object(
+            OpenDssExportDialog,
+            "exec",
+        ) as dialog:
+            window._export_simplified_opendss()
+
+        start.assert_called_once_with()
+        dialog.assert_not_called()
+        self.assertTrue(window._pending_simplified_export)
+        self.assertTrue(window._pending_simplified_activation)
+        self.assertFalse(window.simplified_network_action.isChecked())
 
     def test_dialog_lists_circuits_and_returns_the_selection(self) -> None:
         window = self._window()

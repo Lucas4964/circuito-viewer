@@ -34,6 +34,15 @@ from PyQt6.QtWidgets import (
 )
 
 from .branch_analysis import BranchAnalysisResult, BranchRecord
+from .branch_json_export import (
+    BranchJsonExportResult,
+    BranchJsonValidationError,
+    suggested_branch_json_filename,
+)
+from .branch_table_export import (
+    BranchCsvExportResult,
+    suggested_branch_csv_filename,
+)
 from .branch_window import BranchesWindow, BranchTableModel
 from .calculation_levels import CalculationLevelSchedule
 from .calculation_levels_store import load_calculation_levels
@@ -137,6 +146,12 @@ from .opendss_export import (
     phase_letters_by_node,
 )
 from .opendss_export_dialog import OpenDssExportDialog
+from .opendss_simplified_export import (
+    SINGLE_PHASE_BRANCHES_FILENAME,
+    TWO_PHASE_BRANCHES_FILENAME,
+    SimplifiedOpenDssExportBundle,
+    simplified_export_directory_name,
+)
 from .opendss_engine import power_flow_import_error
 from .opendss_powerflow import (
     LINE_VOLTAGE_PU_BASE,
@@ -181,6 +196,8 @@ from .theme import (
 )
 from .workers import (
     BranchAnalysisWorker,
+    BranchCsvExportWorker,
+    BranchJsonExportWorker,
     CableImportWorker,
     CircuitImportWorker,
     CircuitLevelImportWorker,
@@ -191,6 +208,7 @@ from .workers import (
     LoadPatternImportWorker,
     MdbImportWorker,
     OpenDssExportWorker,
+    SimplifiedOpenDssExportWorker,
     PowerFlowWorker,
     RegulatorImportWorker,
     SegmentImportWorker,
@@ -211,6 +229,43 @@ _GENERATOR_EXPORT_FILES: tuple[tuple[int, str, str], ...] = (
     (2, TWO_PHASE_GENERATORS_FILENAME, "bifásicos"),
     (3, THREE_PHASE_GENERATORS_FILENAME, "trifásicos"),
 )
+
+
+def _update_progress_dialog(
+    dialog: QProgressDialog | None,
+    *,
+    label: str | None = None,
+    minimum: int | None = None,
+    maximum: int | None = None,
+    value: int | None = None,
+) -> None:
+    """Atualiza um progresso modal sem acessar o objeto depois de ``setValue``.
+
+    ``QProgressDialog.setValue`` pode processar eventos quando o diálogo é
+    modal. Isso permite que o término da thread limpe as referências da janela
+    durante a própria chamada. Por isso o valor é sempre a última operação.
+    """
+
+    if dialog is None:
+        return
+    if minimum is not None and maximum is not None:
+        dialog.setRange(minimum, maximum)
+    elif minimum is not None:
+        dialog.setMinimum(minimum)
+    elif maximum is not None:
+        dialog.setMaximum(maximum)
+    if label is not None:
+        dialog.setLabelText(label)
+    if value is not None:
+        dialog.setValue(value)
+
+
+def _close_progress_dialog(dialog: QProgressDialog | None) -> None:
+    """Fecha uma referência local estável, sem reler o estado da janela."""
+
+    if dialog is not None:
+        dialog.close()
+
 
 # Grandezas do fluxo de potência oferecidas em cada página de detalhes, como
 # (chave, rótulo, casas decimais, tem fasor). Uma tabela por página em vez de
@@ -651,14 +706,27 @@ class MainWindow(QMainWindow):
         self._branch_analysis_snapshot: tuple[object, ...] | None = None
         self._close_after_branch_analysis = False
         self._show_branches_after_analysis = True
+        self._pending_branch_metrics = False
+        self._branch_json_thread: QThread | None = None
+        self._branch_json_worker: BranchJsonExportWorker | None = None
+        self._branch_json_progress_dialog: QProgressDialog | None = None
+        self._close_after_branch_json_export = False
+        self._branch_csv_thread: QThread | None = None
+        self._branch_csv_worker: BranchCsvExportWorker | None = None
+        self._branch_csv_progress_dialog: QProgressDialog | None = None
+        self._close_after_branch_csv_export = False
         self._pending_simplified_activation = False
+        self._pending_simplified_export = False
+        self._restart_equivalent_after_finish = False
         self._equivalent_thread: QThread | None = None
         self._equivalent_worker: EquivalentNetworkWorker | None = None
         self._equivalent_progress_dialog: QProgressDialog | None = None
         self._equivalent_snapshot: tuple[object, ...] | None = None
         self._close_after_equivalent_build = False
         self._export_thread: QThread | None = None
-        self._export_worker: OpenDssExportWorker | None = None
+        self._export_worker: (
+            OpenDssExportWorker | SimplifiedOpenDssExportWorker | None
+        ) = None
         self._export_progress_dialog: QProgressDialog | None = None
         self._export_directory: Path | None = None
         self._close_after_export = False
@@ -785,6 +853,12 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._show_curves_load_warning)
         if self._calculation_levels_load.issue is not None:
             QTimer.singleShot(0, self._show_calculation_levels_load_warning)
+
+    def _is_current_signal_source(self, expected: object | None) -> bool:
+        """Aceita chamadas diretas e sinais apenas da operação ainda vigente."""
+
+        source = self.sender()
+        return source is None or source is expected
 
     def _create_actions(self) -> None:
         self.import_action = QAction("Importar CSV…", self)
@@ -933,6 +1007,19 @@ class MainWindow(QMainWindow):
         )
         self.opendss_export_action.triggered.connect(self._export_opendss)
 
+        self.simplified_opendss_export_action = QAction(
+            "OpenDSS — Rede simplificada por ramais…",
+            self,
+        )
+        self.simplified_opendss_export_action.setEnabled(False)
+        self.simplified_opendss_export_action.setToolTip(
+            "Exportar uma projeção independente em que cada ramal é substituído "
+            "por sua carga equivalente"
+        )
+        self.simplified_opendss_export_action.triggered.connect(
+            self._export_simplified_opendss
+        )
+
         self.opendss_settings_action = QAction("OpenDSS…", self)
         self.opendss_settings_action.setToolTip(
             "Definir parâmetros globais aplicados a todas as cargas do modelo "
@@ -1041,6 +1128,7 @@ class MainWindow(QMainWindow):
 
         self.export_menu = self.menuBar().addMenu("Exportar")
         self.export_menu.addAction(self.opendss_export_action)
+        self.export_menu.addAction(self.simplified_opendss_export_action)
 
         self.tools_menu = self.menuBar().addMenu("Ferramentas")
         self.tools_menu.addAction(self.branches_action)
@@ -1458,9 +1546,11 @@ class MainWindow(QMainWindow):
             ("phases2", "FASES2:"),
             ("phase", "FASE:"),
             ("source_load_count", "NUM_CARGAS:"),
+            ("source_generator_count", "NUM_GERADORES:"),
             ("snom", "SNOM:"),
             ("sadm", "SADM:"),
             ("source_load_ids", "CARGAS_ORIGEM:"),
+            ("source_generator_ids", "GERADORES_ORIGEM:"),
         )
         self.equivalent_details_page = QScrollArea(self.details_stack)
         self.equivalent_details_page.setFrameShape(QFrame.Shape.NoFrame)
@@ -1724,6 +1814,12 @@ class MainWindow(QMainWindow):
             self._clear_branch_highlight
         )
         self.branches_window.closed.connect(self._clear_branch_highlight)
+        self.branches_window.exportJsonRequested.connect(
+            self._export_visible_branches_json
+        )
+        self.branches_window.exportCsvRequested.connect(
+            self._export_visible_branches_csv
+        )
         self.cables_window.importRequested.connect(self._choose_cables_csv)
 
     def _choose_import(self) -> None:
@@ -1944,6 +2040,8 @@ class MainWindow(QMainWindow):
             self._import_thread is not None
             or self._branch_thread is not None
             or self._equivalent_thread is not None
+            or self._branch_json_thread is not None
+            or self._branch_csv_thread is not None
             or self._power_flow_thread is not None
             or self._generator_update_thread is not None
         )
@@ -2089,9 +2187,7 @@ class MainWindow(QMainWindow):
         catálogo de circuitos, que é reconstruído por ``_set_switch_model``.
         """
 
-        if self._progress_dialog is not None:
-            self._progress_dialog.setValue(100)
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
 
         # As barras substituem tudo: trechos e cargas antigos referenciam o
         # modelo anterior e precisam sair antes.
@@ -2541,18 +2637,18 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_import_progress(self, rows: int, current: int, total: int) -> None:
-        if self._progress_dialog is None:
+        if not self._is_current_signal_source(self._import_worker):
             return
+        progress = self._progress_dialog
         percent = min(99, int(current * 100 / max(total, 1)))
-        self._progress_dialog.setLabelText(
-            f"Lendo {self._progress_entity}… {rows:n} linhas"
+        _update_progress_dialog(
+            progress,
+            label=f"Lendo {self._progress_entity}… {rows:n} linhas",
+            value=percent,
         )
-        self._progress_dialog.setValue(percent)
 
     def _on_import_finished(self, result: CsvLoadResult) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.setValue(100)
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
 
         # Trechos e cargas referenciam o modelo anterior e só são removidos
         # depois que a nova importação de barras foi concluída com sucesso.
@@ -2574,9 +2670,7 @@ class MainWindow(QMainWindow):
         self._show_import_report(result)
 
     def _on_segment_import_finished(self, result: SegmentLoadResult) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.setValue(100)
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
         if self._model is None or result.model.bars is not self._model:
             QMessageBox.critical(
                 self,
@@ -2588,9 +2682,7 @@ class MainWindow(QMainWindow):
         self._show_segment_import_report(result)
 
     def _on_load_import_finished(self, result: LoadCsvResult) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.setValue(100)
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
         if self._model is None or result.model.bars is not self._model:
             QMessageBox.critical(
                 self,
@@ -2602,9 +2694,7 @@ class MainWindow(QMainWindow):
         self._show_load_import_report(result)
 
     def _on_generator_import_finished(self, result: GeneratorCsvResult) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.setValue(100)
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
         if self._load_model is None or result.model.loads is not self._load_model:
             QMessageBox.critical(
                 self,
@@ -2619,9 +2709,7 @@ class MainWindow(QMainWindow):
         self,
         result: LoadPatternCsvResult,
     ) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.setValue(100)
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
         if self._load_model is None or result.model.loads is not self._load_model:
             QMessageBox.critical(
                 self,
@@ -2633,17 +2721,13 @@ class MainWindow(QMainWindow):
         self._show_load_pattern_import_report(result)
 
     def _on_cable_import_finished(self, result: CableCsvResult) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.setValue(100)
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
         # Catálogo raiz: não há modelo-pai cuja identidade precise ser validada.
         self._set_cable_model(result.model)
         self._show_cable_import_report(result)
 
     def _on_switch_import_finished(self, result: SwitchLoadResult) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.setValue(100)
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
         if self._line_model is None or result.model.segments is not self._line_model:
             QMessageBox.critical(
                 self,
@@ -2660,9 +2744,7 @@ class MainWindow(QMainWindow):
         self._show_switch_import_report(result, topology_warnings)
 
     def _on_regulator_import_finished(self, result: RegulatorLoadResult) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.setValue(100)
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
         if self._line_model is None or result.model.segments is not self._line_model:
             QMessageBox.critical(
                 self,
@@ -2674,9 +2756,7 @@ class MainWindow(QMainWindow):
         self._show_regulator_import_report(result)
 
     def _on_circuit_import_finished(self, result: CircuitLoadResult) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.setValue(100)
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
         if (
             self._line_model is None
             or result.model.segments is not self._line_model
@@ -2696,9 +2776,7 @@ class MainWindow(QMainWindow):
     def _on_circuit_level_import_finished(
         self, result: CircuitLevelCsvResult
     ) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.setValue(100)
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
         if (
             self._circuit_catalog is None
             or result.model.circuits is not self._circuit_catalog
@@ -2788,6 +2866,7 @@ class MainWindow(QMainWindow):
         if model is not None and model.loads is not self._load_model:
             raise ValueError("Os geradores devem pertencer às cargas exibidas.")
         if model is not self._generator_model:
+            self._invalidate_equivalent_network()
             self._invalidate_generator_update()
         if (
             self._selected_feature is not None
@@ -2813,12 +2892,16 @@ class MainWindow(QMainWindow):
         # Os patamares são a potência de cada Load exportada: trocá-los muda o
         # fluxo inteiro.
         self._invalidate_power_flow()
-        rebuild_equivalent = (
+        rebuild_visual = (
             self.simplified_network_action.isChecked()
             and self._branch_analysis_result is not None
         )
+        rebuild_table = (
+            self.branches_window.isVisible()
+            and self._branch_analysis_result is not None
+        )
         self._invalidate_equivalent_network(
-            keep_requested=rebuild_equivalent
+            keep_requested=rebuild_visual
         )
         self._load_pattern_model = model
         selection = self._selected_feature
@@ -2830,7 +2913,7 @@ class MainWindow(QMainWindow):
         elif model is None:
             self.load_pattern_table_model.set_records(())
             self.load_patterns_section.setVisible(False)
-        if rebuild_equivalent and self._import_thread is None:
+        if (rebuild_visual or rebuild_table) and self._import_thread is None:
             self._start_equivalent_build()
 
     def _set_cable_model(self, model: CableModel | None) -> None:
@@ -3040,8 +3123,24 @@ class MainWindow(QMainWindow):
                 raise ValueError(
                     "O resultado deve usar a configuração de fases atual."
                 )
-        if result is not self._generator_update_result:
+        changed = result is not self._generator_update_result
+        rebuild_visual = bool(
+            changed
+            and result is not None
+            and self.simplified_network_action.isChecked()
+            and self._branch_analysis_result is not None
+        )
+        rebuild_table = bool(
+            changed
+            and result is not None
+            and self.branches_window.isVisible()
+            and self._branch_analysis_result is not None
+        )
+        if changed:
             self._invalidate_power_flow()
+            self._invalidate_equivalent_network(
+                keep_requested=rebuild_visual
+            )
         self._generator_update_result = result
         selection = self._selected_feature
         if selection is not None and selection.kind == "generator":
@@ -3049,6 +3148,8 @@ class MainWindow(QMainWindow):
                 selection,
                 reveal_hidden=self._search_focus_active,
             )
+        if (rebuild_visual or rebuild_table) and self._generator_update_thread is None:
+            self._start_equivalent_build()
 
     def _invalidate_generator_update(self) -> None:
         if self._generator_update_worker is not None:
@@ -3056,6 +3157,7 @@ class MainWindow(QMainWindow):
         had_result = self._generator_update_result is not None
         if had_result:
             self._invalidate_power_flow()
+            self._invalidate_equivalent_network()
         self._generator_update_result = None
         if hasattr(self, "generator_demand_table_model"):
             self.generator_demand_table_model.set_records(())
@@ -3108,6 +3210,7 @@ class MainWindow(QMainWindow):
             bar_mask = masks.bar_mask
             segment_mask = masks.segment_mask
             load_mask = masks.source_load_mask
+            generator_mask = masks.source_generator_mask
             equivalent_mask = masks.equivalent_load_mask
         colors = () if controller is None else controller.colors
         phase_mode = (
@@ -3289,6 +3392,8 @@ class MainWindow(QMainWindow):
             and self._import_thread is None
             and self._branch_thread is None
             and self._equivalent_thread is None
+            and self._branch_json_thread is None
+            and self._branch_csv_thread is None
             and self._power_flow_thread is None
             and self._generator_update_thread is None
         )
@@ -3298,7 +3403,7 @@ class MainWindow(QMainWindow):
     def _sync_export_availability(self) -> None:
         """Só exporta com tudo que trechos.dss consome carregado."""
 
-        self.opendss_export_action.setEnabled(
+        available = (
             self._model is not None
             and self._line_model is not None
             and self._switch_model is not None
@@ -3307,8 +3412,12 @@ class MainWindow(QMainWindow):
             and self._phase_configuration is not None
             and self._import_thread is None
             and self._export_thread is None
+            and self._branch_json_thread is None
+            and self._branch_csv_thread is None
             and self._generator_update_thread is None
         )
+        self.opendss_export_action.setEnabled(available)
+        self.simplified_opendss_export_action.setEnabled(available)
 
     def _visible_circuit_indices(self) -> tuple[int, ...]:
         """Circuitos marcados na janela de circuitos, na ordem do catálogo.
@@ -3341,6 +3450,8 @@ class MainWindow(QMainWindow):
             and self._import_thread is None
             and self._branch_thread is None
             and self._equivalent_thread is None
+            and self._branch_json_thread is None
+            and self._branch_csv_thread is None
             and self._power_flow_thread is None
             and self._generator_update_thread is None
         )
@@ -3355,6 +3466,8 @@ class MainWindow(QMainWindow):
             and self._import_thread is None
             and self._branch_thread is None
             and self._equivalent_thread is None
+            and self._branch_json_thread is None
+            and self._branch_csv_thread is None
             and self._power_flow_thread is None
             and self._generator_update_thread is None
         )
@@ -3463,18 +3576,20 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_generator_update_progress(self, current: int, total: int) -> None:
-        progress = self._generator_update_progress_dialog
-        if progress is None:
+        if not self._is_current_signal_source(self._generator_update_worker):
             return
-        progress.setRange(0, max(total, 1))
-        progress.setValue(min(current, max(total, 1)))
-        progress.setLabelText(
-            f"Calculando demandas dos geradores… ({current:n}/{total:n})"
+        progress = self._generator_update_progress_dialog
+        maximum = max(total, 1)
+        _update_progress_dialog(
+            progress,
+            minimum=0,
+            maximum=maximum,
+            label=f"Calculando demandas dos geradores… ({current:n}/{total:n})",
+            value=min(current, maximum),
         )
 
     def _close_generator_update_progress(self) -> None:
-        if self._generator_update_progress_dialog is not None:
-            self._generator_update_progress_dialog.close()
+        _close_progress_dialog(self._generator_update_progress_dialog)
 
     def _on_generator_update_finished(self, result: GeneratorUpdateResult) -> None:
         self._close_generator_update_progress()
@@ -3505,9 +3620,13 @@ class MainWindow(QMainWindow):
         )
 
     def _on_generator_update_thread_finished(self) -> None:
+        if not self._is_current_signal_source(self._generator_update_thread):
+            return
+        progress = self._generator_update_progress_dialog
         self._generator_update_thread = None
         self._generator_update_worker = None
         self._generator_update_progress_dialog = None
+        _close_progress_dialog(progress)
         self.cables_window.setEnabled(True)
         self.curves_window.setEnabled(True)
         self.patamares_window.setEnabled(True)
@@ -3516,6 +3635,12 @@ class MainWindow(QMainWindow):
         self._sync_branches_availability()
         self._sync_export_availability()
         self._sync_power_flow_availability()
+        if (
+            self._pending_simplified_activation
+            and self._generator_update_result is not None
+            and not self._close_after_generator_update
+        ):
+            self._start_equivalent_build()
         if self._close_after_generator_update:
             self._close_after_generator_update = False
             self.close()
@@ -3688,6 +3813,247 @@ class MainWindow(QMainWindow):
                 return
         self._start_opendss_export(destination, circuit_indices)
 
+    def _expected_simplified_export_filenames(
+        self,
+        circuit_indices: tuple[int, ...],
+    ) -> tuple[str, ...]:
+        names = [
+            LINES_FILENAME,
+            SWITCHES_FILENAME,
+            SINGLE_PHASE_BRANCHES_FILENAME,
+            TWO_PHASE_BRANCHES_FILENAME,
+        ]
+        if self._regulator_model is not None:
+            names.append(REGULATORS_FILENAME)
+        if self._exportable_loads() is not None:
+            names.extend(filename for _, filename, _ in _LOAD_EXPORT_FILES)
+        if self._exportable_generators() is not None:
+            names.extend(filename for _, filename, _ in _GENERATOR_EXPORT_FILES)
+        if self._circuit_catalog is not None:
+            master = master_filenames(self._circuit_catalog, circuit_indices)
+            if master is not None:
+                names.extend(master)
+        return tuple(names)
+
+    def _export_simplified_opendss(self) -> None:
+        catalog = self._circuit_catalog
+        cables = self._cable_model
+        configuration = self._phase_configuration
+        branches = self._branch_analysis_result
+        equivalent = self._equivalent_network_result
+        if (
+            catalog is None
+            or cables is None
+            or configuration is None
+            or self._export_thread is not None
+        ):
+            return
+        if branches is None:
+            QMessageBox.information(
+                self,
+                "Rede simplificada não processada",
+                "Execute primeiro Ferramentas → Ramais… para identificar os "
+                "ramais que serão simplificados.",
+            )
+            return
+        generator_updates = self._exportable_generators()
+        if self._generator_model is not None and generator_updates is None:
+            QMessageBox.information(
+                self,
+                "Atualize os geradores",
+                "Há geradores importados. Execute primeiro Ferramentas → "
+                "Atualizar Geradores… para incluí-los com segurança nos ramais.",
+            )
+            return
+        if equivalent is None:
+            self._pending_simplified_export = True
+            self._pending_simplified_activation = True
+            self._start_equivalent_build()
+            return
+        if (
+            equivalent.model.branches is not branches
+            or equivalent.model.catalog is not catalog
+            or equivalent.model.source_loads is not self._load_model
+            or equivalent.model.source_patterns is not self._load_pattern_model
+            or equivalent.model.source_generator_updates is not generator_updates
+        ):
+            QMessageBox.information(
+                self,
+                "Rede simplificada desatualizada",
+                "Os dados mudaram depois da simplificação. Execute novamente a "
+                "ferramenta de ramais antes de exportar.",
+            )
+            return
+
+        dialog = OpenDssExportDialog(catalog, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        circuit_indices = dialog.selected_circuit_indices()
+        if len(circuit_indices) != 1:
+            return
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Escolher a pasta base da exportação simplificada",
+        )
+        if not directory:
+            return
+        destination = Path(directory) / simplified_export_directory_name(
+            catalog,
+            circuit_indices[0],
+        )
+        existing = [
+            name
+            for name in self._expected_simplified_export_filenames(circuit_indices)
+            if (destination / name).exists()
+        ]
+        if existing:
+            answer = QMessageBox.question(
+                self,
+                "Substituir arquivos simplificados",
+                f"Já existem em {destination}: {', '.join(existing)}.\n"
+                "Deseja substituí-los?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._start_simplified_opendss_export(
+            destination,
+            circuit_indices,
+            equivalent,
+        )
+
+    def _start_simplified_opendss_export(
+        self,
+        destination: Path,
+        circuit_indices: tuple[int, ...],
+        equivalent: EquivalentNetworkResult,
+    ) -> None:
+        catalog = self._circuit_catalog
+        cables = self._cable_model
+        configuration = self._phase_configuration
+        if catalog is None or cables is None or configuration is None:
+            return
+        exportable_loads = self._exportable_loads()
+        loads, patterns = exportable_loads or (self._load_model, None)
+        worker = SimplifiedOpenDssExportWorker(
+            catalog,
+            cables,
+            configuration,
+            circuit_indices,
+            equivalent,
+            loads=loads,
+            patterns=patterns,
+            generator_updates=self._exportable_generators(),
+            regulators=self._regulator_model,
+            load_settings=self._opendss_load_settings,
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        progress = QProgressDialog(
+            "Gerando a rede simplificada em OpenDSS…",
+            "Cancelar",
+            0,
+            100,
+            self,
+        )
+        progress.setWindowTitle("Exportando rede simplificada")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._export_thread = thread
+        self._export_worker = worker
+        self._export_progress_dialog = progress
+        self._export_directory = destination
+        self._sync_export_availability()
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_export_progress)
+        worker.finished.connect(self._on_simplified_opendss_export_finished)
+        worker.failed.connect(self._on_export_failed)
+        worker.cancelled.connect(self._on_export_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(worker.cancel)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_export_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_simplified_opendss_export_finished(
+        self,
+        result: SimplifiedOpenDssExportBundle,
+    ) -> None:
+        self._close_export_progress()
+        destination = self._export_directory
+        if destination is None:
+            return
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+            for filename, content in result.files:
+                (destination / filename).write_text(content, encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Falha na exportação simplificada",
+                f"Não foi possível gravar em {destination}: {exc.strerror or exc}",
+            )
+            return
+        self._show_simplified_export_report(result, destination)
+
+    def _show_simplified_export_report(
+        self,
+        result: SimplifiedOpenDssExportBundle,
+        destination: Path,
+    ) -> None:
+        equivalent_count = sum(
+            branch_result.exported_count
+            for _, branch_result in result.branches_by_phase_count
+        )
+        zero_count = sum(
+            branch_result.zero_count
+            for _, branch_result in result.branches_by_phase_count
+        )
+        outside_loads = sum(
+            load_result.exported_count
+            for _, load_result in result.loads_by_phase_count
+        )
+        outside_generators = sum(
+            generator_result.exported_count
+            for _, generator_result in result.generators_by_phase_count
+        )
+        summary = (
+            f"Rede simplificada exportada: {result.lines.exported_count:n} "
+            f"trechos, {result.switches.exported_count:n} chaves, "
+            f"{outside_loads:n} cargas externas, {outside_generators:n} "
+            f"geradores externos e {equivalent_count:n} ramais equivalentes"
+        )
+        if not result.has_warnings:
+            self.statusBar().showMessage(
+                f"{summary} em {destination}; {zero_count:n} ramal(is) zerado(s) omitido(s).",
+                8_000,
+            )
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle("Exportação simplificada concluída com avisos")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText(summary + ".")
+        message.setInformativeText(
+            f"Pasta: {destination}\nRamais zerados omitidos: {zero_count:n}"
+        )
+        details = [
+            f"{issue.segment_id}: {issue.reason}" for issue in result.issues
+        ]
+        if result.omitted_issues:
+            details.append(f"… e mais {result.omitted_issues:n} ocorrências.")
+        if details:
+            message.setDetailedText("\n".join(details))
+        message.exec()
+
     def _start_opendss_export(
         self,
         destination: Path,
@@ -3753,20 +4119,22 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_export_progress(self, current: int, total: int) -> None:
-        if self._export_progress_dialog is None:
+        if not self._is_current_signal_source(self._export_worker):
             return
+        progress = self._export_progress_dialog
         if total <= 0:
-            self._export_progress_dialog.setRange(0, 0)
+            _update_progress_dialog(progress, minimum=0, maximum=0)
             return
-        self._export_progress_dialog.setRange(0, total)
-        self._export_progress_dialog.setValue(min(current, total))
-        self._export_progress_dialog.setLabelText(
-            f"Gerando os arquivos .dss… ({current:n}/{total:n})"
+        _update_progress_dialog(
+            progress,
+            minimum=0,
+            maximum=total,
+            label=f"Gerando os arquivos .dss… ({current:n}/{total:n})",
+            value=min(current, total),
         )
 
     def _close_export_progress(self) -> None:
-        if self._export_progress_dialog is not None:
-            self._export_progress_dialog.close()
+        _close_progress_dialog(self._export_progress_dialog)
 
     def _on_opendss_export_finished(self, result: OpenDssExportBundle) -> None:
         self._close_export_progress()
@@ -3798,10 +4166,14 @@ class MainWindow(QMainWindow):
         )
 
     def _on_export_thread_finished(self) -> None:
+        if not self._is_current_signal_source(self._export_thread):
+            return
+        progress = self._export_progress_dialog
         self._export_thread = None
         self._export_worker = None
         self._export_progress_dialog = None
         self._export_directory = None
+        _close_progress_dialog(progress)
         self._sync_export_availability()
         if self._close_after_export:
             self._close_after_export = False
@@ -4029,19 +4401,19 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_power_flow_progress(self, current: int, total: int) -> None:
-        if self._power_flow_progress_dialog is None:
+        if not self._is_current_signal_source(self._power_flow_worker):
             return
-        self._power_flow_progress_dialog.setMaximum(max(1, int(total)))
-        self._power_flow_progress_dialog.setValue(
-            min(int(current), max(1, int(total)))
-        )
-        self._power_flow_progress_dialog.setLabelText(
-            f"Resolvendo o fluxo de potência… {current:n}/{total:n} patamares"
+        progress = self._power_flow_progress_dialog
+        maximum = max(1, int(total))
+        _update_progress_dialog(
+            progress,
+            maximum=maximum,
+            label=f"Resolvendo o fluxo de potência… {current:n}/{total:n} patamares",
+            value=min(int(current), maximum),
         )
 
     def _close_power_flow_progress(self) -> None:
-        if self._power_flow_progress_dialog is not None:
-            self._power_flow_progress_dialog.close()
+        _close_progress_dialog(self._power_flow_progress_dialog)
 
     def _on_power_flow_finished(self, result: PowerFlowResult) -> None:
         self._close_power_flow_progress()
@@ -4097,9 +4469,13 @@ class MainWindow(QMainWindow):
         )
 
     def _on_power_flow_thread_finished(self) -> None:
+        if not self._is_current_signal_source(self._power_flow_thread):
+            return
+        progress = self._power_flow_progress_dialog
         self._power_flow_thread = None
         self._power_flow_worker = None
         self._power_flow_progress_dialog = None
+        _close_progress_dialog(progress)
         self.import_action.setEnabled(True)
         self._sync_power_flow_availability()
         self._sync_branches_availability()
@@ -4179,18 +4555,25 @@ class MainWindow(QMainWindow):
             self.simplified_network_action.isChecked()
             and equivalent_model is not None
         )
-        models = tuple(
-            model
-            for model in (
-                self._load_model,
-                self._generator_model,
+        candidates = (
+            (self._load_model, None),
+            (self._generator_model, None),
+            (
                 equivalent_model if show_equivalent else None,
-            )
-            if model is not None
+                (
+                    None
+                    if not show_equivalent or equivalent_model is None
+                    else tuple(
+                        not record.is_zero for record in equivalent_model.records
+                    )
+                ),
+            ),
         )
+        models = tuple(model for model, _ in candidates if model is not None)
+        layout_masks = tuple(mask for model, mask in candidates if model is not None)
         if not models:
             return
-        layouts = load_layout_offsets_for_models(models)
+        layouts = load_layout_offsets_for_models(models, layout_masks)
         layout_index = 0
         if self._load_model is not None:
             self.load_virtualizer.set_layout_offsets(*layouts[layout_index])
@@ -4208,8 +4591,19 @@ class MainWindow(QMainWindow):
         *,
         keep_requested: bool = False,
     ) -> None:
+        rebuild_after_cancel = bool(
+            self._equivalent_worker is not None
+            and self._branch_analysis_result is not None
+            and (keep_requested or self.branches_window.isVisible())
+        )
+        self._restart_equivalent_after_finish = rebuild_after_cancel
         if self._equivalent_worker is not None:
             self._equivalent_worker.cancel()
+        self._pending_branch_metrics = bool(
+            self._branch_analysis_result is not None
+            and self.branches_window.isVisible()
+        )
+        self._pending_simplified_export = False
         if (
             self._selected_feature is not None
             and self._selected_feature.kind == "equivalent_load"
@@ -4218,6 +4612,9 @@ class MainWindow(QMainWindow):
         self._equivalent_snapshot = None
         self._equivalent_network_result = None
         self.branches_window.set_equivalent_result(None)
+        self.branches_window.set_equivalent_pending(
+            self._pending_branch_metrics
+        )
         self.view.set_equivalent_load_model(None)
         self.equivalent_load_virtualizer.reset_model(None)
         self.equivalent_load_virtualizer.set_loads_visible(False)
@@ -4233,6 +4630,7 @@ class MainWindow(QMainWindow):
 
     def _invalidate_branch_analysis(self) -> None:
         self._invalidate_equivalent_network()
+        self._restart_equivalent_after_finish = False
         if self._branch_worker is not None:
             self._branch_worker.cancel()
         self._branch_analysis_snapshot = None
@@ -4241,16 +4639,21 @@ class MainWindow(QMainWindow):
         self.branch_highlight_overlay.clear()
         self.branches_window.set_result(None)
         self.branches_window.hide()
+        self._pending_branch_metrics = False
+        self.branches_window.set_equivalent_pending(False)
         self._sync_branches_availability()
 
     def _show_or_analyze_branches(self) -> None:
         self._show_branches_after_analysis = True
+        self._pending_branch_metrics = True
         self._start_branch_analysis()
 
     def _start_branch_analysis(self) -> None:
         if self._branch_analysis_result is not None:
             if self._show_branches_after_analysis:
                 self._show_branches_window()
+            if self._equivalent_network_result is None:
+                self._start_equivalent_build()
             return
         if (
             self._circuit_catalog is None
@@ -4309,17 +4712,19 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_branch_analysis_progress(self, current: int, total: int) -> None:
-        if self._branch_progress_dialog is None:
+        if not self._is_current_signal_source(self._branch_worker):
             return
-        self._branch_progress_dialog.setMaximum(max(1, int(total)))
-        self._branch_progress_dialog.setValue(min(int(current), max(1, int(total))))
-        self._branch_progress_dialog.setLabelText(
-            f"Analisando circuitos… {current:n}/{total:n}"
+        progress = self._branch_progress_dialog
+        maximum = max(1, int(total))
+        _update_progress_dialog(
+            progress,
+            maximum=maximum,
+            label=f"Analisando circuitos… {current:n}/{total:n}",
+            value=min(int(current), maximum),
         )
 
     def _close_branch_progress(self) -> None:
-        if self._branch_progress_dialog is not None:
-            self._branch_progress_dialog.close()
+        _close_progress_dialog(self._branch_progress_dialog)
 
     def _on_branch_analysis_finished(self, result: BranchAnalysisResult) -> None:
         self._close_branch_progress()
@@ -4369,15 +4774,23 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Análise de ramais cancelada.", 5_000)
 
     def _on_branch_analysis_thread_finished(self) -> None:
+        if not self._is_current_signal_source(self._branch_thread):
+            return
+        progress = self._branch_progress_dialog
         self._branch_thread = None
         self._branch_worker = None
         self._branch_progress_dialog = None
         self._branch_analysis_snapshot = None
+        _close_progress_dialog(progress)
         self.import_action.setEnabled(True)
         self._sync_branches_availability()
         self._sync_power_flow_availability()
         if (
-            self._pending_simplified_activation
+            (
+                self._pending_simplified_activation
+                or self._pending_simplified_export
+                or self._pending_branch_metrics
+            )
             and self._branch_analysis_result is not None
             and not self._close_after_branch_analysis
         ):
@@ -4395,7 +4808,11 @@ class MainWindow(QMainWindow):
     def _set_simplified_network_enabled(self, enabled: bool) -> None:
         if not enabled:
             self._pending_simplified_activation = False
-            if self._equivalent_worker is not None:
+            if (
+                self._equivalent_worker is not None
+                and not self._pending_branch_metrics
+                and not self._pending_simplified_export
+            ):
                 self._equivalent_worker.cancel()
             if (
                 self._selected_feature is not None
@@ -4437,7 +4854,11 @@ class MainWindow(QMainWindow):
 
     def _start_equivalent_build(self) -> None:
         if (
-            not self._pending_simplified_activation
+            not (
+                self._pending_simplified_activation
+                or self._pending_simplified_export
+                or self._pending_branch_metrics
+            )
             or self._branch_analysis_result is None
             or self._equivalent_thread is not None
             or self._import_thread is not None
@@ -4445,6 +4866,9 @@ class MainWindow(QMainWindow):
         ):
             return
         if not self._branch_analysis_result.records:
+            self._pending_branch_metrics = False
+            self.branches_window.set_equivalent_pending(False)
+            self._pending_simplified_export = False
             self._cancel_simplified_request()
             self.statusBar().showMessage(
                 "Nenhum ramal foi identificado para simplificar.",
@@ -4454,8 +4878,26 @@ class MainWindow(QMainWindow):
         branches = self._branch_analysis_result
         loads = self._load_model
         patterns = self._load_pattern_model
+        generator_updates = self._exportable_generators()
+        if self._generator_model is not None and generator_updates is None:
+            self._pending_branch_metrics = False
+            self.branches_window.set_equivalent_pending(False)
+            self._pending_simplified_export = False
+            self._cancel_simplified_request()
+            QMessageBox.information(
+                self,
+                "Atualize os geradores",
+                "A rede simplificada precisa das potências vigentes dos "
+                "geradores. Execute primeiro Ferramentas → Atualizar Geradores…",
+            )
+            return
         thread = QThread(self)
-        worker = EquivalentNetworkWorker(branches, loads, patterns)
+        worker = EquivalentNetworkWorker(
+            branches,
+            loads,
+            patterns,
+            generator_updates,
+        )
         worker.moveToThread(thread)
         progress = QProgressDialog(
             "Construindo cargas equivalentes…",
@@ -4474,7 +4916,13 @@ class MainWindow(QMainWindow):
         self._equivalent_thread = thread
         self._equivalent_worker = worker
         self._equivalent_progress_dialog = progress
-        self._equivalent_snapshot = (branches, loads, patterns)
+        self._equivalent_snapshot = (
+            branches,
+            loads,
+            patterns,
+            generator_updates,
+        )
+        self.branches_window.set_equivalent_pending(True)
         self.import_action.setEnabled(False)
         self.branches_action.setEnabled(False)
         self.simplified_network_action.setEnabled(False)
@@ -4494,18 +4942,19 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_equivalent_progress(self, current: int, total: int) -> None:
-        if self._equivalent_progress_dialog is None:
+        if not self._is_current_signal_source(self._equivalent_worker):
             return
+        progress = self._equivalent_progress_dialog
         maximum = max(1, int(total))
-        self._equivalent_progress_dialog.setMaximum(maximum)
-        self._equivalent_progress_dialog.setValue(min(int(current), maximum))
-        self._equivalent_progress_dialog.setLabelText(
-            f"Construindo cargas equivalentes… {current:n}/{total:n}"
+        _update_progress_dialog(
+            progress,
+            maximum=maximum,
+            label=f"Construindo cargas equivalentes… {current:n}/{total:n}",
+            value=min(int(current), maximum),
         )
 
     def _close_equivalent_progress(self) -> None:
-        if self._equivalent_progress_dialog is not None:
-            self._equivalent_progress_dialog.close()
+        _close_progress_dialog(self._equivalent_progress_dialog)
 
     def _on_equivalent_finished(self, result: EquivalentNetworkResult) -> None:
         self._close_equivalent_progress()
@@ -4513,6 +4962,7 @@ class MainWindow(QMainWindow):
             self._branch_analysis_result,
             self._load_model,
             self._load_pattern_model,
+            self._exportable_generators(),
         )
         snapshot = self._equivalent_snapshot
         if snapshot is None or any(
@@ -4525,6 +4975,9 @@ class MainWindow(QMainWindow):
             )
             return
         self._equivalent_network_result = result
+        self._restart_equivalent_after_finish = False
+        self._pending_branch_metrics = False
+        self.branches_window.set_equivalent_pending(False)
         self.branches_window.set_equivalent_result(result)
         self.view.set_equivalent_load_model(result.model)
         self.equivalent_load_virtualizer.reset_model(result.model)
@@ -4532,6 +4985,10 @@ class MainWindow(QMainWindow):
 
     def _on_equivalent_failed(self, message: str) -> None:
         self._close_equivalent_progress()
+        self._restart_equivalent_after_finish = False
+        self._pending_branch_metrics = False
+        self.branches_window.set_equivalent_pending(False)
+        self._pending_simplified_export = False
         self._cancel_simplified_request()
         if not self._close_after_equivalent_build:
             QMessageBox.critical(
@@ -4542,6 +4999,15 @@ class MainWindow(QMainWindow):
 
     def _on_equivalent_cancelled(self) -> None:
         self._close_equivalent_progress()
+        if self._restart_equivalent_after_finish:
+            self.statusBar().showMessage(
+                "Reiniciando o cálculo das demandas dos ramais…",
+                3_000,
+            )
+            return
+        self._pending_branch_metrics = False
+        self.branches_window.set_equivalent_pending(False)
+        self._pending_simplified_export = False
         self._cancel_simplified_request()
         if not self._close_after_equivalent_build:
             self.statusBar().showMessage(
@@ -4550,13 +5016,39 @@ class MainWindow(QMainWindow):
             )
 
     def _on_equivalent_thread_finished(self) -> None:
+        if not self._is_current_signal_source(self._equivalent_thread):
+            return
+        progress = self._equivalent_progress_dialog
         self._equivalent_thread = None
         self._equivalent_worker = None
         self._equivalent_progress_dialog = None
         self._equivalent_snapshot = None
+        _close_progress_dialog(progress)
+        restart = bool(
+            self._restart_equivalent_after_finish
+            and self._branch_analysis_result is not None
+            and not self._close_after_equivalent_build
+        )
+        self._restart_equivalent_after_finish = False
+        self.branches_window.set_equivalent_pending(
+            restart and self._pending_branch_metrics
+        )
         self.import_action.setEnabled(True)
         self._sync_branches_availability()
         self._sync_power_flow_availability()
+        pending_export = self._pending_simplified_export
+        resume_export = (
+            pending_export
+            and self._equivalent_network_result is not None
+            and not self._close_after_equivalent_build
+        )
+        self._pending_simplified_export = False
+        if pending_export:
+            self._pending_simplified_activation = False
+        if resume_export:
+            QTimer.singleShot(0, self._export_simplified_opendss)
+        elif restart:
+            QTimer.singleShot(0, self._start_equivalent_build)
         if self._close_after_equivalent_build:
             self._close_after_equivalent_build = False
             self.close()
@@ -4574,13 +5066,19 @@ class MainWindow(QMainWindow):
         self.load_virtualizer.refresh(force=True)
         self.equivalent_load_virtualizer.refresh(force=True)
         issue_count = len(result.issues) + result.omitted_issue_count
+        equivalent_count = sum(
+            not record.is_zero for record in result.model.records
+        )
+        zero_count = len(result.model) - equivalent_count
         suffix = (
             ""
             if issue_count == 0
             else f"; {issue_count:n} diagnóstico(s) de agregação"
         )
+        if zero_count:
+            suffix += f"; {zero_count:n} ramal(is) zerado(s) omitido(s)"
         self.statusBar().showMessage(
-            f"Rede simplificada ativa: {len(result.model):n} carga(s) "
+            f"Rede simplificada ativa: {equivalent_count:n} carga(s) "
             f"equivalente(s){suffix}.",
             8_000,
         )
@@ -4591,6 +5089,318 @@ class MainWindow(QMainWindow):
         self.branches_window.show()
         self.branches_window.raise_()
         self.branches_window.activateWindow()
+        if self._equivalent_network_result is None:
+            self._pending_branch_metrics = True
+            self._start_equivalent_build()
+
+    def _export_visible_branches_csv(self) -> None:
+        branches = self._branch_analysis_result
+        equivalent = self._equivalent_network_result
+        if (
+            branches is None
+            or self._equivalent_thread is not None
+            or self._branch_csv_thread is not None
+            or self._branch_json_thread is not None
+        ):
+            return
+        if equivalent is not None and equivalent.model.branches is not branches:
+            equivalent = None
+        branch_indices = (
+            self.branches_window.visible_source_rows_in_display_order()
+        )
+        if not branch_indices:
+            return
+        suggested = suggested_branch_csv_filename(
+            self.branches_window.selected_circuit_id()
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self.branches_window,
+            "Exportar tabela de ramais para CSV",
+            str(Path.cwd() / suggested),
+            "Arquivos CSV (*.csv);;Todos os arquivos (*)",
+        )
+        if not path:
+            return
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(".csv")
+        self._start_branch_csv_export(target, branch_indices)
+
+    def _start_branch_csv_export(
+        self,
+        target: Path,
+        branch_indices: tuple[int, ...],
+    ) -> None:
+        branches = self._branch_analysis_result
+        equivalent = self._equivalent_network_result
+        if (
+            branches is None
+            or self._branch_csv_thread is not None
+            or self._branch_json_thread is not None
+        ):
+            return
+        if equivalent is not None and equivalent.model.branches is not branches:
+            equivalent = None
+        thread = QThread(self)
+        worker = BranchCsvExportWorker(
+            str(target),
+            branches,
+            equivalent,
+            branch_indices,
+        )
+        worker.moveToThread(thread)
+        progress = QProgressDialog(
+            "Exportando tabela de ramais para CSV…",
+            "Cancelar",
+            0,
+            len(branch_indices),
+            self,
+        )
+        progress.setWindowTitle("Exportar ramais")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._branch_csv_thread = thread
+        self._branch_csv_worker = worker
+        self._branch_csv_progress_dialog = progress
+        self.branches_window.set_csv_export_pending(True)
+        self.import_action.setEnabled(False)
+        self.mdb_import_action.setEnabled(False)
+        self._sync_branches_availability()
+        self._sync_export_availability()
+        self._sync_power_flow_availability()
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_branch_csv_progress)
+        worker.finished.connect(self._on_branch_csv_finished)
+        worker.failed.connect(self._on_branch_csv_failed)
+        worker.cancelled.connect(self._on_branch_csv_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(worker.cancel)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_branch_csv_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_branch_csv_progress(self, current: int, total: int) -> None:
+        if not self._is_current_signal_source(self._branch_csv_worker):
+            return
+        progress = self._branch_csv_progress_dialog
+        maximum = max(1, int(total))
+        _update_progress_dialog(
+            progress,
+            minimum=0,
+            maximum=maximum,
+            label=f"Exportando ramais para CSV… {current:n}/{total:n}",
+            value=min(int(current), maximum),
+        )
+
+    def _close_branch_csv_progress(self) -> None:
+        _close_progress_dialog(self._branch_csv_progress_dialog)
+
+    def _on_branch_csv_finished(self, result: BranchCsvExportResult) -> None:
+        self._close_branch_csv_progress()
+        self.statusBar().showMessage(
+            f"{result.branch_count:n} ramal(is) exportado(s) para {result.path}.",
+            8_000,
+        )
+
+    def _on_branch_csv_failed(self, error: object) -> None:
+        self._close_branch_csv_progress()
+        QMessageBox.critical(
+            self,
+            "Falha na exportação CSV",
+            str(error) or type(error).__name__,
+        )
+
+    def _on_branch_csv_cancelled(self) -> None:
+        self._close_branch_csv_progress()
+        self.statusBar().showMessage(
+            "Exportação CSV cancelada; nenhum arquivo foi alterado.",
+            5_000,
+        )
+
+    def _on_branch_csv_thread_finished(self) -> None:
+        if not self._is_current_signal_source(self._branch_csv_thread):
+            return
+        progress = self._branch_csv_progress_dialog
+        self._branch_csv_thread = None
+        self._branch_csv_worker = None
+        self._branch_csv_progress_dialog = None
+        _close_progress_dialog(progress)
+        self.branches_window.set_csv_export_pending(False)
+        self.import_action.setEnabled(True)
+        self.mdb_import_action.setEnabled(self._mdb_error is None)
+        self._sync_branches_availability()
+        self._sync_export_availability()
+        self._sync_power_flow_availability()
+        if self._close_after_branch_csv_export:
+            self._close_after_branch_csv_export = False
+            self.close()
+
+    def _export_visible_branches_json(self) -> None:
+        branches = self._branch_analysis_result
+        equivalent = self._equivalent_network_result
+        if (
+            branches is None
+            or equivalent is None
+            or equivalent.model.branches is not branches
+            or self._branch_json_thread is not None
+            or self._branch_csv_thread is not None
+        ):
+            return
+        branch_indices = self.branches_window.visible_source_rows()
+        if not branch_indices:
+            return
+        suggested = suggested_branch_json_filename(
+            self.branches_window.selected_circuit_id()
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self.branches_window,
+            "Exportar ramais para JSON",
+            str(Path.cwd() / suggested),
+            "Arquivos JSON (*.json);;Todos os arquivos (*)",
+        )
+        if not path:
+            return
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(".json")
+        self._start_branch_json_export(target, branch_indices)
+
+    def _start_branch_json_export(
+        self,
+        target: Path,
+        branch_indices: tuple[int, ...],
+    ) -> None:
+        branches = self._branch_analysis_result
+        equivalent = self._equivalent_network_result
+        if (
+            branches is None
+            or equivalent is None
+            or self._branch_json_thread is not None
+            or self._branch_csv_thread is not None
+        ):
+            return
+        thread = QThread(self)
+        worker = BranchJsonExportWorker(
+            str(target),
+            branches,
+            equivalent,
+            branch_indices,
+        )
+        worker.moveToThread(thread)
+        progress = QProgressDialog(
+            "Exportando ramais para JSON…",
+            "Cancelar",
+            0,
+            len(branch_indices),
+            self,
+        )
+        progress.setWindowTitle("Exportar ramais")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._branch_json_thread = thread
+        self._branch_json_worker = worker
+        self._branch_json_progress_dialog = progress
+        self.branches_window.set_json_export_pending(True)
+        self.import_action.setEnabled(False)
+        self.mdb_import_action.setEnabled(False)
+        self._sync_branches_availability()
+        self._sync_export_availability()
+        self._sync_power_flow_availability()
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_branch_json_progress)
+        worker.finished.connect(self._on_branch_json_finished)
+        worker.failed.connect(self._on_branch_json_failed)
+        worker.cancelled.connect(self._on_branch_json_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(worker.cancel)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_branch_json_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_branch_json_progress(self, current: int, total: int) -> None:
+        if not self._is_current_signal_source(self._branch_json_worker):
+            return
+        progress = self._branch_json_progress_dialog
+        maximum = max(1, int(total))
+        _update_progress_dialog(
+            progress,
+            minimum=0,
+            maximum=maximum,
+            label=f"Exportando ramais para JSON… {current:n}/{total:n}",
+            value=min(int(current), maximum),
+        )
+
+    def _close_branch_json_progress(self) -> None:
+        _close_progress_dialog(self._branch_json_progress_dialog)
+
+    def _on_branch_json_finished(self, result: BranchJsonExportResult) -> None:
+        self._close_branch_json_progress()
+        self.statusBar().showMessage(
+            f"{result.branch_count:n} ramal(is) exportado(s) para {result.path}.",
+            8_000,
+        )
+
+    def _on_branch_json_failed(self, error: object) -> None:
+        self._close_branch_json_progress()
+        if isinstance(error, BranchJsonValidationError):
+            message = QMessageBox(self)
+            message.setWindowTitle("Não foi possível exportar os ramais")
+            message.setIcon(QMessageBox.Icon.Warning)
+            message.setText(
+                f"Foram encontrados {len(error.issues):n} elemento(s) sem CODIGO."
+            )
+            message.setInformativeText(
+                "Nenhum arquivo foi criado. Corrija os dados de origem e tente novamente."
+            )
+            message.setDetailedText("\n".join(error.issues))
+            message.exec()
+            return
+        QMessageBox.critical(
+            self,
+            "Falha na exportação JSON",
+            str(error) or type(error).__name__,
+        )
+
+    def _on_branch_json_cancelled(self) -> None:
+        self._close_branch_json_progress()
+        self.statusBar().showMessage(
+            "Exportação JSON cancelada; nenhum arquivo foi alterado.",
+            5_000,
+        )
+
+    def _on_branch_json_thread_finished(self) -> None:
+        if not self._is_current_signal_source(self._branch_json_thread):
+            return
+        progress = self._branch_json_progress_dialog
+        self._branch_json_thread = None
+        self._branch_json_worker = None
+        self._branch_json_progress_dialog = None
+        _close_progress_dialog(progress)
+        self.branches_window.set_json_export_pending(False)
+        self.import_action.setEnabled(True)
+        self.mdb_import_action.setEnabled(self._mdb_error is None)
+        self._sync_branches_availability()
+        self._sync_export_availability()
+        self._sync_power_flow_availability()
+        if self._close_after_branch_json_export:
+            self._close_after_branch_json_export = False
+            self.close()
 
     def _clear_branch_highlight(self, *, clear_table: bool = False) -> None:
         self._selected_branch = None
@@ -4989,19 +5799,21 @@ class MainWindow(QMainWindow):
         message.exec()
 
     def _on_import_failed(self, reason: str) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
         QMessageBox.critical(self, "Falha na importação", reason)
 
     def _on_import_cancelled(self) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.close()
+        _close_progress_dialog(self._progress_dialog)
         self.statusBar().showMessage("Importação cancelada; os dados anteriores foram mantidos.", 5_000)
 
     def _on_import_thread_finished(self) -> None:
+        if not self._is_current_signal_source(self._import_thread):
+            return
+        progress = self._progress_dialog
         self._import_thread = None
         self._import_worker = None
         self._progress_dialog = None
+        _close_progress_dialog(progress)
         self.import_action.setEnabled(True)
         self.mdb_import_action.setEnabled(self._mdb_error is None)
         self.patamares_window.setEnabled(True)
@@ -5510,6 +6322,20 @@ class MainWindow(QMainWindow):
             source_text = ", ".join(shown_ids) or "—"
             if len(source_ids) > len(shown_ids):
                 source_text += f" … e mais {len(source_ids) - len(shown_ids):n}"
+            generator_ids = (
+                ()
+                if self._generator_model is None
+                else tuple(
+                    self._generator_model.generator_ids[int(index)]
+                    for index in record.source_generator_indices
+                )
+            )
+            shown_generator_ids = generator_ids[:50]
+            generator_text = ", ".join(shown_generator_ids) or "—"
+            if len(generator_ids) > len(shown_generator_ids):
+                generator_text += (
+                    f" … e mais {len(generator_ids) - len(shown_generator_ids):n}"
+                )
             values = {
                 "origin": "Ramal agregado",
                 "load_id": record.load_id,
@@ -5522,9 +6348,11 @@ class MainWindow(QMainWindow):
                 "phases2": record.phases2,
                 "phase": record.phase,
                 "source_load_count": str(record.source_load_count),
+                "source_generator_count": str(record.source_generator_count),
                 "snom": decimal_text(record.snom),
                 "sadm": decimal_text(record.sadm),
                 "source_load_ids": source_text,
+                "source_generator_ids": generator_text,
             }
             for key, value in values.items():
                 self.equivalent_detail_labels[key].setText(value or "—")
@@ -6239,6 +7067,24 @@ class MainWindow(QMainWindow):
             if self._equivalent_worker is not None:
                 self._equivalent_worker.cancel()
             self._close_after_equivalent_build = True
+            event.ignore()
+            return
+        if (
+            self._branch_json_thread is not None
+            and self._branch_json_thread.isRunning()
+        ):
+            if self._branch_json_worker is not None:
+                self._branch_json_worker.cancel()
+            self._close_after_branch_json_export = True
+            event.ignore()
+            return
+        if (
+            self._branch_csv_thread is not None
+            and self._branch_csv_thread.isRunning()
+        ):
+            if self._branch_csv_worker is not None:
+                self._branch_csv_worker.cancel()
+            self._close_after_branch_csv_export = True
             event.ignore()
             return
         if self._export_thread is not None and self._export_thread.isRunning():

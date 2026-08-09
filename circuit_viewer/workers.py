@@ -7,6 +7,8 @@ import threading
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from .branch_analysis import BranchAnalysisResult, analyze_branches
+from .branch_json_export import export_branches_json
+from .branch_table_export import export_branches_csv
 from .cable_import import load_cables_csv
 from .circuit_import import load_circuits_csv
 from .circuit_level_import import load_circuit_levels_csv
@@ -21,7 +23,7 @@ from .curvas import Curve
 from .calculation_levels import CalculationLevelSchedule
 from .load_import import load_loads_csv
 from .load_pattern_import import load_load_patterns_csv
-from .equivalent_network import build_equivalent_network
+from .equivalent_network import EquivalentNetworkResult, build_equivalent_network
 from .mdb_engine import open_database
 from .mdb_import import load_database
 from .model import (
@@ -38,6 +40,7 @@ from .model import (
 )
 from .opendss_engine import acquire_engine, ascii_workspace
 from .opendss_export import build_export
+from .opendss_simplified_export import build_simplified_export
 from .opendss_powerflow import run_power_flow
 from .opendss_settings import OpenDssLoadSettings
 from .phase_config import PhaseConfiguration
@@ -572,6 +575,157 @@ class OpenDssExportWorker(QObject):
             self.finished.emit(result)
 
 
+class SimplifiedOpenDssExportWorker(QObject):
+    """Worker exclusivo da exportação da projeção simplificada."""
+
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        catalog: CircuitCatalogModel,
+        cables: CableModel,
+        phase_configuration: PhaseConfiguration,
+        circuit_indices: tuple[int, ...],
+        equivalent: EquivalentNetworkResult,
+        *,
+        loads: LoadModel | None = None,
+        patterns: LoadPatternModel | None = None,
+        generator_updates: GeneratorUpdateModel | None = None,
+        regulators: RegulatorModel | None = None,
+        load_settings: OpenDssLoadSettings | None = None,
+    ) -> None:
+        super().__init__()
+        self.catalog = catalog
+        self.cables = cables
+        self.phase_configuration = phase_configuration
+        self.circuit_indices = tuple(circuit_indices)
+        self.equivalent = equivalent
+        self.loads = loads
+        self.patterns = patterns
+        self.generator_updates = generator_updates
+        self.regulators = regulators
+        self.load_settings = load_settings
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = build_simplified_export(
+                self.catalog,
+                self.cables,
+                self.phase_configuration,
+                self.circuit_indices,
+                equivalent=self.equivalent,
+                loads=self.loads,
+                patterns=self.patterns,
+                generator_updates=self.generator_updates,
+                regulators=self.regulators,
+                load_settings=self.load_settings,
+                cancel_check=self._cancel_event.is_set,
+                progress=lambda current, total: self.progress.emit(current, total),
+            )
+        except InterruptedError:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class BranchJsonExportWorker(QObject):
+    """Serializa e grava atomicamente os ramais sem bloquear a interface."""
+
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(object)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        path: str,
+        branches: BranchAnalysisResult,
+        equivalent: EquivalentNetworkResult,
+        branch_indices: tuple[int, ...],
+    ) -> None:
+        super().__init__()
+        self.path = path
+        self.branches = branches
+        self.equivalent = equivalent
+        self.branch_indices = tuple(branch_indices)
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = export_branches_json(
+                self.path,
+                self.branches,
+                self.equivalent,
+                self.branch_indices,
+                cancel_check=self._cancel_event.is_set,
+                progress=lambda current, total: self.progress.emit(current, total),
+            )
+        except InterruptedError:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(exc)
+        else:
+            self.finished.emit(result)
+
+
+class BranchCsvExportWorker(QObject):
+    """Grava a tabela de ramais em CSV pt-BR fora da thread da interface."""
+
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(object)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        path: str,
+        branches: BranchAnalysisResult,
+        equivalent: EquivalentNetworkResult | None,
+        branch_indices: tuple[int, ...],
+    ) -> None:
+        super().__init__()
+        self.path = path
+        self.branches = branches
+        self.equivalent = equivalent
+        self.branch_indices = tuple(branch_indices)
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = export_branches_csv(
+                self.path,
+                self.branches,
+                self.equivalent,
+                self.branch_indices,
+                cancel_check=self._cancel_event.is_set,
+                progress=lambda current, total: self.progress.emit(current, total),
+            )
+        except InterruptedError:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(exc)
+        else:
+            self.finished.emit(result)
+
+
 class PowerFlowWorker(QObject):
     """Gera o modelo OpenDSS de cada circuito, resolve e devolve as grandezas.
 
@@ -694,11 +848,13 @@ class EquivalentNetworkWorker(QObject):
         branches: BranchAnalysisResult,
         loads: LoadModel | None,
         patterns: LoadPatternModel | None,
+        generator_updates: GeneratorUpdateModel | None = None,
     ) -> None:
         super().__init__()
         self.branches = branches
         self.loads = loads
         self.patterns = patterns
+        self.generator_updates = generator_updates
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -711,6 +867,7 @@ class EquivalentNetworkWorker(QObject):
                 self.branches,
                 self.loads,
                 self.patterns,
+                self.generator_updates,
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
             )

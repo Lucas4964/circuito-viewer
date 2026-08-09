@@ -170,8 +170,16 @@ def _render_colors(colors: Sequence[str]) -> tuple[str, ...]:
 
 def load_layout_offsets_for_models(
     models: Sequence[LoadRenderModel],
+    include_masks: Sequence[Sequence[bool] | np.ndarray | None] | None = None,
 ) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
     """Distribui conjuntamente modelos de cargas na mesma grade por barra."""
+
+    if include_masks is None:
+        masks = tuple(None for _ in models)
+    else:
+        masks = tuple(include_masks)
+        if len(masks) != len(models):
+            raise ValueError("Cada modelo deve possuir uma máscara de layout.")
 
     vertical_pitch = (
         ATTACHED_VERTICAL_PITCH_PX
@@ -187,7 +195,15 @@ def load_layout_offsets_for_models(
     ]
     by_bar: dict[int, list[tuple[int, int]]] = {}
     for model_index, model in enumerate(models):
+        raw_mask = masks[model_index]
+        mask = (
+            None
+            if raw_mask is None
+            else _visibility_mask(raw_mask, len(model), "layout")
+        )
         for index, bar_index in enumerate(model.bar_indices):
+            if mask is not None and not bool(mask[index]):
+                continue
             by_bar.setdefault(int(bar_index), []).append((model_index, index))
     for indices in by_bar.values():
         indices.sort(

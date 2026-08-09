@@ -637,6 +637,7 @@ def build_line_export(
     circuit_indices: Sequence[int] | Iterable[int],
     *,
     skip_segments: frozenset[int] = frozenset(),
+    include_segments: frozenset[int] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssLineExportResult:
@@ -687,6 +688,8 @@ def build_line_export(
                 progress(processed, total)
 
             segment_index = int(raw_index)
+            if include_segments is not None and segment_index not in include_segments:
+                continue
             if segment_index in skip_segments:
                 continue
             segment_id = segments.segment_ids[segment_index]
@@ -837,6 +840,7 @@ def build_switch_export(
     circuit_indices: Sequence[int] | Iterable[int],
     *,
     reserved_names: frozenset[str] = frozenset(),
+    include_segments: frozenset[int] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssSwitchExportResult:
@@ -877,6 +881,8 @@ def build_switch_export(
                 progress(processed, total)
 
             segment_index = int(raw_index)
+            if include_segments is not None and segment_index not in include_segments:
+                continue
             if segment_index in seen_segments:
                 continue
             seen_segments.add(segment_index)
@@ -994,6 +1000,7 @@ def build_regulator_export(
     phase_configuration: PhaseConfiguration,
     circuit_indices: Sequence[int] | Iterable[int],
     *,
+    include_segments: frozenset[int] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssRegulatorExportResult:
@@ -1051,6 +1058,8 @@ def build_regulator_export(
         for raw_index in membership.switch_segment_indices:
             segment_index = int(raw_index)
             processed += 1
+            if include_segments is not None and segment_index not in include_segments:
+                continue
             if segment_index in seen_segments:
                 continue
             record_index = int(by_segment[segment_index])
@@ -1073,6 +1082,8 @@ def build_regulator_export(
                 progress(processed, total)
 
             segment_index = int(raw_index)
+            if include_segments is not None and segment_index not in include_segments:
+                continue
             if segment_index in seen_segments:
                 continue
             record_index = int(by_segment[segment_index])
@@ -1323,6 +1334,7 @@ def build_load_export(
     *,
     phase_count: int,
     reserved_names: frozenset[str] = frozenset(),
+    include_load_indices: frozenset[int] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssLoadExportResult:
@@ -1370,6 +1382,9 @@ def build_load_export(
         processed += 1
         if progress is not None and processed % 1_000 == 0:
             progress(processed, total)
+
+        if include_load_indices is not None and load_index not in include_load_indices:
+            continue
 
         bar_index = int(loads.bar_indices[load_index])
         owner = owner_by_bar.get(bar_index)
@@ -1566,6 +1581,7 @@ def build_generator_export(
     *,
     phase_count: int,
     reserved_names: frozenset[str] = frozenset(),
+    include_generator_indices: frozenset[int] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssGeneratorExportResult:
@@ -1603,6 +1619,12 @@ def build_generator_export(
         processed += 1
         if progress is not None and processed % 1_000 == 0:
             progress(processed, total)
+
+        if (
+            include_generator_indices is not None
+            and generator_index not in include_generator_indices
+        ):
+            continue
 
         circuit_index = updates.circuit_indices[generator_index]
         powers = updates.phase_power_records_for_generator(generator_index)
@@ -1817,6 +1839,7 @@ def build_master_export(
     *,
     redirects: Sequence[str] = (),
     load_settings: OpenDssLoadSettings | None = None,
+    include_bar_indices: frozenset[int] | None = None,
 ) -> OpenDssMasterExportResult:
     """Gera o arquivo principal e o CSV de coordenadas de barra.
 
@@ -1920,6 +1943,8 @@ def build_master_export(
     seen_names: dict[str, str] = {}
     for raw_index in catalog.membership(selected[0]).bar_indices:
         bar_index = int(raw_index)
+        if include_bar_indices is not None and bar_index not in include_bar_indices:
+            continue
         name = bus_name(bar_index)
         bar_id = bars.bar_ids[bar_index]
         if name in seen_names:

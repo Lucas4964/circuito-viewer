@@ -862,6 +862,10 @@ class GeneratorModel:
         return self._generator_ids
 
     @property
+    def generator_codes(self) -> tuple[str, ...]:
+        return self._generator_codes
+
+    @property
     def load_indices(self) -> IndexArray:
         return self._load_indices
 
