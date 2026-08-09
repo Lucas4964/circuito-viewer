@@ -17,7 +17,13 @@ except ModuleNotFoundError:
 
 from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QBrush, QImage, QPainter, QPen, QPixmap, QPolygonF
-from PyQt6.QtWidgets import QApplication, QGraphicsRectItem, QGraphicsScene, QMessageBox
+from PyQt6.QtWidgets import (
+    QApplication,
+    QGraphicsRectItem,
+    QGraphicsScene,
+    QLabel,
+    QMessageBox,
+)
 
 from circuit_viewer.csv_import import CsvLoadResult
 from circuit_viewer.graphics import DiagramView
@@ -68,8 +74,12 @@ class SatelliteGraphicsTests(unittest.TestCase):
         return scene, view
 
     @staticmethod
-    def _solid_manager(view: DiagramView, color: QColor) -> GerenciadorTiles:
-        manager = GerenciadorTiles(PROVEDOR_ESRI, parent=view)
+    def _solid_manager(
+        view: DiagramView,
+        color: QColor,
+        provider=PROVEDOR_ESRI,
+    ) -> GerenciadorTiles:
+        manager = GerenciadorTiles(provider, parent=view)
         tile = QPixmap(256, 256)
         tile.fill(color)
         manager.definir_interesse = lambda _keys, _center: None
@@ -176,14 +186,21 @@ class SatelliteGraphicsTests(unittest.TestCase):
         _, view = self._make_view(model)
         view.set_tile_manager(self._solid_manager(view, QColor("#008000")))
         view.set_satellite_enabled(True)
+        labels = view.viewport().findChildren(QLabel, "satelliteAttribution")
+        self.assertEqual(len(labels), 1)
+        label = labels[0]
+        self.assertEqual(label.text(), PROVEDOR_ESRI.atribuicao)
 
         def assert_anchored() -> None:
             view.viewport().update()
             self.app.processEvents()
-            rect = view._satellite_attribution_rect
-            self.assertIsNotNone(rect)
-            self.assertEqual(rect.right(), view.viewport().width() - 7)
-            self.assertEqual(rect.bottom(), view.viewport().height() - 7)
+            self.assertTrue(label.isVisible())
+            self.assertEqual(label.geometry().right(), view.viewport().width() - 7)
+            self.assertEqual(label.geometry().bottom(), view.viewport().height() - 7)
+            self.assertEqual(
+                view.viewport().findChildren(QLabel, "satelliteAttribution"),
+                [label],
+            )
 
         assert_anchored()
         view.zoom_at(QPoint(200, 150), 1.5)
@@ -194,6 +211,38 @@ class SatelliteGraphicsTests(unittest.TestCase):
         view.resize(780, 520)
         self.app.processEvents()
         assert_anchored()
+
+    def test_attribution_updates_provider_and_visibility_without_duplicates(self) -> None:
+        model = self._model_for_location(-54.6, -15.6, UtmCrs(21, False))
+        _, view = self._make_view(model)
+        label = view.viewport().findChild(QLabel, "satelliteAttribution")
+        self.assertIsNotNone(label)
+        self.assertFalse(label.isVisible())
+
+        view.set_tile_manager(self._solid_manager(view, QColor("green")))
+        view.set_satellite_enabled(True)
+        self.app.processEvents()
+        self.assertTrue(label.isVisible())
+        self.assertEqual(label.text(), PROVEDOR_ESRI.atribuicao)
+
+        view.set_tile_manager(
+            self._solid_manager(view, QColor("green"), PROVEDOR_GOOGLE_SAT)
+        )
+        self.app.processEvents()
+        self.assertIs(
+            view.viewport().findChild(QLabel, "satelliteAttribution"), label
+        )
+        self.assertEqual(label.text(), PROVEDOR_GOOGLE_SAT.atribuicao)
+
+        view.set_satellite_enabled(False)
+        self.app.processEvents()
+        self.assertFalse(label.isVisible())
+        view.set_satellite_enabled(True)
+        self.app.processEvents()
+        self.assertTrue(label.isVisible())
+        view.set_tile_manager(None)
+        self.app.processEvents()
+        self.assertFalse(label.isVisible())
 
     def test_projective_tiles_have_no_seams_and_parent_fallback_paints(self) -> None:
         target = QPixmap(160, 160)

@@ -12,7 +12,6 @@ from PyQt6.QtCore import (
     QObject,
     QPoint,
     QPointF,
-    QRect,
     QRectF,
     QSignalBlocker,
     QSize,
@@ -23,7 +22,6 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QColor,
     QBrush,
-    QFont,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -39,6 +37,7 @@ from PyQt6.QtWidgets import (
     QGraphicsObject,
     QGraphicsScene,
     QGraphicsView,
+    QLabel,
 )
 
 from .model import (
@@ -1250,7 +1249,6 @@ class DiagramView(QGraphicsView):
         self._satellite_opacity = 1.0
         self._tile_manager: GerenciadorTiles | None = None
         self._satellite_last_frame: tuple[int, int, int, int, int] | None = None
-        self._satellite_attribution_rect: QRect | None = None
         self._satellite_failure_notified = False
         self._model_to_geographic = None
         self._geographic_to_model = None
@@ -1279,6 +1277,19 @@ class DiagramView(QGraphicsView):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setBackgroundBrush(QBrush(CANVAS_BACKGROUND))
         self.setFrameShape(QFrame.Shape.NoFrame)
+        self._satellite_attribution = QLabel(self.viewport())
+        self._satellite_attribution.setObjectName("satelliteAttribution")
+        self._satellite_attribution.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        self._satellite_attribution.setTextInteractionFlags(
+            Qt.TextInteractionFlag.NoTextInteraction
+        )
+        self._satellite_attribution.setStyleSheet(
+            'font: 8pt "Arial"; color: #f0f0f0; '
+            "background-color: rgba(0, 0, 0, 140); padding: 3px 6px;"
+        )
+        self._satellite_attribution.hide()
         self._apply_cursor()
 
     @property
@@ -1294,6 +1305,7 @@ class DiagramView(QGraphicsView):
         if not self._satellite_enabled:
             self._satellite_prefetch_timer.stop()
             self._satellite_last_frame = None
+        self._sync_satellite_attribution()
         self.viewport().update()
 
     def set_tile_manager(self, manager: GerenciadorTiles | None) -> None:
@@ -1306,6 +1318,7 @@ class DiagramView(QGraphicsView):
         if previous is not None:
             previous.fechar()
             previous.deleteLater()
+        self._sync_satellite_attribution()
         self.viewport().update()
 
     def shutdown_satellite(self) -> None:
@@ -1833,35 +1846,23 @@ class DiagramView(QGraphicsView):
         if self._satellite_enabled:
             self._draw_satellite(painter, rect)
 
-    def paintEvent(self, event) -> None:  # noqa: ANN001, N802
-        super().paintEvent(event)
-        if self._satellite_enabled and self._tile_manager is not None:
-            self._draw_satellite_attribution()
-        else:
-            self._satellite_attribution_rect = None
-
-    def _draw_satellite_attribution(self) -> None:
+    def _sync_satellite_attribution(self) -> None:
         manager = self._tile_manager
-        if manager is None:
+        label = self._satellite_attribution
+        if not self._satellite_enabled or manager is None:
+            label.hide()
             return
         text = manager.provedor.atribuicao
-        painter = QPainter(self.viewport())
-        try:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            font = QFont("Arial", 8)
-            painter.setFont(font)
-            metrics = painter.fontMetrics()
-            viewport = self.viewport().rect()
-            width = metrics.horizontalAdvance(text) + 12
-            height = metrics.height() + 6
-            x = viewport.width() - width - 6
-            y = viewport.height() - height - 6
-            self._satellite_attribution_rect = QRect(x, y, width, height)
-            painter.fillRect(x, y, width, height, QColor(0, 0, 0, 140))
-            painter.setPen(QColor("#f0f0f0"))
-            painter.drawText(x + 6, y + metrics.ascent() + 3, text)
-        finally:
-            painter.end()
+        if label.text() != text:
+            label.setText(text)
+            label.adjustSize()
+        viewport = self.viewport().rect()
+        label.move(
+            viewport.width() - label.width() - 6,
+            viewport.height() - label.height() - 6,
+        )
+        label.raise_()
+        label.show()
 
     def _draw_satellite(self, painter: QPainter, rect: QRectF) -> None:
         manager = self._tile_manager
@@ -2186,10 +2187,12 @@ class DiagramView(QGraphicsView):
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001, N802
         super().resizeEvent(event)
+        self._sync_satellite_attribution()
         self.viewportChanged.emit()
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:  # noqa: N802
         super().scrollContentsBy(dx, dy)
+        self._sync_satellite_attribution()
         self.viewportChanged.emit()
 
 
