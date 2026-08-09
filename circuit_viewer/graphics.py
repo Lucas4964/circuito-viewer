@@ -2506,6 +2506,100 @@ class ItemVirtualizer(QObject):
         return self._active.keys()
 
 
+class LoadLodCoordinator(QObject):
+    """Sincroniza o nível de detalhe de camadas associadas às barras."""
+
+    def __init__(
+        self,
+        view: DiagramView,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.view = view
+        self._layers: list[LoadVirtualizer] = []
+        self._force_refresh = False
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(VIRTUALIZATION_DEBOUNCE_MS)
+        self._refresh_timer.timeout.connect(self._refresh_from_timer)
+        self.view.viewportChanged.connect(self.schedule_refresh)
+
+    @property
+    def layers(self) -> tuple[LoadVirtualizer, ...]:
+        return tuple(self._layers)
+
+    def add_layer(self, layer: LoadVirtualizer) -> None:
+        if layer.view is not self.view:
+            raise ValueError("As camadas coordenadas devem compartilhar a viewport.")
+        if layer in self._layers:
+            return
+        if (
+            layer._lod_coordinator is not None
+            and layer._lod_coordinator is not self
+        ):
+            raise ValueError("A camada já pertence a outro coordenador de LOD.")
+        layer._lod_coordinator = self
+        layer._refresh_timer.stop()
+        self._layers.append(layer)
+        self.invalidate()
+
+    def schedule_refresh(self) -> None:
+        if self._force_refresh:
+            return
+        if any(layer._participates_in_lod for layer in self._layers):
+            self._refresh_timer.start(VIRTUALIZATION_DEBOUNCE_MS)
+
+    def invalidate(self) -> None:
+        """Agenda uma recomputação integral, agrupando mudanças do mesmo evento."""
+
+        self._force_refresh = True
+        self._refresh_timer.start(0)
+
+    def _refresh_from_timer(self) -> None:
+        force = self._force_refresh
+        self._force_refresh = False
+        self.refresh(force=force)
+
+    def refresh(self, force: bool = False) -> None:
+        if force:
+            self._refresh_timer.stop()
+            self._force_refresh = False
+        layers = tuple(
+            layer for layer in self._layers if layer._participates_in_lod
+        )
+        if not layers:
+            return
+        viewport_rect = self.view.mapToScene(
+            self.view.viewport().rect()
+        ).boundingRect()
+        if not force and all(
+            layer._can_reuse_loaded_rect(viewport_rect) for layer in layers
+        ):
+            return
+        margin_x = viewport_rect.width() * VIRTUALIZATION_MARGIN
+        margin_y = viewport_rect.height() * VIRTUALIZATION_MARGIN
+        loaded_rect = viewport_rect.adjusted(
+            -margin_x,
+            -margin_y,
+            margin_x,
+            margin_y,
+        )
+        layer_indices = tuple(
+            (layer, layer._visible_indices(loaded_rect)) for layer in layers
+        )
+        overview = any(
+            indices.size > layer.max_active_items
+            for layer, indices in layer_indices
+        )
+        for layer, indices in layer_indices:
+            layer._apply_refresh(
+                viewport_rect,
+                loaded_rect,
+                indices,
+                overview=overview,
+            )
+
+
 class LoadVirtualizer(QObject):
     """Camada híbrida que materializa somente as cargas próximas da viewport."""
 
@@ -2518,6 +2612,7 @@ class LoadVirtualizer(QObject):
         *,
         max_active_items: int = MAX_ACTIVE_ITEMS,
         symbol_kind: str = "load",
+        lod_coordinator: LoadLodCoordinator | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -2544,6 +2639,7 @@ class LoadVirtualizer(QObject):
         self._reveal_hidden_selection = False
         self._pending_indices: list[int] = []
         self._mode = "Visão geral"
+        self._lod_coordinator: LoadLodCoordinator | None = None
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
@@ -2552,7 +2648,10 @@ class LoadVirtualizer(QObject):
         self._batch_timer = QTimer(self)
         self._batch_timer.setSingleShot(True)
         self._batch_timer.timeout.connect(self._materialize_next_batch)
-        self.view.viewportChanged.connect(self.schedule_refresh)
+        if lod_coordinator is None:
+            self.view.viewportChanged.connect(self.schedule_refresh)
+        else:
+            lod_coordinator.add_layer(self)
 
     @property
     def active_count(self) -> int:
@@ -2565,6 +2664,14 @@ class LoadVirtualizer(QObject):
     @property
     def loads_visible(self) -> bool:
         return self._loads_visible
+
+    @property
+    def _participates_in_lod(self) -> bool:
+        return (
+            self._loads_visible
+            and self.model is not None
+            and self.overview_item is not None
+        )
 
     @property
     def layout_offsets(self) -> tuple[np.ndarray, np.ndarray]:
@@ -2601,6 +2708,8 @@ class LoadVirtualizer(QObject):
             self.overview_item.setVisible(self._loads_visible)
         self._mode = "Visão geral"
         self.countsChanged.emit(0)
+        if self._lod_coordinator is not None:
+            self._lod_coordinator.invalidate()
 
     def set_layout_offsets(
         self,
@@ -2637,10 +2746,15 @@ class LoadVirtualizer(QObject):
         self.view.viewport().update()
 
     def schedule_refresh(self) -> None:
-        if self.model is not None and self._loads_visible:
+        if self._lod_coordinator is not None:
+            self._lod_coordinator.schedule_refresh()
+        elif self.model is not None and self._loads_visible:
             self._refresh_timer.start()
 
     def refresh(self, force: bool = False) -> None:
+        if self._lod_coordinator is not None:
+            self._lod_coordinator.refresh(force=force)
+            return
         if not self._loads_visible or self.model is None or self.overview_item is None:
             return
         viewport_rect = self.view.mapToScene(self.view.viewport().rect()).boundingRect()
@@ -2649,14 +2763,36 @@ class LoadVirtualizer(QObject):
         margin_x = viewport_rect.width() * VIRTUALIZATION_MARGIN
         margin_y = viewport_rect.height() * VIRTUALIZATION_MARGIN
         loaded_rect = viewport_rect.adjusted(-margin_x, -margin_y, margin_x, margin_y)
-        indices = self.model.spatial_index.query_rect(_model_bounds_from_scene(loaded_rect))
+        indices = self._visible_indices(loaded_rect)
+        self._apply_refresh(
+            viewport_rect,
+            loaded_rect,
+            indices,
+            overview=indices.size > self.max_active_items,
+        )
+
+    def _visible_indices(self, loaded_rect: QRectF) -> np.ndarray:
+        assert self.model is not None
+        indices = self.model.spatial_index.query_rect(
+            _model_bounds_from_scene(loaded_rect)
+        )
         if self._visibility_mask is not None:
             indices = indices[self._visibility_mask[indices]]
+        return indices
+
+    def _apply_refresh(
+        self,
+        viewport_rect: QRectF,
+        loaded_rect: QRectF,
+        indices: np.ndarray,
+        *,
+        overview: bool,
+    ) -> None:
         self._loaded_rect = loaded_rect
         self._last_view_rect = viewport_rect
         self._pending_indices.clear()
         self._batch_timer.stop()
-        if indices.size > self.max_active_items:
+        if overview:
             self._show_overview()
             return
 
@@ -2782,10 +2918,15 @@ class LoadVirtualizer(QObject):
                 item.setVisible(False)
             self._sync_selection()
             self.view.viewport().update()
+            if self._lod_coordinator is not None:
+                self._lod_coordinator.invalidate()
             return
         self._loaded_rect = None
         self._last_view_rect = None
-        self.refresh(force=True)
+        if self._lod_coordinator is None:
+            self.refresh(force=True)
+        else:
+            self._lod_coordinator.invalidate()
         self.view.viewport().update()
 
     def set_visibility_mask(self, mask: BoolArray | None) -> None:
@@ -2817,7 +2958,10 @@ class LoadVirtualizer(QObject):
         self._sync_selection()
         self.countsChanged.emit(self.active_count)
         if self._loads_visible:
-            self.refresh(force=True)
+            if self._lod_coordinator is None:
+                self.refresh(force=True)
+            else:
+                self._lod_coordinator.invalidate()
         else:
             self.view.viewport().update()
 

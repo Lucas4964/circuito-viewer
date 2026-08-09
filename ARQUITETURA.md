@@ -765,7 +765,8 @@ _choose_import()
 evento (wheel/pan/resize/scroll)
   └─ DiagramView.viewportChanged
        ├─ ItemVirtualizer.schedule_refresh()      (debounce 120 ms)
-       ├─ LoadVirtualizer.schedule_refresh() × 2  (debounce 120 ms)
+       ├─ LoadLodCoordinator.schedule_refresh()   (debounce 120 ms)
+       │    └─ LoadVirtualizer × 3 (cargas, geradores e equivalentes)
        └─ MainWindow._schedule_viewport_overlay_update() (timer 0 ms)
               └─ reposiciona a legenda de fases
 
@@ -793,14 +794,21 @@ A solução é uma **camada agregada** sempre presente e uma **camada
 materializada** ativada só quando a densidade permite.
 
 ```
-indices_visiveis = spatial_index.query_rect(viewport + 25% de margem)
-indices_visiveis = indices_visiveis[visibility_mask[indices_visiveis]]
+para cada camada visível de carga/gerador/equivalente:
+    indices_visiveis = spatial_index.query_rect(viewport + 25% de margem)
+    indices_visiveis = indices_visiveis[visibility_mask[indices_visiveis]]
 
-se len(indices) > MAX_ACTIVE_ITEMS (1.000):
-    modo "Visão geral"  → só o item agregado pinta (1 drawPoints)
+se qualquer camada excede MAX_ACTIVE_ITEMS (1.000):
+    todas em "Visão geral" → só os itens agregados pintam
 senão:
-    modo "Detalhado"    → materializa em lotes de 250 via QTimer(0)
+    todas em "Detalhado" → materializam em lotes de 250 via QTimer(0)
 ```
+
+`LoadLodCoordinator` é o único responsável por essa decisão compartilhada.
+Camadas ocultas ou sem modelo não participam; por isso cargas equivalentes só
+entram no cálculo quando a rede simplificada está ativa. Um `LoadVirtualizer`
+sem coordenador conserva o comportamento independente usado por testes e
+benchmarks.
 
 Durante a materialização o agregado permanece visível e só é ocultado após o
 último lote — isso evita um quadro em branco.
@@ -810,7 +818,7 @@ Durante a materialização o agregado permanece visível e só é ocultado após
 | Classe | Z | Técnica |
 |---|---|---|
 | `BarsOverviewItem` | −10 | `QPolygonF` de pontos + `drawPoints` com pen cosmético `RoundCap` |
-| `LoadsOverviewItem` | −11 | idem, `SquareCap`, diâmetro 7 px |
+| `LoadsOverviewItem` | −11 | `SquareCap` para cargas e `RoundCap` para geradores, diâmetro 7 px |
 | `LineNetworkItem` | −20 | `dict[categoria → QPainterPath]` com subcaminhos desconectados; 1 `drawPath` por cor |
 | `SwitchNetworkItem` | −15 | `_red_path` único no modo circuito; `_colored_paths` por categoria no modo fases |
 | `RegulatorNetworkItem` | −12 | pontos médios pré-calculados; um `drawEllipse` por regulador, raio derivado da escala do painter |
@@ -854,8 +862,8 @@ ponto da barra até um retângulo 12×8 px.
 Cargas na mesma barra são distribuídas por `load_layout_offsets_for_models()`:
 agrupa por `bar_index`, ordena por `load_id.casefold()` (determinístico),
 calcula `colunas = ceil(sqrt(n))` e posiciona em grade. A função aceita
-**vários modelos simultaneamente** — é assim que cargas originais e cargas
-equivalentes compartilham a mesma grade sem se sobrepor no modo simplificado.
+**vários modelos simultaneamente** — é assim que cargas originais, geradores e
+cargas equivalentes compartilham a mesma grade sem se sobrepor.
 
 ### Overlays de seleção
 

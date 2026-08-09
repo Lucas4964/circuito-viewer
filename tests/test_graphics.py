@@ -22,6 +22,7 @@ try:
         LOAD_HEIGHT_PX,
         LOAD_WIDTH_PX,
         LoadItem,
+        LoadLodCoordinator,
         LoadVirtualizer,
         NORMAL_SEGMENT_WIDTH_PX,
         REGULATOR_COLOR,
@@ -120,6 +121,81 @@ class GraphicsTests(unittest.TestCase):
             if not loads_layer._pending_indices:
                 break
         return bars, loads, scene, view, bars_layer, loads_layer
+
+    def _make_coordinated_load_canvas(
+        self,
+        counts: tuple[int, int, int],
+        *,
+        cap: int,
+    ):
+        bar_count = max(counts)
+        bars = CircuitModel(
+            [f"B{i}" for i in range(bar_count)],
+            [""] * bar_count,
+            [float(i * 10_000) for i in range(bar_count)],
+            [0.0] * bar_count,
+            UtmCrs(21, northern=False),
+        )
+        scene = QGraphicsScene()
+        scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
+        view = DiagramView(scene)
+        view.resize(800, 600)
+        view.show()
+        view.set_model(bars)
+        coordinator = LoadLodCoordinator(view, parent=view)
+        layers = (
+            LoadVirtualizer(
+                scene,
+                view,
+                max_active_items=cap,
+                lod_coordinator=coordinator,
+                parent=view,
+            ),
+            LoadVirtualizer(
+                scene,
+                view,
+                max_active_items=cap,
+                symbol_kind="generator",
+                lod_coordinator=coordinator,
+                parent=view,
+            ),
+            LoadVirtualizer(
+                scene,
+                view,
+                max_active_items=cap,
+                lod_coordinator=coordinator,
+                parent=view,
+            ),
+        )
+        models = []
+        for model_index, count in enumerate(counts):
+            models.append(
+                LoadModel(
+                    bars,
+                    [f"L{model_index}-{i}" for i in range(count)],
+                    list(range(count)),
+                    [""] * count,
+                    [""] * count,
+                    [""] * count,
+                    [""] * count,
+                    [""] * count,
+                    [""] * count,
+                    [""] * count,
+                )
+            )
+        view.set_load_model(models[0])
+        for layer, model in zip(layers, models, strict=True):
+            layer.reset_model(model)
+        view.fit_model()
+        coordinator.refresh(force=True)
+        self._settle_load_layers(layers)
+        return bars, view, coordinator, layers
+
+    def _settle_load_layers(self, layers) -> None:  # noqa: ANN001
+        for _ in range(100):
+            self.app.processEvents()
+            if all(not layer._pending_indices for layer in layers):
+                break
 
     def test_overview_does_not_materialize_above_cap(self) -> None:
         _, _, view, virtualizer = self._make_canvas(100, 10)
@@ -619,6 +695,77 @@ class GraphicsTests(unittest.TestCase):
         layer.set_selected_index(1, reveal_hidden=True)
         self.assertTrue(layer.selection_overlay.isVisible())
         self.assertIs(layer.model, loads)
+
+    def test_coordinated_load_layers_follow_any_layer_above_cap(self) -> None:
+        for dominant_layer in range(3):
+            with self.subTest(dominant_layer=dominant_layer):
+                counts = tuple(
+                    3 if index == dominant_layer else 1 for index in range(3)
+                )
+                _, view, _, layers = self._make_coordinated_load_canvas(
+                    counts,
+                    cap=2,
+                )
+                try:
+                    self.assertEqual(
+                        [layer.mode for layer in layers],
+                        ["Visão geral"] * 3,
+                    )
+                    self.assertTrue(
+                        all(layer.active_count == 0 for layer in layers)
+                    )
+                    self.assertTrue(
+                        all(layer.overview_item.isVisible() for layer in layers)
+                    )
+                finally:
+                    view.close()
+
+    def test_coordinated_layers_react_to_masks_and_hidden_layers(self) -> None:
+        _, view, coordinator, layers = self._make_coordinated_load_canvas(
+            (3, 1, 1),
+            cap=2,
+        )
+        self.addCleanup(view.close)
+        loads, generator, equivalent = layers
+
+        loads.set_visibility_mask(np.array([True, True, False], dtype=np.bool_))
+        coordinator.refresh(force=True)
+        self._settle_load_layers(layers)
+        self.assertEqual([layer.mode for layer in layers], ["Detalhado"] * 3)
+        self.assertEqual(
+            [layer.active_count for layer in layers],
+            [2, 1, 1],
+        )
+
+        loads.set_visibility_mask(None)
+        loads.set_loads_visible(False)
+        coordinator.refresh(force=True)
+        self._settle_load_layers(layers)
+        self.assertEqual(generator.mode, "Detalhado")
+        self.assertEqual(equivalent.mode, "Detalhado")
+        self.assertFalse(loads.overview_item.isVisible())
+
+        loads.set_loads_visible(True)
+        coordinator.refresh(force=True)
+        self.assertEqual([layer.mode for layer in layers], ["Visão geral"] * 3)
+
+    def test_coordinated_layers_change_lod_together_after_zoom(self) -> None:
+        _, view, coordinator, layers = self._make_coordinated_load_canvas(
+            (3, 3, 3),
+            cap=1,
+        )
+        self.addCleanup(view.close)
+        self.assertEqual([layer.mode for layer in layers], ["Visão geral"] * 3)
+
+        view.focus_bar(0)
+        coordinator.refresh(force=True)
+        self._settle_load_layers(layers)
+        self.assertEqual([layer.mode for layer in layers], ["Detalhado"] * 3)
+        self.assertEqual([layer.active_count for layer in layers], [1, 1, 1])
+
+        view.fit_model()
+        coordinator.refresh(force=True)
+        self.assertEqual([layer.mode for layer in layers], ["Visão geral"] * 3)
 
     def test_load_rectangle_has_priority_but_bar_keeps_terminal_priority(self) -> None:
         bars, _, _, view, _, layer = self._make_load_canvas(["L1"])

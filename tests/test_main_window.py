@@ -139,6 +139,14 @@ class MainWindowSelectionTests(unittest.TestCase):
     def test_single_import_action_opens_choices_with_dependency_state(self) -> None:
         window = MainWindow()
         self.addCleanup(window.close)
+        self.assertEqual(
+            window.load_lod_coordinator.layers,
+            (
+                window.load_virtualizer,
+                window.generator_virtualizer,
+                window.equivalent_load_virtualizer,
+            ),
+        )
         toolbar = window.findChild(QToolBar, "main_toolbar")
         import_actions = [
             action for action in toolbar.actions() if action.text().startswith("Importar")

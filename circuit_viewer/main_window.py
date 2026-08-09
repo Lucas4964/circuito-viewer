@@ -84,6 +84,7 @@ from .graphics import (
     DiagramView,
     ItemVirtualizer,
     LineNetworkItem,
+    LoadLodCoordinator,
     LoadVirtualizer,
     load_layout_offsets_for_models,
     RegulatorNetworkItem,
@@ -751,9 +752,11 @@ class MainWindow(QMainWindow):
         self.view = DiagramView(self.scene, self)
         self.setCentralWidget(self.view)
         self.virtualizer = ItemVirtualizer(self.scene, self.view, parent=self)
+        self.load_lod_coordinator = LoadLodCoordinator(self.view, parent=self)
         self.load_virtualizer = LoadVirtualizer(
             self.scene,
             self.view,
+            lod_coordinator=self.load_lod_coordinator,
             parent=self,
         )
         self.view.set_load_layer(self.load_virtualizer)
@@ -761,12 +764,14 @@ class MainWindow(QMainWindow):
             self.scene,
             self.view,
             symbol_kind="generator",
+            lod_coordinator=self.load_lod_coordinator,
             parent=self,
         )
         self.view.set_generator_layer(self.generator_virtualizer)
         self.equivalent_load_virtualizer = LoadVirtualizer(
             self.scene,
             self.view,
+            lod_coordinator=self.load_lod_coordinator,
             parent=self,
         )
         self.equivalent_load_virtualizer.set_loads_visible(False)
