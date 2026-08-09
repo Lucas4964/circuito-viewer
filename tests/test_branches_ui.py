@@ -15,8 +15,9 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt6.QtCore import QPoint, Qt
-    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from PyQt6.QtCore import QItemSelection, QItemSelectionModel, QPoint, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication, QAbstractItemView, QMessageBox
 
     from circuit_viewer.branch_analysis import analyze_branches
     from circuit_viewer.equivalent_network import build_equivalent_network
@@ -185,23 +186,24 @@ class BranchesUiTests(unittest.TestCase):
         self.assertTrue(window.branches_window.export_csv_button.isEnabled())
         model = window.branch_table_model
         self.assertEqual(model.rowCount(), 1)
-        self.assertEqual(model.columnCount(), 21)
+        self.assertEqual(model.columnCount(), 24)
         self.assertEqual(
-            model.headerData(5, Qt.Orientation.Horizontal),
+            model.headerData(6, Qt.Orientation.Horizontal),
             "NIVEL_TOPOLOGICO",
         )
-        self.assertEqual(model.headerData(11, Qt.Orientation.Horizontal), "DEMANDA_MAXIMA")
-        self.assertEqual(model.data(model.index(0, 0)), "1")
-        self.assertEqual(model.data(model.index(0, 1)), "MONOFASICO")
-        self.assertEqual(model.data(model.index(0, 2)), "C1")
-        self.assertEqual(model.data(model.index(0, 3)), "B1")
-        self.assertEqual(model.data(model.index(0, 5)), "1")
-        self.assertEqual(model.data(model.index(0, 6)), "T2")
-        self.assertEqual(model.data(model.index(0, 8)), "2")
-        self.assertEqual(model.data(model.index(0, 9)), "200.000")
-        self.assertEqual(model.data(model.index(0, 11)), "0.0000")
-        self.assertEqual(model.data(model.index(0, 12)), "D")
-        self.assertEqual(model.data(model.index(0, 13)), "D")
+        self.assertEqual(model.headerData(14, Qt.Orientation.Horizontal), "DEMANDA_MAXIMA")
+        self.assertEqual(model.data(model.index(0, 1)), "1")
+        self.assertEqual(model.data(model.index(0, 2)), "MONOFASICO")
+        self.assertEqual(model.data(model.index(0, 3)), "C1")
+        self.assertEqual(model.data(model.index(0, 4)), "B1")
+        self.assertEqual(model.data(model.index(0, 6)), "1")
+        self.assertEqual(model.data(model.index(0, 7)), "T2")
+        self.assertEqual(model.data(model.index(0, 9)), "—")
+        self.assertEqual(model.data(model.index(0, 11)), "2")
+        self.assertEqual(model.data(model.index(0, 12)), "200.000")
+        self.assertEqual(model.data(model.index(0, 14)), "0.0000")
+        self.assertEqual(model.data(model.index(0, 15)), "D")
+        self.assertEqual(model.data(model.index(0, 16)), "D")
 
         cached = window._branch_analysis_result
         window._show_or_analyze_branches()
@@ -220,6 +222,16 @@ class BranchesUiTests(unittest.TestCase):
         window.branches_window.set_result(branches)
         window.branches_window.set_equivalent_result(equivalent)
         window._show_branches_window()
+        window.branch_table_model.setData(
+            window.branch_table_model.index(0, 0),
+            Qt.CheckState.Checked,
+            Qt.ItemDataRole.CheckStateRole,
+        )
+        window.branch_table_model.setData(
+            window.branch_table_model.index(1, 0),
+            Qt.CheckState.Checked,
+            Qt.ItemDataRole.CheckStateRole,
+        )
         window.branches_window.circuit_filter.setCurrentIndex(1)
         self.app.processEvents()
         target = Path(self.temp.name) / "circuito.json"
@@ -232,7 +244,8 @@ class BranchesUiTests(unittest.TestCase):
             self.wait_for_json_export(window)
 
         payload = json.loads(target.read_text(encoding="utf-8"))
-        self.assertEqual(list(payload), ["RAMAL-1"])
+        self.assertEqual(list(payload), ["ramais_interesse", "RAMAL-1"])
+        self.assertEqual(payload["ramais_interesse"], [1])
         self.assertEqual(payload["RAMAL-1"]["barra_inicio"], "CB1")
 
     def test_all_circuits_filter_exposes_every_branch_for_json(self) -> None:
@@ -259,6 +272,81 @@ class BranchesUiTests(unittest.TestCase):
         self.assertTrue(window.branches_window.export_json_button.isEnabled())
         self.assertTrue(window.branches_window.export_csv_button.isEnabled())
 
+    def test_interest_checkboxes_survive_sort_filter_and_reset_on_new_result(self) -> None:
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        branch_window = window.branches_window
+        model = window.branch_table_model
+        branch_window.set_result(branches)
+        branch_window.show()
+        self.app.processEvents()
+
+        check = model.index(0, 0)
+        self.assertTrue(model.flags(check) & Qt.ItemFlag.ItemIsUserCheckable)
+        proxy_check = branch_window.proxy_model.index(0, 0)
+        QTest.mouseClick(
+            branch_window.table.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=branch_window.table.visualRect(proxy_check).center(),
+        )
+        self.app.processEvents()
+        self.assertEqual(model.interest_branch_ids(), (1,))
+        branch_window.proxy_model.sort(1, Qt.SortOrder.DescendingOrder)
+        branch_window.circuit_filter.setCurrentIndex(2)
+        self.app.processEvents()
+        self.assertEqual(model.interest_branch_ids(), (1,))
+        self.assertEqual(
+            branch_window.interest_branch_ids_for_source_rows(
+                branch_window.visible_source_rows()
+            ),
+            (),
+        )
+
+        model.set_result(branches)
+        self.assertEqual(model.interest_branch_ids(), ())
+
+    def test_table_copies_selected_cells_as_tsv_without_checkbox(self) -> None:
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        branch_window = window.branches_window
+        branch_window.set_result(branches)
+        branch_window.proxy_model.sort(1, Qt.SortOrder.AscendingOrder)
+        self.app.processEvents()
+
+        self.assertEqual(
+            branch_window.table.selectionBehavior(),
+            QAbstractItemView.SelectionBehavior.SelectItems,
+        )
+        self.assertEqual(
+            branch_window.table.selectionMode(),
+            QAbstractItemView.SelectionMode.ExtendedSelection,
+        )
+        self.assertEqual(
+            branch_window.table.editTriggers(),
+            QAbstractItemView.EditTrigger.NoEditTriggers,
+        )
+        selection = QItemSelection(
+            branch_window.proxy_model.index(0, 0),
+            branch_window.proxy_model.index(1, 3),
+        )
+        branch_window.table.selectionModel().select(
+            selection,
+            QItemSelectionModel.SelectionFlag.ClearAndSelect,
+        )
+
+        branch_window.table.copy_selection()
+
+        self.assertEqual(
+            QApplication.clipboard().text(),
+            "1\tMONOFASICO\tC1\n2\tMONOFASICO\tC2",
+        )
+
     def test_csv_button_preserves_visual_filter_and_sort_order(self) -> None:
         window, _, _, catalog = self.make_window(two_circuits=True)
         branches = analyze_branches(
@@ -268,7 +356,7 @@ class BranchesUiTests(unittest.TestCase):
         window._branch_analysis_result = branches
         window.branches_window.set_result(branches)
         proxy = window.branches_window.proxy_model
-        proxy.sort(0, Qt.SortOrder.DescendingOrder)
+        proxy.sort(1, Qt.SortOrder.DescendingOrder)
         self.app.processEvents()
         target = Path(self.temp.name) / "todos.csv"
 
@@ -310,15 +398,15 @@ class BranchesUiTests(unittest.TestCase):
             1: Decimal("10.123456789"),
             2: Decimal("2.5"),
         }
-        model.dataChanged.emit(model.index(0, 11), model.index(1, 11))
+        model.dataChanged.emit(model.index(0, 14), model.index(1, 14))
 
-        self.assertEqual(model.data(model.index(0, 11)), "10.1235")
+        self.assertEqual(model.data(model.index(0, 14)), "10.1235")
         self.assertEqual(
-            model.data(model.index(0, 11), Qt.ItemDataRole.ToolTipRole),
+            model.data(model.index(0, 14), Qt.ItemDataRole.ToolTipRole),
             "10.123456789",
         )
         proxy = window.branches_window.proxy_model
-        proxy.sort(11, Qt.SortOrder.AscendingOrder)
+        proxy.sort(14, Qt.SortOrder.AscendingOrder)
         self.app.processEvents()
 
         ordered_ids = tuple(
@@ -556,7 +644,22 @@ class BranchesUiTests(unittest.TestCase):
         self.assertEqual(branch.branch_type.value, "BIFASICO")
         self.assertEqual(set(branch.segment_indices), {2, 3})
         self.assertTrue(branch.removable)
-        self.assertEqual(window.branch_table_model.data(window.branch_table_model.index(0, 1)), "BIFASICO")
+        self.assertEqual(
+            window.branch_table_model.data(window.branch_table_model.index(0, 2)),
+            "BIFASICO",
+        )
+        self.assertEqual(
+            window.branch_table_model.data(window.branch_table_model.index(0, 7)),
+            "T2",
+        )
+        self.assertEqual(
+            window.branch_table_model.data(window.branch_table_model.index(0, 9)),
+            "CH1",
+        )
+        self.assertEqual(
+            window.branch_table_model.data(window.branch_table_model.index(0, 10)),
+            "CCH1",
+        )
 
         window.branches_window.table.selectRow(0)
         self.app.processEvents()

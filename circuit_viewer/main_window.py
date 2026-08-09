@@ -5262,6 +5262,11 @@ class MainWindow(QMainWindow):
         branch_indices = self.branches_window.visible_source_rows()
         if not branch_indices:
             return
+        interest_branch_ids = (
+            self.branches_window.interest_branch_ids_for_source_rows(
+                branch_indices
+            )
+        )
         suggested = suggested_branch_json_filename(
             self.branches_window.selected_circuit_id()
         )
@@ -5276,12 +5281,17 @@ class MainWindow(QMainWindow):
         target = Path(path)
         if not target.suffix:
             target = target.with_suffix(".json")
-        self._start_branch_json_export(target, branch_indices)
+        self._start_branch_json_export(
+            target,
+            branch_indices,
+            interest_branch_ids,
+        )
 
     def _start_branch_json_export(
         self,
         target: Path,
         branch_indices: tuple[int, ...],
+        interest_branch_ids: tuple[int, ...] = (),
     ) -> None:
         branches = self._branch_analysis_result
         equivalent = self._equivalent_network_result
@@ -5298,6 +5308,7 @@ class MainWindow(QMainWindow):
             branches,
             equivalent,
             branch_indices,
+            interest_branch_ids,
         )
         worker.moveToThread(thread)
         progress = QProgressDialog(

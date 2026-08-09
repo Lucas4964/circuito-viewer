@@ -153,6 +153,89 @@ class BranchAnalysisTests(unittest.TestCase):
         self.assertFalse(record.segment_indices.flags.writeable)
         self.assertFalse(record.bar_indices.flags.writeable)
 
+    def test_switch_entry_keeps_topological_identity_and_exposes_common_segment(self) -> None:
+        bars = make_bars(4)
+        network = make_network(
+            bars,
+            [0, 1, 2],
+            [1, 2, 3],
+            ["DEF", "D", "D"],
+        )
+        switches = make_switch(network, 1)
+        catalog = CircuitCatalogModel.build(
+            network,
+            switches,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+
+        record = analyze_branches(catalog, PHASES).records[0]
+
+        self.assertEqual(record.first_segment_id, "T1")
+        self.assertEqual(record.first_common_segment_index, 2)
+        self.assertEqual(record.first_common_segment_id, "T2")
+        self.assertEqual(record.first_common_segment_code, "CT2")
+        self.assertEqual(record.first_switch_record_index, 0)
+        self.assertEqual(record.first_switch_id, "CH1")
+        self.assertEqual(record.first_switch_code, "CCH1")
+        self.assertEqual(record.first_switch_position, 1)
+        self.assertTrue(record.removable)
+
+    def test_branch_containing_only_a_switch_has_no_common_segment(self) -> None:
+        bars = make_bars(3)
+        network = make_network(
+            bars,
+            [0, 1],
+            [1, 2],
+            ["DEF", "D"],
+        )
+        switches = make_switch(network, 1)
+        catalog = CircuitCatalogModel.build(
+            network,
+            switches,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+
+        record = analyze_branches(catalog, PHASES).records[0]
+
+        self.assertIsNone(record.first_common_segment_index)
+        self.assertEqual(record.first_common_segment_id, "")
+        self.assertEqual(record.first_common_segment_code, "")
+        self.assertEqual(record.first_switch_id, "CH1")
+
+    def test_nearest_switch_wins_even_when_switch_records_are_reversed(self) -> None:
+        bars = make_bars(6)
+        network = make_network(
+            bars,
+            [0, 1, 2, 3, 4],
+            [1, 2, 3, 4, 5],
+            ["DEF", "D", "D", "D", "D"],
+        )
+        switches = SwitchModel(
+            network,
+            ["CH-LONGE", "CH-PERTO"],
+            ["TIPO", "TIPO"],
+            ["C1", "C1"],
+            [3, 1],
+            ["COD-LONGE", "COD-PERTO"],
+            ["1", "1"],
+            ["1", "1"],
+            ["", ""],
+            ["", ""],
+            ["", ""],
+        )
+        catalog = CircuitCatalogModel.build(
+            network,
+            switches,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+
+        record = analyze_branches(catalog, PHASES).records[0]
+
+        self.assertEqual(record.first_switch_record_index, 1)
+        self.assertEqual(record.first_switch_id, "CH-PERTO")
+        self.assertEqual(record.first_switch_code, "COD-PERTO")
+        self.assertEqual(record.first_switch_position, 1)
+
     def test_missing_length_makes_total_unavailable(self) -> None:
         bars = make_bars(4)
         network = make_network(
@@ -476,6 +559,27 @@ class BranchAnalysisTests(unittest.TestCase):
 
         self.assertEqual(record.first_switch_position, 5)
         self.assertTrue(record.removable)
+
+    def test_closed_switch_after_fifth_level_is_not_removable(self) -> None:
+        bars = make_bars(8)
+        network = make_network(
+            bars,
+            list(range(7)),
+            list(range(1, 8)),
+            ["DEF"] + ["D"] * 6,
+        )
+        switches = make_switch(network, 6, state="1")
+        catalog = CircuitCatalogModel.build(
+            network,
+            switches,
+            [CircuitDefinition("C1", "B0", "", "")],
+        )
+
+        record = analyze_branches(catalog, PHASES).records[0]
+
+        self.assertEqual(record.first_switch_position, 6)
+        self.assertEqual(record.first_switch_id, "CH1")
+        self.assertFalse(record.removable)
 
     def test_overlapping_circuits_are_analyzed_independently(self) -> None:
         bars = make_bars(4)

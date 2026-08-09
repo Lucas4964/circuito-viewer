@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import codecs
 import csv
+from dataclasses import replace
 from decimal import Decimal
 import io
 from pathlib import Path
@@ -22,8 +23,10 @@ from circuit_viewer.model import (
     CircuitDefinition,
     CircuitModel,
     LineNetworkModel,
+    SwitchModel,
     UtmCrs,
 )
+from circuit_viewer.branch_table_export import branch_table_values
 from circuit_viewer.phase_config import PhaseConfiguration, PhaseMappingEntry
 
 
@@ -76,6 +79,47 @@ def make_snapshot(*, two_branches: bool = False):
     return analyze_branches(catalog, PHASES)
 
 
+def make_switch_first_snapshot():
+    bars = CircuitModel(
+        ["B0", "B1", "B2", "B3"],
+        ["CB0", "CB1", "CB2", "CB3"],
+        [500_000.0, 500_010.0, 500_020.0, 500_030.0],
+        [8_000_000.0] * 4,
+        UtmCrs(21, northern=False),
+    )
+    segments = LineNetworkModel(
+        bars,
+        ["T0", "T1", "T2"],
+        ["CT0", "TRECHO-CHAVE", "TRECHO-COMUM"],
+        ["DEF", "D", "D"],
+        [0, 1, 2],
+        [1, 2, 3],
+        ["", "", ""],
+        ["", "", ""],
+        ["", "", ""],
+        [10.0, 10.0, 10.0],
+    )
+    switches = SwitchModel(
+        segments,
+        ["CH1"],
+        ["TIPO"],
+        ["C1"],
+        [1],
+        ["COD-CH1"],
+        ["1"],
+        ["1"],
+        [""],
+        [""],
+        [""],
+    )
+    catalog = CircuitCatalogModel.build(
+        segments,
+        switches,
+        [CircuitDefinition("C1", "B0", "", "")],
+    )
+    return analyze_branches(catalog, PHASES)
+
+
 def equivalent_with_demand(branches, value: Decimal):  # noqa: ANN001
     record = SimpleNamespace(branch_id=1, maximum_active_demand=value)
     model = SimpleNamespace(branches=branches, records=(record,))
@@ -103,22 +147,44 @@ class BranchTableExportTests(unittest.TestCase):
         self.assertNotIn(b"\n", content.replace(b"\r\n", b""))
         rows = parse_csv(content)
         self.assertEqual(tuple(rows[0]), BRANCH_TABLE_HEADERS)
-        self.assertEqual(len(rows[1]), 21)
+        self.assertEqual(len(rows[1]), 23)
         self.assertEqual(rows[1][2], "C;Á")
         self.assertEqual(rows[1][5], "1")
         self.assertEqual(rows[1][7], "TRECHO;Á")
+        self.assertEqual(rows[1][8], "")
+        self.assertEqual(rows[1][9], "")
         self.assertEqual(
-            rows[1][9],
+            rows[1][11],
             repr(branches.records[0].total_length).replace(".", ","),
         )
-        self.assertEqual(rows[1][11], "40,905912345678901234")
+        self.assertEqual(rows[1][13], "40,905912345678901234")
 
     def test_missing_maximum_demand_is_an_empty_cell(self) -> None:
         branches = make_snapshot()
 
         rows = parse_csv(build_branches_csv_bytes(branches, None, (0,)))
 
-        self.assertEqual(rows[1][11], "")
+        self.assertEqual(rows[1][13], "")
+
+    def test_csv_separates_first_common_segment_from_first_switch(self) -> None:
+        branches = make_switch_first_snapshot()
+
+        rows = parse_csv(build_branches_csv_bytes(branches, None, (0,)))
+
+        self.assertEqual(rows[1][6:10], ["T2", "TRECHO-COMUM", "CH1", "COD-CH1"])
+
+    def test_non_removable_branch_hides_switch_columns(self) -> None:
+        record = make_switch_first_snapshot().records[0]
+        record = replace(
+            record,
+            removable=False,
+            first_switch_position=6,
+        )
+
+        values = branch_table_values(record, None)
+
+        self.assertEqual(values[BRANCH_TABLE_HEADERS.index("CHAVE_ID")], "")
+        self.assertEqual(values[BRANCH_TABLE_HEADERS.index("CHAVE_CODIGO")], "")
 
     def test_received_order_is_preserved_exactly(self) -> None:
         branches = make_snapshot(two_branches=True)

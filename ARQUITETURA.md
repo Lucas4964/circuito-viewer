@@ -264,7 +264,7 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | `opendss_powerflow.py` | motor OpenDSS injetado + as mesmas entradas da exportação + pasta de trabalho | `PowerFlowResult` (correntes por trecho e tensões por barra, um retrato por patamar + diagnósticos) |
 | `equivalent_network.py` | `BranchAnalysisResult`, `LoadModel?`, `LoadPatternModel?` | `EquivalentNetworkResult` (cargas equivalentes + máscaras) |
 | `branch_json_export.py` | ramais, equivalentes e índices filtrados | objeto JSON validado e `BranchJsonExportResult` gravado atomicamente |
-| `branch_table_export.py` | ramais, equivalente opcional e índices na ordem visual | 21 colunas canônicas e `BranchCsvExportResult` pt-BR gravado atomicamente |
+| `branch_table_export.py` | ramais, equivalente opcional e índices na ordem visual | 23 colunas canônicas e `BranchCsvExportResult` pt-BR gravado atomicamente |
 | `generator_update.py` | `GeneratorModel`, `CircuitCatalogModel`, `PhaseConfiguration`, uma `Curve` e agendas efetivas | `GeneratorUpdateResult` (demanda média, quatro demandas totais e quatro potências por fase com sinal elétrico + diagnósticos) |
 
 ### Gráfico e UI
@@ -1187,7 +1187,8 @@ interrompem; só chaves fechadas do próprio circuito são atravessadas).
    depois os ramais monofásicos de status 1.
 
 **Métricas por ramal** (`append_record`): BFS de distância a partir das conexões
-com o tronco para obter `POS_PRIMEIRA_CHAVE`; `REMANEJAVEL = posição ≤ 5`;
+com o tronco para obter o primeiro trecho convencional, a primeira chave e
+`POS_PRIMEIRA_CHAVE`; `REMANEJAVEL = posição ≤ 5`;
 comprimento total (`None` se algum `COMPR` faltar); cargas coletadas via CSR
 `bar → cargas`; topologia classificada em `Linear` / `Bifurcado` / `Cíclico`
 (+ `Múltiplas conexões`). Os índices das chaves identificadas são persistidos em
@@ -1623,7 +1624,8 @@ usando exclusivamente o bundle convencional.
 #### Exportação JSON dos ramais (`branch_json_export.py`)
 
 O botão da janela de ramais entrega ao worker apenas os índices das linhas
-aceitas pelo filtro. O exportador ordena esses índices por `branch_id` e monta o
+aceitas pelo filtro e os IDs marcados que pertencem a essas linhas. O exportador
+grava primeiro `ramais_interesse`, ordena os índices por `branch_id` e monta o
 documento diretamente de `BranchRecord` e `EquivalentLoadRecord`: barras,
 trechos, cargas, geradores e chaves vêm dos índices imutáveis já associados.
 Não há nova BFS nem recálculo dos patamares.
@@ -1640,8 +1642,10 @@ cancelamento, validação ou falha anterior à substituição preservam o destin
 
 #### Exportação CSV da tabela (`branch_table_export.py`)
 
-`BRANCH_TABLE_HEADERS` e `branch_table_values()` são a definição única das 21
-colunas consumidas pelo modelo Qt e pelo exportador. A interface captura os
+`BRANCH_TABLE_HEADERS` e `branch_table_values()` são a definição única das 23
+colunas de dados consumidas pelo modelo Qt e pelo exportador. A interface
+acrescenta antes delas uma coluna estreita e exclusiva para o checkbox de
+interesse, que não entra no CSV. A interface captura os
 índices na ordem atual do `QSortFilterProxyModel`; o núcleo não reordena nem
 refaz a análise. O equivalente é opcional e sua ausência produz apenas uma
 célula vazia em `DEMANDA_MAXIMA`.

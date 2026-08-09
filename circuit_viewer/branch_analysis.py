@@ -76,10 +76,16 @@ class BranchRecord:
     first_segment_index: int
     first_segment_id: str
     first_segment_code: str
+    first_common_segment_index: int | None
+    first_common_segment_id: str
+    first_common_segment_code: str
     segment_indices: IndexArray
     bar_indices: IndexArray
     load_indices: IndexArray
     switch_indices: IndexArray
+    first_switch_record_index: int | None
+    first_switch_id: str
+    first_switch_code: str
     total_length: float | None
     load_count: int
     phases2: str
@@ -111,6 +117,16 @@ class BranchRecord:
             raise ValueError("O índice do circuito não pode ser negativo.")
         if self.connection_bar_index < 0 or self.first_segment_index < 0:
             raise ValueError("A conexão do ramal deve possuir índices válidos.")
+        if self.first_common_segment_index is None:
+            if self.first_common_segment_id or self.first_common_segment_code:
+                raise ValueError("Ramal sem trecho convencional não pode identificá-lo.")
+        elif self.first_common_segment_index < 0 or not self.first_common_segment_id:
+            raise ValueError("O primeiro trecho convencional deve ser válido.")
+        if self.first_switch_record_index is None:
+            if self.first_switch_id or self.first_switch_code:
+                raise ValueError("Ramal sem chave não pode identificá-la.")
+        elif self.first_switch_record_index < 0 or not self.first_switch_id:
+            raise ValueError("A primeira chave deve ser válida.")
         if self.topological_level < 0:
             raise ValueError("O nível topológico não pode ser negativo.")
         for count in (
@@ -125,6 +141,10 @@ class BranchRecord:
             raise ValueError("NUM_CARGAS deve corresponder aos índices das cargas.")
         if self.switch_count != int(self.switch_indices.size):
             raise ValueError("NUM_CHAVES deve corresponder aos índices das chaves.")
+        if (self.first_switch_position is None) != (
+            self.first_switch_record_index is None
+        ):
+            raise ValueError("A posição e a identificação da primeira chave divergem.")
 
     @property
     def segment_count(self) -> int:
@@ -653,15 +673,41 @@ def analyze_branches(
                 if switch_by_segment is None
                 else branch_array[switch_by_segment[branch_array] >= 0]
             )
-            first_switch_position = (
+            common_segment_indices = (
+                branch_array
+                if switch_by_segment is None
+                else branch_array[switch_by_segment[branch_array] < 0]
+            )
+            first_common_segment_index = (
+                None
+                if common_segment_indices.size == 0
+                else min(
+                    (int(value) for value in common_segment_indices),
+                    key=lambda index: (int(segment_distances[index]), index),
+                )
+            )
+            first_switch_segment_index = (
                 None
                 if switch_segment_indices.size == 0
-                else int(segment_distances[switch_segment_indices].min())
+                else min(
+                    (int(value) for value in switch_segment_indices),
+                    key=lambda index: (int(segment_distances[index]), index),
+                )
+            )
+            first_switch_position = (
+                None
+                if first_switch_segment_index is None
+                else int(segment_distances[first_switch_segment_index])
             )
             switch_record_indices = (
                 np.empty(0, dtype=np.intp)
                 if switch_by_segment is None
                 else switch_by_segment[switch_segment_indices]
+            )
+            first_switch_record_index = (
+                None
+                if first_switch_segment_index is None
+                else int(switch_by_segment[first_switch_segment_index])
             )
             lengths = segments.lengths[branch_array]
             missing_length_count = int(np.count_nonzero(np.isnan(lengths)))
@@ -731,10 +777,32 @@ def analyze_branches(
                     first_segment_index=first_segment,
                     first_segment_id=segments.segment_ids[first_segment],
                     first_segment_code=segments.codes[first_segment],
+                    first_common_segment_index=first_common_segment_index,
+                    first_common_segment_id=(
+                        ""
+                        if first_common_segment_index is None
+                        else segments.segment_ids[first_common_segment_index]
+                    ),
+                    first_common_segment_code=(
+                        ""
+                        if first_common_segment_index is None
+                        else segments.codes[first_common_segment_index]
+                    ),
                     segment_indices=_readonly_indices(branch_array),
                     bar_indices=_readonly_indices(downstream_array),
                     load_indices=_readonly_indices(load_array),
                     switch_indices=_readonly_indices(switch_record_indices),
+                    first_switch_record_index=first_switch_record_index,
+                    first_switch_id=(
+                        ""
+                        if first_switch_record_index is None
+                        else switches.switch_ids[first_switch_record_index]
+                    ),
+                    first_switch_code=(
+                        ""
+                        if first_switch_record_index is None
+                        else switches.codes[first_switch_record_index]
+                    ),
                     total_length=total_length,
                     load_count=load_count,
                     phases2=segments.phases[first_segment].strip(),

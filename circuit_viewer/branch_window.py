@@ -11,6 +11,7 @@ from PyQt6.QtCore import (
     Qt,
     pyqtSignal,
 )
+from PyQt6.QtGui import QGuiApplication, QKeyEvent, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -36,19 +37,32 @@ from .branch_table_export import (
 from .equivalent_network import EquivalentNetworkResult
 
 
+BRANCH_INTEREST_COLUMN = 0
+BRANCH_DATA_COLUMN_OFFSET = 1
+
+
 class BranchTableModel(QAbstractTableModel):
-    HEADERS = BRANCH_TABLE_HEADERS
-    NUMERIC_COLUMNS = BRANCH_NUMERIC_COLUMNS
+    HEADERS = ("", *BRANCH_TABLE_HEADERS)
+    NUMERIC_COLUMNS = frozenset(
+        column + BRANCH_DATA_COLUMN_OFFSET for column in BRANCH_NUMERIC_COLUMNS
+    )
+    LENGTH_COLUMN = BRANCH_LENGTH_COLUMN + BRANCH_DATA_COLUMN_OFFSET
+    MAXIMUM_DEMAND_COLUMN = (
+        BRANCH_MAXIMUM_DEMAND_COLUMN + BRANCH_DATA_COLUMN_OFFSET
+    )
+    REMOVABLE_COLUMN = BRANCH_REMOVABLE_COLUMN + BRANCH_DATA_COLUMN_OFFSET
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
         self.result: BranchAnalysisResult | None = None
         self._maximum_demand_by_branch: dict[int, Decimal | None] = {}
+        self._interest_branch_ids: set[int] = set()
 
     def set_result(self, result: BranchAnalysisResult | None) -> None:
         self.beginResetModel()
         self.result = result
         self._maximum_demand_by_branch = {}
+        self._interest_branch_ids.clear()
         self.endResetModel()
 
     def set_equivalent_result(
@@ -67,10 +81,10 @@ class BranchTableModel(QAbstractTableModel):
         )
         if self.rowCount() > 0:
             self.dataChanged.emit(
-                self.index(0, BRANCH_MAXIMUM_DEMAND_COLUMN),
+                self.index(0, self.MAXIMUM_DEMAND_COLUMN),
                 self.index(
                     self.rowCount() - 1,
-                    BRANCH_MAXIMUM_DEMAND_COLUMN,
+                    self.MAXIMUM_DEMAND_COLUMN,
                 ),
                 (
                     Qt.ItemDataRole.DisplayRole,
@@ -94,11 +108,21 @@ class BranchTableModel(QAbstractTableModel):
         role=Qt.ItemDataRole.DisplayRole,
     ):
         if (
-            role == Qt.ItemDataRole.DisplayRole
-            and orientation == Qt.Orientation.Horizontal
+            orientation == Qt.Orientation.Horizontal
             and 0 <= int(section) < len(self.HEADERS)
         ):
-            return self.HEADERS[int(section)]
+            if role == Qt.ItemDataRole.DisplayRole:
+                return self.HEADERS[int(section)]
+            if (
+                role == Qt.ItemDataRole.ToolTipRole
+                and int(section) == BRANCH_INTEREST_COLUMN
+            ):
+                return "Ramal de interesse"
+            if (
+                role == Qt.ItemDataRole.TextAlignmentRole
+                and int(section) == BRANCH_INTEREST_COLUMN
+            ):
+                return Qt.AlignmentFlag.AlignCenter
         return None
 
     def record(self, row: int) -> BranchRecord:
@@ -112,17 +136,70 @@ class BranchTableModel(QAbstractTableModel):
             self._maximum_demand_by_branch.get(record.branch_id),
         )
 
+    def interest_branch_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(self._interest_branch_ids))
+
+    def flags(self, index: QModelIndex):  # noqa: ANN201
+        flags = super().flags(index)
+        if index.isValid() and index.column() == BRANCH_INTEREST_COLUMN:
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+        return flags
+
+    def setData(  # noqa: ANN001, ANN201, N802
+        self,
+        index: QModelIndex,
+        value,
+        role=Qt.ItemDataRole.EditRole,
+    ):
+        if (
+            not index.isValid()
+            or index.column() != BRANCH_INTEREST_COLUMN
+            or role != Qt.ItemDataRole.CheckStateRole
+        ):
+            return False
+        branch_id = self.record(index.row()).branch_id
+        checked = value in (Qt.CheckState.Checked, Qt.CheckState.Checked.value)
+        before = branch_id in self._interest_branch_ids
+        if checked == before:
+            return True
+        if checked:
+            self._interest_branch_ids.add(branch_id)
+        else:
+            self._interest_branch_ids.discard(branch_id)
+        self.dataChanged.emit(
+            index,
+            index,
+            (Qt.ItemDataRole.CheckStateRole, Qt.ItemDataRole.UserRole),
+        )
+        return True
+
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):  # noqa: ANN201
         if not index.isValid() or self.result is None:
             return None
         record = self.record(index.row())
-        value = self._raw_values(record)[index.column()]
+        if index.column() == BRANCH_INTEREST_COLUMN:
+            if role == Qt.ItemDataRole.CheckStateRole:
+                return (
+                    Qt.CheckState.Checked
+                    if record.branch_id in self._interest_branch_ids
+                    else Qt.CheckState.Unchecked
+                )
+            if role == Qt.ItemDataRole.UserRole:
+                return record.branch_id in self._interest_branch_ids
+            if role == Qt.ItemDataRole.TextAlignmentRole:
+                return Qt.AlignmentFlag.AlignCenter
+            if role == Qt.ItemDataRole.ToolTipRole:
+                return "Marcar como ramal de interesse"
+            return None
+        value = self._raw_values(record)[
+            index.column() - BRANCH_DATA_COLUMN_OFFSET
+        ]
         if role == Qt.ItemDataRole.UserRole:
             if value is None:
                 return float("inf") if index.column() in self.NUMERIC_COLUMNS else ""
             return value
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            if index.column() == BRANCH_REMOVABLE_COLUMN:
+            if index.column() == self.REMOVABLE_COLUMN:
                 return Qt.AlignmentFlag.AlignCenter
             if index.column() in self.NUMERIC_COLUMNS:
                 return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -134,9 +211,9 @@ class BranchTableModel(QAbstractTableModel):
             return None
         if value is None or value == "":
             display = "—"
-        elif index.column() == BRANCH_LENGTH_COLUMN:
+        elif index.column() == self.LENGTH_COLUMN:
             display = f"{float(value):.3f}"
-        elif index.column() == BRANCH_MAXIMUM_DEMAND_COLUMN:
+        elif index.column() == self.MAXIMUM_DEMAND_COLUMN:
             display = (
                 str(value)
                 if role == Qt.ItemDataRole.ToolTipRole
@@ -186,6 +263,51 @@ class BranchFilterProxyModel(QSortFilterProxyModel):
         return super().lessThan(left, right)
 
 
+class BranchTableView(QTableView):
+    """Tabela somente leitura com cópia tabular compatível com planilhas."""
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self.copy_selection()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def copy_selection(self) -> None:
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is None:  # pragma: no cover - depende da plataforma
+            return
+        indexes = tuple(
+            index
+            for index in self.selectedIndexes()
+            if index.column() != BRANCH_INTEREST_COLUMN
+        )
+        if not indexes:
+            return
+        selected = {(index.row(), index.column()) for index in indexes}
+        first_row = min(index.row() for index in indexes)
+        last_row = max(index.row() for index in indexes)
+        first_column = min(index.column() for index in indexes)
+        last_column = max(index.column() for index in indexes)
+        model = self.model()
+        if model is None:
+            return
+        lines: list[str] = []
+        for row in range(first_row, last_row + 1):
+            cells: list[str] = []
+            for column in range(first_column, last_column + 1):
+                if (row, column) not in selected:
+                    cells.append("")
+                    continue
+                value = model.data(
+                    model.index(row, column),
+                    Qt.ItemDataRole.DisplayRole,
+                )
+                cells.append("" if value is None else str(value))
+            lines.append("\t".join(cells))
+        clipboard.setText("\n".join(lines))
+
+
 class BranchesWindow(QDialog):
     branchSelected = pyqtSignal(object)
     branchActivated = pyqtSignal(object)
@@ -232,14 +354,14 @@ class BranchesWindow(QDialog):
 
         self.proxy_model = BranchFilterProxyModel(self)
         self.proxy_model.setSourceModel(table_model)
-        self.table = QTableView(self)
+        self.table = BranchTableView(self)
         self.table.setObjectName("branches_table")
         self.table.setModel(self.proxy_model)
         self.table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
+            QAbstractItemView.SelectionBehavior.SelectItems
         )
         self.table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
+            QAbstractItemView.SelectionMode.ExtendedSelection
         )
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(True)
@@ -249,6 +371,11 @@ class BranchesWindow(QDialog):
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(
+            BRANCH_INTEREST_COLUMN,
+            QHeaderView.ResizeMode.Fixed,
+        )
+        self.table.setColumnWidth(BRANCH_INTEREST_COLUMN, 32)
         header.setSectionResizeMode(
             len(BranchTableModel.HEADERS) - 1,
             QHeaderView.ResizeMode.Stretch,
@@ -302,7 +429,10 @@ class BranchesWindow(QDialog):
             )
         self._refresh_issues()
         self._sync_export_availability()
-        self.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        self.table.sortByColumn(
+            BRANCH_DATA_COLUMN_OFFSET,
+            Qt.SortOrder.AscendingOrder,
+        )
 
     def set_equivalent_result(
         self,
@@ -346,6 +476,22 @@ class BranchesWindow(QDialog):
             if source_index.isValid():
                 rows.append(source_index.row())
         return tuple(rows)
+
+    def interest_branch_ids_for_source_rows(
+        self,
+        source_rows: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        source = self.proxy_model.sourceModel()
+        if not isinstance(source, BranchTableModel):
+            return ()
+        marked = set(source.interest_branch_ids())
+        return tuple(
+            sorted(
+                source.record(row).branch_id
+                for row in source_rows
+                if source.record(row).branch_id in marked
+            )
+        )
 
     def selected_circuit_id(self) -> str | None:
         value = self.circuit_filter.currentData()

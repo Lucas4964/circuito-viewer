@@ -29,6 +29,8 @@ BRANCH_TABLE_HEADERS = (
     "NIVEL_TOPOLOGICO",
     "TRECHO_ID",
     "TRECHO_CODIGO",
+    "CHAVE_ID",
+    "CHAVE_CODIGO",
     "NUM_TRECHOS",
     "COMPR",
     "NUM_CARGAS",
@@ -44,11 +46,25 @@ BRANCH_TABLE_HEADERS = (
     "TOPOLOGIA",
 )
 BRANCH_NUMERIC_COLUMNS = frozenset(
-    {0, 5, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19}
+    BRANCH_TABLE_HEADERS.index(name)
+    for name in (
+        "RAMAL_ID",
+        "NIVEL_TOPOLOGICO",
+        "NUM_TRECHOS",
+        "COMPR",
+        "NUM_CARGAS",
+        "DEMANDA_MAXIMA",
+        "REMANEJAVEL",
+        "NUM_BARRAS",
+        "NUM_CHAVES",
+        "POS_PRIMEIRA_CHAVE",
+        "NUM_CONEXOES_TRONCO",
+        "NUM_COMPR_AUSENTE",
+    )
 )
-BRANCH_LENGTH_COLUMN = 9
-BRANCH_MAXIMUM_DEMAND_COLUMN = 11
-BRANCH_REMOVABLE_COLUMN = 14
+BRANCH_LENGTH_COLUMN = BRANCH_TABLE_HEADERS.index("COMPR")
+BRANCH_MAXIMUM_DEMAND_COLUMN = BRANCH_TABLE_HEADERS.index("DEMANDA_MAXIMA")
+BRANCH_REMOVABLE_COLUMN = BRANCH_TABLE_HEADERS.index("REMANEJAVEL")
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,8 +94,10 @@ def branch_table_values(
         record.connection_bar_id,
         record.connection_bar_code,
         record.topological_level,
-        record.first_segment_id,
-        record.first_segment_code,
+        record.first_common_segment_id,
+        record.first_common_segment_code,
+        record.first_switch_id if record.removable else "",
+        record.first_switch_code if record.removable else "",
         record.segment_count,
         record.total_length,
         record.load_count,

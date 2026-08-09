@@ -652,12 +652,14 @@ class BranchJsonExportWorker(QObject):
         branches: BranchAnalysisResult,
         equivalent: EquivalentNetworkResult,
         branch_indices: tuple[int, ...],
+        interest_branch_ids: tuple[int, ...] = (),
     ) -> None:
         super().__init__()
         self.path = path
         self.branches = branches
         self.equivalent = equivalent
         self.branch_indices = tuple(branch_indices)
+        self.interest_branch_ids = tuple(interest_branch_ids)
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -671,6 +673,7 @@ class BranchJsonExportWorker(QObject):
                 self.branches,
                 self.equivalent,
                 self.branch_indices,
+                interest_branch_ids=self.interest_branch_ids,
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
             )

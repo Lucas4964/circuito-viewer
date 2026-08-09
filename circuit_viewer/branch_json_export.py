@@ -73,9 +73,10 @@ def build_branch_json_payload(
     equivalent: EquivalentNetworkResult,
     branch_indices: Sequence[int],
     *,
+    interest_branch_ids: Sequence[int] = (),
     cancel_check: CancelCheck | None = None,
     progress: ProgressCallback | None = None,
-) -> dict[str, dict[str, object]]:
+) -> dict[str, object]:
     """Monta o objeto JSON somente por índices persistidos nos dois snapshots."""
 
     if equivalent.model.branches is not branches:
@@ -95,6 +96,17 @@ def build_branch_json_payload(
     selected = tuple(
         sorted(selected, key=lambda index: branches.records[index].branch_id)
     )
+    interest = tuple(int(branch_id) for branch_id in interest_branch_ids)
+    if len(set(interest)) != len(interest):
+        raise ValueError("A lista de ramais de interesse contém IDs duplicados.")
+    exported_branch_ids = {
+        branches.records[index].branch_id for index in selected
+    }
+    if any(branch_id not in exported_branch_ids for branch_id in interest):
+        raise ValueError(
+            "Todo ramal de interesse deve pertencer aos ramais exportados."
+        )
+    interest = tuple(sorted(interest))
 
     cancelled = cancel_check or (lambda: False)
     bars = catalog.segments.bars
@@ -108,7 +120,7 @@ def build_branch_json_payload(
         None if generator_updates is None else generator_updates.generators
     )
     issues: list[str] = []
-    payload: dict[str, dict[str, object]] = {}
+    payload: dict[str, object] = {"ramais_interesse": list(interest)}
     total = len(selected)
 
     for position, branch_index in enumerate(selected, start=1):
@@ -215,16 +227,19 @@ def export_branches_json(
     equivalent: EquivalentNetworkResult,
     branch_indices: Sequence[int],
     *,
+    interest_branch_ids: Sequence[int] = (),
     cancel_check: CancelCheck | None = None,
     progress: ProgressCallback | None = None,
 ) -> BranchJsonExportResult:
     """Valida, serializa e substitui o destino atomicamente."""
 
     cancelled = cancel_check or (lambda: False)
+    selected = tuple(int(index) for index in branch_indices)
     payload = build_branch_json_payload(
         branches,
         equivalent,
-        branch_indices,
+        selected,
+        interest_branch_ids=interest_branch_ids,
         cancel_check=cancelled,
         progress=progress,
     )
@@ -253,8 +268,8 @@ def export_branches_json(
 
     circuit_ids = tuple(
         sorted(
-            {branches.records[int(index)].circuit_id for index in branch_indices},
+            {branches.records[index].circuit_id for index in selected},
             key=str.casefold,
         )
     )
-    return BranchJsonExportResult(target, len(payload), circuit_ids)
+    return BranchJsonExportResult(target, len(selected), circuit_ids)

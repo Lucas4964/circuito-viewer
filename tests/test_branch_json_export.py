@@ -161,6 +161,7 @@ class BranchJsonExportTests(unittest.TestCase):
         self.assertEqual(
             payload,
             {
+                "ramais_interesse": [],
                 "RAMAL-1": {
                     "barra_inicio": "CB1",
                     "barras": ["CB3", "CB4"],
@@ -183,6 +184,33 @@ class BranchJsonExportTests(unittest.TestCase):
             equivalent.model.record(0).maximum_active_demand,
             Decimal("43"),
         )
+
+    def test_interest_ids_are_first_sorted_and_limited_to_exported_branches(self) -> None:
+        branches, equivalent = make_snapshot()
+
+        payload = build_branch_json_payload(
+            branches,
+            equivalent,
+            (0,),
+            interest_branch_ids=(1,),
+        )
+
+        self.assertEqual(list(payload), ["ramais_interesse", "RAMAL-1"])
+        self.assertEqual(payload["ramais_interesse"], [1])
+        with self.assertRaisesRegex(ValueError, "duplicados"):
+            build_branch_json_payload(
+                branches,
+                equivalent,
+                (0,),
+                interest_branch_ids=(1, 1),
+            )
+        with self.assertRaisesRegex(ValueError, "pertencer"):
+            build_branch_json_payload(
+                branches,
+                equivalent,
+                (0,),
+                interest_branch_ids=(2,),
+            )
 
     def test_empty_code_blocks_export_and_preserves_existing_file(self) -> None:
         branches, equivalent = make_snapshot(empty_load_code=True)
@@ -215,13 +243,21 @@ class BranchJsonExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "ramais.json"
 
-            result = export_branches_json(target, branches, equivalent, (0,))
+            result = export_branches_json(
+                target,
+                branches,
+                equivalent,
+                (0,),
+                interest_branch_ids=(1,),
+            )
 
             self.assertEqual(result.path, target)
             self.assertEqual(result.branch_count, 1)
             self.assertEqual(result.circuit_ids, ("C1",))
             text = target.read_text(encoding="utf-8")
             self.assertIn("GERAÇÃO-1", text)
+            self.assertEqual(list(json.loads(text))[0], "ramais_interesse")
+            self.assertEqual(json.loads(text)["ramais_interesse"], [1])
             self.assertEqual(json.loads(text)["RAMAL-1"]["chaves"], ["CHAVE-Á"])
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 

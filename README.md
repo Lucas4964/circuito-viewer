@@ -1064,7 +1064,11 @@ distintos também interrompem o ramal e são reportadas.
 
 Além da conexão, primeiro trecho, quantidade, comprimento, cargas e fase, a
 tabela informa barras, chaves, posição da primeira chave, conexões adicionais,
-comprimentos ausentes e classificação da topologia. `DEMANDA_MAXIMA` é o maior
+comprimentos ausentes e classificação da topologia. `TRECHO_ID` e
+`TRECHO_CODIGO` identificam o trecho convencional mais próximo do tronco, sem
+misturar o segmento que modela uma chave. Quando o ramal é remanejável,
+`CHAVE_ID` e `CHAVE_CODIGO` identificam sua chave mais próxima; nos demais casos
+essas células ficam vazias. `DEMANDA_MAXIMA` é o maior
 valor algébrico de potência ativa encontrado entre as fases reais do ramal e os
 quatro NPAT; mantém o sinal, ignora integralmente potência reativa e aparece
 como `—` quando a equivalência estiver indisponível ou incompleta.
@@ -1078,8 +1082,12 @@ que há uma chave em até cinco níveis do início do conjunto completo do ramal
 inclusive em uma subárvore monofásica incorporada. Se algum `COMPR` estiver
 vazio, o total é exibido como `—`.
 
-A tabela pode ser ordenada e filtrada por circuito. Selecionar um ramal reativa
-seu circuito caso ele esteja oculto, sem alterar o modo de coloração por fases.
+A tabela pode ser ordenada e filtrada por circuito. A primeira coluna contém um
+checkbox para marcar ramais de interesse; as marcações sobrevivem a filtros e
+ordenação, mas são limpas por uma nova análise. Células podem ser selecionadas
+em intervalos e copiadas com `Ctrl+C` como texto tabulado para o Excel, sem
+permitir edição ou colagem. Selecionar um ramal reativa seu circuito caso ele
+esteja oculto, sem alterar o modo de coloração por fases.
 Resultados são descartados automaticamente quando barras, trechos, cargas,
 chaves ou circuitos forem substituídos.
 
@@ -1091,8 +1099,10 @@ os patamares. Se houver geradores importados, é necessário executar antes
 **Atualizar Geradores…**.
 
 O botão **Exportar JSON** grava os ramais atualmente aceitos pelo filtro do
-ComboBox: um circuito específico ou todos os circuitos exibidos. O objeto raiz
-usa chaves `RAMAL-<ID>` e cada entrada contém `barra_inicio`, `barras`, `trechos`,
+ComboBox: um circuito específico ou todos os circuitos exibidos. O primeiro
+campo do objeto raiz é `ramais_interesse`, uma lista numérica ordenada apenas
+com os ramais marcados que também fazem parte da exportação. Em seguida vêm as
+chaves `RAMAL-<ID>`; cada entrada contém `barra_inicio`, `barras`, `trechos`,
 `cargas`, `geradores`, `chaves`, `fase` e o booleano `remanejavel`. A ordem é
 determinística e ramais zerados ou eletricamente incompletos continuam presentes,
 pois o arquivo descreve a topologia. Qualquer `CODIGO` vazio bloqueia o arquivo
@@ -1102,7 +1112,8 @@ Trechos que possuem chave associada são excluídos de `trechos` e aparecem
 exclusivamente em `chaves`, evitando duplicidade lógica entre as duas listas.
 
 O botão **Exportar CSV (Excel)** grava exatamente as linhas aceitas pelo filtro
-e na ordem atualmente exibida na tabela. O arquivo usa `;`, vírgula decimal,
+e na ordem atualmente exibida na tabela, incluindo `CHAVE_ID` e
+`CHAVE_CODIGO`, mas não o checkbox de interesse. O arquivo usa `;`, vírgula decimal,
 precisão numérica interna completa, células vazias para valores indisponíveis,
 UTF-8 com BOM e linhas CRLF. A gravação também é atômica; se a demanda máxima
 não estiver disponível, somente essa célula fica vazia e os demais dados do
