@@ -348,12 +348,13 @@ chave fechada virar aberta, e `FASES2` como `"13.0"` não casaria com o
   exclusão protegida por uso, estimativas de dimensão, importação/exportação
   de `cabos.json` e restauração dos padrões.
 - **Bibliotecas > Geometrias…**: abre as abas **Arranjos** (`LineSpacing`) e
-  **Montagens** (`LineGeometry`). É possível editar livremente as posições
-  `x`/`h`, associar um cabo a cada posição, validar fases e referências, ver a
-  ampacidade das fases e inspecionar o gráfico cartesiano interativo. As tabelas
-  exibem todas as posições sem rolagem vertical interna; quando necessário, o
-  painel completo é rolado. No gráfico, a roda aplica zoom sob o cursor, o
-  arraste com o botão esquerdo faz pan e o duplo clique reenquadra os pontos.
+  **Montagens automáticas**. Os arranjos continuam editáveis; as montagens são
+  combinações transitórias, somente leitura, criadas a partir dos trechos
+  carregados, dos mapas salvos e das fases reais de cada linha. A aba mostra os
+  vínculos `F1 → fase`, os cabos aplicados, os trechos consumidores e os
+  diagnósticos agrupados. As tabelas exibem todas as posições sem rolagem
+  vertical interna; no gráfico, a roda aplica zoom sob o cursor, o arraste com
+  o botão esquerdo faz pan e o duplo clique reenquadra os pontos.
 - **Enquadrar tudo** ou tecla `F`: mostra todo o conjunto.
 - **Buscar** ou `Ctrl+F`: abre uma janela não modal que pode ser movida,
   redimensionada e fechada pelo `X`, pelo botão **Fechar** ou por `Esc`. No modo
@@ -856,9 +857,11 @@ que o usuário o limpe ou corrija. **Cancelar** descarta as alterações ainda
 pendentes, mas não desfaz um mapa que já tenha sido gravado explicitamente pelo
 botão **Salvar**.
 
-Nesta etapa, os mapas são apenas cadastros persistentes: ainda não participam da
-montagem automática nem da exportação OpenDSS e, por isso, alterá-los não invalida
-um resultado de fluxo de potência. Essa integração será feita na etapa seguinte.
+Os mapas participam da montagem automática assim que existem trechos na tela.
+Salvar um mapa recalcula as combinações transitórias; rascunhos ainda não salvos
+não alteram o modelo ativo. A exportação OpenDSS continua usando os parâmetros de
+sequência importados, portanto essa atualização visual não invalida um resultado
+de fluxo de potência.
 
 ## Patamares de cálculo
 
@@ -897,11 +900,12 @@ exportação OpenDSS nem o fluxo de potência.
 
 ## Bibliotecas OpenDSS
 
-As bibliotecas são globais e independentes das importações de rede. Cabos ficam
-em `circuit_viewer/dados/cabos.json`; arranjos e montagens, em
-`circuit_viewer/dados/geometrias.json`. Os dois arquivos usam a versão 1 e são
-compatíveis com os formatos `{versao, cabos}` e
-`{versao, arranjos, montagens}` do OPENDSS_GRAFICO.
+As bibliotecas são globais. Cabos ficam em `circuit_viewer/dados/cabos.json` e
+arranjos em `circuit_viewer/dados/geometrias.json`. Os dois arquivos continuam
+na versão 1 e compatíveis com os formatos `{versao, cabos}` e
+`{versao, arranjos, montagens}` do OPENDSS_GRAFICO. O array manual `montagens` é
+preservado para round-trip de arquivos antigos, mas não é exibido nem usado pelo
+catálogo operacional; montagens automáticas nunca são gravadas.
 
 Nomes de cabos e arranjos são obrigatórios, únicos sem distinção entre
 maiúsculas e minúsculas e armazenados em letras maiúsculas. Nomes de montagens
@@ -921,14 +925,13 @@ Se um dos arquivos persistidos estiver corrompido, apenas ele volta aos padrões
 de fábrica — a outra biblioteca é preservada.
 
 Cabos incompletos podem ser cadastrados, mas recebem uma marca de aviso. A
-exclusão de cabos e arranjos em uso é bloqueada; mudar o número de posições de
-um arranjo sincroniza os slots das montagens sem inventar qual cabo deve ocupar
-uma nova posição. Arranjos e montagens usam o mesmo gráfico cartesiano: `x` no
-eixo X, `h` no eixo Y, grade adaptativa e pontos identificados por papel e, nas
-montagens, também pelo cabo. A navegação no gráfico não edita coordenadas.
-Nesta versão, as bibliotecas são cadastro e visualização:
-uma associação explícita entre `ARRANJO_ID` e montagem será adicionada quando o
-usuário puder escolher entre parâmetros importados e geometrias OpenDSS.
+exclusão de cabos e arranjos mapeados ou usados por montagens automáticas é
+bloqueada. Cada arranjo com `N` posições de fase atende linhas com até `N`
+fases: as primeiras posições são preenchidas, em sequência, pelas fases reais.
+Por exemplo, o `FASES2` rotulado historicamente como `FD` usa `F1 → D` e
+`F2 → F`, seguindo a ordem dos terminais DSS. Se o cabo neutro não resolver,
+as posições neutras são removidas e a aba registra um aviso. Arranjos e
+montagens usam o mesmo gráfico cartesiano; a navegação não edita coordenadas.
 
 ## Curvas horárias
 

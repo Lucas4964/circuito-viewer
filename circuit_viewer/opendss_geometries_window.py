@@ -1,4 +1,4 @@
-"""Cadastro nativo de arranjos ``LineSpacing`` e montagens ``LineGeometry``."""
+"""Cadastro de arranjos e consulta das montagens OpenDSS automáticas."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QSignalBlocker, QTime
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -26,22 +25,20 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
-    QStyledItemDelegate,
     QTabWidget,
+    QTableView,
     QVBoxLayout,
     QWidget,
 )
 
-from .opendss_geometry_preview import CartesianGeometryView, GeometryCutDialog
+from .opendss_geometry_preview import CartesianGeometryView
+from .opendss_automatic_assembly_session import OpenDssAutomaticAssemblySession
 from .opendss_library import (
     OPEN_DSS_UNITS,
     ArrangementDefinition,
     ConductorPosition,
-    GeometryDefinition,
     LibraryFormatError,
     coincident_positions,
-    geometry_ampacity,
-    geometry_issues,
     normalize_library_name,
     unique_id,
     unique_name,
@@ -140,102 +137,146 @@ class PositionTableModel(QAbstractTableModel):
         return True
 
 
-class GeometryCableTableModel(QAbstractTableModel):
-    HEADERS = ("#", "Papel", "x / h", "Cabo")
+class AutomaticAssemblyTableModel(QAbstractTableModel):
+    """Posições e vínculos de uma montagem automática, sempre somente leitura."""
 
-    def __init__(self, session: OpenDssLibrarySession, parent=None) -> None:  # noqa: ANN001
+    HEADERS = ("#", "Posição", "Fase real", "x / h", "Cabo")
+
+    def __init__(
+        self,
+        assembly_session: OpenDssAutomaticAssemblySession | None,
+        parent=None,  # noqa: ANN001
+    ) -> None:
         super().__init__(parent)
-        self.session = session
-        self.geometry_id: str | None = None
+        self.assembly_session = assembly_session
+        self.assembly_id: str | None = None
 
-    def set_geometry(self, geometry_id: str | None) -> None:
+    def set_assembly(self, assembly_id: str | None) -> None:
         self.beginResetModel()
-        self.geometry_id = geometry_id
+        self.assembly_id = assembly_id
         self.endResetModel()
 
-    def context(self) -> tuple[GeometryDefinition | None, ArrangementDefinition | None]:
-        geometry = self.session.catalog.geometry(self.geometry_id)
-        arrangement = None if geometry is None else self.session.catalog.arrangement(geometry.arrangement_id)
-        return geometry, arrangement
+    def assembly(self):  # noqa: ANN201
+        return (
+            None
+            if self.assembly_session is None
+            else self.assembly_session.assembly(self.assembly_id)
+        )
 
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: ANN001, N802
-        _geometry, arrangement = self.context()
-        return 0 if parent.isValid() or arrangement is None else arrangement.conductor_count
+        assembly = self.assembly()
+        return (
+            0
+            if parent.isValid() or assembly is None
+            else assembly.arrangement.conductor_count
+        )
 
     def columnCount(self, parent=QModelIndex()) -> int:  # noqa: ANN001, N802
         return 0 if parent.isValid() else len(self.HEADERS)
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):  # noqa: ANN001, ANN201, N802
-        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
-            if 0 <= int(section) < len(self.HEADERS):
-                return self.HEADERS[int(section)]
+        if (
+            role == Qt.ItemDataRole.DisplayRole
+            and orientation == Qt.Orientation.Horizontal
+            and 0 <= int(section) < len(self.HEADERS)
+        ):
+            return self.HEADERS[int(section)]
         return None
 
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):  # noqa: ANN201
-        geometry, arrangement = self.context()
-        if not index.isValid() or geometry is None or arrangement is None:
+        assembly = self.assembly()
+        if not index.isValid() or assembly is None:
             return None
         row = index.row()
+        arrangement = assembly.arrangement
         position = arrangement.positions[row]
-        cable_id = geometry.cable_ids[row] if row < len(geometry.cable_ids) else None
-        cable = self.session.catalog.cable(cable_id)
+        is_phase = row < arrangement.phase_count
+        physical_role = f"F{row + 1}" if is_phase else f"N{row - arrangement.phase_count + 1}"
+        electrical_role = assembly.phase_letters[row] if is_phase else "Neutro"
+        cable_id = assembly.geometry.cable_ids[row]
+        cable = (
+            None
+            if self.assembly_session is None
+            else self.assembly_session.catalog.cable(cable_id)
+        )
         values = (
             row + 1,
-            f"F{row + 1}" if row < arrangement.phase_count else "N",
+            physical_role,
+            electrical_role,
             f"{position.x:g} / {position.height:g} {arrangement.units}",
-            "— selecione —" if cable is None else cable.name,
+            "—" if cable is None else cable.name,
         )
-        if role in {Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole}:
+        if role == Qt.ItemDataRole.DisplayRole:
             return values[index.column()]
-        if role == Qt.ItemDataRole.UserRole and index.column() == 3:
-            return cable_id
-        if role == Qt.ItemDataRole.ToolTipRole and index.column() == 3 and cable_id and cable is None:
-            return f"Cabo '{cable_id}' ausente da biblioteca."
-        if role == Qt.ItemDataRole.TextAlignmentRole and index.column() == 0:
+        if role == Qt.ItemDataRole.ToolTipRole:
+            if is_phase:
+                return f"{physical_role} → fase {electrical_role}"
+            return f"{physical_role} → condutor neutro"
+        if role == Qt.ItemDataRole.TextAlignmentRole and index.column() in {0, 3}:
             return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         return None
 
-    def flags(self, index: QModelIndex):  # noqa: ANN201
-        flags = super().flags(index)
-        if index.isValid() and index.column() == 3:
-            flags |= Qt.ItemFlag.ItemIsEditable
-        return flags
 
-    def setData(self, index: QModelIndex, value, role=Qt.ItemDataRole.EditRole) -> bool:  # noqa: ANN001, N802
-        geometry, arrangement = self.context()
-        if geometry is None or arrangement is None or index.column() != 3 or role not in {Qt.ItemDataRole.EditRole, Qt.ItemDataRole.UserRole}:
-            return False
-        while len(geometry.cable_ids) < arrangement.conductor_count:
-            geometry.cable_ids.append(None)
-        cable_id = str(value).strip() if value else None
-        cable_id = cable_id if cable_id and self.session.catalog.cable(cable_id) is not None else None
-        if geometry.cable_ids[index.row()] == cable_id:
-            return True
-        geometry.cable_ids[index.row()] = cable_id
-        self.dataChanged.emit(index, index, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.UserRole])
-        self.session.mark_geometries_changed()
-        return True
+class AutomaticAssemblyIssueTableModel(QAbstractTableModel):
+    HEADERS = ("Nível", "Campo", "Valor", "Qtd.", "Motivo", "Trechos")
 
-
-class CableComboDelegate(QStyledItemDelegate):
-    def __init__(self, session: OpenDssLibrarySession, parent=None) -> None:  # noqa: ANN001
+    def __init__(
+        self,
+        assembly_session: OpenDssAutomaticAssemblySession | None,
+        parent=None,  # noqa: ANN001
+    ) -> None:
         super().__init__(parent)
-        self.session = session
+        self.assembly_session = assembly_session
 
-    def createEditor(self, parent, option, index):  # noqa: ANN001, ANN201, N802
-        combo = QComboBox(parent)
-        combo.addItem("— selecione —", None)
-        for cable in sorted(self.session.catalog.cables, key=lambda item: item.name.casefold()):
-            suffix = " (CN)" if cable.is_concentric else ""
-            combo.addItem(cable.name + suffix, cable.cable_id)
-        return combo
+    def refresh(self) -> None:
+        self.beginResetModel()
+        self.endResetModel()
 
-    def setEditorData(self, editor: QComboBox, index: QModelIndex) -> None:  # noqa: N802
-        cable_id = index.data(Qt.ItemDataRole.UserRole)
-        editor.setCurrentIndex(max(editor.findData(cable_id), 0))
+    def issues(self):  # noqa: ANN201
+        return (
+            ()
+            if self.assembly_session is None
+            else self.assembly_session.result.issues
+        )
 
-    def setModelData(self, editor: QComboBox, model, index: QModelIndex) -> None:  # noqa: ANN001, N802
-        model.setData(index, editor.currentData(), Qt.ItemDataRole.UserRole)
+    def rowCount(self, parent=QModelIndex()) -> int:  # noqa: ANN001, N802
+        return 0 if parent.isValid() else len(self.issues())
+
+    def columnCount(self, parent=QModelIndex()) -> int:  # noqa: ANN001, N802
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):  # noqa: ANN001, ANN201, N802
+        if (
+            role == Qt.ItemDataRole.DisplayRole
+            and orientation == Qt.Orientation.Horizontal
+            and 0 <= int(section) < len(self.HEADERS)
+        ):
+            return self.HEADERS[int(section)]
+        return None
+
+    def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):  # noqa: ANN201
+        if not index.isValid():
+            return None
+        issue = self.issues()[index.row()]
+        shown = issue.segment_ids[:12]
+        segment_text = ", ".join(shown)
+        if len(issue.segment_ids) > len(shown):
+            segment_text += f" … e mais {len(issue.segment_ids) - len(shown):n}"
+        values = (
+            "Erro" if issue.severity == "error" else "Aviso",
+            issue.field,
+            issue.value,
+            issue.count,
+            issue.reason,
+            segment_text,
+        )
+        if role == Qt.ItemDataRole.DisplayRole:
+            return values[index.column()]
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return ", ".join(issue.segment_ids)
+        if role == Qt.ItemDataRole.TextAlignmentRole and index.column() == 3:
+            return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        return None
 
 
 class OpenDssGeometriesWindow(QDialog):
@@ -244,10 +285,13 @@ class OpenDssGeometriesWindow(QDialog):
         session: OpenDssLibrarySession,
         help_dialog: OpenDssLibraryHelpDialog,
         parent=None,  # noqa: ANN001
+        *,
+        assembly_session: OpenDssAutomaticAssemblySession | None = None,
     ) -> None:
         super().__init__(parent)
         self.session = session
         self.help_dialog = help_dialog
+        self.assembly_session = assembly_session
         self._selected_arrangement_id: str | None = None
         self._selected_geometry_id: str | None = None
         self._loading = False
@@ -264,7 +308,7 @@ class OpenDssGeometriesWindow(QDialog):
         self.tabs = QTabWidget(self)
         self.tabs.setObjectName("opendss_geometries_tabs")
         self.tabs.addTab(self._build_arrangements_tab(), "Arranjos")
-        self.tabs.addTab(self._build_geometries_tab(), "Montagens")
+        self.tabs.addTab(self._build_geometries_tab(), "Montagens automáticas")
         root.addWidget(self.tabs, 1)
         self.status_label = QLabel(self)
         self.status_label.setObjectName("opendss_geometries_status")
@@ -272,7 +316,6 @@ class OpenDssGeometriesWindow(QDialog):
         root.addWidget(self.status_label)
         root.addLayout(self._build_actions())
 
-        self.cut_dialog = GeometryCutDialog(session.catalog, self)
         self._connect_signals()
         self.refresh()
         self._sync_dirty_state(session.geometries_dirty)
@@ -350,7 +393,7 @@ class OpenDssGeometriesWindow(QDialog):
 
     def _build_geometries_tab(self) -> QWidget:
         tab = QWidget(self.tabs)
-        layout = QHBoxLayout(tab)
+        layout = QVBoxLayout(tab)
         splitter = QSplitter(Qt.Orientation.Horizontal, tab)
         side = QWidget(splitter)
         side_layout = QVBoxLayout(side)
@@ -358,38 +401,49 @@ class OpenDssGeometriesWindow(QDialog):
         self.geometries_list = QListWidget(side)
         self.geometries_list.setObjectName("opendss_montages_list")
         side_layout.addWidget(self.geometries_list, 1)
-        geometry_buttons = QHBoxLayout()
-        self.new_geometry_button = QPushButton("Nova", side)
-        self.duplicate_geometry_button = QPushButton("Duplicar", side)
-        self.delete_geometry_button = QPushButton("Excluir…", side)
-        for button in (self.new_geometry_button, self.duplicate_geometry_button, self.delete_geometry_button):
-            geometry_buttons.addWidget(button)
-        side_layout.addLayout(geometry_buttons)
+        self.automatic_list_hint = QLabel(
+            "As combinações são agrupadas por arranjo, cabos e fases reais.", side
+        )
+        self.automatic_list_hint.setWordWrap(True)
+        side_layout.addWidget(self.automatic_list_hint)
 
         scroll = QScrollArea(splitter)
         scroll.setWidgetResizable(True)
         editor = QWidget(scroll)
         column = QVBoxLayout(editor)
-        self.geometry_empty_label = QLabel("Selecione uma montagem ou crie uma nova.", editor)
+        self.geometry_empty_label = QLabel(
+            "Importe trechos para gerar as montagens automáticas.", editor
+        )
+        self.geometry_empty_label.setWordWrap(True)
         column.addWidget(self.geometry_empty_label)
-        group = QGroupBox("Montagem (LineGeometry)", editor)
+        group = QGroupBox("Montagem automática (somente leitura)", editor)
         form = QFormLayout(group)
-        self.geometry_name_edit = QLineEdit(group)
-        form.addRow("Nome:", self.geometry_name_edit)
-        self.geometry_arrangement_combo = QComboBox(group)
-        form.addRow("Arranjo:", self.geometry_arrangement_combo)
-        self.geometry_reduce_check = QCheckBox("Aplicar redução de Kron", group)
-        form.addRow("Redução:", self.geometry_reduce_check)
-        self.geometry_description_edit = QLineEdit(group)
-        form.addRow("Descrição:", self.geometry_description_edit)
-        self.geometry_ampacity_label = QLabel(group)
-        form.addRow("Ampacidade:", self.geometry_ampacity_label)
+        self.automatic_name_label = QLabel(group)
+        self.automatic_name_label.setWordWrap(True)
+        form.addRow("Nome:", self.automatic_name_label)
+        self.automatic_arrangement_label = QLabel(group)
+        form.addRow("Arranjo base:", self.automatic_arrangement_label)
+        self.automatic_phases_label = QLabel(group)
+        form.addRow("Fases:", self.automatic_phases_label)
+        self.automatic_phase_cable_label = QLabel(group)
+        form.addRow("Cabo de fase:", self.automatic_phase_cable_label)
+        self.automatic_neutral_cable_label = QLabel(group)
+        form.addRow("Cabo neutro:", self.automatic_neutral_cable_label)
+        self.automatic_usage_label = QLabel(group)
+        self.automatic_usage_label.setWordWrap(True)
+        form.addRow("Trechos:", self.automatic_usage_label)
+        self.automatic_reduce_label = QLabel(group)
+        form.addRow("Redução de Kron:", self.automatic_reduce_label)
         column.addWidget(group)
-        self.assignment_model = GeometryCableTableModel(self.session, self)
+        self.assignment_model = AutomaticAssemblyTableModel(
+            self.assembly_session, self
+        )
         self.assignments_table = AllRowsTableView(editor)
         self.assignments_table.setObjectName("opendss_geometry_cables_table")
         self.assignments_table.setModel(self.assignment_model)
-        self.assignments_table.setItemDelegateForColumn(3, CableComboDelegate(self.session, self.assignments_table))
+        self.assignments_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
         self.assignments_table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
         enable_interactive_columns(self.assignments_table)
         column.addWidget(self.assignments_table)
@@ -399,14 +453,34 @@ class OpenDssGeometriesWindow(QDialog):
         self.geometry_preview = CartesianGeometryView(editor)
         self.geometry_preview.setObjectName("opendss_geometry_preview")
         column.addWidget(self.geometry_preview, 1)
-        self.cut_button = QPushButton("Ampliar gráfico…", editor)
-        column.addWidget(self.cut_button)
         scroll.setWidget(editor)
         splitter.addWidget(side)
         splitter.addWidget(scroll)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
-        layout.addWidget(splitter)
+        layout.addWidget(splitter, 1)
+
+        self.automatic_draft_label = QLabel(tab)
+        self.automatic_draft_label.setWordWrap(True)
+        layout.addWidget(self.automatic_draft_label)
+        self.automatic_issue_summary = QLabel(tab)
+        self.automatic_issue_summary.setWordWrap(True)
+        layout.addWidget(self.automatic_issue_summary)
+        self.automatic_issue_model = AutomaticAssemblyIssueTableModel(
+            self.assembly_session, self
+        )
+        self.automatic_issue_table = QTableView(tab)
+        self.automatic_issue_table.setObjectName("opendss_automatic_issues_table")
+        self.automatic_issue_table.setModel(self.automatic_issue_model)
+        self.automatic_issue_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.automatic_issue_table.setAlternatingRowColors(True)
+        self.automatic_issue_table.verticalHeader().hide()
+        self.automatic_issue_table.setMaximumHeight(190)
+        self.automatic_issue_table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
+        enable_interactive_columns(self.automatic_issue_table)
+        layout.addWidget(self.automatic_issue_table)
         return tab
 
     def _build_actions(self) -> QHBoxLayout:
@@ -440,14 +514,8 @@ class OpenDssGeometriesWindow(QDialog):
         self.new_arrangement_button.clicked.connect(self._new_arrangement)
         self.duplicate_arrangement_button.clicked.connect(self._duplicate_arrangement)
         self.delete_arrangement_button.clicked.connect(self._delete_arrangement)
-        self.geometry_name_edit.editingFinished.connect(self._edit_geometry_name)
-        self.geometry_arrangement_combo.currentIndexChanged.connect(self._edit_geometry_arrangement)
-        self.geometry_reduce_check.toggled.connect(self._edit_geometry_reduce)
-        self.geometry_description_edit.editingFinished.connect(self._edit_geometry_description)
-        self.new_geometry_button.clicked.connect(self._new_geometry)
-        self.duplicate_geometry_button.clicked.connect(self._duplicate_geometry)
-        self.delete_geometry_button.clicked.connect(self._delete_geometry)
-        self.cut_button.clicked.connect(self._show_cut)
+        if self.assembly_session is not None:
+            self.assembly_session.changed.connect(self._schedule_refresh)
         self.import_button.clicked.connect(self._import_geometries)
         self.export_button.clicked.connect(self._export_geometries)
         self.restore_button.clicked.connect(self._restore_defaults)
@@ -468,8 +536,18 @@ class OpenDssGeometriesWindow(QDialog):
     def refresh(self) -> None:
         self._loading = True
         try:
+            automatic = (
+                None if self.assembly_session is None else self.assembly_session.result
+            )
+            automatic_count = 0 if automatic is None else len(automatic.assemblies)
+            coverage = (
+                "sem trechos carregados"
+                if automatic is None or automatic.total_segments == 0
+                else f"{automatic.assembled_segments:n}/{automatic.total_segments:n} trecho(s) atendido(s)"
+            )
             self.summary_label.setText(
-                f"{len(self.session.catalog.arrangements):n} arranjo(s) e {len(self.session.catalog.geometries):n} montagem(ns)"
+                f"{len(self.session.catalog.arrangements):n} arranjo(s), "
+                f"{automatic_count:n} montagem(ns) automática(s) — {coverage}"
             )
             self._populate_arrangements()
             self._populate_geometries()
@@ -499,15 +577,21 @@ class OpenDssGeometriesWindow(QDialog):
     def _populate_geometries(self) -> None:
         with QSignalBlocker(self.geometries_list):
             self.geometries_list.clear()
-            for geometry in self.session.catalog.geometries:
-                issues = geometry_issues(geometry, self.session.catalog)
-                suffix = "  ●" if issues else ""
-                item = QListWidgetItem(geometry.name + suffix)
-                item.setData(Qt.ItemDataRole.UserRole, geometry.geometry_id)
-                if issues:
-                    item.setToolTip("; ".join(issues))
+            assemblies = (
+                ()
+                if self.assembly_session is None
+                else self.assembly_session.result.assemblies
+            )
+            for assembly in assemblies:
+                item = QListWidgetItem(
+                    f"{assembly.name}  ({assembly.usage_count:n})"
+                )
+                item.setData(Qt.ItemDataRole.UserRole, assembly.assembly_id)
+                item.setToolTip(
+                    f"Trechos: {', '.join(assembly.segment_ids)}"
+                )
                 self.geometries_list.addItem(item)
-                if geometry.geometry_id == self._selected_geometry_id:
+                if assembly.assembly_id == self._selected_geometry_id:
                     self.geometries_list.setCurrentItem(item)
             if self.geometries_list.currentRow() < 0 and self.geometries_list.count():
                 self.geometries_list.setCurrentRow(0)
@@ -517,8 +601,12 @@ class OpenDssGeometriesWindow(QDialog):
     def selected_arrangement(self) -> ArrangementDefinition | None:
         return self.session.catalog.arrangement(self._selected_arrangement_id)
 
-    def selected_geometry(self) -> GeometryDefinition | None:
-        return self.session.catalog.geometry(self._selected_geometry_id)
+    def selected_geometry(self):  # noqa: ANN201
+        return (
+            None
+            if self.assembly_session is None
+            else self.assembly_session.assembly(self._selected_geometry_id)
+        )
 
     def _select_arrangement(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if self._loading:
@@ -559,35 +647,108 @@ class OpenDssGeometriesWindow(QDialog):
         )
 
     def _load_geometry_editor(self) -> None:
-        geometry = self.selected_geometry()
-        has_item = geometry is not None
+        assembly = self.selected_geometry()
+        has_item = assembly is not None
+        automatic = (
+            None if self.assembly_session is None else self.assembly_session.result
+        )
+        has_lines = automatic is not None and automatic.total_segments > 0
+        if not has_lines:
+            self.geometry_empty_label.setText(
+                "Importe trechos para gerar as montagens automáticas."
+            )
+        elif not has_item:
+            self.geometry_empty_label.setText(
+                "Nenhuma montagem completa foi gerada. Consulte os diagnósticos abaixo."
+            )
         self.geometry_empty_label.setVisible(not has_item)
-        self.duplicate_geometry_button.setEnabled(has_item)
-        self.delete_geometry_button.setEnabled(has_item)
-        self.cut_button.setEnabled(has_item)
-        self.assignment_model.set_geometry(self._selected_geometry_id)
-        with QSignalBlocker(self.geometry_arrangement_combo):
-            self.geometry_arrangement_combo.clear()
-            for arrangement in self.session.catalog.arrangements:
-                self.geometry_arrangement_combo.addItem(
-                    f"{arrangement.name} ({arrangement.conductor_count} cond.)",
-                    arrangement.arrangement_id,
-                )
-        if geometry is None:
+        self.assignment_model.set_assembly(self._selected_geometry_id)
+
+        self.automatic_issue_model.refresh()
+        issue_count = 0 if automatic is None else len(automatic.issues)
+        self.automatic_issue_table.setVisible(issue_count > 0)
+        if automatic is None or automatic.total_segments == 0:
+            self.automatic_issue_summary.setText("Sem diagnósticos: não há trechos carregados.")
+        elif issue_count:
+            self.automatic_issue_summary.setText(
+                f"Diagnósticos agrupados: {issue_count:n}. "
+                f"{automatic.unassembled_segments:n} trecho(s) sem montagem completa."
+            )
+        else:
+            self.automatic_issue_summary.setText(
+                "Todos os trechos receberam uma montagem automática."
+            )
+        self.automatic_draft_label.setText(
+            "Há rascunhos de arranjos. As montagens automáticas continuam usando "
+            "a última versão salva."
+            if self.session.geometries_dirty
+            else "As montagens usam exclusivamente bibliotecas e mapas salvos."
+        )
+
+        if assembly is None:
             self.geometry_issue_label.clear()
-            self.geometry_ampacity_label.setText("—")
-            self.geometry_preview.set_content(self.session.catalog, None)
+            for label in (
+                self.automatic_name_label,
+                self.automatic_arrangement_label,
+                self.automatic_phases_label,
+                self.automatic_phase_cable_label,
+                self.automatic_neutral_cable_label,
+                self.automatic_usage_label,
+                self.automatic_reduce_label,
+            ):
+                label.setText("—")
+            catalog = (
+                self.session.saved_catalog()
+                if self.assembly_session is None
+                else self.assembly_session.catalog
+            )
+            self.geometry_preview.set_content(catalog, None)
             return
-        self.geometry_name_edit.setText(geometry.name)
-        self.geometry_arrangement_combo.setCurrentIndex(max(self.geometry_arrangement_combo.findData(geometry.arrangement_id), 0))
-        self.geometry_reduce_check.setChecked(geometry.reduce)
-        self.geometry_description_edit.setText(geometry.description)
-        arrangement = self.session.catalog.arrangement(geometry.arrangement_id)
-        ampacity = geometry_ampacity(geometry, self.session.catalog)
-        self.geometry_ampacity_label.setText("—" if ampacity is None else f"{ampacity:g} A")
-        issues = geometry_issues(geometry, self.session.catalog)
-        self.geometry_issue_label.setText("Atenção: " + "; ".join(issues) + "." if issues else "")
-        self.geometry_preview.set_content(self.session.catalog, arrangement, geometry)
+
+        assert self.assembly_session is not None
+        base = self.assembly_session.catalog.arrangement(
+            assembly.key.arrangement_id
+        )
+        phase_cable = self.assembly_session.catalog.cable(
+            assembly.key.phase_cable_id
+        )
+        neutral_cable = self.assembly_session.catalog.cable(
+            assembly.key.neutral_cable_id
+        )
+        bindings = ", ".join(
+            f"F{index + 1} → {letter}"
+            for index, letter in enumerate(assembly.phase_letters)
+        )
+        shown_segments = assembly.segment_ids[:20]
+        segment_text = ", ".join(shown_segments)
+        if len(assembly.segment_ids) > len(shown_segments):
+            segment_text += (
+                f" … e mais {len(assembly.segment_ids) - len(shown_segments):n}"
+            )
+        self.automatic_name_label.setText(assembly.name)
+        self.automatic_arrangement_label.setText("—" if base is None else base.name)
+        self.automatic_phases_label.setText(bindings)
+        self.automatic_phase_cable_label.setText(
+            "—" if phase_cable is None else phase_cable.name
+        )
+        self.automatic_neutral_cable_label.setText(
+            "Removido/não aplicável" if neutral_cable is None else neutral_cable.name
+        )
+        self.automatic_usage_label.setText(
+            f"{assembly.usage_count:n} — {segment_text}"
+        )
+        self.automatic_reduce_label.setText(
+            "Sim" if assembly.geometry.reduce else "Não"
+        )
+        self.geometry_issue_label.setText(
+            "Posições de fase usadas em sequência; posições excedentes do arranjo base foram descartadas."
+        )
+        self.geometry_preview.set_content(
+            self.assembly_session.catalog,
+            assembly.arrangement,
+            assembly.geometry,
+            assembly.phase_letters,
+        )
 
     def _edit_arrangement_name(self) -> None:
         if self._loading or (arrangement := self.selected_arrangement()) is None:
@@ -673,9 +834,20 @@ class OpenDssGeometriesWindow(QDialog):
         arrangement = self.selected_arrangement()
         if arrangement is None:
             return
-        uses = self.session.catalog.geometries_using_arrangement(arrangement.arrangement_id)
+        uses = (
+            ()
+            if self.assembly_session is None
+            else self.assembly_session.assemblies_using_arrangement(
+                arrangement.arrangement_id
+            )
+        )
         if uses:
-            QMessageBox.warning(self, "Arranjo em uso", f'"{arrangement.name}" é usado por {len(uses)} montagem(ns):\n\n• ' + "\n• ".join(item.name for item in uses))
+            QMessageBox.warning(
+                self,
+                "Arranjo em uso",
+                f'"{arrangement.name}" é usado por {len(uses)} montagem(ns) automática(s).\n\n'
+                "Altere os vínculos de ARRANJO_ID antes de excluí-lo.",
+            )
             return
         mapping_session = self.session.mapping_session
         mapped_ids = (
@@ -697,84 +869,6 @@ class OpenDssGeometriesWindow(QDialog):
         self._selected_arrangement_id = None
         self.session.mark_geometries_changed()
 
-    def _edit_geometry_name(self) -> None:
-        if self._loading or (geometry := self.selected_geometry()) is None:
-            return
-        name = self.geometry_name_edit.text().strip()
-        if not name or any(item.geometry_id != geometry.geometry_id and item.name.casefold() == name.casefold() for item in self.session.catalog.geometries):
-            QMessageBox.warning(self, "Nome inválido", "Informe um nome não vazio e exclusivo para a montagem.")
-            self._load_geometry_editor()
-            return
-        if geometry.name != name:
-            geometry.name = name
-            self.session.mark_geometries_changed()
-
-    def _edit_geometry_arrangement(self) -> None:
-        if self._loading or (geometry := self.selected_geometry()) is None:
-            return
-        arrangement_id = self.geometry_arrangement_combo.currentData()
-        if arrangement_id and geometry.arrangement_id != arrangement_id:
-            geometry.arrangement_id = str(arrangement_id)
-            self.session.catalog.synchronize_geometry_slots(geometry.arrangement_id)
-            self.session.mark_geometries_changed()
-
-    def _edit_geometry_reduce(self, checked: bool) -> None:
-        if self._loading or (geometry := self.selected_geometry()) is None:
-            return
-        if geometry.reduce != checked:
-            geometry.reduce = checked
-            self.session.mark_geometries_changed()
-
-    def _edit_geometry_description(self) -> None:
-        if self._loading or (geometry := self.selected_geometry()) is None:
-            return
-        value = self.geometry_description_edit.text().strip()
-        if geometry.description != value:
-            geometry.description = value
-            self.session.mark_geometries_changed()
-
-    def _new_geometry(self) -> None:
-        if not self.session.catalog.arrangements:
-            QMessageBox.warning(self, "Sem arranjos", "Crie um arranjo antes da montagem.")
-            return
-        arrangement = self.selected_arrangement() or self.session.catalog.arrangements[0]
-        name = unique_name("Montagem nova", (item.name for item in self.session.catalog.geometries))
-        geometry = GeometryDefinition(
-            unique_id(name, (item.geometry_id for item in self.session.catalog.geometries)),
-            name,
-            arrangement.arrangement_id,
-            [None] * arrangement.conductor_count,
-            arrangement.conductor_count > arrangement.phase_count,
-        )
-        self.session.catalog.geometries.append(geometry)
-        self._selected_geometry_id = geometry.geometry_id
-        self.session.mark_geometries_changed()
-
-    def _duplicate_geometry(self) -> None:
-        geometry = self.selected_geometry()
-        if geometry is None:
-            return
-        duplicate = copy.deepcopy(geometry)
-        duplicate.name = unique_name(geometry.name, (item.name for item in self.session.catalog.geometries))
-        duplicate.geometry_id = unique_id(duplicate.name, (item.geometry_id for item in self.session.catalog.geometries))
-        self.session.catalog.geometries.append(duplicate)
-        self._selected_geometry_id = duplicate.geometry_id
-        self.session.mark_geometries_changed()
-
-    def _delete_geometry(self) -> None:
-        geometry = self.selected_geometry()
-        if geometry is None:
-            return
-        if QMessageBox.question(self, "Excluir montagem", f'Excluir a montagem "{geometry.name}"?') != QMessageBox.StandardButton.Yes:
-            return
-        self.session.catalog.geometries.remove(geometry)
-        self._selected_geometry_id = None
-        self.session.mark_geometries_changed()
-
-    def _show_cut(self) -> None:
-        if self._selected_geometry_id:
-            self.cut_dialog.show_geometry(self._selected_geometry_id)
-
     def _import_geometries(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Importar geometrias", "", "JSON (*.json)")
         if not path:
@@ -787,7 +881,9 @@ class OpenDssGeometriesWindow(QDialog):
         if QMessageBox.question(
             self,
             "Substituir geometrias",
-            f"Substituir os {len(self.session.catalog.arrangements):n} arranjos e {len(self.session.catalog.geometries):n} montagens atuais pelos {len(arrangements):n} arranjos e {len(geometries):n} montagens do arquivo?\n\nA alteração ficará pendente até Salvar.",
+            f"Substituir os {len(self.session.catalog.arrangements):n} arranjos atuais pelos {len(arrangements):n} do arquivo?\n\n"
+            f"As {len(geometries):n} montagem(ns) manuais do arquivo serão preservadas apenas como legado. "
+            "A alteração ficará pendente até Salvar.",
         ) != QMessageBox.StandardButton.Yes:
             return
         try:
@@ -796,8 +892,7 @@ class OpenDssGeometriesWindow(QDialog):
             QMessageBox.warning(self, "Arranjos mapeados", str(exc))
             return
         self._selected_arrangement_id = self.session.catalog.arrangements[0].arrangement_id if self.session.catalog.arrangements else None
-        self._selected_geometry_id = self.session.catalog.geometries[0].geometry_id if self.session.catalog.geometries else None
-        self._warn_missing_references()
+        self._selected_geometry_id = None
 
     def _export_geometries(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Exportar geometrias", "geometrias.json", "JSON (*.json)")
@@ -817,7 +912,8 @@ class OpenDssGeometriesWindow(QDialog):
         if QMessageBox.question(
             self,
             "Restaurar geometrias padrão",
-            "Restaurar os 9 arranjos e 12 montagens de fábrica?\n\nOs itens criados ou editados serão substituídos no rascunho.",
+            "Restaurar os 9 arranjos de fábrica?\n\nAs 12 montagens manuais do pacote serão mantidas somente no campo legado. "
+            "Os arranjos criados ou editados serão substituídos no rascunho.",
         ) != QMessageBox.StandardButton.Yes:
             return
         try:
@@ -826,14 +922,7 @@ class OpenDssGeometriesWindow(QDialog):
             QMessageBox.warning(self, "Arranjos mapeados", str(exc))
             return
         self._selected_arrangement_id = self.session.catalog.arrangements[0].arrangement_id
-        self._selected_geometry_id = self.session.catalog.geometries[0].geometry_id
-
-    def _warn_missing_references(self) -> None:
-        issues = sum(bool(geometry_issues(item, self.session.catalog)) for item in self.session.catalog.geometries)
-        if issues:
-            message = f"{issues:n} montagem(ns) ficaram incompletas ou com referências ausentes. Importe a biblioteca de cabos correspondente ou corrija os campos destacados."
-            self.status_label.setText(message)
-            QMessageBox.warning(self, "Montagens incompletas", message)
+        self._selected_geometry_id = None
 
     def _save(self) -> bool:
         try:
@@ -842,13 +931,21 @@ class OpenDssGeometriesWindow(QDialog):
             QMessageBox.warning(self, "Falha ao salvar", str(exc))
             return False
         self.status_label.setText(
-            f"{len(self.session.catalog.arrangements):n} arranjo(s) e {len(self.session.catalog.geometries):n} montagem(ns) salvos."
+            f"{len(self.session.catalog.arrangements):n} arranjo(s) salvo(s). "
+            "As montagens automáticas não são persistidas."
         )
         return True
 
     def _sync_dirty_state(self, dirty: bool) -> None:
         self.save_button.setEnabled(dirty)
         self.setWindowTitle("Biblioteca de Geometrias OpenDSS" + (" *" if dirty else ""))
+        if hasattr(self, "automatic_draft_label"):
+            self.automatic_draft_label.setText(
+                "Há rascunhos de arranjos. As montagens automáticas continuam usando "
+                "a última versão salva."
+                if dirty
+                else "As montagens usam exclusivamente bibliotecas e mapas salvos."
+            )
 
     def confirm_pending_changes(self) -> bool:
         if not self.session.geometries_dirty:

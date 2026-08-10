@@ -148,6 +148,7 @@ from .opendss_export import (
 )
 from .opendss_export_dialog import OpenDssExportDialog
 from .opendss_cables_window import OpenDssCablesWindow
+from .opendss_automatic_assembly_session import OpenDssAutomaticAssemblySession
 from .opendss_geometries_window import OpenDssGeometriesWindow
 from .opendss_library_help import OpenDssLibraryHelpDialog
 from .opendss_library_session import OpenDssLibrarySession
@@ -814,8 +815,8 @@ class MainWindow(QMainWindow):
         self.branches_window = BranchesWindow(self.branch_table_model, self)
         self.cable_table_model = CableTableModel(self)
         self.cables_window = CablesWindow(self.cable_table_model, self)
-        # WireData/CNData e LineSpacing/LineGeometry são bibliotecas globais e
-        # independentes do catálogo de cabos importado da concessionária.
+        # WireData/CNData e LineSpacing são bibliotecas globais. As montagens
+        # transitórias serão combinadas com os trechos assim que eles existirem.
         self.opendss_mapping_session = OpenDssMappingSession(
             cable_map_path=cable_map_path,
             arrangement_map_path=arrangement_map_path,
@@ -827,16 +828,24 @@ class MainWindow(QMainWindow):
             mapping_session=self.opendss_mapping_session,
             parent=self,
         )
+        self.opendss_automatic_assembly_session = OpenDssAutomaticAssemblySession(
+            self.opendss_library_session,
+            self.opendss_mapping_session,
+            self._phase_configuration,
+            self,
+        )
         self.opendss_library_help = OpenDssLibraryHelpDialog(self)
         self.opendss_cables_window = OpenDssCablesWindow(
             self.opendss_library_session,
             self.opendss_library_help,
             self,
+            assembly_session=self.opendss_automatic_assembly_session,
         )
         self.opendss_geometries_window = OpenDssGeometriesWindow(
             self.opendss_library_session,
             self.opendss_library_help,
             self,
+            assembly_session=self.opendss_automatic_assembly_session,
         )
         self.opendss_library_session.cablesSaved.connect(
             lambda count: self.statusBar().showMessage(
@@ -844,9 +853,9 @@ class MainWindow(QMainWindow):
             )
         )
         self.opendss_library_session.geometriesSaved.connect(
-            lambda arrangements, geometries: self.statusBar().showMessage(
+            lambda arrangements, _legacy: self.statusBar().showMessage(
                 "Biblioteca OpenDSS: "
-                f"{arrangements:n} arranjo(s) e {geometries:n} montagem(ns) salvos.",
+                f"{arrangements:n} arranjo(s) salvo(s); montagens automáticas atualizadas.",
                 6_000,
             )
         )
@@ -2879,6 +2888,7 @@ class MainWindow(QMainWindow):
             self.scene.removeItem(self._line_item)
             self._line_item = None
         self._line_model = model
+        self.opendss_automatic_assembly_session.set_line_model(model)
         self._phase_classification = (
             None
             if model is None or self._phase_configuration is None
@@ -7287,7 +7297,6 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.opendss_library_help.close()
-        self.opendss_geometries_window.cut_dialog.close()
         self.search_palette.shutdown()
         self.view.shutdown_satellite()
         super().closeEvent(event)

@@ -15,6 +15,10 @@ try:
     from PyQt6.QtWidgets import QApplication, QMessageBox
 
     from circuit_viewer.main_window import MainWindow
+    from circuit_viewer.model import CircuitModel, LineNetworkModel, UtmCrs
+    from circuit_viewer.opendss_automatic_assembly_session import (
+        OpenDssAutomaticAssemblySession,
+    )
     from circuit_viewer.opendss_cables_window import OpenDssCablesWindow
     from circuit_viewer.opendss_geometries_window import OpenDssGeometriesWindow
     from circuit_viewer.opendss_library import (
@@ -32,6 +36,7 @@ try:
         read_arrangement_map,
         read_cable_map,
     )
+    from circuit_viewer.phase_config import load_phase_configuration
 
     PYQT_AVAILABLE = True
 except ModuleNotFoundError:
@@ -50,26 +55,85 @@ class LibraryUiTests(unittest.TestCase):
         root = Path(self.directory.name)
         self.cables_path = root / "cabos.json"
         self.geometries_path = root / "geometrias.json"
+        self.mapping_session = OpenDssMappingSession(
+            cable_map_path=root / "mapa_cabos.json",
+            arrangement_map_path=root / "mapa_arranjos.json",
+        )
         self.session = OpenDssLibrarySession(
             cables_path=self.cables_path,
             geometries_path=self.geometries_path,
+            mapping_session=self.mapping_session,
+        )
+        self.automatic_session = OpenDssAutomaticAssemblySession(
+            self.session,
+            self.mapping_session,
+            load_phase_configuration(),
         )
         self.help = OpenDssLibraryHelpDialog()
         self.addCleanup(self.help.deleteLater)
 
     def _cables_window(self) -> "OpenDssCablesWindow":
-        window = OpenDssCablesWindow(self.session, self.help)
+        window = OpenDssCablesWindow(
+            self.session,
+            self.help,
+            assembly_session=self.automatic_session,
+        )
         window.show()
         self.app.processEvents()
         self.addCleanup(window.deleteLater)
         return window
 
     def _geometries_window(self) -> "OpenDssGeometriesWindow":
-        window = OpenDssGeometriesWindow(self.session, self.help)
+        window = OpenDssGeometriesWindow(
+            self.session,
+            self.help,
+            assembly_session=self.automatic_session,
+        )
         window.show()
         self.app.processEvents()
         self.addCleanup(window.deleteLater)
         return window
+
+    def _set_automatic_lines(
+        self,
+        phases: tuple[str, ...] = ("9",),
+        *,
+        neutral_id: str = "CN",
+    ) -> None:
+        arrangement = self.session.catalog.arrangement("cruzeta_8ft_3fn")
+        phase_cable = self.session.catalog.cable("acsr_556_5")
+        neutral_cable = self.session.catalog.cable("acsr_4/0")
+        self.mapping_session.save_maps(
+            OpenDssLibraryMappings(
+                cables=(
+                    LibraryNameMapping("CF", phase_cable.name),
+                    LibraryNameMapping("CN", neutral_cable.name),
+                ),
+                arrangements=(LibraryNameMapping("AR", arrangement.name),),
+            )
+        )
+        count = len(phases)
+        bars = CircuitModel(
+            [f"B{index}" for index in range(count + 1)],
+            [f"BAR{index}" for index in range(count + 1)],
+            [500_000.0 + index for index in range(count + 1)],
+            [8_000_000.0] * (count + 1),
+            UtmCrs(21, northern=False),
+        )
+        network = LineNetworkModel(
+            bars,
+            [f"T{index + 1}" for index in range(count)],
+            [f"L{index + 1}" for index in range(count)],
+            phases,
+            list(range(count)),
+            list(range(1, count + 1)),
+            ["AR"] * count,
+            ["CF"] * count,
+            [neutral_id] * count,
+            [10.0] * count,
+        )
+        self.automatic_session.set_line_model(network)
+        self.app.processEvents()
 
     def test_main_menu_keeps_imported_catalog_and_adds_libraries_after_tables(self) -> None:
         window = MainWindow(
@@ -252,6 +316,7 @@ class LibraryUiTests(unittest.TestCase):
         )
 
     def test_delete_used_cable_is_blocked(self) -> None:
+        self._set_automatic_lines()
         window = self._cables_window()
         window._selected_id = "acsr_556_5"
         window._load_editor()
@@ -262,45 +327,56 @@ class LibraryUiTests(unittest.TestCase):
         self.assertIn("usado", warning.call_args.args[2])
 
     def test_cross_window_updates_usage_and_missing_reference_warning(self) -> None:
+        self._set_automatic_lines()
         cables = self._cables_window()
         geometries = self._geometries_window()
-        geometry = self.session.catalog.geometries[0]
-        cable_id = geometry.cable_ids[0]
+        assembly = self.automatic_session.result.assemblies[0]
+        cable_id = assembly.key.phase_cable_id
         source_row = next(index for index, cable in enumerate(self.session.catalog.cables) if cable.cable_id == cable_id)
-        self.assertGreater(self.session.catalog.geometries_using_cable(cable_id).__len__(), 0)
+        self.assertGreater(len(self.automatic_session.assemblies_using_cable(cable_id)), 0)
         self.assertNotEqual(cables.table_model.data(cables.table_model.index(source_row, 7)), "—")
 
-        self.session.catalog.cables = [item for item in self.session.catalog.cables if item.cable_id != cable_id]
-        self.session.mark_cables_changed()
+        self._set_automatic_lines(neutral_id="SEM-MAPA")
         self.app.processEvents()
-        self.assertIn("referência", cables.reference_label.text().lower())
-        self.assertIn("posição sem cabo válido", geometries.geometry_issue_label.text())
+        self.assertIn("ocorrência", cables.reference_label.text().lower())
+        self.assertIn("Diagnósticos", geometries.automatic_issue_summary.text())
+        self.assertGreater(geometries.automatic_issue_model.rowCount(), 0)
 
-    def test_arrangement_position_changes_synchronize_mountings(self) -> None:
+    def test_arrangement_draft_only_rebuilds_automatic_mountings_after_save(self) -> None:
+        self._set_automatic_lines()
         window = self._geometries_window()
         arrangement = self.session.catalog.arrangement("cruzeta_8ft_3fn")
-        geometry = self.session.catalog.geometry("ieee_601")
         window._selected_arrangement_id = arrangement.arrangement_id
         window._load_arrangement_editor()
-        old_count = arrangement.conductor_count
+        automatic_before = self.automatic_session.result.assemblies[0]
+        legacy_before = tuple(
+            tuple(item.cable_ids) for item in self.session.legacy_geometries
+        )
 
         window._add_position()
         self.app.processEvents()
-        self.assertEqual(arrangement.conductor_count, old_count + 1)
-        self.assertEqual(len(geometry.cable_ids), old_count + 1)
-        self.assertIsNone(geometry.cable_ids[-1])
+        self.assertEqual(
+            self.automatic_session.result.assemblies[0].arrangement.conductor_count,
+            automatic_before.arrangement.conductor_count,
+        )
+        self.assertIn("última versão salva", window.automatic_draft_label.text())
+        self.assertEqual(
+            tuple(tuple(item.cable_ids) for item in self.session.legacy_geometries),
+            legacy_before,
+        )
 
-        window.positions_table.setCurrentIndex(window.position_model.index(old_count, 0))
-        window._remove_position()
+        self.assertTrue(window._save())
         self.app.processEvents()
-        self.assertEqual(len(geometry.cable_ids), old_count)
+        self.assertEqual(
+            self.automatic_session.result.assemblies[0].arrangement.conductor_count,
+            automatic_before.arrangement.conductor_count + 1,
+        )
 
     def test_position_and_assignment_tables_show_every_row_without_inner_scroll(self) -> None:
+        self._set_automatic_lines()
         window = self._geometries_window()
         window._selected_arrangement_id = "cruzeta_8ft_3fn"
         window._load_arrangement_editor()
-        window._selected_geometry_id = "ieee_601"
-        window._load_geometry_editor()
 
         for table in (window.positions_table, window.assignments_table):
             table.sync_height_to_rows()
@@ -326,22 +402,40 @@ class LibraryUiTests(unittest.TestCase):
         window.positions_table.sync_height_to_rows()
         self.assertEqual(window.positions_table.height(), original_height)
 
-    def test_geometry_assignment_model_and_ampacity_react_to_cable_selection(self) -> None:
+    def test_automatic_assignment_model_is_read_only(self) -> None:
+        self._set_automatic_lines()
         window = self._geometries_window()
-        window._selected_geometry_id = "met_3f_tri"
-        window._load_geometry_editor()
-        index = window.assignment_model.index(0, 3)
-        self.assertTrue(window.assignment_model.setData(index, "acsr795", Qt.ItemDataRole.UserRole))
-        self.app.processEvents()
-        geometry = self.session.catalog.geometry("met_3f_tri")
-        self.assertEqual(geometry.cable_ids[0], "acsr795")
-        self.assertTrue(self.session.geometries_dirty)
+        index = window.assignment_model.index(0, 4)
+        self.assertFalse(
+            bool(window.assignment_model.flags(index) & Qt.ItemFlag.ItemIsEditable)
+        )
+        self.assertFalse(
+            window.assignment_model.setData(
+                index, "acsr795", Qt.ItemDataRole.UserRole
+            )
+        )
+        self.assertFalse(hasattr(window, "new_geometry_button"))
+        self.assertFalse(hasattr(window, "delete_geometry_button"))
 
-    def test_preview_and_cut_render_visible_content(self) -> None:
+    def test_automatic_session_rebuilds_on_saved_maps_and_clears_with_lines(self) -> None:
+        self._set_automatic_lines(("7", "8"))
+        window = self._geometries_window()
+        self.assertEqual(window.geometries_list.count(), 2)
+
+        self.mapping_session.save_maps(OpenDssLibraryMappings())
+        self.app.processEvents()
+        self.assertEqual(window.geometries_list.count(), 0)
+        self.assertEqual(self.automatic_session.result.unassembled_segments, 2)
+
+        self.automatic_session.set_line_model(None)
+        self.app.processEvents()
+        self.assertEqual(self.automatic_session.result.total_segments, 0)
+        self.assertIn("Importe trechos", window.geometry_empty_label.text())
+
+    def test_automatic_preview_renders_phase_bindings(self) -> None:
+        self._set_automatic_lines(("9",))
         window = self._geometries_window()
         window.tabs.setCurrentIndex(1)
-        window._selected_geometry_id = "subterraneo_3f"
-        window._load_geometry_editor()
         window.geometry_preview.resize(600, 340)
         self.app.processEvents()
         pixmap = QPixmap(window.geometry_preview.size())
@@ -357,17 +451,11 @@ class LibraryUiTests(unittest.TestCase):
         }
         self.assertGreater(len(sampled), 1)
         self.assertEqual(window.geometry_preview.point_count, 3)
-        self.assertTrue(all(label.startswith("F") for label in window.geometry_preview.point_labels))
+        self.assertTrue(window.geometry_preview.point_labels[0].startswith("F1→D"))
+        self.assertTrue(window.geometry_preview.point_labels[1].startswith("F2→F"))
         self.assertTrue(all("Cabo:" in item.toolTip() for item in window.geometry_preview._point_items))
-        self.assertEqual(window.cut_button.text(), "Ampliar gráfico…")
-
-        window._show_cut()
-        self.app.processEvents()
-        self.assertTrue(window.cut_dialog.isVisible())
-        self.assertEqual(window.cut_dialog.table.rowCount(), 3)
-        self.assertEqual(window.cut_dialog.preview.point_count, 3)
-        self.assertIn("Gráfico cartesiano", window.cut_dialog.windowTitle())
-        self.assertIn("GEO_UG_3F_CN", window.cut_dialog.windowTitle())
+        self.assertIn("F1 → D", window.automatic_phases_label.text())
+        self.assertIn("F2 → F", window.automatic_phases_label.text())
 
     def test_cartesian_graph_zoom_pan_fit_and_content_update_do_not_edit_coordinates(self) -> None:
         window = self._geometries_window()
@@ -457,13 +545,18 @@ class LibraryUiTests(unittest.TestCase):
         self.assertAlmostEqual(visual_delta.x(), delta.x() * repetitions, places=8)
         self.assertAlmostEqual(visual_delta.y(), delta.y() * repetitions, places=8)
 
-    def test_real_left_drag_uses_same_pan_in_all_three_graphs(self) -> None:
+    def test_real_left_drag_uses_same_pan_in_arrangement_and_automatic_graphs(self) -> None:
+        self._set_automatic_lines()
         window = self._geometries_window()
         arrangement = self.session.catalog.arrangements[0]
-        geometry = self.session.catalog.geometries[0]
+        assembly = self.automatic_session.result.assemblies[0]
         window.arrangement_preview.set_content(self.session.catalog, arrangement)
-        window.geometry_preview.set_content(self.session.catalog, arrangement, geometry)
-        window.cut_dialog.preview.set_content(self.session.catalog, arrangement, geometry)
+        window.geometry_preview.set_content(
+            self.automatic_session.catalog,
+            assembly.arrangement,
+            assembly.geometry,
+            assembly.phase_letters,
+        )
         original_positions = tuple((item.x, item.height) for item in arrangement.positions)
 
         start = QPointF(120.25, 90.5)
@@ -472,7 +565,6 @@ class LibraryUiTests(unittest.TestCase):
         for view in (
             window.arrangement_preview,
             window.geometry_preview,
-            window.cut_dialog.preview,
         ):
             view.resize(620, 360)
             view.fit_to_content()
@@ -574,7 +666,7 @@ class LibraryUiTests(unittest.TestCase):
             self.assertTrue(window.confirm_pending_changes())
         self.assertTrue(self.cables_path.exists())
 
-    def test_geometry_import_with_missing_cables_is_allowed_and_reported(self) -> None:
+    def test_geometry_import_preserves_manual_mountings_only_as_legacy(self) -> None:
         window = self._geometries_window()
         source = Path(self.directory.name) / "custom_geometrias.json"
         source.write_text(
@@ -616,6 +708,13 @@ class LibraryUiTests(unittest.TestCase):
             patch("circuit_viewer.opendss_geometries_window.QMessageBox.warning") as warning,
         ):
             window._import_geometries()
-        self.assertEqual(self.session.catalog.geometries, [GeometryDefinition("g", "G", "a", ["ausente"], False)])
-        self.assertTrue(warning.called)
+        self.assertEqual(self.session.catalog.geometries, [])
+        self.assertEqual(
+            self.session.legacy_geometries,
+            (GeometryDefinition("g", "G", "a", ["ausente"], False),),
+        )
+        self.assertFalse(warning.called)
         self.assertTrue(self.session.geometries_dirty)
+        self.assertTrue(window._save())
+        payload = json.loads(self.geometries_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["montagens"][0]["id"], "g")

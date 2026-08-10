@@ -42,6 +42,7 @@ from .opendss_library import (
 )
 from .opendss_library_help import OpenDssLibraryHelpDialog
 from .opendss_library_session import OpenDssLibrarySession
+from .opendss_automatic_assembly_session import OpenDssAutomaticAssemblySession
 from .opendss_mapping_session import MappedLibraryItemError
 from .opendss_library_store import read_cables_file
 from .table_columns import EXCEL_LIKE_TABLE_STYLE, enable_interactive_columns
@@ -75,9 +76,15 @@ def _parse_number(text: str, *, integer: bool = False) -> float | int | None:
 class OpenDssCableTableModel(QAbstractTableModel):
     HEADERS = ("Nome", "Tipo", "Família", "R", "GMR", "Dimensão", "Ampac.", "Usos", "Estado")
 
-    def __init__(self, session: OpenDssLibrarySession, parent=None) -> None:  # noqa: ANN001
+    def __init__(
+        self,
+        session: OpenDssLibrarySession,
+        assembly_session: OpenDssAutomaticAssemblySession | None = None,
+        parent=None,  # noqa: ANN001
+    ) -> None:
         super().__init__(parent)
         self.session = session
+        self.assembly_session = assembly_session
 
     def refresh(self) -> None:
         self.beginResetModel()
@@ -102,7 +109,11 @@ class OpenDssCableTableModel(QAbstractTableModel):
         if not index.isValid():
             return None
         cable = self.cable(index.row())
-        uses = len(self.session.catalog.geometries_using_cable(cable.cable_id))
+        uses = (
+            0
+            if self.assembly_session is None
+            else len(self.assembly_session.assemblies_using_cable(cable.cable_id))
+        )
         resistance = cable.rac if cable.rac is not None else cable.rdc
         resistance_kind = "ac" if cable.rac is not None else "dc"
         dimension = (
@@ -199,10 +210,13 @@ class OpenDssCablesWindow(QDialog):
         session: OpenDssLibrarySession,
         help_dialog: OpenDssLibraryHelpDialog,
         parent=None,  # noqa: ANN001
+        *,
+        assembly_session: OpenDssAutomaticAssemblySession | None = None,
     ) -> None:
         super().__init__(parent)
         self.session = session
         self.help_dialog = help_dialog
+        self.assembly_session = assembly_session
         self._selected_id: str | None = None
         self._loading = False
         self.setWindowTitle("Biblioteca de Cabos OpenDSS")
@@ -224,7 +238,7 @@ class OpenDssCablesWindow(QDialog):
         root.addLayout(header)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        self.table_model = OpenDssCableTableModel(session, self)
+        self.table_model = OpenDssCableTableModel(session, assembly_session, self)
         self.proxy_model = CableFilterProxyModel(self)
         self.proxy_model.setSourceModel(self.table_model)
         self.proxy_model.setSortRole(Qt.ItemDataRole.UserRole)
@@ -397,6 +411,8 @@ class OpenDssCablesWindow(QDialog):
         self.table.selectionModel().currentRowChanged.connect(self._on_current_row_changed)
         self.session.cablesChanged.connect(self.refresh)
         self.session.geometriesChanged.connect(self._refresh_usage_only)
+        if self.assembly_session is not None:
+            self.assembly_session.changed.connect(self._refresh_usage_only)
         self.session.cablesDirtyChanged.connect(self._sync_dirty_state)
         self.name_edit.editingFinished.connect(self._edit_name)
         self.family_edit.editingFinished.connect(lambda: self._edit_text("family", self.family_edit))
@@ -652,14 +668,18 @@ class OpenDssCablesWindow(QDialog):
         cable = self.selected_cable()
         if cable is None:
             return
-        uses = self.session.catalog.geometries_using_cable(cable.cable_id)
+        uses = (
+            ()
+            if self.assembly_session is None
+            else self.assembly_session.assemblies_using_cable(cable.cable_id)
+        )
         if uses:
             QMessageBox.warning(
                 self,
                 "Cabo em uso",
-                f'"{cable.name}" é usado por {len(uses)} montagem(ns):\n\n• '
+                f'"{cable.name}" é usado por {len(uses)} montagem(ns) automática(s):\n\n• '
                 + "\n• ".join(item.name for item in uses)
-                + "\n\nTroque o cabo nessas montagens antes de excluí-lo.",
+                + "\n\nAltere os vínculos de CABO_ID antes de excluí-lo.",
             )
             return
         mapping_session = self.session.mapping_session
@@ -747,21 +767,24 @@ class OpenDssCablesWindow(QDialog):
         self.setWindowTitle("Biblioteca de Cabos OpenDSS" + (" *" if dirty else ""))
 
     def _sync_reference_warning(self, *, show_dialog: bool = False) -> None:
-        missing = sorted(
-            {
-                cable_id
-                for geometry in self.session.catalog.geometries
-                for cable_id in geometry.cable_ids
-                if cable_id and self.session.catalog.cable(cable_id) is None
-            }
+        issues = (
+            ()
+            if self.assembly_session is None
+            else tuple(
+                item
+                for item in self.assembly_session.result.issues
+                if item.field in {"CABOF_ID", "CABON_ID"}
+            )
         )
-        if not missing:
+        if not issues:
             if self.reference_label.text().startswith("Atenção:"):
                 self.reference_label.clear()
             return
+        affected = sum(item.count for item in issues)
         message = (
-            f"Atenção: {len(missing):n} referência(s) de cabo das montagens não existem nesta biblioteca. "
-            "Importe o arquivo de geometrias correspondente ou corrija as montagens."
+            f"Atenção: {affected:n} ocorrência(s) de cabo das linhas não puderam "
+            "ser aplicadas integralmente às montagens automáticas. Consulte a "
+            "aba Montagens automáticas em Bibliotecas > Geometrias."
         )
         self.reference_label.setText(message)
         if show_dialog:

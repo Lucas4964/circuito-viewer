@@ -276,6 +276,13 @@ from .opendss_mapping_store import (
     save_arrangement_map,
     save_cable_map,
 )
+from .opendss_automatic_assembly import (
+    AutomaticAssembly,
+    AutomaticAssemblyIssue,
+    AutomaticAssemblyKey,
+    AutomaticAssemblyResult,
+    build_automatic_assemblies,
+)
 from .mapa_tiles import (
     PROVEDORES,
     PROVEDOR_ESRI,
@@ -511,6 +518,11 @@ __all__ = [
     "read_cable_map",
     "save_arrangement_map",
     "save_cable_map",
+    "AutomaticAssembly",
+    "AutomaticAssemblyIssue",
+    "AutomaticAssemblyKey",
+    "AutomaticAssemblyResult",
+    "build_automatic_assemblies",
     "PowerFlowEngineError",
     "PowerFlowIssue",
     "PowerFlowResult",

@@ -53,6 +53,10 @@ class PhaseConfigurationTests(unittest.TestCase):
                 ("14", "DEFN", 3, "1.2.3.0"),
             ],
         )
+        self.assertEqual(config.phase_letters_for_value("7"), ("D", "E"))
+        self.assertEqual(config.phase_letters_for_value("8"), ("E", "F"))
+        self.assertEqual(config.phase_letters_for_value("9"), ("D", "F"))
+        self.assertEqual(config.phase_letters_for_value("14"), ("D", "E", "F"))
 
     def test_accepts_numeric_values_normalizes_text_and_ignores_extras(self) -> None:
         path = self.write_json(
@@ -87,6 +91,20 @@ class PhaseConfigurationTests(unittest.TestCase):
         config = load_phase_configuration(path)
 
         self.assertIsNone(config.entries[0].dss)
+
+    def test_phase_letters_follow_terminal_order_for_custom_abc_labels(self) -> None:
+        config = load_phase_configuration(
+            self.write_json(
+                [
+                    {"FASES2": "A", "NOME": "A", "NUMERO_FASES": 1, "DSS": "1"},
+                    {"FASES2": "B", "NOME": "B", "NUMERO_FASES": 1, "DSS": "2"},
+                    {"FASES2": "C", "NOME": "C", "NUMERO_FASES": 1, "DSS": "3"},
+                    {"FASES2": "AC", "NOME": "CA", "NUMERO_FASES": 2, "DSS": "1.3"},
+                ]
+            )
+        )
+
+        self.assertEqual(config.phase_letters_for_value("AC"), ("A", "C"))
 
     def test_classifies_once_and_reports_distinct_unmapped_values(self) -> None:
         config = load_phase_configuration(

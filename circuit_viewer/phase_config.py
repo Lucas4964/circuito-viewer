@@ -101,11 +101,12 @@ class PhaseConfiguration:
         )
 
     def phase_letters_for_value(self, value: object) -> tuple[str, ...] | None:
-        """Resolve as fases elétricas D/E/F de um valor ``FASES2``.
+        """Resolve as fases elétricas em ordem canônica dos terminais DSS.
 
-        O ``NOME`` é a fonte da ordem e das letras, enquanto ``NUMERO_FASES``
-        confirma que a entrada não está semanticamente incompleta. O neutro
-        presente em nomes como ``DN``/``DEFN`` é ignorado.
+        As entradas monofásicas definem a correspondência letra/terminal. Isso
+        faz ``FD`` com ``DSS=1.3`` resultar em ``("D", "F")`` em vez de copiar
+        a ordem histórica do rótulo. Quando um terminal não é numérico ou está
+        ausente, a letra funciona como desempate determinístico.
         """
 
         try:
@@ -115,14 +116,39 @@ class PhaseConfiguration:
         entry = next((item for item in self.entries if item.fases2 == key), None)
         if entry is None:
             return None
+        terminal_order: dict[str, tuple[int, str]] = {}
+        for candidate in self.entries:
+            if candidate.phase_count != 1:
+                continue
+            name = (candidate.name or "").strip().upper()
+            if not name:
+                continue
+            letter = name[0]
+            raw_node = (candidate.dss or "").split(".", 1)[0].strip()
+            try:
+                node_order = int(raw_node)
+            except ValueError:
+                node_order = 1_000_000
+            terminal_order.setdefault(letter, (node_order, letter))
+
+        # D/E/F continuam sendo uma reserva compatível para configurações
+        # antigas sem entradas monofásicas completas.
+        known_letters = set(terminal_order) or {"D", "E", "F"}
         letters = tuple(
             letter
             for letter in (entry.name or "").strip().upper()
-            if letter in {"D", "E", "F"}
+            if letter in known_letters
         )
         if len(letters) != entry.phase_count or len(set(letters)) != len(letters):
             return None
-        return letters
+        return tuple(
+            sorted(
+                letters,
+                key=lambda letter: terminal_order.get(
+                    letter, (1_000_000, letter)
+                ),
+            )
+        )
 
 
 def normalize_phase_value(value: object) -> str:

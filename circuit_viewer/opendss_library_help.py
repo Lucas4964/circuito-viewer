@@ -28,17 +28,23 @@ permissividade são opcionais porque o OpenDSS possui valores derivados/padrão.
 _GEOMETRY_HELP = """
 <h2>Geometrias</h2>
 <p>Um <b>arranjo</b> corresponde a <code>LineSpacing</code>: contém apenas as
-posições <code>x</code>/<code>h</code>. Uma <b>montagem</b> corresponde a
-<code>LineGeometry</code>: escolhe um arranjo e o cabo de cada posição.</p>
+posições <code>x</code>/<code>h</code>. As <b>montagens automáticas</b> são
+combinações transitórias, somente leitura, derivadas dos trechos, dos mapas e
+das bibliotecas salvas.</p>
 <p>Os primeiros <code>nphases</code> condutores são fases; os restantes são
 neutros. Altura zero é o solo e valores negativos representam cabos enterrados.
 Duas posições idênticas tornam a matriz elétrica singular.</p>
+<h3>Fases reais</h3>
+<p>F1, F2 e F3 são posições físicas, não nomes fixos de fases. Uma linha usa as
+primeiras posições necessárias e associa a elas suas fases em ordem elétrica.
+Assim, uma linha nas fases D/F usa <code>F1 → D</code> e <code>F2 → F</code>.
+Um arranjo trifásico pode atender linhas de uma, duas ou três fases.</p>
+<p>Quando o arranjo possui neutro, suas posições só são mantidas se
+<code>CABON_ID</code> resolver um cabo salvo. Sem ele, os neutros são removidos e
+um aviso é apresentado nos diagnósticos.</p>
 <h3>Redução de Kron</h3>
-<p>Com a redução habilitada, o OpenDSS elimina os condutores neutros da matriz
-completa e preserva seu efeito na matriz equivalente das fases.</p>
-<p>As fases de uma montagem devem usar todas fios nus ou todas cabos
-concêntricos. O neutro pode ser de outro tipo. A ampacidade mostrada é o menor
-valor declarado entre os cabos de fase.</p>
+<p>A redução fica habilitada automaticamente quando a montagem preserva
+condutores neutros e desabilitada quando eles são removidos.</p>
 <h3>Gráfico cartesiano</h3>
 <p>As prévias mostram cada condutor como um ponto: <code>x</code> é o eixo X e
 <code>h</code> é o eixo Y. Os eixos zero aparecem destacados e a grade se adapta

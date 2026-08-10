@@ -51,13 +51,17 @@ class OpenDssLibrarySession(QObject):
         self.cables_load: CablesLoadResult = load_cables(cables_path)
         self.geometries_load: GeometriesLoadResult = load_geometries(geometries_path)
         self._saved_cables = clone_cables(self.cables_load.cables)
-        self._saved_arrangements, self._saved_geometries = clone_geometries(
+        self._saved_arrangements, self._saved_legacy_geometries = clone_geometries(
             self.geometries_load.arrangements,
             self.geometries_load.geometries,
         )
+        _, self._legacy_geometries = clone_geometries(
+            (), self._saved_legacy_geometries
+        )
         self.catalog = OpenDssLibraryCatalog(
             clone_cables(self._saved_cables),
-            *clone_geometries(self._saved_arrangements, self._saved_geometries),
+            clone_geometries(self._saved_arrangements, ())[0],
+            [],
         )
         self._cables_dirty = False
         self._geometries_dirty = False
@@ -78,16 +82,34 @@ class OpenDssLibrarySession(QObject):
     def saved_arrangement_names(self) -> tuple[str, ...]:
         return tuple(item.name for item in self._saved_arrangements)
 
+    @property
+    def legacy_geometries(self):  # noqa: ANN201
+        """Montagens manuais preservadas apenas para round-trip do JSON v1."""
+
+        return tuple(self._legacy_geometries)
+
+    def saved_catalog(self) -> OpenDssLibraryCatalog:
+        """Retrato isolado usado pelas montagens automáticas ativas."""
+
+        arrangements, _ = clone_geometries(self._saved_arrangements, ())
+        return OpenDssLibraryCatalog(
+            clone_cables(self._saved_cables),
+            arrangements,
+            [],
+        )
+
     def mark_cables_changed(self) -> None:
         self._set_cables_dirty(True)
         self.cablesChanged.emit()
-        # Seletores, ampacidade e diagnósticos das montagens dependem dos cabos.
+        # A janela de geometrias também informa que o modelo ativo usa somente
+        # o último retrato salvo da biblioteca de cabos.
         self.geometriesChanged.emit()
 
     def mark_geometries_changed(self) -> None:
         self._set_geometries_dirty(True)
         self.geometriesChanged.emit()
-        # A coluna de usos da janela de cabos depende das montagens.
+        # A janela de cabos mantém seus contadores automáticos visíveis enquanto
+        # o rascunho de arranjos aguarda salvamento.
         self.cablesChanged.emit()
 
     def _set_cables_dirty(self, dirty: bool) -> None:
@@ -116,10 +138,10 @@ class OpenDssLibrarySession(QObject):
             self.mapping_session.validate_arrangement_replacement(
                 self._saved_arrangements, arrangements
             )
-        (
-            self.catalog.arrangements,
-            self.catalog.geometries,
-        ) = clone_geometries(arrangements, geometries)
+        self.catalog.arrangements, self._legacy_geometries = clone_geometries(
+            arrangements, geometries
+        )
+        self.catalog.geometries = []
         self.mark_geometries_changed()
         return len(arrangements), len(geometries)
 
@@ -139,10 +161,10 @@ class OpenDssLibrarySession(QObject):
             self.mapping_session.validate_arrangement_replacement(
                 self._saved_arrangements, arrangements
             )
-        (
-            self.catalog.arrangements,
-            self.catalog.geometries,
-        ) = clone_geometries(arrangements, geometries)
+        self.catalog.arrangements, self._legacy_geometries = clone_geometries(
+            arrangements, geometries
+        )
+        self.catalog.geometries = []
         self.mark_geometries_changed()
         return len(arrangements), len(geometries)
 
@@ -163,23 +185,23 @@ class OpenDssLibrarySession(QObject):
         if self.mapping_session is None:
             save_geometries(
                 self.catalog.arrangements,
-                self.catalog.geometries,
+                self._legacy_geometries,
                 self.geometries_path,
             )
         else:
             self.mapping_session.save_geometry_library(
                 self._saved_arrangements,
                 self.catalog.arrangements,
-                self.catalog.geometries,
+                self._legacy_geometries,
                 self.geometries_path,
             )
-        self._saved_arrangements, self._saved_geometries = clone_geometries(
+        self._saved_arrangements, self._saved_legacy_geometries = clone_geometries(
             self.catalog.arrangements,
-            self.catalog.geometries,
+            self._legacy_geometries,
         )
         self._set_geometries_dirty(False)
         self.geometriesSaved.emit(
-            len(self.catalog.arrangements), len(self.catalog.geometries)
+            len(self.catalog.arrangements), len(self._legacy_geometries)
         )
 
     def discard_cable_drafts(self) -> None:
@@ -189,10 +211,10 @@ class OpenDssLibrarySession(QObject):
         self.geometriesChanged.emit()
 
     def discard_geometry_drafts(self) -> None:
-        (
-            self.catalog.arrangements,
-            self.catalog.geometries,
-        ) = clone_geometries(self._saved_arrangements, self._saved_geometries)
+        self.catalog.arrangements, self._legacy_geometries = clone_geometries(
+            self._saved_arrangements, self._saved_legacy_geometries
+        )
+        self.catalog.geometries = []
         self._set_geometries_dirty(False)
         self.geometriesChanged.emit()
         self.cablesChanged.emit()
@@ -201,4 +223,4 @@ class OpenDssLibrarySession(QObject):
         save_cables(self.catalog.cables, path)
 
     def export_geometries(self, path: str | Path) -> None:
-        save_geometries(self.catalog.arrangements, self.catalog.geometries, path)
+        save_geometries(self.catalog.arrangements, self._legacy_geometries, path)

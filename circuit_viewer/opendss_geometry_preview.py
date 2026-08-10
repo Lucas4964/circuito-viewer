@@ -135,7 +135,11 @@ class CartesianGeometryView(QGraphicsView):
         self.catalog: OpenDssLibraryCatalog | None = None
         self.arrangement: ArrangementDefinition | None = None
         self.geometry: GeometryDefinition | None = None
-        self._content_key: tuple[str | None, str | None] = (None, None)
+        self._content_key: tuple[str | None, str | None, tuple[str, ...]] = (
+            None,
+            None,
+            (),
+        )
         self._content_bounds = QRectF(-1.0, -1.0, 2.0, 2.0)
         self._point_items: list[_ConductorPointItem] = []
         self._fit_pending = True
@@ -186,12 +190,14 @@ class CartesianGeometryView(QGraphicsView):
         catalog: OpenDssLibraryCatalog,
         arrangement: ArrangementDefinition | None,
         geometry: GeometryDefinition | None = None,
+        phase_letters: tuple[str, ...] = (),
     ) -> None:
         """Atualiza pontos; preserva a câmera quando o item é o mesmo."""
 
         new_key = (
             None if arrangement is None else arrangement.arrangement_id,
             None if geometry is None else geometry.geometry_id,
+            tuple(phase_letters),
         )
         same_content = new_key == self._content_key
         old_transform = self.transform()
@@ -208,7 +214,17 @@ class CartesianGeometryView(QGraphicsView):
         if arrangement is not None:
             for index, position in enumerate(arrangement.positions):
                 is_phase = index < arrangement.phase_count
-                role = f"F{index + 1}" if is_phase else "N"
+                physical_role = f"F{index + 1}" if is_phase else "N"
+                electrical_phase = (
+                    phase_letters[index]
+                    if is_phase and index < len(phase_letters)
+                    else None
+                )
+                role = (
+                    f"{physical_role}→{electrical_phase}"
+                    if electrical_phase
+                    else physical_role
+                )
                 cable_id = (
                     geometry.cable_ids[index]
                     if geometry is not None and index < len(geometry.cable_ids)
@@ -222,10 +238,12 @@ class CartesianGeometryView(QGraphicsView):
                     f"{arrangement.units}"
                 )
                 tooltip_lines = [
-                    f"Papel: {role}",
+                    f"Papel: {physical_role}",
                     f"X: {_coordinate(position.x)} {arrangement.units}",
                     f"Y (h): {_coordinate(position.height)} {arrangement.units}",
                 ]
+                if electrical_phase:
+                    tooltip_lines.insert(1, f"Fase real: {electrical_phase}")
                 if geometry is not None:
                     tooltip_lines.append(
                         "Cabo: " + (cable_name or (f"{cable_id} (ausente)" if cable_id else "não associado"))
