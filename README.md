@@ -148,8 +148,14 @@ depende de barras nem de trechos. O CSV deve conter `CABO_ID`, `TIPO`, `CODIGO`,
 `IADM`, `GMR`, `R`, `X`, `QCAP`, `R0`, `X0`, `R1`, `X1`, `NOME` e `EXTERN_ID`.
 Todos os campos são preservados como texto, inclusive com vírgula decimal; só
 `CABO_ID` é obrigatório e precisa ser único. O catálogo é consultado em
-**Tabelas > Cabos…** e nunca altera a rede desenhada — importar cabos não
+**Tabelas > Cabos importados…** e nunca altera a rede desenhada — importar cabos não
 invalida nada, e importar qualquer outra entidade não invalida os cabos.
+
+Esse catálogo importado não é a mesma coisa que a biblioteca física do
+OpenDSS: ele guarda parâmetros de sequência (`R1`, `X1`, `R0`, `X0`, `QCAP`)
+referenciados por `CABOF_ID`/`CABON_ID`. Os condutores `WireData`/`CNData` e as
+geometrias `LineSpacing`/`LineGeometry` ficam no menu **Bibliotecas**, descrito
+adiante, e ainda não alteram os trechos nem a exportação atual.
 
 ## Importação por banco de dados (`.mdb`)
 
@@ -324,7 +330,7 @@ chave fechada virar aberta, e `FASES2` como `"13.0"` não casaria com o
 - **Visualizar > Sobreposições…**: lista os trechos associados a mais de um
   circuito. O relatório também é aberto automaticamente quando uma sobreposição
   é encontrada.
-- **Tabelas > Cabos…**: abre a tabela não modal do catálogo de cabos, com as
+- **Tabelas > Cabos importados…**: abre a tabela não modal do catálogo de cabos, com as
   catorze colunas na ordem do arquivo. Clicar em um cabeçalho ordena; as colunas
   numéricas (`IADM` a `X1`) ordenam por valor, aceitando ponto **ou** vírgula
   decimal. Sem catálogo importado, a janela mostra um botão **Importar cabos…**.
@@ -336,6 +342,18 @@ chave fechada virar aberta, e `FASES2` como `"13.0"` não casaria com o
   **carga**, o `BARRA_ID` mostra o `CODIGO` da barra e o `FASES2` mostra o
   `NOME`. Em todos os casos o tooltip do `FASES2` informa o `NUMERO_FASES`, e
   valores sem correspondência exibem `—`.
+- **Bibliotecas > Cabos…**: abre o cadastro global de condutores físicos
+  `WireData` e `CNData`, separado do catálogo importado. A biblioteca começa
+  com 58 definições de referência e permite busca, criação, duplicação,
+  exclusão protegida por uso, estimativas de dimensão, importação/exportação
+  de `cabos.json` e restauração dos padrões.
+- **Bibliotecas > Geometrias…**: abre as abas **Arranjos** (`LineSpacing`) e
+  **Montagens** (`LineGeometry`). É possível editar livremente as posições
+  `x`/`h`, associar um cabo a cada posição, validar fases e referências, ver a
+  ampacidade das fases e inspecionar o gráfico cartesiano interativo. As tabelas
+  exibem todas as posições sem rolagem vertical interna; quando necessário, o
+  painel completo é rolado. No gráfico, a roda aplica zoom sob o cursor, o
+  arraste com o botão esquerdo faz pan e o duplo clique reenquadra os pontos.
 - **Enquadrar tudo** ou tecla `F`: mostra todo o conjunto.
 - **Buscar** ou `Ctrl+F`: abre uma janela não modal que pode ser movida,
   redimensionada e fechada pelo `X`, pelo botão **Fechar** ou por `Esc`. No modo
@@ -769,10 +787,11 @@ sobrescreveria a primeira.
 
 ## Configurações do OpenDSS
 
-O menu **Configurações → OpenDSS…** define parâmetros globais aplicados a **todos
-os elementos `Load`** do modelo — cargas de consumo e geradores — tanto na
-exportação quanto no fluxo de potência. Os dois caminhos geram o mesmo arquivo
-master.
+O menu **Configurações → OpenDSS…** é organizado nas abas **Tensão das cargas**,
+**Mapa de Cabos** e **Mapa de Arranjos**. A primeira aba define parâmetros
+globais aplicados a **todos os elementos `Load`** do modelo — cargas de consumo
+e geradores — tanto na exportação quanto no fluxo de potência. Os dois caminhos
+geram o mesmo arquivo master.
 
 | Parâmetro | Padrão do OpenDSS | Efeito |
 |---|---|---|
@@ -810,6 +829,37 @@ Os valores ficam guardados entre sessões, como a preferência de tema. Alterá-
 descarta um resultado de fluxo de potência já calculado, porque ele descreveria o
 modelo anterior.
 
+As outras duas abas mantêm cadastros manuais entre os identificadores vindos da
+rede e os nomes salvos nas bibliotecas:
+
+- **Mapa de Cabos:** `CABO_ID` → nome de `WireData`/`CNData`;
+- **Mapa de Arranjos:** `ARRANJO_ID` → nome de `LineSpacing`.
+
+Os IDs são textos, têm os espaços externos removidos e não podem se repetir no
+mesmo mapa. O nome é escolhido em uma lista que contém somente itens já salvos
+na biblioteca; o mesmo item pode atender vários IDs. O botão **OK** permanece
+desabilitado enquanto houver uma linha incompleta, duplicada ou apontando para
+uma referência inexistente. **Restaurar padrões** age apenas sobre a aba ativa:
+restaura os limites de tensão ou limpa o respectivo mapa.
+
+Cada mapa possui também um botão **Salvar**, ao lado das ações de inclusão e
+remoção. Ele grava imediatamente somente o mapa daquela aba e mantém a janela
+aberta; mudanças válidas são identificadas como **Alterações não salvas** e a
+confirmação aparece como **Mapa salvo**. O **OK** continua salvando todas as
+pendências válidas e fechando a janela.
+
+Os vínculos ficam em `circuit_viewer/dados/mapa_cabos.json` e
+`circuit_viewer/dados/mapa_arranjos.json`, ambos com `versao: 1` e gravação
+atômica. Arquivo ausente significa mapa vazio. Se um arquivo estiver corrompido,
+somente aquele mapa fica bloqueado e o conteúdo original não é sobrescrito até
+que o usuário o limpe ou corrija. **Cancelar** descarta as alterações ainda
+pendentes, mas não desfaz um mapa que já tenha sido gravado explicitamente pelo
+botão **Salvar**.
+
+Nesta etapa, os mapas são apenas cadastros persistentes: ainda não participam da
+montagem automática nem da exportação OpenDSS e, por isso, alterá-los não invalida
+um resultado de fluxo de potência. Essa integração será feita na etapa seguinte.
+
 ## Patamares de cálculo
 
 O menu **Configurações → Patamares…** abre uma grade editável com as colunas
@@ -844,6 +894,41 @@ a última versão salva daquela opção.
 Este cadastro define a agenda usada por **Atualizar Geradores**. Ele continua
 independente dos patamares de potência importados por carga e não altera a
 exportação OpenDSS nem o fluxo de potência.
+
+## Bibliotecas OpenDSS
+
+As bibliotecas são globais e independentes das importações de rede. Cabos ficam
+em `circuit_viewer/dados/cabos.json`; arranjos e montagens, em
+`circuit_viewer/dados/geometrias.json`. Os dois arquivos usam a versão 1 e são
+compatíveis com os formatos `{versao, cabos}` e
+`{versao, arranjos, montagens}` do OPENDSS_GRAFICO.
+
+Nomes de cabos e arranjos são obrigatórios, únicos sem distinção entre
+maiúsculas e minúsculas e armazenados em letras maiúsculas. Nomes de montagens
+preservam sua grafia. Ao salvar uma renomeação, os mapas OpenDSS acompanham o
+novo nome pelo ID estável do item. Excluir, importar ou restaurar uma biblioteca
+é bloqueado se a operação remover um item mapeado; o aviso lista os `CABO_ID` ou
+`ARRANJO_ID` que precisam ser desvinculados. Biblioteca e mapa afetado são
+gravados como uma única operação, com restauração dos arquivos anteriores se
+alguma substituição falhar.
+
+As alterações ficam em rascunho até **Salvar**. Fechar com pendências oferece
+salvar, descartar ou continuar editando, e a gravação em disco é atômica.
+Importar substitui somente a biblioteca correspondente depois de confirmação;
+referências temporariamente ausentes permanecem visíveis como diagnóstico para
+que `cabos.json` e `geometrias.json` possam ser importados em qualquer ordem.
+Se um dos arquivos persistidos estiver corrompido, apenas ele volta aos padrões
+de fábrica — a outra biblioteca é preservada.
+
+Cabos incompletos podem ser cadastrados, mas recebem uma marca de aviso. A
+exclusão de cabos e arranjos em uso é bloqueada; mudar o número de posições de
+um arranjo sincroniza os slots das montagens sem inventar qual cabo deve ocupar
+uma nova posição. Arranjos e montagens usam o mesmo gráfico cartesiano: `x` no
+eixo X, `h` no eixo Y, grade adaptativa e pontos identificados por papel e, nas
+montagens, também pelo cabo. A navegação no gráfico não edita coordenadas.
+Nesta versão, as bibliotecas são cadastro e visualização:
+uma associação explícita entre `ARRANJO_ID` e montagem será adicionada quando o
+usuário puder escolher entre parâmetros importados e geometrias OpenDSS.
 
 ## Curvas horárias
 

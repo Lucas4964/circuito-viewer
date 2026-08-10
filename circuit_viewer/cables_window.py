@@ -162,7 +162,7 @@ class CablesWindow(QDialog):
 
     def __init__(self, table_model: CableTableModel, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
-        self.setWindowTitle("Cabos")
+        self.setWindowTitle("Cabos importados")
         self.setModal(False)
         self.resize(1_040, 520)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)

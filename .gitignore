@@ -9,3 +9,5 @@ src/
 script20.py
 # Curvas cadastradas pelo usuário: dado de quem usa o programa, não do projeto.
 circuit_viewer/dados/
+# Projeto anterior mantido apenas como referência local para as bibliotecas.
+/OPENDSS_GRAFICO/

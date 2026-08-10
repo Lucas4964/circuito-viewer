@@ -6,10 +6,13 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QStandardItemModel
     from PyQt6.QtWidgets import QApplication, QHeaderView, QTableView
 
     from circuit_viewer.power_flow_table import PowerFlowTableModel
     from circuit_viewer.table_columns import (
+        AllRowsTableView,
         EXCEL_LIKE_TABLE_STYLE,
         enable_interactive_columns,
     )
@@ -193,6 +196,41 @@ class CellPaddingStyleTests(unittest.TestCase):
         # Vertical não-zero brigaria com a altura fixa das linhas (28px) e o
         # AlignVCenter que os modelos dessas tabelas já usam.
         self.assertIn("padding: 0px 10px", EXCEL_LIKE_TABLE_STYLE)
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class AllRowsTableViewTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_height_tracks_all_rows_and_vertical_scrollbar_stays_disabled(self) -> None:
+        model = QStandardItemModel(4, 2)
+        table = AllRowsTableView()
+        self.addCleanup(table.deleteLater)
+        table.setModel(model)
+        table.show()
+        self.app.processEvents()
+        table.sync_height_to_rows()
+
+        expected_rows = sum(table.rowHeight(row) for row in range(model.rowCount()))
+        minimum = table.horizontalHeader().height() + expected_rows + 2 * table.frameWidth()
+        self.assertGreaterEqual(table.height(), minimum)
+        self.assertEqual(
+            table.verticalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+
+        initial_height = table.height()
+        model.insertRow(model.rowCount())
+        self.app.processEvents()
+        table.sync_height_to_rows()
+        self.assertGreater(table.height(), initial_height)
+
+        model.removeRow(model.rowCount() - 1)
+        self.app.processEvents()
+        table.sync_height_to_rows()
+        self.assertEqual(table.height(), initial_height)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,0 +1,369 @@
+{
+  "versao": 1,
+  "arranjos": [
+    {
+      "id": "cruzeta_8ft_3fn",
+      "nome": "Cruzeta_8ft_3F_N",
+      "descricao": "Cruzeta de 8 ft, 3F + neutro sob a cruzeta",
+      "nconds": 4,
+      "nphases": 3,
+      "unidades": "ft",
+      "fonte": "IEEETestCases/LineCodes/IEEELineGeometry.dss",
+      "pos": [
+        {
+          "x": -4,
+          "h": 28
+        },
+        {
+          "x": -1,
+          "h": 28
+        },
+        {
+          "x": 3,
+          "h": 28
+        },
+        {
+          "x": 0,
+          "h": 24
+        }
+      ]
+    },
+    {
+      "id": "cruzeta_8ft_2fn",
+      "nome": "Cruzeta_8ft_2F_N",
+      "descricao": "Cruzeta de 8 ft, 2F nas pontas + neutro",
+      "nconds": 3,
+      "nphases": 2,
+      "unidades": "ft",
+      "fonte": "IEEETestCases/LineCodes/IEEELineGeometry.dss",
+      "pos": [
+        {
+          "x": -4,
+          "h": 28
+        },
+        {
+          "x": 3,
+          "h": 28
+        },
+        {
+          "x": 0,
+          "h": 24
+        }
+      ]
+    },
+    {
+      "id": "poste_1fn_ft",
+      "nome": "Poste_1F_N_ft",
+      "descricao": "Poste de 1F + neutro, cotas em pés",
+      "nconds": 2,
+      "nphases": 1,
+      "unidades": "ft",
+      "fonte": "IEEETestCases/LineCodes/IEEELineGeometry.dss",
+      "pos": [
+        {
+          "x": -0.5,
+          "h": 29
+        },
+        {
+          "x": 0,
+          "h": 24
+        }
+      ]
+    },
+    {
+      "id": "poste_1fn_m",
+      "nome": "Poste_1F_N_m",
+      "descricao": "Poste de 1F + neutro métrico — o arquétipo mais comum do corpus",
+      "nconds": 2,
+      "nphases": 1,
+      "unidades": "m",
+      "fonte": "IEEETestCases/8500-Node/LineGeometry.dss",
+      "pos": [
+        {
+          "x": -0.1524,
+          "h": 10.5156
+        },
+        {
+          "x": 0.1524,
+          "h": 8.2296
+        }
+      ]
+    },
+    {
+      "id": "tri_3fn_m",
+      "nome": "Triangular_3F_N_m",
+      "descricao": "3F em triângulo + neutro, métrico",
+      "nconds": 4,
+      "nphases": 3,
+      "unidades": "m",
+      "fonte": "IEEETestCases/8500-Node/LineGeometry.dss",
+      "pos": [
+        {
+          "x": -0.6096,
+          "h": 9.7536
+        },
+        {
+          "x": 0.1524,
+          "h": 10.3632
+        },
+        {
+          "x": 0.6096,
+          "h": 9.7536
+        },
+        {
+          "x": 0.1524,
+          "h": 8.2296
+        }
+      ]
+    },
+    {
+      "id": "horiz_2fn_m",
+      "nome": "Horizontal_2F_N_m",
+      "descricao": "2F horizontais + neutro, métrico",
+      "nconds": 3,
+      "nphases": 2,
+      "unidades": "m",
+      "fonte": "IEEETestCases/8500-Node/LineGeometry.dss",
+      "pos": [
+        {
+          "x": -0.6096,
+          "h": 9.7536
+        },
+        {
+          "x": 0.6096,
+          "h": 9.7536
+        },
+        {
+          "x": 0.1524,
+          "h": 8.2296
+        }
+      ]
+    },
+    {
+      "id": "vert_3fn_m",
+      "nome": "Vertical_3F_N_m",
+      "descricao": "3F em coluna + neutro (poste sem cruzeta), métrico",
+      "nconds": 4,
+      "nphases": 3,
+      "unidades": "m",
+      "fonte": "IEEETestCases/8500-Node/LineGeometry.dss",
+      "pos": [
+        {
+          "x": 0,
+          "h": 11.683
+        },
+        {
+          "x": 0,
+          "h": 13.1064
+        },
+        {
+          "x": 0,
+          "h": 14.6304
+        },
+        {
+          "x": 0,
+          "h": 10.3632
+        }
+      ]
+    },
+    {
+      "id": "subtransm_3fn_ft",
+      "nome": "Subtransmissao_3F_ft",
+      "descricao": "3F de subtransmissão, para-raios ACIMA das fases (58 ft)",
+      "nconds": 4,
+      "nphases": 3,
+      "unidades": "ft",
+      "fonte": "IEEETestCases/4Bus-YYD/YYD-Master.DSS",
+      "pos": [
+        {
+          "x": -6,
+          "h": 50
+        },
+        {
+          "x": -8,
+          "h": 42
+        },
+        {
+          "x": 8,
+          "h": 42
+        },
+        {
+          "x": 0,
+          "h": 58
+        }
+      ]
+    },
+    {
+      "id": "trifolio_ug_ft",
+      "nome": "Trifolio_UG_ft",
+      "descricao": "3F subterrâneo lado a lado, enterrado a 4 ft",
+      "nconds": 3,
+      "nphases": 3,
+      "unidades": "ft",
+      "fonte": "IEEETestCases/13Bus/IEEE13Nodeckt.dss",
+      "pos": [
+        {
+          "x": -0.5,
+          "h": -4
+        },
+        {
+          "x": 0,
+          "h": -4
+        },
+        {
+          "x": 0.5,
+          "h": -4
+        }
+      ]
+    }
+  ],
+  "montagens": [
+    {
+      "id": "ieee_601",
+      "nome": "GEO_601_3F_N",
+      "descricao": "3F + neutro, cruzeta 8 ft (IEEE 13 \"601\")",
+      "arranjoId": "cruzeta_8ft_3fn",
+      "reduce": true,
+      "cabos": [
+        "acsr_556_5",
+        "acsr_556_5",
+        "acsr_556_5",
+        "acsr_4/0"
+      ]
+    },
+    {
+      "id": "ieee_602",
+      "nome": "GEO_602_3F_N",
+      "descricao": "3F + neutro, todos 4/0 ACSR (IEEE 13 \"602\")",
+      "arranjoId": "cruzeta_8ft_3fn",
+      "reduce": true,
+      "cabos": [
+        "acsr_4/0",
+        "acsr_4/0",
+        "acsr_4/0",
+        "acsr_4/0"
+      ]
+    },
+    {
+      "id": "ieee_603",
+      "nome": "GEO_603_2F_N",
+      "descricao": "2F + neutro, 1/0 ACSR (IEEE 13 \"603\")",
+      "arranjoId": "cruzeta_8ft_2fn",
+      "reduce": true,
+      "cabos": [
+        "acsr_1/0",
+        "acsr_1/0",
+        "acsr_1/0"
+      ]
+    },
+    {
+      "id": "ieee_605",
+      "nome": "GEO_605_1F_N",
+      "descricao": "1F + neutro, 1/0 ACSR (IEEE 13 \"605\")",
+      "arranjoId": "poste_1fn_ft",
+      "reduce": true,
+      "cabos": [
+        "acsr_1/0",
+        "acsr_1/0"
+      ]
+    },
+    {
+      "id": "ieee_300",
+      "nome": "GEO_300_3F_N",
+      "descricao": "3F + neutro, 1/0 ACSR (IEEE 34 \"300\")",
+      "arranjoId": "cruzeta_8ft_3fn",
+      "reduce": true,
+      "cabos": [
+        "acsr_1/0",
+        "acsr_1/0",
+        "acsr_1/0",
+        "acsr_1/0"
+      ]
+    },
+    {
+      "id": "ieee_302",
+      "nome": "GEO_302_1F_N",
+      "descricao": "1F + neutro, #4 ACSR (IEEE 34 \"302\")",
+      "arranjoId": "poste_1fn_ft",
+      "reduce": true,
+      "cabos": [
+        "acsr_#4",
+        "acsr_#4"
+      ]
+    },
+    {
+      "id": "met_1f",
+      "nome": "GEO_MET_1F_N",
+      "descricao": "1F + neutro métrico, #4 ACSR",
+      "arranjoId": "poste_1fn_m",
+      "reduce": true,
+      "cabos": [
+        "4_acsr",
+        "4_acsr"
+      ]
+    },
+    {
+      "id": "met_3f_tri",
+      "nome": "GEO_MET_3F_N",
+      "descricao": "3F + neutro métrico, arranjo triangular, #4 ACSR",
+      "arranjoId": "tri_3fn_m",
+      "reduce": true,
+      "cabos": [
+        "4_acsr",
+        "4_acsr",
+        "4_acsr",
+        "4_acsr"
+      ]
+    },
+    {
+      "id": "met_2f",
+      "nome": "GEO_MET_2F_N",
+      "descricao": "2F + neutro métrico, #2 ACSR",
+      "arranjoId": "horiz_2fn_m",
+      "reduce": true,
+      "cabos": [
+        "2_acsr",
+        "2_acsr",
+        "2_acsr"
+      ]
+    },
+    {
+      "id": "met_3f_vert",
+      "nome": "GEO_MET_3F_VERT",
+      "descricao": "3F + neutro métrico, arranjo vertical (poste sem cruzeta)",
+      "arranjoId": "vert_3fn_m",
+      "reduce": true,
+      "cabos": [
+        "1/0_acsr",
+        "1/0_acsr",
+        "1/0_acsr",
+        "1/0_acsr"
+      ]
+    },
+    {
+      "id": "subtransm",
+      "nome": "GEO_SUBTRANSM_3F",
+      "descricao": "3F subtransmissão, para-raios ACIMA das fases (58 ft)",
+      "arranjoId": "subtransm_3fn_ft",
+      "reduce": true,
+      "cabos": [
+        "acsr336",
+        "acsr336",
+        "acsr336",
+        "acsr4/0"
+      ]
+    },
+    {
+      "id": "subterraneo_3f",
+      "nome": "GEO_UG_3F_CN",
+      "descricao": "3F subterrâneo, cabo concêntrico enterrado a 4 ft (IEEE 13 \"606\")",
+      "arranjoId": "trifolio_ug_ft",
+      "reduce": true,
+      "cabos": [
+        "cn_250_1_3",
+        "cn_250_1_3",
+        "cn_250_1_3"
+      ]
+    }
+  ]
+}

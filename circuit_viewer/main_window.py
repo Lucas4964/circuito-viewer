@@ -147,6 +147,11 @@ from .opendss_export import (
     phase_letters_by_node,
 )
 from .opendss_export_dialog import OpenDssExportDialog
+from .opendss_cables_window import OpenDssCablesWindow
+from .opendss_geometries_window import OpenDssGeometriesWindow
+from .opendss_library_help import OpenDssLibraryHelpDialog
+from .opendss_library_session import OpenDssLibrarySession
+from .opendss_mapping_session import OpenDssMappingSession
 from .opendss_simplified_export import (
     SINGLE_PHASE_BRANCHES_FILENAME,
     TWO_PHASE_BRANCHES_FILENAME,
@@ -616,6 +621,10 @@ class MainWindow(QMainWindow):
         settings: QSettings | None = None,
         curves_path: str | Path | None = None,
         patamares_path: str | Path | None = None,
+        library_cables_path: str | Path | None = None,
+        library_geometries_path: str | Path | None = None,
+        cable_map_path: str | Path | None = None,
+        arrangement_map_path: str | Path | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Visualizador de Circuitos Elétricos")
@@ -805,6 +814,42 @@ class MainWindow(QMainWindow):
         self.branches_window = BranchesWindow(self.branch_table_model, self)
         self.cable_table_model = CableTableModel(self)
         self.cables_window = CablesWindow(self.cable_table_model, self)
+        # WireData/CNData e LineSpacing/LineGeometry são bibliotecas globais e
+        # independentes do catálogo de cabos importado da concessionária.
+        self.opendss_mapping_session = OpenDssMappingSession(
+            cable_map_path=cable_map_path,
+            arrangement_map_path=arrangement_map_path,
+            parent=self,
+        )
+        self.opendss_library_session = OpenDssLibrarySession(
+            cables_path=library_cables_path,
+            geometries_path=library_geometries_path,
+            mapping_session=self.opendss_mapping_session,
+            parent=self,
+        )
+        self.opendss_library_help = OpenDssLibraryHelpDialog(self)
+        self.opendss_cables_window = OpenDssCablesWindow(
+            self.opendss_library_session,
+            self.opendss_library_help,
+            self,
+        )
+        self.opendss_geometries_window = OpenDssGeometriesWindow(
+            self.opendss_library_session,
+            self.opendss_library_help,
+            self,
+        )
+        self.opendss_library_session.cablesSaved.connect(
+            lambda count: self.statusBar().showMessage(
+                f"Biblioteca OpenDSS: {count:n} cabo(s) salvos.", 6_000
+            )
+        )
+        self.opendss_library_session.geometriesSaved.connect(
+            lambda arrangements, geometries: self.statusBar().showMessage(
+                "Biblioteca OpenDSS: "
+                f"{arrangements:n} arranjo(s) e {geometries:n} montagem(ns) salvos.",
+                6_000,
+            )
+        )
         # As curvas são cadastro do usuário, não dado importado: carregam junto
         # com a janela e sobrevivem a qualquer importação.
         self._curves_path = curves_path
@@ -998,11 +1043,27 @@ class MainWindow(QMainWindow):
         self.overlaps_action.setEnabled(False)
         self.overlaps_action.triggered.connect(self._show_overlap_report)
 
-        self.cables_action = QAction("Cabos…", self)
+        self.cables_action = QAction("Cabos importados…", self)
         self.cables_action.setToolTip(
             "Consultar o catálogo de cabos importado"
         )
         self.cables_action.triggered.connect(self._show_cables_window)
+
+        self.opendss_cables_action = QAction("Cabos…", self)
+        self.opendss_cables_action.setToolTip(
+            "Cadastrar condutores WireData e CNData do OpenDSS"
+        )
+        self.opendss_cables_action.triggered.connect(
+            self._show_opendss_cables_window
+        )
+
+        self.opendss_geometries_action = QAction("Geometrias…", self)
+        self.opendss_geometries_action.setToolTip(
+            "Cadastrar arranjos LineSpacing e montagens LineGeometry"
+        )
+        self.opendss_geometries_action.triggered.connect(
+            self._show_opendss_geometries_window
+        )
 
         self.opendss_export_action = QAction("OpenDSS…", self)
         self.opendss_export_action.setEnabled(False)
@@ -1130,6 +1191,10 @@ class MainWindow(QMainWindow):
 
         self.tables_menu = self.menuBar().addMenu("Tabelas")
         self.tables_menu.addAction(self.cables_action)
+
+        self.libraries_menu = self.menuBar().addMenu("Bibliotecas")
+        self.libraries_menu.addAction(self.opendss_cables_action)
+        self.libraries_menu.addAction(self.opendss_geometries_action)
 
         self.export_menu = self.menuBar().addMenu("Exportar")
         self.export_menu.addAction(self.opendss_export_action)
@@ -3388,6 +3453,18 @@ class MainWindow(QMainWindow):
         self.cables_window.show()
         self.cables_window.raise_()
         self.cables_window.activateWindow()
+
+    def _show_opendss_cables_window(self) -> None:
+        self.opendss_cables_window.refresh()
+        self.opendss_cables_window.show()
+        self.opendss_cables_window.raise_()
+        self.opendss_cables_window.activateWindow()
+
+    def _show_opendss_geometries_window(self) -> None:
+        self.opendss_geometries_window.refresh()
+        self.opendss_geometries_window.show()
+        self.opendss_geometries_window.raise_()
+        self.opendss_geometries_window.activateWindow()
 
     def _sync_branches_availability(self) -> None:
         available = (
@@ -5966,17 +6043,84 @@ class MainWindow(QMainWindow):
         falha mais difícil de perceber neste recurso.
         """
 
-        dialog = OpenDssSettingsDialog(self._opendss_load_settings, self)
+        dialog = OpenDssSettingsDialog(
+            self._opendss_load_settings,
+            self,
+            mappings=self.opendss_mapping_session.mappings,
+            cable_names=self.opendss_library_session.saved_cable_names,
+            arrangement_names=self.opendss_library_session.saved_arrangement_names,
+            cable_map_issue=self.opendss_mapping_session.cable_issue,
+            arrangement_map_issue=self.opendss_mapping_session.arrangement_issue,
+        )
+        dialog.cable_map_editor.saveRequested.connect(
+            lambda entries: self._save_single_opendss_map(
+                dialog.cable_map_editor,
+                entries,
+                map_kind="cables",
+            )
+        )
+        dialog.arrangement_map_editor.saveRequested.connect(
+            lambda entries: self._save_single_opendss_map(
+                dialog.arrangement_map_editor,
+                entries,
+                map_kind="arrangements",
+            )
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         chosen = dialog.settings()
-        if chosen == self._opendss_load_settings:
+        chosen_maps = dialog.mappings()
+        load_changed = chosen != self._opendss_load_settings
+        maps_changed = (
+            chosen_maps != self.opendss_mapping_session.mappings
+            or self.opendss_mapping_session.cable_issue is not None
+            or self.opendss_mapping_session.arrangement_issue is not None
+        )
+        if not load_changed and not maps_changed:
             return
-        self._opendss_load_settings = chosen
-        save_opendss_settings(self._settings, chosen)
-        self._invalidate_power_flow()
+        try:
+            if maps_changed:
+                self.opendss_mapping_session.save_maps(chosen_maps)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Falha ao salvar mapas OpenDSS", str(exc))
+            return
+        if load_changed:
+            self._opendss_load_settings = chosen
+            save_opendss_settings(self._settings, chosen)
+            self._invalidate_power_flow()
+        messages: list[str] = []
+        if load_changed:
+            messages.append(self._opendss_settings_summary(chosen))
+        if maps_changed:
+            messages.append(
+                "Mapas OpenDSS: "
+                f"{len(chosen_maps.cables):n} cabo(s) e "
+                f"{len(chosen_maps.arrangements):n} arranjo(s)."
+            )
+        self.statusBar().showMessage(" ".join(messages), 6_000)
+
+    def _save_single_opendss_map(
+        self,
+        editor,  # noqa: ANN001
+        entries,  # noqa: ANN001
+        *,
+        map_kind: str,
+    ) -> None:
+        try:
+            if map_kind == "cables":
+                self.opendss_mapping_session.save_cable_map(entries)
+                label = "cabos"
+            else:
+                self.opendss_mapping_session.save_arrangement_map(entries)
+                label = "arranjos"
+        except (OSError, ValueError) as exc:
+            editor.mark_save_failed(str(exc))
+            QMessageBox.warning(self, "Falha ao salvar mapa OpenDSS", str(exc))
+            return
+        editor.mark_saved(entries)
         self.statusBar().showMessage(
-            self._opendss_settings_summary(chosen), 6_000
+            f"Mapa OpenDSS de {label} salvo: {len(entries):n} vínculo(s).",
+            6_000,
         )
 
     @staticmethod
@@ -7136,6 +7280,14 @@ class MainWindow(QMainWindow):
         if not self.patamares_window.close():
             event.ignore()
             return
+        if not self.opendss_cables_window.close():
+            event.ignore()
+            return
+        if not self.opendss_geometries_window.close():
+            event.ignore()
+            return
+        self.opendss_library_help.close()
+        self.opendss_geometries_window.cut_dialog.close()
         self.search_palette.shutdown()
         self.view.shutdown_satellite()
         super().closeEvent(event)
