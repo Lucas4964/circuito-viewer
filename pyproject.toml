@@ -39,7 +39,13 @@ circuit-viewer = "circuit_viewer.__main__:main"
 include = ["circuit_viewer*"]
 
 [tool.setuptools.package-data]
-circuit_viewer = ["config/*.json"]
+circuit_viewer = [
+    "config/*.json",
+    "dados/cabos.json",
+    "dados/geometrias.json",
+    "dados/mapa_cabos.json",
+    "dados/mapa_arranjos.json",
+]
 
 
 [tool.pytest.ini_options]

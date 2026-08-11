@@ -26,6 +26,7 @@ from .phase_config import PhaseConfiguration
 
 
 IssueSeverity = Literal["error", "warning"]
+_NO_NEUTRAL_CABLE_ID = "-1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,19 +265,20 @@ def build_automatic_assemblies(
         neutral_cable = None
         if neutral_positions:
             raw_neutral_cable = record.neutral_cable_id.strip()
-            neutral_cable, neutral_reason = _resolved_item(
-                raw_neutral_cable,
-                cable_map,
-                cables_by_name,
-            )
-            if neutral_cable is None:
-                report(
-                    "warning",
-                    "CABON_ID",
+            if raw_neutral_cable != _NO_NEUTRAL_CABLE_ID:
+                neutral_cable, neutral_reason = _resolved_item(
                     raw_neutral_cable,
-                    neutral_reason + "; posicoes de neutro removidas",
-                    record.segment_id,
+                    cable_map,
+                    cables_by_name,
                 )
+                if neutral_cable is None:
+                    report(
+                        "warning",
+                        "CABON_ID",
+                        raw_neutral_cable,
+                        neutral_reason + "; posicoes de neutro removidas",
+                        record.segment_id,
+                    )
 
         effective_neutral_id = (
             None
@@ -304,6 +306,7 @@ def build_automatic_assemblies(
             continue
         assembly_id = _stable_id(key)
         keep_neutral = neutral_cable is not None
+        phase_display = "".join(key.phase_letters) + ("N" if keep_neutral else "")
         positions = [
             ConductorPosition(item.x, item.height)
             for item in base.positions[: len(key.phase_letters)]
@@ -315,7 +318,7 @@ def build_automatic_assemblies(
             )
         derived_arrangement = ArrangementDefinition(
             arrangement_id=f"{assembly_id}_spacing",
-            name=f"{base.name} - {''.join(key.phase_letters)}",
+            name=f"{base.name} - {phase_display}",
             phase_count=len(key.phase_letters),
             units=base.units,
             positions=positions,
@@ -328,7 +331,7 @@ def build_automatic_assemblies(
                 [key.neutral_cable_id]
                 * len(base.positions[base.phase_count :])
             )
-        name = f"{base.name} | {''.join(key.phase_letters)} | {phase_cable.name}"
+        name = f"{base.name} | {phase_display} | {phase_cable.name}"
         if neutral_cable is not None:
             name += f" | N:{neutral_cable.name}"
         geometry = GeometryDefinition(

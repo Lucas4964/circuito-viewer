@@ -1,0 +1,85 @@
+{
+  "versao": 1,
+  "mapa_cabos": [
+    {
+      "CABO_ID": "4230",
+      "NOME": "CAL LIGA 6201 1000 KCM 37F"
+    },
+    {
+      "CABO_ID": "4240",
+      "NOME": "CBO ACZ NU 3.09 MM2 1F MOD"
+    },
+    {
+      "CABO_ID": "4243",
+      "NOME": "CBO ACZ NU 2.25 MM2 1F MOD"
+    },
+    {
+      "CABO_ID": "4246",
+      "NOME": "CBO CAL P-XLPE 35MM2 1F MOD"
+    },
+    {
+      "CABO_ID": "4249",
+      "NOME": "CBO CAL P-XLPE 70MM2 1F MOD"
+    },
+    {
+      "CABO_ID": "4250",
+      "NOME": "CBO CAL P-XLPE 50MM2 1F MOD"
+    },
+    {
+      "CABO_ID": "4251",
+      "NOME": "CBO CAL P-XLPE 185MM2 1F MOD"
+    },
+    {
+      "CABO_ID": "4266",
+      "NOME": "ACSR SPARROW 2 AWG"
+    },
+    {
+      "CABO_ID": "4268",
+      "NOME": "ACSR SWAN 4 AWG"
+    },
+    {
+      "CABO_ID": "4271",
+      "NOME": "ACSR TURKEY 6 AWG"
+    },
+    {
+      "CABO_ID": "4275",
+      "NOME": "CBO CA I-XLPE 2X1X10 10MM2 2F MOD"
+    },
+    {
+      "CABO_ID": "4276",
+      "NOME": "CBO CA I-XLPE 3X1X10 10MM2 3F MOD"
+    },
+    {
+      "CABO_ID": "4284",
+      "NOME": "CBO CA I-XLPE 3X1X25 25MM2 3F MOD"
+    },
+    {
+      "CABO_ID": "4302",
+      "NOME": "ACSR RAVEN 1/0 AWG"
+    },
+    {
+      "CABO_ID": "4303",
+      "NOME": "ACSR QUAIL 2/0 AWG"
+    },
+    {
+      "CABO_ID": "4306",
+      "NOME": "ACSR PENGUIN 4/0 AWG"
+    },
+    {
+      "CABO_ID": "4314",
+      "NOME": "CBO CA P-EPR 50 MM2 1F MOD"
+    },
+    {
+      "CABO_ID": "4315",
+      "NOME": "CBO CA NU 8 AWG 1F MOD"
+    },
+    {
+      "CABO_ID": "4332",
+      "NOME": "CBO ACZ NU 9.5 MM2 1F MOD"
+    },
+    {
+      "CABO_ID": "4343",
+      "NOME": "CBO CAL P-XLPE 35MM2 1F MOD"
+    }
+  ]
+}

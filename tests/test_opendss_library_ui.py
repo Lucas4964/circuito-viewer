@@ -432,6 +432,20 @@ class LibraryUiTests(unittest.TestCase):
         self.assertEqual(self.automatic_session.result.total_segments, 0)
         self.assertIn("Importe trechos", window.geometry_empty_label.text())
 
+    def test_automatic_list_marks_only_effective_neutral_with_n(self) -> None:
+        self._set_automatic_lines(("9",))
+        window = self._geometries_window()
+
+        self.assertIn("| DFN |", window.geometries_list.item(0).text())
+
+        self._set_automatic_lines(("9",), neutral_id="-1")
+        self.app.processEvents()
+
+        item_text = window.geometries_list.item(0).text()
+        self.assertIn("| DF |", item_text)
+        self.assertNotIn("| DFN |", item_text)
+        self.assertEqual(self.automatic_session.result.issues, ())
+
     def test_automatic_preview_renders_phase_bindings(self) -> None:
         self._set_automatic_lines(("9",))
         window = self._geometries_window()

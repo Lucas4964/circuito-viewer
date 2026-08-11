@@ -45,6 +45,7 @@ try:
         SegmentCurrents,
         SegmentPowers,
     )
+    from circuit_viewer.opendss_line_mode import OpenDssLineParameterMode
     from circuit_viewer.phase_config import (
         PhaseConfiguration,
         PhaseMappingEntry,
@@ -299,6 +300,20 @@ class PowerFlowUiTests(unittest.TestCase):
         # Sem catálogo de cabos não há R/X/QCAP para montar as Line.
         window._set_cable_model(None)
         self.assertFalse(window.power_flow_action.isEnabled())
+
+    def test_library_mode_allows_power_flow_without_legacy_cables(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        window._opendss_line_parameter_mode = OpenDssLineParameterMode.LIBRARY
+
+        with patch(
+            "circuit_viewer.main_window.power_flow_import_error",
+            return_value=None,
+        ):
+            window._set_cable_model(None)
+            window._sync_power_flow_availability()
+
+        self.assertTrue(window.power_flow_action.isEnabled())
 
     def test_action_needs_at_least_one_visible_circuit(self) -> None:
         window = self._window()
@@ -689,6 +704,112 @@ class PowerFlowUiTests(unittest.TestCase):
         self.assertTrue(window.segment_power_flow_section.isVisible())
 
     # ----------------------------------------------------- consistência/estado
+
+    def test_power_flow_worker_receives_saved_library_snapshots(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        window._opendss_line_parameter_mode = OpenDssLineParameterMode.LIBRARY
+        window._set_cable_model(None)
+        expected_catalog = window.opendss_library_session.saved_catalog()
+        draft_cables = window.opendss_library_session.catalog.cables
+        if draft_cables:
+            draft_cables[0].name = "RASCUNHO NÃO SALVO"
+        created = []
+
+        class SignalStub:
+            def connect(self, _callback) -> None:  # noqa: ANN001
+                pass
+
+        class RecordingWorker:
+            def __init__(self, *args, **kwargs) -> None:  # noqa: ANN003
+                self.args = args
+                self.kwargs = kwargs
+                self.progress = SignalStub()
+                self.finished = SignalStub()
+                self.failed = SignalStub()
+                self.cancelled = SignalStub()
+                created.append(self)
+
+            def moveToThread(self, _thread) -> None:  # noqa: N802, ANN001
+                pass
+
+            def run(self) -> None:
+                pass
+
+            def cancel(self) -> None:
+                pass
+
+            def deleteLater(self) -> None:  # noqa: N802
+                pass
+
+        with patch(
+            "circuit_viewer.main_window.PowerFlowWorker",
+            RecordingWorker,
+        ), patch("circuit_viewer.main_window.QThread.start"):
+            window._run_power_flow()
+
+        worker = created[0]
+        self.assertIsNone(worker.args[1])
+        self.assertIs(
+            worker.kwargs["line_parameter_mode"],
+            OpenDssLineParameterMode.LIBRARY,
+        )
+        snapshot = worker.kwargs["library_catalog"]
+        self.assertIsNot(snapshot, window.opendss_library_session.catalog)
+        self.assertEqual(
+            [(item.cable_id, item.name) for item in snapshot.cables],
+            [(item.cable_id, item.name) for item in expected_catalog.cables],
+        )
+        self.assertEqual(
+            worker.kwargs["library_mappings"],
+            window.opendss_mapping_session.mappings,
+        )
+        self.assertIs(
+            window._power_flow_snapshot[-1],
+            OpenDssLineParameterMode.LIBRARY,
+        )
+        thread = window._power_flow_thread
+        window._on_power_flow_thread_finished()
+        if thread is not None:
+            thread.deleteLater()
+        self.app.processEvents()
+
+    def test_saved_library_signals_invalidate_only_library_power_flow(self) -> None:
+        window = self._window()
+
+        class RunningWorker:
+            def __init__(self) -> None:
+                self.cancel_count = 0
+
+            def cancel(self) -> None:
+                self.cancel_count += 1
+
+        worker = RunningWorker()
+        window._power_flow_worker = worker
+        marker = object()
+        window._power_flow_result = marker
+        window._power_flow_snapshot = (marker,)
+        signals = (
+            (window.opendss_library_session.cablesSaved, (1,)),
+            (window.opendss_library_session.geometriesSaved, (1, 0)),
+            (window.opendss_mapping_session.mapsSaved, (1, 1)),
+        )
+
+        for signal, args in signals:
+            signal.emit(*args)
+        self.assertIs(window._power_flow_result, marker)
+        self.assertEqual(worker.cancel_count, 0)
+
+        window._opendss_line_parameter_mode = OpenDssLineParameterMode.LIBRARY
+        for signal, args in signals:
+            window._power_flow_result = marker
+            window._power_flow_snapshot = (marker,)
+            before = worker.cancel_count
+            signal.emit(*args)
+            self.assertIsNone(window._power_flow_result)
+            self.assertIsNone(window._power_flow_snapshot)
+            self.assertEqual(worker.cancel_count, before + 1)
+        window._power_flow_worker = None
 
     def test_stale_result_is_discarded(self) -> None:
         window = self._window()

@@ -155,7 +155,11 @@ Esse catálogo importado não é a mesma coisa que a biblioteca física do
 OpenDSS: ele guarda parâmetros de sequência (`R1`, `X1`, `R0`, `X0`, `QCAP`)
 referenciados por `CABOF_ID`/`CABON_ID`. Os condutores `WireData`/`CNData` e as
 geometrias `LineSpacing`/`LineGeometry` ficam no menu **Bibliotecas**, descrito
-adiante, e ainda não alteram os trechos nem a exportação atual.
+adiante. No modo original, o catálogo importado continua alimentando a
+exportação e o fluxo de potência; no modo de bibliotecas, esses dois caminhos
+passam a usar os mapas, os `WireData` e os arranjos salvos, sem exigir que o
+catálogo legado de cabos tenha sido importado. Nenhum dos dois modos altera a
+rede desenhada.
 
 ## Importação por banco de dados (`.mdb`)
 
@@ -432,8 +436,10 @@ filtros de visibilidade dos circuitos continuam sendo respeitados.
 
 ## Exportação para OpenDSS
 
-**Exportar > OpenDSS…** gera `trechos.dss`, `chaves.dss`, `reguladores.dss`
-(quando houver regulador exportável) e, quando houver cargas
+**Exportar > OpenDSS…** sempre gera `trechos.dss`, `chaves.dss` e
+`reguladores.dss` (quando houver regulador exportável). Conforme o modo dos
+parâmetros das linhas, também pode gerar os três arquivos físicos descritos
+abaixo. Quando houver cargas
 e patamares importados, um arquivo de cargas por contagem de fases:
 `cargasmonofasicas.dss`, `cargasbifasicas.dss` e `cargastrifasicas.dss`. Por
 cima deles saem `<CODIGO>_Master.dss` e `<CODIGO>_Buscoords.csv`, o arquivo
@@ -442,9 +448,12 @@ das barras. Se houver um resultado vigente de **Atualizar Geradores…**, també
 saem `geradoresmonofasicos.dss`, `geradoresbifasicos.dss` e
 `geradorestrifasicos.dss`.
 
-A opção só fica disponível com barras, trechos, chaves, circuitos e cabos
-importados e um `fases2.json` válido — são as cinco fontes que os dois arquivos
-de rede consomem. Cargas e patamares **não** entram nessa lista: sem eles a
+A opção exige barras, trechos, chaves, circuitos e um `fases2.json` válido. No
+modo **Usar parâmetros elétricos importados**, também exige o catálogo importado
+por **Importar cabos…**. No modo **Usar bibliotecas de cabos e arranjos**, esse
+catálogo legado deixa de ser pré-requisito: os `CABOF_ID`, `CABON_ID` e
+`ARRANJO_ID` dos próprios trechos são resolvidos pelos mapas contra as
+bibliotecas salvas. Cargas e patamares **não** entram nessa lista: sem eles a
 exportação continua funcionando e apenas os arquivos de carga deixam de ser
 gerados. Quando são gerados, saem os três, mesmo que algum fique só com o
 cabeçalho. Geradores também não são precondição: se estiverem importados sem um
@@ -457,6 +466,60 @@ Ao acionar, uma janela lista os circuitos do catálogo para você escolher **um*
 energiza um alimentador só. Em seguida é pedida **uma única pasta de destino**,
 que recebe todos os arquivos gerados; se algum deles já existir, a substituição
 é confirmada antes.
+
+### Modos dos parâmetros das linhas
+
+O modo é escolhido em **Configurações → OpenDSS… → Parâmetros das linhas**
+e vale tanto para esta exportação quanto para o fluxo de potência interno:
+
+- **Usar parâmetros elétricos importados** é o padrão e preserva integralmente o
+  comportamento anterior. `trechos.dss` recebe `R1`, `X1`, `R0`, `X0`, `C1` e
+  `C0` calculados a partir do catálogo importado de cabos, e nenhum arquivo de
+  biblioteca é acrescentado.
+- **Usar bibliotecas de cabos e arranjos** monta cada linha com os dados
+  físicos salvos e os dois mapas OpenDSS. O fechamento é gerado somente para os
+  cabos, arranjos e configurações efetivamente usados pelo circuito; o array
+  legado `montagens` de `geometrias.json` não participa desse caminho.
+
+No segundo modo, o master chama os arquivos nesta ordem, antes dos demais
+elementos: `cabos.dss` → `arranjos.dss` → `geometria_linhas.dss` →
+`trechos.dss`. A dependência fica, portanto, explícita como
+`WireData` → `LineSpacing` → `LineGeometry` → `Line`:
+
+1. **`cabos.dss`** contém um `New WireData.<NOME>` para cada condutor de fase ou
+   neutro realmente referenciado. Embora o cadastro geral também aceite
+   `CNData`, esta exportação física é deliberadamente **WireData-only**: um
+   `CNData` mapeado para um trecho bloqueia a operação.
+2. **`arranjos.dss`** contém somente os `LineSpacing` necessários, nomeados
+   `<NOME_DO_ARRANJO>-<CONFIGURAÇÃO>`, onde a configuração é `1F`, `2F`,
+   `3F`, `1FN`, `2FN` ou `3FN`. `nconds`, `nphases`, `units`, `x` e `h` saem da
+   montagem automática correspondente; variações não usadas não são emitidas.
+3. **`geometria_linhas.dss`** associa cada posição do `LineSpacing` ao
+   `WireData` resolvido pelo Mapa de Cabos. O nome segue
+   `<NOME_DO_ARRANJO>-<CONFIGURAÇÃO>-<CODIGO_DO_CABO>`; o código é o
+   `CABOF_ID` de origem resolvido pelo mapa e, quando há um neutro efetivo, o
+   sufixo `-N-<CABON_ID>` distingue combinações com cabos neutros diferentes.
+   Todas as geometrias são emitidas com `reduce=yes`, inclusive quando não há
+   condutor neutro.
+
+Nesse modo, os elementos de `trechos.dss` deixam de repetir parâmetros de
+sequência e passam a apontar para a montagem pronta:
+
+```text
+New Line.TR-1 Bus1=COD-A.1.2 Bus2=COD-B.1.2 Phases=2 geometry=INTERLAN_PADRAO-2F-CABO_X Length=0.25 units=km
+```
+
+Os nomes físicos e os elementos `Line` são saneados para ASCII e comparados sem
+diferenciar caixa. Colisões posteriores ao saneamento recebem sufixos estáveis
+`_2`, `_3` e assim por diante; a mesma regra cobre chaves e mantém seus comandos
+`Open` apontando para o nome desambiguado.
+
+A validação das bibliotecas é estrita. Se um trecho que passou pelas
+validações comuns não resolver mapa, cabo, arranjo ou montagem; usar cabo
+incompleto ou que não seja `WireData`; ou produzir arranjo inválido, insuficiente
+ou com posições coincidentes, toda a operação é bloqueada antes da gravação.
+Não há retorno silencioso aos parâmetros originais nem exportação parcial do
+fechamento físico.
 
 ### Exportação da rede simplificada por ramais
 
@@ -482,16 +545,20 @@ topologia, mas não cria símbolo nem `Load` no OpenDSS. Equivalência incomplet
 associação ambígua, colisão de nome ou fase incompatível bloqueia toda a
 exportação antes da gravação.
 
+Esta modalidade simplificada continua usando **sempre os parâmetros originais**
+do catálogo importado de cabos. A preferência de bibliotecas afeta somente
+**Exportar > OpenDSS…** e o fluxo de potência interno.
+
 Os equivalentes usam uma `Load` monofásica por fase, `LoadShape` de quatro
 NPAT, `kW=1`, `kvar=1`, `conn=wye`, `class=1` ou `class=2` e nomes
 `RAMAL-<ID>-<N>F-<FASE>`. Cargas, geradores e ramais compartilham o namespace
 `Load.*`. Esta opção não altera **Exportar > OpenDSS…** nem o fluxo de potência
 interno da aplicação.
 
-### `trechos.dss`
+### `trechos.dss` no modo original
 
-Um elemento `Line` por trecho que **não** representa chave. Cada trecho vira uma
-linha no formato:
+Um elemento `Line` por trecho que **não** representa chave. No modo original,
+cada trecho vira uma linha no formato:
 
 ```
 New Line.TR-1 Bus1=COD-A.1.2.3 Bus2=COD-B.1.2.3 Phases=3 R1=0.367 X1=0.42 R0=0.551 X0=1.232 C1=50.1433 C0=50.1433 Length=0.25 units=km
@@ -789,10 +856,10 @@ sobrescreveria a primeira.
 ## Configurações do OpenDSS
 
 O menu **Configurações → OpenDSS…** é organizado nas abas **Tensão das cargas**,
-**Mapa de Cabos** e **Mapa de Arranjos**. A primeira aba define parâmetros
-globais aplicados a **todos os elementos `Load`** do modelo — cargas de consumo
-e geradores — tanto na exportação quanto no fluxo de potência. Os dois caminhos
-geram o mesmo arquivo master.
+**Parâmetros das linhas**, **Mapa de Cabos** e **Mapa de Arranjos**. A primeira
+aba define parâmetros globais aplicados a **todos os elementos `Load`** do modelo
+— cargas de consumo e geradores — tanto na exportação quanto no fluxo de
+potência. Os dois caminhos geram o mesmo arquivo master.
 
 | Parâmetro | Padrão do OpenDSS | Efeito |
 |---|---|---|
@@ -830,10 +897,18 @@ Os valores ficam guardados entre sessões, como a preferência de tema. Alterá-
 descarta um resultado de fluxo de potência já calculado, porque ele descreveria o
 modelo anterior.
 
-As outras duas abas mantêm cadastros manuais entre os identificadores vindos da
-rede e os nomes salvos nas bibliotecas:
+A aba **Parâmetros das linhas** oferece duas opções mutuamente exclusivas:
+**Usar parâmetros elétricos importados** e **Usar bibliotecas de cabos e
+arranjos**. A primeira vem selecionada por padrão, inclusive quando a preferência
+persistida está ausente ou inválida. A escolha é armazenada separadamente em
+`opendss/line_parameter_mode` no `QSettings`; trocá-la invalida imediatamente um
+fluxo de potência calculado com o modelo anterior.
 
-- **Mapa de Cabos:** `CABO_ID` → nome de `WireData`/`CNData`;
+As duas últimas abas mantêm cadastros manuais entre os identificadores vindos
+da rede e os nomes salvos nas bibliotecas:
+
+- **Mapa de Cabos:** `CABO_ID` → nome de cabo da biblioteca (`WireData` ou
+  `CNData`; o modo de exportação por bibliotecas aceita apenas `WireData`);
 - **Mapa de Arranjos:** `ARRANJO_ID` → nome de `LineSpacing`.
 
 Os IDs são textos, têm os espaços externos removidos e não podem se repetir no
@@ -841,7 +916,8 @@ mesmo mapa. O nome é escolhido em uma lista que contém somente itens já salvo
 na biblioteca; o mesmo item pode atender vários IDs. O botão **OK** permanece
 desabilitado enquanto houver uma linha incompleta, duplicada ou apontando para
 uma referência inexistente. **Restaurar padrões** age apenas sobre a aba ativa:
-restaura os limites de tensão ou limpa o respectivo mapa.
+restaura os limites de tensão, seleciona o modo original ou limpa o respectivo
+mapa.
 
 Cada mapa possui também um botão **Salvar**, ao lado das ações de inclusão e
 remoção. Ele grava imediatamente somente o mapa daquela aba e mantém a janela
@@ -859,9 +935,9 @@ botão **Salvar**.
 
 Os mapas participam da montagem automática assim que existem trechos na tela.
 Salvar um mapa recalcula as combinações transitórias; rascunhos ainda não salvos
-não alteram o modelo ativo. A exportação OpenDSS continua usando os parâmetros de
-sequência importados, portanto essa atualização visual não invalida um resultado
-de fluxo de potência.
+não alteram o modelo ativo. No modo original, isso continua sem efeito elétrico.
+No modo de bibliotecas, os mapas salvos passam a alimentar a exportação e o
+fluxo de potência; salvá-los invalida qualquer resultado de fluxo anterior.
 
 ## Patamares de cálculo
 
@@ -930,8 +1006,19 @@ bloqueada. Cada arranjo com `N` posições de fase atende linhas com até `N`
 fases: as primeiras posições são preenchidas, em sequência, pelas fases reais.
 Por exemplo, o `FASES2` rotulado historicamente como `FD` usa `F1 → D` e
 `F2 → F`, seguindo a ordem dos terminais DSS. Se o cabo neutro não resolver,
-as posições neutras são removidas e a aba registra um aviso. Arranjos e
-montagens usam o mesmo gráfico cartesiano; a navegação não edita coordenadas.
+as posições neutras são removidas e a aba registra um aviso. `CABON_ID=-1`
+declara explicitamente que o trecho não usa neutro: o mapa de cabos não é
+consultado e nenhum aviso é emitido. O nome da montagem acrescenta `N` ao bloco
+de fases somente quando o neutro foi efetivamente preservado (`DEFN`, por
+exemplo). Arranjos e montagens usam o mesmo gráfico cartesiano; a navegação não
+edita coordenadas.
+
+Com **Usar bibliotecas de cabos e arranjos** ativo, somente o retrato
+**salvo** dessas bibliotecas e mapas entra na exportação normal e no fluxo de
+potência. Salvar uma mudança em cabos ou geometrias invalida um fluxo anterior;
+rascunhos não. Cabos incompletos continuam permitidos no cadastro, e `CNData`
+continua disponível para compatibilidade da biblioteca, mas qualquer um deles
+efetivamente usado bloqueia a exportação WireData-only com um diagnóstico.
 
 ## Curvas horárias
 
@@ -1040,6 +1127,14 @@ exatamente os mesmos arquivos da exportação acima, compila o master no OpenDSS
 traz as grandezas de volta para o painel lateral — o passo de exportar, abrir o
 OpenDSS e ler os resultados por fora deixa de ser necessário.
 
+O modo dos parâmetros das linhas também vale aqui. No modo de bibliotecas, os
+três arquivos físicos e o `geometry=` das linhas entram no modelo temporário, e
+o catálogo legado de cabos não é pré-requisito. Antes de compilar o primeiro
+circuito, a aplicação valida as montagens de **todos** os circuitos visíveis; uma
+referência física inválida bloqueia o estudo inteiro, sem resolver apenas uma
+parte com outro modelo. Trocar o modo ou, enquanto ele estiver ativo, salvar
+mapas ou bibliotecas descarta o resultado anterior.
+
 O fluxo usa o mesmo retrato de geradores da exportação. Se houver geradores
 importados sem **Atualizar Geradores…**, pede confirmação para executar sem
 eles. Atualizar, substituir ou invalidar esse retrato descarta qualquer fluxo já
@@ -1068,13 +1163,15 @@ python -m pip install -e ".[opendss]"
   deixaria só o último; a aplicação reconduz a solução com `number=1` e resolve
   patamar por patamar.
 - **Pré-requisitos:** os mesmos da exportação (barras, trechos, chaves,
-  circuitos, cabos e `fases2.json`). Cargas e patamares são opcionais, mas sem os
-  dois o modelo sai sem carga alguma e as correntes tendem a zero — a aplicação
-  pede confirmação antes de executar nesse caso.
+  circuitos e `fases2.json`). O catálogo importado de cabos é obrigatório apenas
+  no modo original; no modo de bibliotecas, valem as bibliotecas e os mapas
+  salvos. Cargas e patamares são opcionais, mas sem os dois o modelo sai sem carga
+  alguma e as correntes tendem a zero — a aplicação pede confirmação antes de
+  executar nesse caso.
 
 Os arquivos `.dss` gerados vão para uma pasta temporária e são apagados no fim.
-Quem quiser os arquivos deve usar **Exportar > OpenDSS…**, que continua
-inalterado.
+Quem quiser inspecioná-los deve usar **Exportar > OpenDSS…**, que aplica o mesmo
+modo selecionado e grava o conjunto correspondente.
 
 ### Onde os resultados aparecem
 

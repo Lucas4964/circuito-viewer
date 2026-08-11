@@ -28,10 +28,11 @@ Três decisões dão forma ao módulo:
   implementação dessas regras.
 
 Os nomes são comparados com ``casefold()`` porque o OpenDSS não diferencia
-maiúsculas de minúsculas e devolve tudo em minúsculas. Como a checagem de
-homônimos do exportador **é** sensível a caixa, dois códigos que difiram só na
-caixa chegam aqui como colisão: as duas entradas são descartadas com
-diagnóstico, em vez de atribuir a corrente de um trecho ao outro.
+maiúsculas de minúsculas e devolve tudo em minúsculas. O modo de bibliotecas
+desambigua homônimos com sufixos determinísticos; no modo original, dois códigos
+que difiram só na caixa ainda podem chegar aqui como colisão e as duas entradas
+são descartadas com diagnóstico, em vez de atribuir a corrente de um trecho ao
+outro.
 """
 
 from __future__ import annotations
@@ -52,11 +53,16 @@ from .opendss_engine import DssEngine
 from .opendss_export import (
     LOAD_PATTERN_COUNT,
     MAX_REPORTED_ISSUES,
+    OpenDssExportBundle,
+    OpenDssLibraryExportError,
     build_export,
     bus_namer,
     parse_number,
     sanitize_dss_name,
 )
+from .opendss_library import OpenDssLibraryCatalog
+from .opendss_line_mode import OpenDssLineParameterMode
+from .opendss_mapping_store import OpenDssLibraryMappings
 from .opendss_settings import OpenDssLoadSettings
 from .phase_config import PhaseConfiguration
 
@@ -227,7 +233,7 @@ class PowerFlowResult:
     """
 
     catalog: CircuitCatalogModel
-    cables: CableModel
+    cables: CableModel | None
     phase_configuration: PhaseConfiguration
     loads: LoadModel | None
     patterns: LoadPatternModel | None
@@ -361,11 +367,40 @@ def _segment_index_by_line_name(
     )
 
 
-def _ampacity(cables: CableModel, cable_id: str) -> float | None:
-    cable = cables.record_for_id(cable_id) if cable_id else None
-    if cable is None:
+def _ampacity(
+    cables: CableModel | None,
+    cable_id: str,
+    *,
+    line_parameter_mode: OpenDssLineParameterMode,
+    library_catalog: OpenDssLibraryCatalog | None,
+    library_mappings: OpenDssLibraryMappings | None,
+) -> float | None:
+    if not cable_id:
         return None
-    value = parse_number(cable.iadm)
+    if line_parameter_mode is OpenDssLineParameterMode.LIBRARY:
+        if library_catalog is None or library_mappings is None:
+            return None
+        source_id = str(cable_id).strip()
+        if not source_id:
+            return None
+        library_name = next(
+            (
+                entry.library_name
+                for entry in library_mappings.cables
+                if entry.source_id == source_id
+            ),
+            None,
+        )
+        if library_name is None:
+            return None
+        cable = next(
+            (item for item in library_catalog.cables if item.name == library_name),
+            None,
+        )
+        value = None if cable is None else parse_number(cable.normal_amps)
+    else:
+        cable = cables.record_for_id(cable_id) if cables is not None else None
+        value = None if cable is None else parse_number(cable.iadm)
     return value if value is not None and value > 0.0 else None
 
 
@@ -768,7 +803,7 @@ def _harvest_regulator_taps(
 def run_power_flow(
     engine: DssEngine,
     catalog: CircuitCatalogModel,
-    cables: CableModel,
+    cables: CableModel | None,
     phase_configuration: PhaseConfiguration,
     circuit_indices: Sequence[int] | Iterable[int],
     *,
@@ -778,6 +813,11 @@ def run_power_flow(
     generator_updates: GeneratorUpdateModel | None = None,
     regulators: RegulatorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
+    line_parameter_mode: OpenDssLineParameterMode = (
+        OpenDssLineParameterMode.ORIGINAL
+    ),
+    library_catalog: OpenDssLibraryCatalog | None = None,
+    library_mappings: OpenDssLibraryMappings | None = None,
     step_count: int = LOAD_PATTERN_COUNT,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
@@ -808,6 +848,45 @@ def run_power_flow(
             )
 
     selected = _selected_indices(catalog, circuit_indices)
+    line_parameter_mode = OpenDssLineParameterMode(line_parameter_mode)
+
+    def build_circuit_export(circuit_index: int) -> OpenDssExportBundle:
+        return build_export(
+            catalog,
+            cables,
+            phase_configuration,
+            (circuit_index,),
+            loads=loads,
+            patterns=patterns,
+            generator_updates=generator_updates,
+            regulators=regulators,
+            load_settings=load_settings,
+            line_parameter_mode=line_parameter_mode,
+            library_catalog=library_catalog,
+            library_mappings=library_mappings,
+            cancel_check=cancel_check,
+        )
+
+    # No modo biblioteca, a consistência é uma propriedade do estudo inteiro:
+    # uma referência ausente em qualquer alimentador deve falhar antes que o
+    # motor compile ou resolva o primeiro. Os bundles também são reutilizados no
+    # laço abaixo, evitando gerar cada circuito duas vezes.
+    preflight_exports: dict[int, OpenDssExportBundle] = {}
+    if line_parameter_mode is OpenDssLineParameterMode.LIBRARY:
+        preflight_errors: list[str] = []
+        for circuit_index in selected:
+            if cancel_check is not None and cancel_check():
+                raise InterruptedError("Fluxo de potência cancelado.")
+            try:
+                preflight_exports[circuit_index] = build_circuit_export(circuit_index)
+            except OpenDssLibraryExportError as exc:
+                circuit_id = catalog.definition(circuit_index).circuit_id
+                preflight_errors.extend(
+                    f"Circuito {circuit_id}: {error}" for error in exc.errors
+                )
+        if preflight_errors:
+            raise OpenDssLibraryExportError(preflight_errors)
+
     report = _PowerFlowReport()
     segment_currents: dict[int, SegmentCurrents] = {}
     segment_powers: dict[int, SegmentPowers] = {}
@@ -825,18 +904,9 @@ def run_power_flow(
         if cancel_check is not None and cancel_check():
             raise InterruptedError("Fluxo de potência cancelado.")
         definition = catalog.definition(circuit_index)
-        bundle = build_export(
-            catalog,
-            cables,
-            phase_configuration,
-            (circuit_index,),
-            loads=loads,
-            patterns=patterns,
-            generator_updates=generator_updates,
-            regulators=regulators,
-            load_settings=load_settings,
-            cancel_check=cancel_check,
-        )
+        bundle = preflight_exports.get(circuit_index)
+        if bundle is None:
+            bundle = build_circuit_export(circuit_index)
         master = bundle.master
         if master is None or not master.text:
             reason = "; ".join(issue.reason for issue in (master.issues if master else ()))
@@ -958,6 +1028,9 @@ def run_power_flow(
             segment_currents,
             segment_powers,
             report,
+            line_parameter_mode=line_parameter_mode,
+            library_catalog=library_catalog,
+            library_mappings=library_mappings,
         )
         solved.append(definition.circuit_id)
 
@@ -997,7 +1070,7 @@ def _rows(values: Sequence[float], width: int, step_count: int) -> tuple[tuple[f
 
 def _merge_circuit_results(
     catalog: CircuitCatalogModel,
-    cables: CableModel,
+    cables: CableModel | None,
     step_count: int,
     circuit_nodes: Mapping[int, Sequence[int]],
     circuit_magnitudes: Mapping[int, Sequence[float]],
@@ -1014,6 +1087,10 @@ def _merge_circuit_results(
     segment_currents: dict[int, SegmentCurrents],
     segment_powers: dict[int, SegmentPowers],
     report: _PowerFlowReport,
+    *,
+    line_parameter_mode: OpenDssLineParameterMode,
+    library_catalog: OpenDssLibraryCatalog | None,
+    library_mappings: OpenDssLibraryMappings | None,
 ) -> None:
     """Converte os acumuladores do circuito em dataclasses e mescla no total.
 
@@ -1045,6 +1122,7 @@ def _merge_circuit_results(
             angles=bar_angles,
         )
 
+    ampacity_by_cable_id: dict[str, float | None] = {}
     for segment_index, nodes in line_nodes.items():
         if segment_index in segment_currents:
             continue
@@ -1057,14 +1135,20 @@ def _merge_circuit_results(
                 "trecho ficou sem resultado",
             )
             continue
+        cable_id = segments.record(segment_index).phase_cable_id
+        if cable_id not in ampacity_by_cable_id:
+            ampacity_by_cable_id[cable_id] = _ampacity(
+                cables,
+                cable_id,
+                line_parameter_mode=line_parameter_mode,
+                library_catalog=library_catalog,
+                library_mappings=library_mappings,
+            )
         segment_currents[segment_index] = SegmentCurrents(
             nodes=nodes,
             magnitudes=magnitudes,
             angles=segment_angles,
-            ampacity=_ampacity(
-                cables,
-                segments.record(segment_index).phase_cable_id,
-            ),
+            ampacity=ampacity_by_cable_id[cable_id],
         )
         # A potência é opcional: um motor que não a forneça deixa o trecho com
         # corrente e sem potência, em vez de perder os dois resultados.

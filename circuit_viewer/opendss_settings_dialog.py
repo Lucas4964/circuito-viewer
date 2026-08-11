@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from PyQt6.QtCore import QSettings, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QRadioButton,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -24,6 +26,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .opendss_line_mode import (
+    DEFAULT_OPENDSS_LINE_PARAMETER_MODE,
+    OpenDssLineParameterMode,
+    parse_opendss_line_parameter_mode,
+)
 from .opendss_mapping_store import (
     LibraryNameMapping,
     OpenDssLibraryMappings,
@@ -39,6 +46,7 @@ from .table_columns import EXCEL_LIKE_TABLE_STYLE
 
 
 SETTINGS_PREFIX = "opendss/load_"
+LINE_PARAMETER_MODE_SETTINGS_KEY = "opendss/line_parameter_mode"
 
 
 def load_opendss_settings(settings: QSettings) -> OpenDssLoadSettings:
@@ -59,6 +67,27 @@ def save_opendss_settings(
 ) -> None:
     for key, text in value.as_mapping().items():
         settings.setValue(f"{SETTINGS_PREFIX}{key}", text)
+    settings.sync()
+
+
+def load_opendss_line_parameter_mode(
+    settings: QSettings,
+) -> OpenDssLineParameterMode:
+    """Lê o modo das linhas; ausência ou corrupção usam o modo original."""
+
+    return parse_opendss_line_parameter_mode(
+        settings.value(LINE_PARAMETER_MODE_SETTINGS_KEY)
+    )
+
+
+def save_opendss_line_parameter_mode(
+    settings: QSettings,
+    value: OpenDssLineParameterMode,
+) -> None:
+    """Persiste separadamente a fonte dos parâmetros elétricos das linhas."""
+
+    mode = OpenDssLineParameterMode(value)
+    settings.setValue(LINE_PARAMETER_MODE_SETTINGS_KEY, mode.value)
     settings.sync()
 
 
@@ -317,6 +346,9 @@ class OpenDssSettingsDialog(QDialog):
         arrangement_names: Sequence[str] = (),
         cable_map_issue: str | None = None,
         arrangement_map_issue: str | None = None,
+        line_parameter_mode: OpenDssLineParameterMode = (
+            DEFAULT_OPENDSS_LINE_PARAMETER_MODE
+        ),
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Configurações do OpenDSS")
@@ -328,7 +360,12 @@ class OpenDssSettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget(self)
         self.tabs.setObjectName("opendss_settings_tabs")
-        self.tabs.addTab(self._build_voltage_tab(current), "Tensão das cargas")
+        self.voltage_tab = self._build_voltage_tab(current)
+        self.tabs.addTab(self.voltage_tab, "Tensão das cargas")
+        self.line_parameters_tab = self._build_line_parameters_tab(
+            parse_opendss_line_parameter_mode(line_parameter_mode)
+        )
+        self.tabs.addTab(self.line_parameters_tab, "Parâmetros das linhas")
         self.cable_map_editor = MappingTableEditor(
             "CABO_ID",
             cable_names,
@@ -367,6 +404,67 @@ class OpenDssSettingsDialog(QDialog):
         self.arrangement_map_editor.changed.connect(self._sync_accept_enabled)
         self._sync_fields(self.apply_limits_check.isChecked())
         self._sync_accept_enabled()
+
+    def _build_line_parameters_tab(
+        self,
+        current: OpenDssLineParameterMode,
+    ) -> QWidget:
+        tab = QWidget(self.tabs)
+        tab.setObjectName("opendss_line_parameters_tab")
+        layout = QVBoxLayout(tab)
+
+        explanation = QLabel(
+            "Escolha a fonte dos parâmetros elétricos e físicos usados nas "
+            "linhas exportadas para o OpenDSS.",
+            tab,
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self.line_parameter_mode_group = QButtonGroup(tab)
+        self.line_parameter_mode_group.setObjectName(
+            "opendss_line_parameter_mode_group"
+        )
+        self.line_parameter_mode_group.setExclusive(True)
+
+        self.original_line_parameters_radio = QRadioButton(
+            "Usar parâmetros elétricos importados",
+            tab,
+        )
+        self.original_line_parameters_radio.setObjectName(
+            "opendss_line_parameters_original"
+        )
+        self.original_line_parameters_radio.setToolTip(
+            "Mantém a exportação atual baseada nos parâmetros de sequência "
+            "dos cabos importados."
+        )
+        self.line_parameter_mode_group.addButton(
+            self.original_line_parameters_radio
+        )
+        layout.addWidget(self.original_line_parameters_radio)
+
+        self.library_line_parameters_radio = QRadioButton(
+            "Usar bibliotecas de cabos e arranjos",
+            tab,
+        )
+        self.library_line_parameters_radio.setObjectName(
+            "opendss_line_parameters_library"
+        )
+        self.library_line_parameters_radio.setToolTip(
+            "Usa as bibliotecas e os mapas salvos para gerar WireData, "
+            "LineSpacing e LineGeometry."
+        )
+        self.line_parameter_mode_group.addButton(
+            self.library_line_parameters_radio
+        )
+        layout.addWidget(self.library_line_parameters_radio)
+
+        if current is OpenDssLineParameterMode.LIBRARY:
+            self.library_line_parameters_radio.setChecked(True)
+        else:
+            self.original_line_parameters_radio.setChecked(True)
+        layout.addStretch(1)
+        return tab
 
     def _build_voltage_tab(self, current: OpenDssLoadSettings) -> QWidget:
         tab = QWidget(self.tabs)
@@ -456,16 +554,18 @@ class OpenDssSettingsDialog(QDialog):
             ok.setEnabled(valid)
 
     def restore_defaults(self) -> None:
-        index = self.tabs.currentIndex()
-        if index == 0:
+        current_tab = self.tabs.currentWidget()
+        if current_tab is self.voltage_tab:
             self.apply_limits_check.setChecked(
                 DEFAULT_OPENDSS_LOAD_SETTINGS.voltage_limits_enabled
             )
             self.vminpu_input.setValue(DEFAULT_OPENDSS_LOAD_SETTINGS.vminpu)
             self.vmaxpu_input.setValue(DEFAULT_OPENDSS_LOAD_SETTINGS.vmaxpu)
-        elif index == 1:
+        elif current_tab is self.line_parameters_tab:
+            self.original_line_parameters_radio.setChecked(True)
+        elif current_tab is self.cable_map_editor:
             self.cable_map_editor.clear_map()
-        else:
+        elif current_tab is self.arrangement_map_editor:
             self.arrangement_map_editor.clear_map()
         self._sync_accept_enabled()
 
@@ -478,6 +578,11 @@ class OpenDssSettingsDialog(QDialog):
             )
         except ValueError:
             return DEFAULT_OPENDSS_LOAD_SETTINGS
+
+    def line_parameter_mode(self) -> OpenDssLineParameterMode:
+        if self.library_line_parameters_radio.isChecked():
+            return OpenDssLineParameterMode.LIBRARY
+        return OpenDssLineParameterMode.ORIGINAL
 
     def mappings(self) -> OpenDssLibraryMappings:
         return OpenDssLibraryMappings(

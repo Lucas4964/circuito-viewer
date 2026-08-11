@@ -133,6 +133,9 @@ from .model import (
     UtmCrs,
 )
 from .opendss_export import (
+    ARRANGEMENTS_FILENAME,
+    CABOS_FILENAME,
+    LINE_GEOMETRIES_FILENAME,
     LINES_FILENAME,
     REGULATORS_FILENAME,
     SINGLE_PHASE_GENERATORS_FILENAME,
@@ -152,6 +155,7 @@ from .opendss_automatic_assembly_session import OpenDssAutomaticAssemblySession
 from .opendss_geometries_window import OpenDssGeometriesWindow
 from .opendss_library_help import OpenDssLibraryHelpDialog
 from .opendss_library_session import OpenDssLibrarySession
+from .opendss_line_mode import OpenDssLineParameterMode
 from .opendss_mapping_session import OpenDssMappingSession
 from .opendss_simplified_export import (
     SINGLE_PHASE_BRANCHES_FILENAME,
@@ -173,7 +177,9 @@ from .opendss_powerflow import (
 from .opendss_settings import OpenDssLoadSettings
 from .opendss_settings_dialog import (
     OpenDssSettingsDialog,
+    load_opendss_line_parameter_mode,
     load_opendss_settings,
+    save_opendss_line_parameter_mode,
     save_opendss_settings,
 )
 from .overlap_report import CircuitOverlapReportWindow, OverlapReportTableModel
@@ -638,6 +644,9 @@ class MainWindow(QMainWindow):
         # Preferência de sessão para sessão, como o tema: os limites de tensão
         # das cargas valem para a exportação e para o fluxo de potência.
         self._opendss_load_settings = load_opendss_settings(self._settings)
+        self._opendss_line_parameter_mode = load_opendss_line_parameter_mode(
+            self._settings
+        )
 
         self._model: CircuitModel | None = None
         self._line_model: LineNetworkModel | None = None
@@ -852,12 +861,21 @@ class MainWindow(QMainWindow):
                 f"Biblioteca OpenDSS: {count:n} cabo(s) salvos.", 6_000
             )
         )
+        self.opendss_library_session.cablesSaved.connect(
+            self._on_opendss_library_inputs_saved
+        )
         self.opendss_library_session.geometriesSaved.connect(
             lambda arrangements, _legacy: self.statusBar().showMessage(
                 "Biblioteca OpenDSS: "
                 f"{arrangements:n} arranjo(s) salvo(s); montagens automáticas atualizadas.",
                 6_000,
             )
+        )
+        self.opendss_library_session.geometriesSaved.connect(
+            self._on_opendss_library_inputs_saved
+        )
+        self.opendss_mapping_session.mapsSaved.connect(
+            self._on_opendss_library_inputs_saved
         )
         # As curvas são cadastro do usuário, não dado importado: carregam junto
         # com a janela e sobrevivem a qualquer importação.
@@ -3493,14 +3511,13 @@ class MainWindow(QMainWindow):
         self.simplified_network_action.setEnabled(available)
 
     def _sync_export_availability(self) -> None:
-        """Só exporta com tudo que trechos.dss consome carregado."""
+        """Habilita cada exportação com os insumos exigidos por seu modo."""
 
-        available = (
+        common_available = (
             self._model is not None
             and self._line_model is not None
             and self._switch_model is not None
             and self._circuit_catalog is not None
-            and self._cable_model is not None
             and self._phase_configuration is not None
             and self._import_thread is None
             and self._export_thread is None
@@ -3508,8 +3525,17 @@ class MainWindow(QMainWindow):
             and self._branch_csv_thread is None
             and self._generator_update_thread is None
         )
-        self.opendss_export_action.setEnabled(available)
-        self.simplified_opendss_export_action.setEnabled(available)
+        self.opendss_export_action.setEnabled(
+            common_available
+            and (
+                self._cable_model is not None
+                or self._uses_opendss_library_parameters()
+            )
+        )
+        # A projeção simplificada mantém integralmente o exportador original.
+        self.simplified_opendss_export_action.setEnabled(
+            common_available and self._cable_model is not None
+        )
 
     def _visible_circuit_indices(self) -> tuple[int, ...]:
         """Circuitos marcados na janela de circuitos, na ordem do catálogo.
@@ -3536,7 +3562,10 @@ class MainWindow(QMainWindow):
             and self._line_model is not None
             and self._switch_model is not None
             and self._circuit_catalog is not None
-            and self._cable_model is not None
+            and (
+                self._cable_model is not None
+                or self._uses_opendss_library_parameters()
+            )
             and self._phase_configuration is not None
             and bool(self._visible_circuit_indices())
             and self._import_thread is None
@@ -3767,6 +3796,18 @@ class MainWindow(QMainWindow):
             message.setDetailedText("\n".join(details))
         message.exec()
 
+    def _uses_opendss_library_parameters(self) -> bool:
+        return (
+            self._opendss_line_parameter_mode
+            is OpenDssLineParameterMode.LIBRARY
+        )
+
+    def _on_opendss_library_inputs_saved(self, *_counts: int) -> None:
+        """Invalida somente estudos que dependem do retrato salvo alterado."""
+
+        if self._uses_opendss_library_parameters():
+            self._invalidate_power_flow()
+
     def _invalidate_power_flow(self) -> None:
         """Descarta o resultado: ele deriva de todos os modelos importados."""
 
@@ -3830,6 +3871,12 @@ class MainWindow(QMainWindow):
         """
 
         names = [LINES_FILENAME, SWITCHES_FILENAME]
+        if self._uses_opendss_library_parameters():
+            names[:0] = [
+                CABOS_FILENAME,
+                ARRANGEMENTS_FILENAME,
+                LINE_GEOMETRIES_FILENAME,
+            ]
         # Aproximação deliberada: só a exportação sabe quantos reguladores são
         # de fato exportáveis, e um modelo cujos reguladores fossem todos
         # descartados não geraria o arquivo. Perguntar por um arquivo que não
@@ -3853,7 +3900,7 @@ class MainWindow(QMainWindow):
         configuration = self._phase_configuration
         if (
             catalog is None
-            or cables is None
+            or (cables is None and not self._uses_opendss_library_parameters())
             or configuration is None
             or self._export_thread is not None
         ):
@@ -4154,7 +4201,11 @@ class MainWindow(QMainWindow):
         catalog = self._circuit_catalog
         cables = self._cable_model
         configuration = self._phase_configuration
-        if catalog is None or cables is None or configuration is None:
+        if (
+            catalog is None
+            or (cables is None and not self._uses_opendss_library_parameters())
+            or configuration is None
+        ):
             return
         exportable_loads = self._exportable_loads()
         generator_updates = self._exportable_generators()
@@ -4163,6 +4214,16 @@ class MainWindow(QMainWindow):
         # arquivo sai como um retrato consistente do estado atual, mesmo que uma
         # importação substitua os modelos enquanto a exportação corre.
         loads, patterns = exportable_loads or (None, None)
+        library_catalog = (
+            self.opendss_library_session.saved_catalog()
+            if self._uses_opendss_library_parameters()
+            else None
+        )
+        library_mappings = (
+            self.opendss_mapping_session.mappings
+            if self._uses_opendss_library_parameters()
+            else None
+        )
         worker = OpenDssExportWorker(
             catalog,
             cables,
@@ -4173,6 +4234,9 @@ class MainWindow(QMainWindow):
             generator_updates=generator_updates,
             regulators=self._regulator_model,
             load_settings=self._opendss_load_settings,
+            line_parameter_mode=self._opendss_line_parameter_mode,
+            library_catalog=library_catalog,
+            library_mappings=library_mappings,
         )
         worker.moveToThread(thread)
 
@@ -4307,9 +4371,28 @@ class MainWindow(QMainWindow):
             if self._opendss_load_settings.is_default
             else f" ({self._opendss_settings_summary(self._opendss_load_settings)})"
         )
+        library_result = result.library
+        library_file_summaries = (
+            ()
+            if library_result is None
+            else (
+                f"{CABOS_FILENAME} ({library_result.cable_count:n} cabo(s))",
+                f"{ARRANGEMENTS_FILENAME} "
+                f"({library_result.arrangement_count:n} arranjo(s))",
+                f"{LINE_GEOMETRIES_FILENAME} "
+                f"({library_result.line_geometry_count:n} geometria(s))",
+            )
+        )
+        library_notice = (
+            ""
+            if not library_file_summaries
+            else " Arquivos de biblioteca: "
+            + ", ".join(library_file_summaries)
+            + "."
+        )
         if not result.has_warnings:
             self.statusBar().showMessage(
-                f"{summary} exportados para {destination}.{limits}",
+                f"{summary} exportados para {destination}.{limits}{library_notice}",
                 5_000,
             )
             return
@@ -4323,6 +4406,17 @@ class MainWindow(QMainWindow):
                 ()
                 if self._opendss_load_settings.is_default
                 else (self._opendss_settings_summary(self._opendss_load_settings),)
+            ),
+            *(
+                ()
+                if library_result is None
+                else (
+                    f"{CABOS_FILENAME}: {library_result.cable_count:n} cabo(s)",
+                    f"{ARRANGEMENTS_FILENAME}: "
+                    f"{library_result.arrangement_count:n} arranjo(s)",
+                    f"{LINE_GEOMETRIES_FILENAME}: "
+                    f"{library_result.line_geometry_count:n} geometria(s)",
+                )
             ),
             f"{LINES_FILENAME}: {result.lines.exported_count:n} trechos, "
             f"{result.lines.discarded_count:n} descartados",
@@ -4392,7 +4486,7 @@ class MainWindow(QMainWindow):
         configuration = self._phase_configuration
         if (
             catalog is None
-            or cables is None
+            or (cables is None and not self._uses_opendss_library_parameters())
             or configuration is None
             or self._import_thread is not None
             or self._branch_thread is not None
@@ -4435,6 +4529,16 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
+        library_catalog = (
+            self.opendss_library_session.saved_catalog()
+            if self._uses_opendss_library_parameters()
+            else None
+        )
+        library_mappings = (
+            self.opendss_mapping_session.mappings
+            if self._uses_opendss_library_parameters()
+            else None
+        )
         thread = QThread(self)
         worker = PowerFlowWorker(
             catalog,
@@ -4446,6 +4550,9 @@ class MainWindow(QMainWindow):
             generator_updates=generator_updates,
             regulators=self._regulator_model,
             load_settings=self._opendss_load_settings,
+            line_parameter_mode=self._opendss_line_parameter_mode,
+            library_catalog=library_catalog,
+            library_mappings=library_mappings,
         )
         worker.moveToThread(thread)
 
@@ -4473,6 +4580,7 @@ class MainWindow(QMainWindow):
             loads,
             patterns,
             generator_updates,
+            self._opendss_line_parameter_mode,
         )
         self.import_action.setEnabled(False)
         self._sync_power_flow_availability()
@@ -4521,6 +4629,7 @@ class MainWindow(QMainWindow):
             loads,
             patterns,
             generator_updates,
+            self._opendss_line_parameter_mode,
         )
         snapshot = self._power_flow_snapshot
         # Resultados produzidos antes da inclusão dos geradores (e alguns
@@ -4528,6 +4637,8 @@ class MainWindow(QMainWindow):
         # continuam válidos somente quando não há resultado de geradores.
         if snapshot is not None and len(snapshot) == 5:
             snapshot = (*snapshot, None)
+        if snapshot is not None and len(snapshot) == 6:
+            snapshot = (*snapshot, OpenDssLineParameterMode.ORIGINAL)
         if snapshot is None or any(
             expected is not actual
             for expected, actual in zip(snapshot, current, strict=True)
@@ -6061,6 +6172,7 @@ class MainWindow(QMainWindow):
             arrangement_names=self.opendss_library_session.saved_arrangement_names,
             cable_map_issue=self.opendss_mapping_session.cable_issue,
             arrangement_map_issue=self.opendss_mapping_session.arrangement_issue,
+            line_parameter_mode=self._opendss_line_parameter_mode,
         )
         dialog.cable_map_editor.saveRequested.connect(
             lambda entries: self._save_single_opendss_map(
@@ -6079,14 +6191,16 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         chosen = dialog.settings()
+        chosen_mode = dialog.line_parameter_mode()
         chosen_maps = dialog.mappings()
         load_changed = chosen != self._opendss_load_settings
+        mode_changed = chosen_mode is not self._opendss_line_parameter_mode
         maps_changed = (
             chosen_maps != self.opendss_mapping_session.mappings
             or self.opendss_mapping_session.cable_issue is not None
             or self.opendss_mapping_session.arrangement_issue is not None
         )
-        if not load_changed and not maps_changed:
+        if not load_changed and not mode_changed and not maps_changed:
             return
         try:
             if maps_changed:
@@ -6097,10 +6211,22 @@ class MainWindow(QMainWindow):
         if load_changed:
             self._opendss_load_settings = chosen
             save_opendss_settings(self._settings, chosen)
+        if mode_changed:
+            self._opendss_line_parameter_mode = chosen_mode
+            save_opendss_line_parameter_mode(self._settings, chosen_mode)
+            self._sync_export_availability()
+        if load_changed or mode_changed:
             self._invalidate_power_flow()
         messages: list[str] = []
         if load_changed:
             messages.append(self._opendss_settings_summary(chosen))
+        if mode_changed:
+            mode_label = (
+                "biblioteca de cabos e arranjos"
+                if chosen_mode is OpenDssLineParameterMode.LIBRARY
+                else "parâmetros originais"
+            )
+            messages.append(f"Parâmetros das linhas: {mode_label}.")
         if maps_changed:
             messages.append(
                 "Mapas OpenDSS: "

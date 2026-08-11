@@ -1,0 +1,33 @@
+{
+  "versao": 1,
+  "arranjos": [
+    {
+      "id": "arranjo_novo",
+      "nome": "INTERPLAN_MT",
+      "nconds": 4,
+      "nphases": 3,
+      "unidades": "m",
+      "pos": [
+        {
+          "x": 0.22,
+          "h": 10.0
+        },
+        {
+          "x": 0.92,
+          "h": 10.0
+        },
+        {
+          "x": 1.66,
+          "h": 10.0
+        },
+        {
+          "x": 0.0,
+          "h": 6.0
+        }
+      ],
+      "descricao": "ARRANJO PADRAO INTERPLAN",
+      "fonte": "INTERPLAN"
+    }
+  ],
+  "montagens": []
+}

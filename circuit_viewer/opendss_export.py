@@ -4,8 +4,10 @@ Camada de núcleo: não importa Qt, para poder ser testada headless e executada
 em thread secundária sem cuidados de afinidade.
 
 Dois arquivos de rede são sempre gerados — ``trechos.dss`` (``Line``) e
-``chaves.dss`` (``Line ... Switch=Yes``). Cargas e geradores acrescentam, cada
-um, um arquivo por contagem de fases (``Load`` + ``LoadShape``). O par
+``chaves.dss`` (``Line ... Switch=Yes``). No modo de bibliotecas, eles são
+precedidos por ``cabos.dss``, ``arranjos.dss`` e ``geometria_linhas.dss``.
+Cargas e geradores acrescentam, cada um, um arquivo por contagem de fases
+(``Load`` + ``LoadShape``). O par
 ``<CODIGO>_Master.dss`` e ``<CODIGO>_Buscoords.csv`` cria o circuito, chama os
 demais arquivos existentes e resolve.
 
@@ -38,6 +40,20 @@ from .model import (
     LoadPatternModel,
     RegulatorModel,
 )
+from .opendss_automatic_assembly import (
+    AutomaticAssembly,
+    build_automatic_assemblies,
+)
+from .opendss_library import (
+    OPEN_DSS_UNITS,
+    ArrangementDefinition,
+    CableDefinition,
+    OpenDssLibraryCatalog,
+    cable_issues,
+    coincident_positions,
+)
+from .opendss_line_mode import OpenDssLineParameterMode
+from .opendss_mapping_store import OpenDssLibraryMappings
 from .phase_config import PhaseConfiguration
 
 if TYPE_CHECKING:
@@ -52,6 +68,9 @@ FREQUENCY_HZ = 60.0
 LINES_FILENAME = "trechos.dss"
 SWITCHES_FILENAME = "chaves.dss"
 REGULATORS_FILENAME = "reguladores.dss"
+CABOS_FILENAME = "cabos.dss"
+ARRANGEMENTS_FILENAME = "arranjos.dss"
+LINE_GEOMETRIES_FILENAME = "geometria_linhas.dss"
 SINGLE_PHASE_LOADS_FILENAME = "cargasmonofasicas.dss"
 TWO_PHASE_LOADS_FILENAME = "cargasbifasicas.dss"
 THREE_PHASE_LOADS_FILENAME = "cargastrifasicas.dss"
@@ -128,6 +147,36 @@ class OpenDssExportIssue:
 
     segment_id: str
     reason: str
+
+
+class OpenDssLibraryExportError(ValueError):
+    """Falha estrita ao resolver as bibliotecas físicas de uma exportação."""
+
+    def __init__(self, errors: Iterable[str]) -> None:
+        unique = tuple(
+            dict.fromkeys(
+                str(error).strip() for error in errors if str(error).strip()
+            )
+        )
+        if not unique:
+            unique = ("erro desconhecido ao resolver as bibliotecas OpenDSS",)
+        self.errors = unique
+        super().__init__(
+            "Não foi possível exportar usando as bibliotecas OpenDSS:\n• "
+            + "\n• ".join(unique)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OpenDssLibraryExportResult:
+    """Os três arquivos físicos que precedem ``trechos.dss`` no master."""
+
+    cables_text: str
+    arrangements_text: str
+    line_geometries_text: str
+    cable_count: int
+    arrangement_count: int
+    line_geometry_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +334,7 @@ class OpenDssExportBundle:
     two_phase_generators: OpenDssGeneratorExportResult | None = None
     three_phase_generators: OpenDssGeneratorExportResult | None = None
     master: OpenDssMasterExportResult | None = None
+    library: OpenDssLibraryExportResult | None = None
 
     @property
     def loads_by_phase_count(
@@ -333,7 +383,17 @@ class OpenDssExportBundle:
         """
 
         regulators = self.regulators
+        library = self.library
         return (
+            *(
+                ()
+                if library is None
+                else (
+                    (CABOS_FILENAME, library.cables_text),
+                    (ARRANGEMENTS_FILENAME, library.arrangements_text),
+                    (LINE_GEOMETRIES_FILENAME, library.line_geometries_text),
+                )
+            ),
             (LINES_FILENAME, self.lines.text),
             (SWITCHES_FILENAME, self.switches.text),
             *(
@@ -834,12 +894,532 @@ def build_line_export(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _LibraryLineCandidate:
+    segment_index: int
+    segment_id: str
+    name: str
+    dss_nodes: str
+    phase_count: int
+    bus1: str
+    bus2: str
+    length: float
+
+
+def _full_precision(value: float | int) -> str:
+    """Representação decimal curta que preserva o ``float`` da biblioteca."""
+
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return repr(number)
+
+
+def _usable_library_number(value: float | int | None) -> bool:
+    return (
+        value is not None
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) != 0.0
+    )
+
+
+def _namespace_names(
+    entries: Sequence[tuple[object, str, str]],
+) -> dict[object, str]:
+    """Saneia e desambigua nomes dentro de um namespace OpenDSS."""
+
+    used: set[str] = set()
+    result: dict[object, str] = {}
+    for key, raw_name, fallback in entries:
+        base = sanitize_dss_name(raw_name) or sanitize_dss_name(fallback) or "ITEM"
+        candidate = base
+        suffix = 2
+        while candidate.casefold() in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate.casefold())
+        result[key] = candidate
+    return result
+
+
+def _render_definition_file(
+    header: str,
+    blocks: Sequence[Sequence[str]],
+) -> str:
+    lines = [header, ""]
+    for block in blocks:
+        lines.extend(block)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _cable_block(cable: CableDefinition, dss_name: str) -> tuple[str, ...]:
+    parameters: list[str] = [f"New WireData.{dss_name}"]
+    if _usable_library_number(cable.rac):
+        parameters.append(f"Rac={_full_precision(cable.rac)}")
+    if _usable_library_number(cable.rdc):
+        parameters.append(f"Rdc={_full_precision(cable.rdc)}")
+    parameters.append(f"Runits={cable.resistance_units}")
+    parameters.append(f"GMRac={_full_precision(cable.gmr)}")
+    parameters.append(f"GMRunits={cable.gmr_units}")
+    if _usable_library_number(cable.radius):
+        parameters.append(f"Radius={_full_precision(cable.radius)}")
+    elif _usable_library_number(cable.diameter):
+        parameters.append(f"Diam={_full_precision(cable.diameter)}")
+    parameters.append(f"Radunits={cable.radius_units}")
+    if _usable_library_number(cable.normal_amps):
+        parameters.append(f"Normamps={_full_precision(cable.normal_amps)}")
+    if _usable_library_number(cable.emergency_amps):
+        parameters.append(f"Emergamps={_full_precision(cable.emergency_amps)}")
+    return (" ".join(parameters),)
+
+
+def _segments_label(segment_ids: Iterable[str]) -> str:
+    values = tuple(sorted(set(segment_ids), key=str.casefold))
+    return ", ".join(values)
+
+
+def build_library_line_export(
+    catalog: CircuitCatalogModel,
+    phase_configuration: PhaseConfiguration,
+    circuit_indices: Sequence[int] | Iterable[int],
+    library_catalog: OpenDssLibraryCatalog,
+    library_mappings: OpenDssLibraryMappings,
+    *,
+    skip_segments: frozenset[int] = frozenset(),
+    cancel_check: Callable[[], bool] | None = None,
+    progress: ProgressCallback | None = None,
+) -> tuple[OpenDssLineExportResult, OpenDssLibraryExportResult]:
+    """Gera linhas por ``geometry=`` e o fecho físico estritamente necessário."""
+
+    selected = _selected_indices(catalog, circuit_indices)
+    segments = catalog.segments
+    entries_by_value = _entries_by_value(phase_configuration)
+    report = _ExportReport()
+    bus_name = bus_namer(catalog)
+    total = sum(
+        int(catalog.membership(index).common_segment_indices.size)
+        for index in selected
+    )
+    processed = 0
+    owner_voltage: dict[int, tuple[str, float | None]] = {}
+    used_names: dict[str, str] = {}
+    used_names_casefold: dict[str, str] = {}
+    switch_segments: set[int] = set()
+    candidates: list[_LibraryLineCandidate] = []
+
+    # Este laço replica apenas os filtros comuns do caminho legado. A resolução
+    # física abaixo é deliberadamente paralela e não altera build_line_export().
+    for circuit_index in selected:
+        definition = catalog.definition(circuit_index)
+        membership = catalog.membership(circuit_index)
+        switch_segments.update(int(value) for value in membership.switch_segment_indices)
+        nominal_voltage = parse_number(definition.nominal_voltage)
+        if nominal_voltage is not None and nominal_voltage <= 0.0:
+            nominal_voltage = None
+
+        for raw_index in membership.common_segment_indices:
+            if cancel_check is not None and processed % 4_096 == 0 and cancel_check():
+                raise InterruptedError("Exportação cancelada.")
+            processed += 1
+            if progress is not None and processed % 1_000 == 0:
+                progress(processed, total)
+
+            segment_index = int(raw_index)
+            if segment_index in skip_segments:
+                continue
+            segment_id = segments.segment_ids[segment_index]
+            previous = owner_voltage.get(segment_index)
+            if previous is not None:
+                owner_id, owner_kv = previous
+                if owner_kv != nominal_voltage:
+                    report.add(
+                        segment_id,
+                        f"trecho compartilhado com o circuito {definition.circuit_id}, "
+                        f"de VNOM diferente; foi usada a do circuito {owner_id}",
+                        discarded=False,
+                    )
+                continue
+            owner_voltage[segment_index] = (definition.circuit_id, nominal_voltage)
+
+            if nominal_voltage is None:
+                report.add(
+                    segment_id,
+                    f"circuito {definition.circuit_id} sem VNOM numérica positiva "
+                    f"({definition.nominal_voltage.strip() or '<vazio>'})",
+                )
+                continue
+
+            record = segments.record(segment_index)
+            entry = entries_by_value.get(record.phases.strip().casefold())
+            if entry is None:
+                report.add(
+                    segment_id,
+                    f"FASES2 '{record.phases.strip() or '<vazio>'}' sem relação "
+                    "em fases2.json",
+                )
+                continue
+            if not entry.dss:
+                report.add(
+                    segment_id,
+                    f"FASES2 '{entry.fases2}' sem código DSS em fases2.json",
+                )
+                continue
+            if record.length is None:
+                report.add(segment_id, "COMPR ausente")
+                continue
+
+            name = sanitize_dss_name(record.code)
+            if not name:
+                name = sanitize_dss_name(segment_id) or "LINE"
+                report.add(
+                    segment_id,
+                    "CODIGO vazio ou sem caracteres válidos; o nome da linha "
+                    "usou um identificador alternativo",
+                    discarded=False,
+                )
+            base_name = name
+            suffix = 2
+            while name.casefold() in used_names_casefold:
+                name = f"{base_name}_{suffix}"
+                suffix += 1
+            if name != base_name:
+                previous_segment = used_names_casefold[base_name.casefold()]
+                report.add(
+                    segment_id,
+                    f"nome '{base_name}' colidiu com o trecho {previous_segment} "
+                    f"no namespace Line; foi exportado como '{name}'",
+                    discarded=False,
+                )
+            used_names[name] = segment_id
+            used_names_casefold[name.casefold()] = segment_id
+            candidates.append(
+                _LibraryLineCandidate(
+                    segment_index=segment_index,
+                    segment_id=segment_id,
+                    name=name,
+                    dss_nodes=entry.dss,
+                    phase_count=entry.phase_count,
+                    bus1=bus_name(int(segments.start_indices[segment_index])),
+                    bus2=bus_name(int(segments.end_indices[segment_index])),
+                    length=record.length,
+                )
+            )
+
+    if cancel_check is not None and cancel_check():
+        raise InterruptedError("Exportação cancelada.")
+
+    automatic = build_automatic_assemblies(
+        segments,
+        phase_configuration,
+        library_catalog,
+        library_mappings,
+    )
+    candidate_indices = {item.segment_index for item in candidates}
+    candidate_ids = {item.segment_id for item in candidates}
+    strict_errors: list[str] = []
+    for issue in automatic.issues:
+        affected = tuple(
+            segment_id for segment_id in issue.segment_ids if segment_id in candidate_ids
+        )
+        if affected:
+            strict_errors.append(
+                f"{issue.field} '{issue.value}': {issue.reason} "
+                f"(trechos: {_segments_label(affected)})"
+            )
+
+    assembly_by_segment: dict[int, AutomaticAssembly] = {}
+    for assembly in automatic.assemblies:
+        for segment_index in assembly.segment_indices:
+            if segment_index not in candidate_indices:
+                continue
+            previous = assembly_by_segment.setdefault(segment_index, assembly)
+            if previous is not assembly:
+                strict_errors.append(
+                    f"trecho {segments.segment_ids[segment_index]} recebeu mais de uma montagem automática"
+                )
+    for candidate in candidates:
+        if candidate.segment_index not in assembly_by_segment:
+            strict_errors.append(
+                f"trecho {candidate.segment_id} não recebeu montagem automática"
+            )
+
+    # spacing: arranjo base + quantidade de fases + presença efetiva de neutro.
+    spacing_specs: dict[
+        tuple[str, int, bool], tuple[ArrangementDefinition, str, set[str]]
+    ] = {}
+    # geometry: spacing + IDs crus de cabo, para honrar o Mapa de Cabos.
+    geometry_specs: dict[
+        tuple[tuple[str, int, bool], str, str | None],
+        tuple[AutomaticAssembly, set[str]],
+    ] = {}
+    geometry_by_segment: dict[
+        int, tuple[tuple[str, int, bool], str, str | None]
+    ] = {}
+    cable_uses: dict[str, set[str]] = {}
+
+    for candidate in candidates:
+        assembly = assembly_by_segment.get(candidate.segment_index)
+        if assembly is None:
+            continue
+        neutral = assembly.key.neutral_cable_id is not None
+        phase_count = len(assembly.phase_letters)
+        spacing_key = (assembly.key.arrangement_id, phase_count, neutral)
+        existing_spacing = spacing_specs.get(spacing_key)
+        if existing_spacing is None:
+            spacing_specs[spacing_key] = (
+                assembly.arrangement,
+                f"{phase_count}F{'N' if neutral else ''}",
+                {candidate.segment_id},
+            )
+        else:
+            existing_spacing[2].add(candidate.segment_id)
+            first_positions = tuple(
+                (item.x, item.height) for item in existing_spacing[0].positions
+            )
+            current_positions = tuple(
+                (item.x, item.height) for item in assembly.arrangement.positions
+            )
+            if first_positions != current_positions:
+                strict_errors.append(
+                    f"arranjo {assembly.key.arrangement_id} gerou posições divergentes "
+                    f"para {existing_spacing[1]}"
+                )
+
+        record = segments.record(candidate.segment_index)
+        raw_phase = record.phase_cable_id.strip()
+        raw_neutral = record.neutral_cable_id.strip() if neutral else None
+        geometry_key = (spacing_key, raw_phase, raw_neutral)
+        existing_geometry = geometry_specs.get(geometry_key)
+        if existing_geometry is None:
+            geometry_specs[geometry_key] = (assembly, {candidate.segment_id})
+        else:
+            existing_geometry[1].add(candidate.segment_id)
+            if existing_geometry[0].key.phase_cable_id != assembly.key.phase_cable_id or (
+                existing_geometry[0].key.neutral_cable_id
+                != assembly.key.neutral_cable_id
+            ):
+                strict_errors.append(
+                    f"os IDs de cabo da montagem {raw_phase} resolvem cabos físicos divergentes"
+                )
+        geometry_by_segment[candidate.segment_index] = geometry_key
+        cable_uses.setdefault(assembly.key.phase_cable_id, set()).add(
+            candidate.segment_id
+        )
+        if assembly.key.neutral_cable_id is not None:
+            cable_uses.setdefault(assembly.key.neutral_cable_id, set()).add(
+                candidate.segment_id
+            )
+
+    for spacing_key, (arrangement, config, uses) in spacing_specs.items():
+        if arrangement.units not in OPEN_DSS_UNITS:
+            strict_errors.append(
+                f"arranjo {spacing_key[0]} ({config}) usa unidade inválida "
+                f"'{arrangement.units}' (trechos: {_segments_label(uses)})"
+            )
+        if arrangement.phase_count not in {1, 2, 3}:
+            strict_errors.append(
+                f"arranjo {spacing_key[0]} gerou {arrangement.phase_count} fases; "
+                "somente 1F, 2F e 3F são suportados"
+            )
+        if arrangement.conductor_count < arrangement.phase_count:
+            strict_errors.append(
+                f"arranjo {spacing_key[0]} ({config}) tem menos condutores que fases"
+            )
+        invalid_positions = [
+            index + 1
+            for index, position in enumerate(arrangement.positions)
+            if not math.isfinite(float(position.x))
+            or not math.isfinite(float(position.height))
+        ]
+        if invalid_positions:
+            strict_errors.append(
+                f"arranjo {spacing_key[0]} ({config}) possui coordenadas inválidas "
+                f"nas posições {', '.join(map(str, invalid_positions))}"
+            )
+        repeated = coincident_positions(arrangement)
+        if repeated:
+            pairs = ", ".join(f"{left} e {right}" for left, right in repeated)
+            strict_errors.append(
+                f"arranjo {spacing_key[0]} ({config}) possui posições coincidentes: {pairs} "
+                f"(trechos: {_segments_label(uses)})"
+            )
+
+    used_cables: dict[str, CableDefinition] = {}
+    for cable_id, uses in cable_uses.items():
+        cable = library_catalog.cable(cable_id)
+        if cable is None:
+            strict_errors.append(
+                f"cabo {cable_id} ausente da biblioteca "
+                f"(trechos: {_segments_label(uses)})"
+            )
+            continue
+        used_cables[cable_id] = cable
+        if cable.cable_type != "wire":
+            strict_errors.append(
+                f"cabo {cable.name} é {cable.cable_type}; este modo aceita somente WireData "
+                f"(trechos: {_segments_label(uses)})"
+            )
+        missing = cable_issues(cable)
+        if missing:
+            strict_errors.append(
+                f"cabo {cable.name} incompleto: falta {', '.join(missing)} "
+                f"(trechos: {_segments_label(uses)})"
+            )
+
+    if strict_errors:
+        raise OpenDssLibraryExportError(strict_errors)
+
+    sorted_cables = sorted(
+        used_cables.values(), key=lambda item: (item.name.casefold(), item.cable_id)
+    )
+    cable_names = _namespace_names(
+        [
+            (cable.cable_id, cable.name, cable.cable_id)
+            for cable in sorted_cables
+        ]
+    )
+    sorted_spacings = sorted(
+        spacing_specs,
+        key=lambda key: (
+            library_catalog.arrangement(key[0]).name.casefold(),
+            key[1],
+            key[2],
+            key[0],
+        ),
+    )
+    spacing_names = _namespace_names(
+        [
+            (
+                key,
+                f"{library_catalog.arrangement(key[0]).name}-{spacing_specs[key][1]}",
+                f"{key[0]}-{spacing_specs[key][1]}",
+            )
+            for key in sorted_spacings
+        ]
+    )
+    sorted_geometries = sorted(
+        geometry_specs,
+        key=lambda key: (
+            spacing_names[key[0]].casefold(),
+            key[1].casefold(),
+            (key[2] or "").casefold(),
+        ),
+    )
+    geometry_name_entries: list[tuple[object, str, str]] = []
+    for key in sorted_geometries:
+        spacing_key, raw_phase, raw_neutral = key
+        base = library_catalog.arrangement(spacing_key[0])
+        config = spacing_specs[spacing_key][1]
+        raw_name = f"{base.name}-{config}-{raw_phase}"
+        if raw_neutral is not None:
+            raw_name += f"-N-{raw_neutral}"
+        geometry_name_entries.append((key, raw_name, geometry_specs[key][0].assembly_id))
+    geometry_names = _namespace_names(geometry_name_entries)
+
+    cable_blocks = [
+        _cable_block(cable, cable_names[cable.cable_id]) for cable in sorted_cables
+    ]
+    spacing_blocks: list[tuple[str, ...]] = []
+    for key in sorted_spacings:
+        arrangement = spacing_specs[key][0]
+        spacing_blocks.append(
+            (
+                f"New LineSpacing.{spacing_names[key]} "
+                f"nconds={arrangement.conductor_count} "
+                f"nphases={arrangement.phase_count} units={arrangement.units}",
+                "~ x=["
+                + ",".join(_full_precision(item.x) for item in arrangement.positions)
+                + "]",
+                "~ h=["
+                + ",".join(
+                    _full_precision(item.height) for item in arrangement.positions
+                )
+                + "]",
+            )
+        )
+
+    geometry_blocks: list[tuple[str, ...]] = []
+    for key in sorted_geometries:
+        spacing_key = key[0]
+        assembly = geometry_specs[key][0]
+        arrangement = spacing_specs[spacing_key][0]
+        block = [
+            f"New LineGeometry.{geometry_names[key]} "
+            f"nconds={arrangement.conductor_count} "
+            f"nphases={arrangement.phase_count} "
+            "reduce=yes "
+            f"spacing={spacing_names[spacing_key]}"
+        ]
+        for index, cable_id in enumerate(assembly.geometry.cable_ids, start=1):
+            block.append(f"~ cond={index} wire={cable_names[cable_id]}")
+        geometry_blocks.append(tuple(block))
+
+    line_entries: list[str] = []
+    exported_segments: list[tuple[str, int]] = []
+    for candidate in candidates:
+        geometry_key = geometry_by_segment[candidate.segment_index]
+        line_entries.append(
+            f"New Line.{candidate.name}"
+            f" Bus1={candidate.bus1}.{candidate.dss_nodes}"
+            f" Bus2={candidate.bus2}.{candidate.dss_nodes}"
+            f" Phases={candidate.phase_count}"
+            f" geometry={geometry_names[geometry_key]}"
+            f" Length={_format(candidate.length / 1_000.0)}"
+            " units=km"
+        )
+        exported_segments.append((candidate.name, candidate.segment_index))
+
+    if progress is not None:
+        progress(total, total)
+    line_header = (
+        "! Trechos exportados pelo Visualizador de Circuitos Eletricos",
+        "! Parametros fisicos em cabos.dss, arranjos.dss e geometria_linhas.dss",
+        "! Circuitos: "
+        + ", ".join(
+            sanitize_dss_name(catalog.definition(index).circuit_id)
+            for index in selected
+        ),
+        "",
+    )
+    line_text = "\n".join((*line_header, *line_entries))
+    if line_entries:
+        line_text += "\n"
+    line_result = OpenDssLineExportResult(
+        text=line_text,
+        exported_count=len(line_entries),
+        skipped_switch_count=len(switch_segments),
+        discarded_count=report.discarded,
+        issues=tuple(report.issues),
+        omitted_issues=report.omitted,
+        used_names=frozenset(used_names),
+        exported_segments=tuple(exported_segments),
+    )
+    library_result = OpenDssLibraryExportResult(
+        cables_text=_render_definition_file(
+            "! Cabos WireData usados pelo circuito", cable_blocks
+        ),
+        arrangements_text=_render_definition_file(
+            "! Arranjos LineSpacing usados pelo circuito", spacing_blocks
+        ),
+        line_geometries_text=_render_definition_file(
+            "! Geometrias LineGeometry usadas pelo circuito", geometry_blocks
+        ),
+        cable_count=len(cable_blocks),
+        arrangement_count=len(spacing_blocks),
+        line_geometry_count=len(geometry_blocks),
+    )
+    return line_result, library_result
+
+
 def build_switch_export(
     catalog: CircuitCatalogModel,
     phase_configuration: PhaseConfiguration,
     circuit_indices: Sequence[int] | Iterable[int],
     *,
     reserved_names: frozenset[str] = frozenset(),
+    resolve_name_collisions: bool = False,
     include_segments: frozenset[int] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
@@ -868,6 +1448,8 @@ def build_switch_export(
     lines: list[str] = []
     open_commands: list[str] = []
     used_names: dict[str, str] = {}
+    used_names_casefold: set[str] = set()
+    reserved_names_casefold = {name.casefold() for name in reserved_names}
     exported_segments: list[tuple[str, int]] = []
     seen_segments: set[int] = set()
 
@@ -922,18 +1504,37 @@ def build_switch_export(
                     "linha usou o CHAVE_ID",
                     discarded=False,
                 )
-            if name in reserved_names:
-                report.add(
-                    segment_id,
-                    f"nome '{name}' já usado por um trecho em {LINES_FILENAME}",
-                )
-                continue
-            if name in used_names:
-                report.add(
-                    segment_id,
-                    f"nome '{name}' já usado pela chave {used_names[name]}",
-                )
-                continue
+                if resolve_name_collisions and not name:
+                    name = "SWITCH"
+            if resolve_name_collisions:
+                base_name = name
+                suffix = 2
+                while (
+                    name.casefold() in reserved_names_casefold
+                    or name.casefold() in used_names_casefold
+                ):
+                    name = f"{base_name}_{suffix}"
+                    suffix += 1
+                if name != base_name:
+                    report.add(
+                        segment_id,
+                        f"nome '{base_name}' colidiu no namespace Line; "
+                        f"a chave foi exportada como '{name}'",
+                        discarded=False,
+                    )
+            else:
+                if name in reserved_names:
+                    report.add(
+                        segment_id,
+                        f"nome '{name}' já usado por um trecho em {LINES_FILENAME}",
+                    )
+                    continue
+                if name in used_names:
+                    report.add(
+                        segment_id,
+                        f"nome '{name}' já usado pela chave {used_names[name]}",
+                    )
+                    continue
 
             bus1 = bus_name(int(segments.start_indices[segment_index]))
             bus2 = bus_name(int(segments.end_indices[segment_index]))
@@ -948,6 +1549,7 @@ def build_switch_export(
                 " Switch=Yes"
             )
             used_names[name] = switch.switch_id
+            used_names_casefold.add(name.casefold())
             exported_segments.append((name, segment_index))
 
             state = switch.state.strip()
@@ -1974,7 +2576,7 @@ def build_master_export(
 
 def build_export(
     catalog: CircuitCatalogModel,
-    cables: CableModel,
+    cables: CableModel | None,
     phase_configuration: PhaseConfiguration,
     circuit_indices: Sequence[int] | Iterable[int],
     *,
@@ -1983,6 +2585,9 @@ def build_export(
     generator_updates: GeneratorUpdateModel | None = None,
     regulators: RegulatorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
+    line_parameter_mode: OpenDssLineParameterMode = OpenDssLineParameterMode.ORIGINAL,
+    library_catalog: OpenDssLibraryCatalog | None = None,
+    library_mappings: OpenDssLibraryMappings | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssExportBundle:
@@ -2017,6 +2622,18 @@ def build_export(
     mantém a linha dele.
     """
 
+    if isinstance(line_parameter_mode, OpenDssLineParameterMode):
+        normalized_line_mode = line_parameter_mode
+    else:
+        try:
+            normalized_line_mode = OpenDssLineParameterMode(
+                str(line_parameter_mode).strip().casefold()
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Modo de parâmetros de linha inválido: {line_parameter_mode!r}."
+            ) from exc
+
     selected = _selected_indices(catalog, circuit_indices)
     regulator_result = (
         None
@@ -2030,24 +2647,52 @@ def build_export(
             progress=progress,
         )
     )
-    line_result = build_line_export(
-        catalog,
-        cables,
-        phase_configuration,
-        selected,
-        skip_segments=(
-            frozenset()
-            if regulator_result is None
-            else regulator_result.replaced_segments
-        ),
-        cancel_check=cancel_check,
-        progress=progress,
+    skip_segments = (
+        frozenset()
+        if regulator_result is None
+        else regulator_result.replaced_segments
     )
+    library_result: OpenDssLibraryExportResult | None = None
+    if normalized_line_mode is OpenDssLineParameterMode.LIBRARY:
+        missing_library_inputs: list[str] = []
+        if library_catalog is None:
+            missing_library_inputs.append("biblioteca de cabos e arranjos não informada")
+        if library_mappings is None:
+            missing_library_inputs.append("mapas de cabos e arranjos não informados")
+        if missing_library_inputs:
+            raise OpenDssLibraryExportError(missing_library_inputs)
+        assert library_catalog is not None
+        assert library_mappings is not None
+        line_result, library_result = build_library_line_export(
+            catalog,
+            phase_configuration,
+            selected,
+            library_catalog,
+            library_mappings,
+            skip_segments=skip_segments,
+            cancel_check=cancel_check,
+            progress=progress,
+        )
+    else:
+        if cables is None:
+            raise ValueError("O modo original requer o modelo de cabos importado.")
+        line_result = build_line_export(
+            catalog,
+            cables,
+            phase_configuration,
+            selected,
+            skip_segments=skip_segments,
+            cancel_check=cancel_check,
+            progress=progress,
+        )
     switch_result = build_switch_export(
         catalog,
         phase_configuration,
         selected,
         reserved_names=line_result.used_names,
+        resolve_name_collisions=(
+            normalized_line_mode is OpenDssLineParameterMode.LIBRARY
+        ),
         cancel_check=cancel_check,
         progress=progress,
     )
@@ -2110,6 +2755,7 @@ def build_export(
         single_phase_generators=generator_results.get(1),
         two_phase_generators=generator_results.get(2),
         three_phase_generators=generator_results.get(3),
+        library=library_result,
     )
     # O master vem por último: ele chama os arquivos de elementos e por isso
     # precisa saber quais existem.
@@ -2132,4 +2778,5 @@ def build_export(
         two_phase_generators=generator_results.get(2),
         three_phase_generators=generator_results.get(3),
         master=master_result,
+        library=library_result,
     )

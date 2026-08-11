@@ -3,13 +3,14 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt6.QtCore import Qt
+    from PyQt6.QtCore import QSettings, Qt
     from PyQt6.QtWidgets import (
         QApplication,
         QDialog,
@@ -37,7 +38,11 @@ try:
         UtmCrs,
     )
     from circuit_viewer.opendss_export import (
+        ARRANGEMENTS_FILENAME,
+        CABOS_FILENAME,
+        LINE_GEOMETRIES_FILENAME,
         LINES_FILENAME,
+        OpenDssLibraryExportResult,
         REGULATORS_FILENAME,
         SINGLE_PHASE_LOADS_FILENAME,
         SWITCHES_FILENAME,
@@ -46,6 +51,11 @@ try:
         build_export,
     )
     from circuit_viewer.opendss_export_dialog import OpenDssExportDialog
+    from circuit_viewer.opendss_line_mode import OpenDssLineParameterMode
+    from circuit_viewer.opendss_settings_dialog import (
+        OpenDssSettingsDialog,
+        load_opendss_line_parameter_mode,
+    )
     from circuit_viewer.regulator_import import RegulatorLoadResult
     from circuit_viewer.segment_import import SegmentLoadResult
     from circuit_viewer.switch_import import SwitchLoadResult
@@ -92,8 +102,8 @@ class OpenDssExportUiTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.destination = Path(directory.name)
 
-    def _window(self) -> MainWindow:
-        window = MainWindow()
+    def _window(self, **kwargs) -> MainWindow:  # noqa: ANN003
+        window = MainWindow(**kwargs)
         self.addCleanup(window.close)
         window.show()
         return window
@@ -213,10 +223,202 @@ class OpenDssExportUiTests(unittest.TestCase):
         self.assertTrue(window.opendss_export_action.isEnabled())
         self.assertTrue(window.simplified_opendss_export_action.isEnabled())
 
-        # Sem o catálogo de cabos a exportação volta a ficar indisponível.
         window._set_cable_model(None)
         self.assertFalse(window.opendss_export_action.isEnabled())
         self.assertFalse(window.simplified_opendss_export_action.isEnabled())
+
+    def test_library_mode_exports_without_legacy_cables_but_simplified_does_not(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        window._opendss_line_parameter_mode = OpenDssLineParameterMode.LIBRARY
+
+        window._set_cable_model(None)
+
+        self.assertTrue(window.opendss_export_action.isEnabled())
+        self.assertFalse(window.simplified_opendss_export_action.isEnabled())
+
+    def test_line_parameter_mode_is_saved_and_reloaded_by_main_window(self) -> None:
+        settings = QSettings(
+            str(self.destination / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        window = self._window(settings=settings)
+        window._power_flow_result = object()
+
+        def choose_library(dialog) -> int:  # noqa: ANN001
+            self.assertIs(
+                dialog.line_parameter_mode(),
+                OpenDssLineParameterMode.ORIGINAL,
+            )
+            dialog.library_line_parameters_radio.setChecked(True)
+            return int(QDialog.DialogCode.Accepted)
+
+        with patch.object(OpenDssSettingsDialog, "exec", choose_library):
+            window._show_opendss_settings()
+
+        self.assertIs(
+            window._opendss_line_parameter_mode,
+            OpenDssLineParameterMode.LIBRARY,
+        )
+        self.assertIsNone(window._power_flow_result)
+        self.assertIs(
+            load_opendss_line_parameter_mode(settings),
+            OpenDssLineParameterMode.LIBRARY,
+        )
+        reloaded = self._window(settings=settings)
+        self.assertIs(
+            reloaded._opendss_line_parameter_mode,
+            OpenDssLineParameterMode.LIBRARY,
+        )
+
+    def test_library_mode_adds_only_its_three_expected_filenames(self) -> None:
+        window = self._window()
+        self._load_everything(window, with_loads=False)
+        library_names = {
+            CABOS_FILENAME,
+            ARRANGEMENTS_FILENAME,
+            LINE_GEOMETRIES_FILENAME,
+        }
+
+        original = set(window._expected_export_filenames((0,)))
+        window._opendss_line_parameter_mode = OpenDssLineParameterMode.LIBRARY
+        library = set(window._expected_export_filenames((0,)))
+
+        self.assertTrue(library_names.isdisjoint(original))
+        self.assertTrue(library_names.issubset(library))
+        self.assertEqual(library - original, library_names)
+
+    def test_library_files_are_named_in_the_overwrite_confirmation(self) -> None:
+        window = self._window()
+        self._load_everything(window, with_loads=False)
+        window._opendss_line_parameter_mode = OpenDssLineParameterMode.LIBRARY
+        for filename in (
+            CABOS_FILENAME,
+            ARRANGEMENTS_FILENAME,
+            LINE_GEOMETRIES_FILENAME,
+        ):
+            (self.destination / filename).write_text("anterior", encoding="utf-8")
+
+        with patch.object(
+            OpenDssExportDialog, "exec", accept_dialog
+        ), patch(
+            "circuit_viewer.main_window.QFileDialog.getExistingDirectory",
+            return_value=str(self.destination),
+        ), patch(
+            "circuit_viewer.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as question:
+            window._export_opendss()
+
+        prompt = question.call_args.args[2]
+        self.assertIn(CABOS_FILENAME, prompt)
+        self.assertIn(ARRANGEMENTS_FILENAME, prompt)
+        self.assertIn(LINE_GEOMETRIES_FILENAME, prompt)
+        self.assertIsNone(window._export_thread)
+
+    def test_export_worker_receives_saved_library_snapshots(self) -> None:
+        window = self._window()
+        self._load_everything(window, with_loads=False)
+        window._opendss_line_parameter_mode = OpenDssLineParameterMode.LIBRARY
+        window._set_cable_model(None)
+        expected_catalog = window.opendss_library_session.saved_catalog()
+        draft_cables = window.opendss_library_session.catalog.cables
+        if draft_cables:
+            draft_cables[0].name = "RASCUNHO NÃO SALVO"
+        created = []
+
+        class SignalStub:
+            def connect(self, _callback) -> None:  # noqa: ANN001
+                pass
+
+        class RecordingWorker:
+            def __init__(self, *args, **kwargs) -> None:  # noqa: ANN003
+                self.args = args
+                self.kwargs = kwargs
+                self.progress = SignalStub()
+                self.finished = SignalStub()
+                self.failed = SignalStub()
+                self.cancelled = SignalStub()
+                created.append(self)
+
+            def moveToThread(self, _thread) -> None:  # noqa: N802, ANN001
+                pass
+
+            def run(self) -> None:
+                pass
+
+            def cancel(self) -> None:
+                pass
+
+            def deleteLater(self) -> None:  # noqa: N802
+                pass
+
+        with patch(
+            "circuit_viewer.main_window.OpenDssExportWorker",
+            RecordingWorker,
+        ), patch("circuit_viewer.main_window.QThread.start"):
+            window._start_opendss_export(self.destination, (0,))
+
+        worker = created[0]
+        self.assertIsNone(worker.args[1])
+        self.assertIs(
+            worker.kwargs["line_parameter_mode"],
+            OpenDssLineParameterMode.LIBRARY,
+        )
+        snapshot = worker.kwargs["library_catalog"]
+        self.assertIsNot(snapshot, window.opendss_library_session.catalog)
+        self.assertEqual(
+            [(item.cable_id, item.name) for item in snapshot.cables],
+            [(item.cable_id, item.name) for item in expected_catalog.cables],
+        )
+        self.assertEqual(
+            worker.kwargs["library_mappings"],
+            window.opendss_mapping_session.mappings,
+        )
+        thread = window._export_thread
+        window._on_export_thread_finished()
+        if thread is not None:
+            thread.deleteLater()
+        self.app.processEvents()
+
+    def test_export_report_uses_the_completed_bundle_not_the_current_mode(self) -> None:
+        window = self._window()
+        self._load_everything(window, with_loads=False)
+        result = build_export(
+            window._circuit_catalog,
+            window._cable_model,
+            window._phase_configuration,
+            (0,),
+        )
+
+        library_bundle = replace(
+            result,
+            library=OpenDssLibraryExportResult(
+                cables_text="",
+                arrangements_text="",
+                line_geometries_text="",
+                cable_count=2,
+                arrangement_count=3,
+                line_geometry_count=4,
+            ),
+        )
+
+        window._opendss_line_parameter_mode = OpenDssLineParameterMode.ORIGINAL
+        window._show_opendss_export_report(library_bundle, self.destination)
+        library_message = window.statusBar().currentMessage()
+        self.assertIn(CABOS_FILENAME, library_message)
+        self.assertIn(ARRANGEMENTS_FILENAME, library_message)
+        self.assertIn(LINE_GEOMETRIES_FILENAME, library_message)
+        self.assertIn("2 cabo(s)", library_message)
+        self.assertIn("3 arranjo(s)", library_message)
+        self.assertIn("4 geometria(s)", library_message)
+
+        window._opendss_line_parameter_mode = OpenDssLineParameterMode.LIBRARY
+        window._show_opendss_export_report(result, self.destination)
+        original_message = window.statusBar().currentMessage()
+        self.assertNotIn(CABOS_FILENAME, original_message)
+        self.assertNotIn(ARRANGEMENTS_FILENAME, original_message)
+        self.assertNotIn(LINE_GEOMETRIES_FILENAME, original_message)
 
     def test_simplified_export_requires_processed_branch_projection(self) -> None:
         window = self._window()

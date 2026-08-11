@@ -40,6 +40,9 @@ from .model import (
 )
 from .opendss_engine import acquire_engine, ascii_workspace
 from .opendss_export import build_export
+from .opendss_library import OpenDssLibraryCatalog
+from .opendss_line_mode import OpenDssLineParameterMode
+from .opendss_mapping_store import OpenDssLibraryMappings
 from .opendss_simplified_export import build_simplified_export
 from .opendss_powerflow import run_power_flow
 from .opendss_settings import OpenDssLoadSettings
@@ -527,7 +530,7 @@ class OpenDssExportWorker(QObject):
     def __init__(
         self,
         catalog: CircuitCatalogModel,
-        cables: CableModel,
+        cables: CableModel | None,
         phase_configuration: PhaseConfiguration,
         circuit_indices: tuple[int, ...],
         loads: LoadModel | None = None,
@@ -535,6 +538,11 @@ class OpenDssExportWorker(QObject):
         generator_updates: GeneratorUpdateModel | None = None,
         regulators: RegulatorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
+        line_parameter_mode: OpenDssLineParameterMode = (
+            OpenDssLineParameterMode.ORIGINAL
+        ),
+        library_catalog: OpenDssLibraryCatalog | None = None,
+        library_mappings: OpenDssLibraryMappings | None = None,
     ) -> None:
         super().__init__()
         self.catalog = catalog
@@ -546,6 +554,9 @@ class OpenDssExportWorker(QObject):
         self.generator_updates = generator_updates
         self.regulators = regulators
         self.load_settings = load_settings
+        self.line_parameter_mode = line_parameter_mode
+        self.library_catalog = library_catalog
+        self.library_mappings = library_mappings
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -564,6 +575,9 @@ class OpenDssExportWorker(QObject):
                 generator_updates=self.generator_updates,
                 regulators=self.regulators,
                 load_settings=self.load_settings,
+                line_parameter_mode=self.line_parameter_mode,
+                library_catalog=self.library_catalog,
+                library_mappings=self.library_mappings,
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
             )
@@ -746,7 +760,7 @@ class PowerFlowWorker(QObject):
     def __init__(
         self,
         catalog: CircuitCatalogModel,
-        cables: CableModel,
+        cables: CableModel | None,
         phase_configuration: PhaseConfiguration,
         circuit_indices: tuple[int, ...],
         loads: LoadModel | None = None,
@@ -754,6 +768,11 @@ class PowerFlowWorker(QObject):
         generator_updates: GeneratorUpdateModel | None = None,
         regulators: RegulatorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
+        line_parameter_mode: OpenDssLineParameterMode = (
+            OpenDssLineParameterMode.ORIGINAL
+        ),
+        library_catalog: OpenDssLibraryCatalog | None = None,
+        library_mappings: OpenDssLibraryMappings | None = None,
     ) -> None:
         super().__init__()
         self.catalog = catalog
@@ -765,6 +784,9 @@ class PowerFlowWorker(QObject):
         self.generator_updates = generator_updates
         self.regulators = regulators
         self.load_settings = load_settings
+        self.line_parameter_mode = line_parameter_mode
+        self.library_catalog = library_catalog
+        self.library_mappings = library_mappings
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -788,6 +810,9 @@ class PowerFlowWorker(QObject):
                     generator_updates=self.generator_updates,
                     regulators=self.regulators,
                     load_settings=self.load_settings,
+                    line_parameter_mode=self.line_parameter_mode,
+                    library_catalog=self.library_catalog,
+                    library_mappings=self.library_mappings,
                     cancel_check=self._cancel_event.is_set,
                     progress=lambda current, total: self.progress.emit(
                         current, total

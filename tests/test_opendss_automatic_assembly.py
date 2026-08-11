@@ -104,6 +104,7 @@ class AutomaticAssemblyTests(unittest.TestCase):
 
         fd = by_phases[("D", "F")]
         self.assertEqual(fd.geometry.cable_ids, ["phase", "phase", "neutral"])
+        self.assertIn("| DFN |", fd.name)
         self.assertEqual(
             [(item.x, item.height) for item in fd.arrangement.positions],
             [(-1.0, 10.0), (0.0, 11.0), (0.0, 8.0)],
@@ -123,10 +124,60 @@ class AutomaticAssemblyTests(unittest.TestCase):
         self.assertEqual(assembly.arrangement.conductor_count, 2)
         self.assertEqual(assembly.geometry.cable_ids, ["phase", "phase"])
         self.assertFalse(assembly.geometry.reduce)
+        self.assertIn("| DF |", assembly.name)
+        self.assertNotIn("| DFN |", assembly.name)
         self.assertEqual(len(result.issues), 1)
         self.assertEqual(result.issues[0].severity, "warning")
         self.assertEqual(result.issues[0].field, "CABON_ID")
         self.assertIn("removidas", result.issues[0].reason)
+
+    def test_minus_one_explicitly_disables_neutral_without_mapping_or_warning(
+        self,
+    ) -> None:
+        self.mappings = OpenDssLibraryMappings(
+            cables=self.mappings.cables
+            + (LibraryNameMapping("-1", self.neutral_cable.name),),
+            arrangements=self.mappings.arrangements,
+        )
+
+        result = self.build(lines(["9"], neutral_cables=["  -1  "]))
+
+        self.assertEqual(result.issues, ())
+        assembly = result.assemblies[0]
+        self.assertIsNone(assembly.key.neutral_cable_id)
+        self.assertEqual(assembly.arrangement.conductor_count, 2)
+        self.assertEqual(assembly.geometry.cable_ids, ["phase", "phase"])
+        self.assertFalse(assembly.geometry.reduce)
+        self.assertIn("| DF |", assembly.name)
+        self.assertNotIn("| DFN |", assembly.name)
+
+    def test_arrangement_without_neutral_positions_never_shows_neutral(self) -> None:
+        phase_only = ArrangementDefinition(
+            "phase-only",
+            "BASE 3F",
+            3,
+            "m",
+            [
+                ConductorPosition(-1.0, 10.0),
+                ConductorPosition(0.0, 11.0),
+                ConductorPosition(1.0, 10.0),
+            ],
+        )
+        self.catalog.arrangements.append(phase_only)
+        self.mappings = OpenDssLibraryMappings(
+            cables=self.mappings.cables,
+            arrangements=(LibraryNameMapping("AR", phase_only.name),),
+        )
+
+        result = self.build(lines(["9"], neutral_cables=["CN"]))
+
+        self.assertEqual(result.issues, ())
+        assembly = result.assemblies[0]
+        self.assertIsNone(assembly.key.neutral_cable_id)
+        self.assertEqual(assembly.geometry.cable_ids, ["phase", "phase"])
+        self.assertFalse(assembly.geometry.reduce)
+        self.assertIn("| DF |", assembly.name)
+        self.assertNotIn("| DFN |", assembly.name)
 
     def test_phase_variants_are_distinct_and_identical_lines_are_grouped(self) -> None:
         result = self.build(lines(["7", "7", "8"]))

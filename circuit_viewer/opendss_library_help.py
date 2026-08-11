@@ -41,7 +41,10 @@ Assim, uma linha nas fases D/F usa <code>F1 → D</code> e <code>F2 → F</code>
 Um arranjo trifásico pode atender linhas de uma, duas ou três fases.</p>
 <p>Quando o arranjo possui neutro, suas posições só são mantidas se
 <code>CABON_ID</code> resolver um cabo salvo. Sem ele, os neutros são removidos e
-um aviso é apresentado nos diagnósticos.</p>
+um aviso é apresentado nos diagnósticos. O valor <code>-1</code> declara
+intencionalmente que o trecho não possui neutro, sem consultar o mapa e sem
+gerar diagnóstico. No nome da montagem, o sufixo <code>N</code> junto às fases
+indica que o neutro foi efetivamente preservado.</p>
 <h3>Redução de Kron</h3>
 <p>A redução fica habilitada automaticamente quando a montagem preserva
 condutores neutros e desabilitada quando eles são removidos.</p>

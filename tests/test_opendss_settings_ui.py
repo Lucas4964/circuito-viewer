@@ -20,6 +20,10 @@ try:
     from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox
 
     from circuit_viewer.main_window import MainWindow
+    from circuit_viewer.opendss_line_mode import (
+        DEFAULT_OPENDSS_LINE_PARAMETER_MODE,
+        OpenDssLineParameterMode,
+    )
     from circuit_viewer.opendss_settings import (
         DEFAULT_OPENDSS_LOAD_SETTINGS,
         DEFAULT_VMAXPU,
@@ -27,8 +31,11 @@ try:
         OpenDssLoadSettings,
     )
     from circuit_viewer.opendss_settings_dialog import (
+        LINE_PARAMETER_MODE_SETTINGS_KEY,
         OpenDssSettingsDialog,
+        load_opendss_line_parameter_mode,
         load_opendss_settings,
+        save_opendss_line_parameter_mode,
         save_opendss_settings,
     )
     from circuit_viewer.opendss_mapping_store import (
@@ -99,6 +106,39 @@ class PersistenceTests(unittest.TestCase):
             DEFAULT_OPENDSS_LOAD_SETTINGS,
         )
 
+    def test_line_parameter_mode_defaults_to_original(self) -> None:
+        self.assertIs(
+            load_opendss_line_parameter_mode(self.settings),
+            DEFAULT_OPENDSS_LINE_PARAMETER_MODE,
+        )
+
+    def test_line_parameter_mode_round_trip_uses_its_own_key(self) -> None:
+        save_opendss_line_parameter_mode(
+            self.settings,
+            OpenDssLineParameterMode.LIBRARY,
+        )
+
+        self.assertEqual(
+            self.settings.value(LINE_PARAMETER_MODE_SETTINGS_KEY),
+            "library",
+        )
+        self.assertIs(
+            load_opendss_line_parameter_mode(self.settings),
+            OpenDssLineParameterMode.LIBRARY,
+        )
+        self.assertEqual(
+            load_opendss_settings(self.settings),
+            DEFAULT_OPENDSS_LOAD_SETTINGS,
+        )
+
+    def test_corrupt_line_parameter_mode_falls_back_to_original(self) -> None:
+        self.settings.setValue(LINE_PARAMETER_MODE_SETTINGS_KEY, "inválido")
+
+        self.assertIs(
+            load_opendss_line_parameter_mode(self.settings),
+            DEFAULT_OPENDSS_LINE_PARAMETER_MODE,
+        )
+
 
 @unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
 class DialogTests(unittest.TestCase):
@@ -130,6 +170,61 @@ class DialogTests(unittest.TestCase):
         self.assertFalse(dialog.apply_limits_check.isChecked())
         self.assertAlmostEqual(dialog.vminpu_input.value(), DEFAULT_VMINPU)
         self.assertAlmostEqual(dialog.vmaxpu_input.value(), DEFAULT_VMAXPU)
+
+    def test_line_parameter_mode_defaults_to_original(self) -> None:
+        dialog = self._dialog()
+
+        self.assertTrue(dialog.original_line_parameters_radio.isChecked())
+        self.assertFalse(dialog.library_line_parameters_radio.isChecked())
+        self.assertIs(
+            dialog.line_parameter_mode(),
+            OpenDssLineParameterMode.ORIGINAL,
+        )
+
+    def test_line_parameter_mode_opens_on_the_keyword_choice(self) -> None:
+        dialog = OpenDssSettingsDialog(
+            line_parameter_mode=OpenDssLineParameterMode.LIBRARY,
+        )
+        self.addCleanup(dialog.close)
+
+        self.assertFalse(dialog.original_line_parameters_radio.isChecked())
+        self.assertTrue(dialog.library_line_parameters_radio.isChecked())
+        self.assertIs(
+            dialog.line_parameter_mode(),
+            OpenDssLineParameterMode.LIBRARY,
+        )
+
+    def test_line_parameter_radios_are_exclusive_and_identifiable(self) -> None:
+        dialog = self._dialog()
+
+        self.assertTrue(dialog.line_parameter_mode_group.exclusive())
+        self.assertEqual(
+            dialog.line_parameter_mode_group.objectName(),
+            "opendss_line_parameter_mode_group",
+        )
+        self.assertEqual(
+            dialog.original_line_parameters_radio.objectName(),
+            "opendss_line_parameters_original",
+        )
+        self.assertEqual(
+            dialog.library_line_parameters_radio.objectName(),
+            "opendss_line_parameters_library",
+        )
+        self.assertEqual(
+            dialog.original_line_parameters_radio.text(),
+            "Usar parâmetros elétricos importados",
+        )
+        self.assertEqual(
+            dialog.library_line_parameters_radio.text(),
+            "Usar bibliotecas de cabos e arranjos",
+        )
+        self.assertIn("WireData", dialog.library_line_parameters_radio.toolTip())
+        self.assertNotIn("CNData", dialog.library_line_parameters_radio.toolTip())
+
+        dialog.library_line_parameters_radio.setChecked(True)
+        self.assertFalse(dialog.original_line_parameters_radio.isChecked())
+        dialog.original_line_parameters_radio.setChecked(True)
+        self.assertFalse(dialog.library_line_parameters_radio.isChecked())
 
     def test_the_checkbox_governs_the_fields(self) -> None:
         dialog = self._dialog()
@@ -203,12 +298,17 @@ class DialogTests(unittest.TestCase):
 
         self.assertEqual(dialog.settings(), DEFAULT_OPENDSS_LOAD_SETTINGS)
 
-    def test_dialog_has_the_three_named_tabs(self) -> None:
+    def test_dialog_has_the_four_named_tabs(self) -> None:
         dialog = self._dialog()
 
         self.assertEqual(
             [dialog.tabs.tabText(index) for index in range(dialog.tabs.count())],
-            ["Tensão das cargas", "Mapa de Cabos", "Mapa de Arranjos"],
+            [
+                "Tensão das cargas",
+                "Parâmetros das linhas",
+                "Mapa de Cabos",
+                "Mapa de Arranjos",
+            ],
         )
 
     def test_maps_show_saved_values_and_canonical_library_names(self) -> None:
@@ -278,10 +378,10 @@ class DialogTests(unittest.TestCase):
         self.assertIn("não existe", dialog.cable_map_editor.issue_label.text())
         self.assertIn("Arquivo inválido", dialog.arrangement_map_editor.issue_label.text())
 
-        dialog.tabs.setCurrentIndex(1)
+        dialog.tabs.setCurrentWidget(dialog.cable_map_editor)
         dialog.restore_defaults()
         self.assertFalse(ok.isEnabled())
-        dialog.tabs.setCurrentIndex(2)
+        dialog.tabs.setCurrentWidget(dialog.arrangement_map_editor)
         dialog.restore_defaults()
         self.assertTrue(ok.isEnabled())
 
@@ -294,16 +394,30 @@ class DialogTests(unittest.TestCase):
             ),
             cable_names=("CABO A",),
             arrangement_names=("ARRANJO A",),
+            line_parameter_mode=OpenDssLineParameterMode.LIBRARY,
         )
         self.addCleanup(dialog.close)
 
-        dialog.tabs.setCurrentIndex(1)
+        dialog.tabs.setCurrentWidget(dialog.cable_map_editor)
         dialog.restore_defaults()
         self.assertEqual(dialog.cable_map_editor.table.rowCount(), 0)
         self.assertEqual(dialog.arrangement_map_editor.table.rowCount(), 1)
         self.assertEqual(dialog.settings(), OpenDssLoadSettings(True, 0.8, 1.2))
+        self.assertIs(
+            dialog.line_parameter_mode(),
+            OpenDssLineParameterMode.LIBRARY,
+        )
 
-        dialog.tabs.setCurrentIndex(0)
+        dialog.tabs.setCurrentWidget(dialog.line_parameters_tab)
+        dialog.restore_defaults()
+        self.assertIs(
+            dialog.line_parameter_mode(),
+            OpenDssLineParameterMode.ORIGINAL,
+        )
+        self.assertEqual(dialog.arrangement_map_editor.table.rowCount(), 1)
+        self.assertEqual(dialog.settings(), OpenDssLoadSettings(True, 0.8, 1.2))
+
+        dialog.tabs.setCurrentWidget(dialog.voltage_tab)
         dialog.restore_defaults()
         self.assertEqual(dialog.settings(), DEFAULT_OPENDSS_LOAD_SETTINGS)
 

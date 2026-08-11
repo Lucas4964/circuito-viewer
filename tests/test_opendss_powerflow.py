@@ -11,6 +11,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from circuit_viewer.calculation_levels import default_calculation_levels
 from circuit_viewer.curvas import Curve
@@ -34,10 +35,22 @@ from circuit_viewer.model import (
 )
 from circuit_viewer.opendss_export import (
     LINES_FILENAME,
+    OpenDssLibraryExportError,
     SINGLE_PHASE_GENERATORS_FILENAME,
     THREE_PHASE_GENERATORS_FILENAME,
     TWO_PHASE_GENERATORS_FILENAME,
     build_export,
+)
+from circuit_viewer.opendss_library import (
+    ArrangementDefinition,
+    CableDefinition,
+    ConductorPosition,
+    OpenDssLibraryCatalog,
+)
+from circuit_viewer.opendss_line_mode import OpenDssLineParameterMode
+from circuit_viewer.opendss_mapping_store import (
+    LibraryNameMapping,
+    OpenDssLibraryMappings,
 )
 from circuit_viewer.opendss_powerflow import (
     PowerFlowIssue,
@@ -97,6 +110,7 @@ def make_network(
     *,
     codes: tuple[str, str] = ("TR-1", "TR-2"),
     cables: tuple[str, str] = ("CB1", "CB1"),
+    arrangements: tuple[str, str] = ("", ""),
 ) -> LineNetworkModel:
     return LineNetworkModel(
         bars,
@@ -105,11 +119,47 @@ def make_network(
         ["13", "13"],
         [0, 1],
         [1, 2],
-        ["", ""],
+        list(arrangements),
         list(cables),
         ["", ""],
         [250.0, 400.0],
     )
+
+
+def make_library_inputs(
+    *,
+    normal_amps: float = 321.0,
+) -> tuple[OpenDssLibraryCatalog, OpenDssLibraryMappings]:
+    catalog = OpenDssLibraryCatalog(
+        cables=[
+            CableDefinition(
+                "cable-library-id",
+                "CABO LIB",
+                rac=0.1,
+                gmr=0.01,
+                diameter=0.02,
+                normal_amps=normal_amps,
+            )
+        ],
+        arrangements=[
+            ArrangementDefinition(
+                "arrangement-library-id",
+                "ARRANJO LIB",
+                3,
+                "m",
+                [
+                    ConductorPosition(-1.0, 10.0),
+                    ConductorPosition(0.0, 10.0),
+                    ConductorPosition(1.0, 10.0),
+                ],
+            )
+        ],
+    )
+    mappings = OpenDssLibraryMappings(
+        cables=(LibraryNameMapping("CB1", "CABO LIB"),),
+        arrangements=(LibraryNameMapping("AR1", "ARRANJO LIB"),),
+    )
+    return catalog, mappings
 
 
 def make_catalog(
@@ -662,6 +712,34 @@ class PowerFlowRunTests(unittest.TestCase):
 
         self.assertEqual(engine.solves, [])
 
+    def test_library_mode_harvests_with_no_legacy_cable_model(self) -> None:
+        network = make_network(
+            make_bars(),
+            cables=(" CB1 ", "CB1"),
+            arrangements=("AR1", "AR1"),
+        )
+        catalog = make_catalog(network)
+        library_catalog, library_mappings = make_library_inputs(normal_amps=321.0)
+        engine = FakeEngine()
+
+        result = run_power_flow(
+            engine,
+            catalog,
+            None,
+            PHASES,
+            [0],
+            workspace=self.workspace,
+            line_parameter_mode=OpenDssLineParameterMode.LIBRARY,
+            library_catalog=library_catalog,
+            library_mappings=library_mappings,
+        )
+
+        self.assertIsNone(result.cables)
+        self.assertEqual(result.segment_currents[0].ampacity, 321.0)
+        self.assertEqual(result.segment_currents[1].ampacity, 321.0)
+        self.assertEqual(engine.compiles, 1)
+        self.assertEqual(len(engine.solves), 4)
+
     def test_rejects_a_circuit_index_out_of_range(self) -> None:
         with self.assertRaises(IndexError):
             run_power_flow(
@@ -802,6 +880,40 @@ class MultipleCircuitTests(unittest.TestCase):
         self.assertEqual(len(compiles), 2)
         self.assertEqual(result.solved_circuits, ("C1", "C2"))
         self.assertEqual(engine.solves, [1, 2, 3, 4, 1, 2, 3, 4])
+
+    def test_library_errors_from_all_circuits_are_grouped_before_first_compile(self) -> None:
+        engine = FakeEngine()
+        first_error = OpenDssLibraryExportError(["referencia um cabo ausente"])
+        second_error = OpenDssLibraryExportError(["referencia um arranjo ausente"])
+
+        with patch(
+            "circuit_viewer.opendss_powerflow.build_export",
+            side_effect=[first_error, second_error],
+        ) as builder, self.assertRaises(OpenDssLibraryExportError) as raised:
+            run_power_flow(
+                engine,
+                self.catalog,
+                None,
+                PHASES,
+                [0, 1],
+                workspace=self.workspace,
+                line_parameter_mode=OpenDssLineParameterMode.LIBRARY,
+                library_catalog=OpenDssLibraryCatalog(),
+                library_mappings=OpenDssLibraryMappings(),
+            )
+
+        self.assertEqual(builder.call_count, 2)
+        self.assertEqual(builder.call_args_list[0].args[3], (0,))
+        self.assertEqual(builder.call_args_list[1].args[3], (1,))
+        self.assertEqual(
+            raised.exception.errors,
+            (
+                "Circuito C1: referencia um cabo ausente",
+                "Circuito C2: referencia um arranjo ausente",
+            ),
+        )
+        self.assertEqual(engine.commands, [])
+        self.assertEqual(engine.solves, [])
 
     def test_the_first_circuit_owns_a_shared_segment(self) -> None:
         # O motor falso soma 10.000 A por Compile: se o segundo circuito
