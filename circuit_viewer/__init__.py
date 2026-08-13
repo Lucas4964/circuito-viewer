@@ -27,6 +27,23 @@ from .branch_table_export import (
     export_branches_csv,
     suggested_branch_csv_filename,
 )
+from .allocation import (
+    AllocationDataError,
+    AllocationDataIssue,
+    AllocationTable,
+    PhaseValues,
+    TransformerAllocationModel,
+    TransformerAllocationRecord,
+    build_transformer_allocations,
+)
+from .allocation_measurements import (
+    EXPECTED_ALLOCATION_MEASUREMENT_HEADER,
+    AllocationMeasurementCsvResult,
+    AllocationMeasurementModel,
+    AllocationMeasurementRecord,
+    load_allocation_measurements_csv,
+    parse_allocation_measurement_rows,
+)
 from .cable_import import (
     CableCsvResult,
     CableIssue,
@@ -198,6 +215,22 @@ from .opendss_line_mode import (
     OpenDssLineParameterMode,
     parse_opendss_line_parameter_mode,
 )
+from .opendss_allocation_export import (
+    BT_GENERATION_FILENAME,
+    ENERGY_LOADS_FILENAME,
+    MT_GENERATION_FILENAME,
+    AllocationLevelExport,
+    OpenDssAllocationExportBundle,
+    OpenDssAllocationExportError,
+    allocation_export_directory_names,
+    build_allocation_export,
+    write_allocation_export,
+)
+from .opendss_allocation_settings import (
+    DEFAULT_OPENDSS_ALLOCATION_SETTINGS,
+    OpenDssAllocationSettings,
+    allocation_settings_from_mapping,
+)
 from .opendss_export import (
     ARRANGEMENTS_FILENAME,
     CABOS_FILENAME,
@@ -324,6 +357,31 @@ from .search import (
 )
 
 __all__ = [
+    "AllocationDataError",
+    "AllocationDataIssue",
+    "AllocationLevelExport",
+    "AllocationMeasurementCsvResult",
+    "AllocationMeasurementModel",
+    "AllocationMeasurementRecord",
+    "AllocationTable",
+    "BT_GENERATION_FILENAME",
+    "DEFAULT_OPENDSS_ALLOCATION_SETTINGS",
+    "ENERGY_LOADS_FILENAME",
+    "EXPECTED_ALLOCATION_MEASUREMENT_HEADER",
+    "MT_GENERATION_FILENAME",
+    "OpenDssAllocationExportBundle",
+    "OpenDssAllocationExportError",
+    "OpenDssAllocationSettings",
+    "PhaseValues",
+    "TransformerAllocationModel",
+    "TransformerAllocationRecord",
+    "allocation_export_directory_names",
+    "allocation_settings_from_mapping",
+    "build_allocation_export",
+    "build_transformer_allocations",
+    "load_allocation_measurements_csv",
+    "parse_allocation_measurement_rows",
+    "write_allocation_export",
     "analyze_branches",
     "build_equivalent_network",
     "BarRecord",

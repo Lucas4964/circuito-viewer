@@ -34,6 +34,11 @@ from PyQt6.QtWidgets import (
 )
 
 from .branch_analysis import BranchAnalysisResult, BranchRecord
+from .allocation import TransformerAllocationModel
+from .allocation_measurements import (
+    AllocationMeasurementCsvResult,
+    AllocationMeasurementModel,
+)
 from .branch_json_export import (
     BranchJsonExportResult,
     BranchJsonValidationError,
@@ -150,6 +155,16 @@ from .opendss_export import (
     phase_letters_by_node,
 )
 from .opendss_export_dialog import OpenDssExportDialog
+from .opendss_allocation_dialog import (
+    OpenDssAllocationDialog,
+    load_opendss_allocation_settings,
+    save_opendss_allocation_settings,
+)
+from .opendss_allocation_export import (
+    OpenDssAllocationExportBundle,
+    allocation_export_directory_names,
+    write_allocation_export,
+)
 from .opendss_cables_window import OpenDssCablesWindow
 from .opendss_automatic_assembly_session import OpenDssAutomaticAssemblySession
 from .opendss_geometries_window import OpenDssGeometriesWindow
@@ -208,6 +223,7 @@ from .theme import (
     save_theme_preference,
 )
 from .workers import (
+    AllocationMeasurementImportWorker,
     BranchAnalysisWorker,
     BranchCsvExportWorker,
     BranchJsonExportWorker,
@@ -221,6 +237,7 @@ from .workers import (
     LoadPatternImportWorker,
     MdbImportWorker,
     OpenDssExportWorker,
+    OpenDssAllocationExportWorker,
     SimplifiedOpenDssExportWorker,
     PowerFlowWorker,
     RegulatorImportWorker,
@@ -488,6 +505,19 @@ class ImportChoiceDialog(QDialog):
         )
         layout.addWidget(self.circuit_levels_button)
 
+        self.allocation_measurements_button = QPushButton(
+            "Importar correntes para alocação OpenDSS…"
+        )
+        self.allocation_measurements_button.setToolTip(
+            "CSV separado por ponto e vírgula. Cabeçalho obrigatório: "
+            "CODIGO;NPAT;ID;IE;IF (ex.: 004011;0;120.5;98.2;101.7)"
+        )
+        self.allocation_measurements_button.setEnabled(has_circuits)
+        self.allocation_measurements_button.clicked.connect(
+            lambda: self._select("allocation_measurements")
+        )
+        layout.addWidget(self.allocation_measurements_button)
+
         # O catálogo de cabos é uma raiz independente: não depende de barras nem
         # de trechos, então o botão nunca fica desabilitado.
         self.cables_button = QPushButton("Importar cabos…")
@@ -644,6 +674,9 @@ class MainWindow(QMainWindow):
         # Preferência de sessão para sessão, como o tema: os limites de tensão
         # das cargas valem para a exportação e para o fluxo de potência.
         self._opendss_load_settings = load_opendss_settings(self._settings)
+        self._opendss_allocation_settings = load_opendss_allocation_settings(
+            self._settings
+        )
         self._opendss_line_parameter_mode = load_opendss_line_parameter_mode(
             self._settings
         )
@@ -652,6 +685,7 @@ class MainWindow(QMainWindow):
         self._line_model: LineNetworkModel | None = None
         self._line_item: LineNetworkItem | None = None
         self._load_model: LoadModel | None = None
+        self._allocation_model: TransformerAllocationModel | None = None
         self._load_pattern_model: LoadPatternModel | None = None
         self._generator_model: GeneratorModel | None = None
         self._generator_update_result: GeneratorUpdateResult | None = None
@@ -661,6 +695,7 @@ class MainWindow(QMainWindow):
         self._regulator_item: RegulatorNetworkItem | None = None
         self._cable_model: CableModel | None = None
         self._circuit_catalog: CircuitCatalogModel | None = None
+        self._allocation_measurements: AllocationMeasurementModel | None = None
         self._circuit_level_model: CircuitCalculationLevelsModel | None = None
         self._circuit_level_controller: (
             CircuitCalculationLevelsController | None
@@ -715,6 +750,7 @@ class MainWindow(QMainWindow):
             | CircuitImportWorker
             | CircuitLevelImportWorker
             | MdbImportWorker
+            | AllocationMeasurementImportWorker
             | None
         ) = None
         self._progress_dialog: QProgressDialog | None = None
@@ -745,7 +781,10 @@ class MainWindow(QMainWindow):
         self._close_after_equivalent_build = False
         self._export_thread: QThread | None = None
         self._export_worker: (
-            OpenDssExportWorker | SimplifiedOpenDssExportWorker | None
+            OpenDssExportWorker
+            | OpenDssAllocationExportWorker
+            | SimplifiedOpenDssExportWorker
+            | None
         ) = None
         self._export_progress_dialog: QProgressDialog | None = None
         self._export_directory: Path | None = None
@@ -1113,6 +1152,19 @@ class MainWindow(QMainWindow):
             self._export_simplified_opendss
         )
 
+        self.opendss_allocation_export_action = QAction(
+            "OpenDSS — Alocação por energia…",
+            self,
+        )
+        self.opendss_allocation_export_action.setEnabled(False)
+        self.opendss_allocation_export_action.setToolTip(
+            "Gerar quatro circuitos snapshot e alocar somente as cargas "
+            "definidas pela energia agregada"
+        )
+        self.opendss_allocation_export_action.triggered.connect(
+            self._export_opendss_allocation
+        )
+
         self.opendss_settings_action = QAction("OpenDSS…", self)
         self.opendss_settings_action.setToolTip(
             "Definir parâmetros globais aplicados a todas as cargas do modelo "
@@ -1226,6 +1278,7 @@ class MainWindow(QMainWindow):
         self.export_menu = self.menuBar().addMenu("Exportar")
         self.export_menu.addAction(self.opendss_export_action)
         self.export_menu.addAction(self.simplified_opendss_export_action)
+        self.export_menu.addAction(self.opendss_allocation_export_action)
 
         self.tools_menu = self.menuBar().addMenu("Ferramentas")
         self.tools_menu.addAction(self.branches_action)
@@ -1949,6 +2002,8 @@ class MainWindow(QMainWindow):
             self._choose_circuits_csv()
         elif dialog.selected_kind == "circuit_levels":
             self._choose_circuit_levels_csv()
+        elif dialog.selected_kind == "allocation_measurements":
+            self._choose_allocation_measurements_csv()
         elif dialog.selected_kind == "cables":
             self._choose_cables_csv()
 
@@ -2130,6 +2185,18 @@ class MainWindow(QMainWindow):
         if path and self.patamares_window.confirm_pending_changes():
             self._start_circuit_level_import(path)
 
+    def _choose_allocation_measurements_csv(self) -> None:
+        if self._busy() or self._circuit_catalog is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Correntes OpenDSS — cabeçalho: CODIGO;NPAT;ID;IE;IF",
+            "",
+            "Arquivos CSV (*.csv);;Todos os arquivos (*)",
+        )
+        if path:
+            self._start_allocation_measurement_import(path)
+
     def _busy(self) -> bool:
         """``True`` quando alguma operação pesada já ocupa um dos slots."""
 
@@ -2241,6 +2308,7 @@ class MainWindow(QMainWindow):
             entities=selection.entities,
             overrides=selection.overrides,
             scale=selection.scale,
+            phase_configuration=self._phase_configuration,
         )
         worker.moveToThread(thread)
 
@@ -2307,6 +2375,8 @@ class MainWindow(QMainWindow):
             self._set_line_model(result.segments.model)
         if result.loads is not None:
             self._set_load_model(result.loads.model)
+        if result.allocations is not None:
+            self._set_allocation_model(result.allocations)
         if result.generators is not None:
             self._set_generator_model(result.generators.model)
         if result.patterns is not None:
@@ -2733,6 +2803,44 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
+    def _start_allocation_measurement_import(self, path: str) -> None:
+        if self._circuit_catalog is None:
+            return
+        thread = QThread(self)
+        worker = AllocationMeasurementImportWorker(path, self._circuit_catalog)
+        worker.moveToThread(thread)
+        progress = QProgressDialog(
+            "Lendo correntes de alocação…", "Cancelar", 0, 100, self
+        )
+        progress.setWindowTitle("Importando correntes de alocação")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._import_thread = thread
+        self._import_worker = worker
+        self._progress_dialog = progress
+        self._progress_entity = "correntes de alocação"
+        self.import_action.setEnabled(False)
+        self.branches_action.setEnabled(False)
+        self.patamares_window.setEnabled(False)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_import_progress)
+        worker.finished.connect(self._on_allocation_measurement_import_finished)
+        worker.failed.connect(self._on_import_failed)
+        worker.cancelled.connect(self._on_import_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(worker.cancel)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_import_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
     def _on_import_progress(self, rows: int, current: int, total: int) -> None:
         if not self._is_current_signal_source(self._import_worker):
             return
@@ -2887,6 +2995,45 @@ class MainWindow(QMainWindow):
         self._set_circuit_level_model(result.model)
         self._show_circuit_level_import_report(result)
 
+    def _on_allocation_measurement_import_finished(
+        self,
+        result: AllocationMeasurementCsvResult,
+    ) -> None:
+        _close_progress_dialog(self._progress_dialog)
+        if (
+            self._circuit_catalog is None
+            or result.model.circuits is not self._circuit_catalog
+        ):
+            QMessageBox.critical(
+                self,
+                "Falha na importação",
+                "Os circuitos foram alterados durante a importação das correntes.",
+            )
+            return
+        self._set_allocation_measurements(result.model)
+        imported = len(result.model.available_indices)
+        if not result.has_warnings:
+            self.statusBar().showMessage(
+                f"Correntes de alocação importadas para "
+                f"{imported:n} circuito(s).",
+                6_000,
+            )
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle("Correntes importadas com avisos")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText(
+            f"As quatro medições foram importadas para {imported:n} circuito(s)."
+        )
+        message.setInformativeText(
+            f"Linhas lidas: {result.total_rows:n}\n"
+            f"Linhas usadas: {result.valid_rows:n}\n"
+            f"Linhas de grupos recusados: {result.invalid_rows:n}"
+        )
+        if result.issues:
+            message.setDetailedText("\n".join(result.issues))
+        message.exec()
+
     def _set_line_model(self, model: LineNetworkModel | None) -> None:
         self._invalidate_power_flow()
         self._invalidate_branch_analysis()
@@ -2940,6 +3087,7 @@ class MainWindow(QMainWindow):
             raise ValueError("As cargas devem referenciar as barras exibidas.")
         if model is not self._load_model:
             self._set_generator_model(None)
+            self._set_allocation_model(None)
         if (
             self._selected_feature is not None
             and self._selected_feature.kind == "load"
@@ -2959,6 +3107,29 @@ class MainWindow(QMainWindow):
         if model is not None and self.show_loads_action.isChecked():
             self.load_virtualizer.refresh(force=True)
         self.view.viewport().update()
+
+    def _set_allocation_model(
+        self,
+        model: TransformerAllocationModel | None,
+    ) -> None:
+        if model is not None:
+            if model.loads is not self._load_model:
+                raise ValueError("Os agregados devem pertencer às cargas exibidas.")
+            if model.phase_configuration is not self._phase_configuration:
+                raise ValueError(
+                    "Os agregados devem usar a configuração de fases atual."
+                )
+        self._allocation_model = model
+        self._sync_export_availability()
+
+    def _set_allocation_measurements(
+        self,
+        model: AllocationMeasurementModel | None,
+    ) -> None:
+        if model is not None and model.circuits is not self._circuit_catalog:
+            raise ValueError("As correntes devem pertencer aos circuitos exibidos.")
+        self._allocation_measurements = model
+        self._sync_export_availability()
 
     def _set_generator_model(self, model: GeneratorModel | None) -> None:
         if model is not None and model.loads is not self._load_model:
@@ -3161,6 +3332,7 @@ class MainWindow(QMainWindow):
         if catalog is not self._circuit_catalog:
             self._invalidate_generator_update()
             self._set_circuit_level_model(None)
+            self._set_allocation_measurements(None)
         self._circuit_visibility_timer.stop()
         self._circuit_catalog = catalog
         self.search_index.set_circuits(catalog, build_fields=False)
@@ -3450,6 +3622,7 @@ class MainWindow(QMainWindow):
             if replacement != used:
                 self._invalidate_generator_update()
         self._sync_generator_update_availability()
+        self._sync_export_availability()
         self.statusBar().showMessage(f"{count:n} curva(s) salva(s).", 6_000)
 
     def _show_curves_load_warning(self) -> None:
@@ -3536,6 +3709,49 @@ class MainWindow(QMainWindow):
         self.simplified_opendss_export_action.setEnabled(
             common_available and self._cable_model is not None
         )
+        allocation_base_available = (
+            common_available
+            and (
+                self._cable_model is not None
+                or self._uses_opendss_library_parameters()
+            )
+        )
+        # Não deixe a ação cinza por insumos complementares: o clique explica
+        # exatamente o que falta e onde obter, em vez de falhar em silêncio.
+        self.opendss_allocation_export_action.setEnabled(allocation_base_available)
+        missing = self._allocation_export_missing_requirements()
+        if allocation_base_available and missing:
+            self.opendss_allocation_export_action.setToolTip(
+                "Clique para ver os dados pendentes: " + "; ".join(missing)
+            )
+        else:
+            self.opendss_allocation_export_action.setToolTip(
+                "Gerar quatro circuitos snapshot e alocar somente as cargas "
+                "definidas pela energia agregada"
+            )
+
+    def _allocation_export_missing_requirements(self) -> tuple[str, ...]:
+        """Insumos complementares ausentes, com instruções acionáveis."""
+
+        missing: list[str] = []
+        if self._allocation_model is None:
+            missing.append(
+                "agregados de energia do MDB (reimporte o banco com BT_ET, "
+                "BT_CONS, BT_GERADOR_CONS, MT_CONS e MT_GERADOR_CONS)"
+            )
+        if (
+            self._allocation_measurements is None
+            or not self._allocation_measurements.available_indices
+        ):
+            missing.append(
+                "correntes CODIGO/NPAT/ID/IE/IF (Arquivo > Importar CSV… > "
+                "Importar correntes para alocação OpenDSS…)"
+            )
+        if not self._saved_curves:
+            missing.append(
+                "uma curva horária salva (Configurações > Curvas…)"
+            )
+        return tuple(missing)
 
     def _visible_circuit_indices(self) -> tuple[int, ...]:
         """Circuitos marcados na janela de circuitos, na ordem do catálogo.
@@ -3951,6 +4167,240 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
         self._start_opendss_export(destination, circuit_indices)
+
+    def _export_opendss_allocation(self) -> None:
+        catalog = self._circuit_catalog
+        cables = self._cable_model
+        configuration = self._phase_configuration
+        allocations = self._allocation_model
+        measurements = self._allocation_measurements
+        if (
+            catalog is None
+            or configuration is None
+            or self._export_thread is not None
+            or (cables is None and not self._uses_opendss_library_parameters())
+        ):
+            return
+        missing = self._allocation_export_missing_requirements()
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Alocação por energia — dados pendentes",
+                "A exportação não foi iniciada porque ainda faltam:\n\n• "
+                + "\n• ".join(missing),
+            )
+            return
+        assert allocations is not None
+        assert measurements is not None
+        dialog = OpenDssAllocationDialog(
+            catalog,
+            measurements,
+            self._saved_curves,
+            self.calculation_level_schedule,
+            self._circuit_level_controller,
+            self._opendss_allocation_settings,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            circuit_index = dialog.selected_circuit_index()
+            curve = dialog.selected_curve()
+            schedule = dialog.selected_schedule()
+            settings = dialog.selected_settings()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Escolhas inválidas", str(exc))
+            return
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Escolher a pasta base da alocação OpenDSS",
+        )
+        if not directory:
+            return
+        destination = Path(directory)
+        names = allocation_export_directory_names(
+            catalog,
+            circuit_index,
+            schedule,
+        )
+        existing = [name for name in names if (destination / name).exists()]
+        if existing:
+            answer = QMessageBox.question(
+                self,
+                "Substituir circuitos de alocação",
+                "As seguintes pastas já existem e serão substituídas "
+                "somente após os quatro circuitos estarem prontos:\n"
+                + "\n".join(existing)
+                + "\n\nDeseja continuar?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._opendss_allocation_settings = settings
+        save_opendss_allocation_settings(self._settings, settings)
+        self._start_opendss_allocation_export(
+            destination,
+            circuit_index,
+            curve,
+            schedule,
+            settings,
+        )
+
+    def _start_opendss_allocation_export(
+        self,
+        destination: Path,
+        circuit_index: int,
+        curve: Curve,
+        schedule: CalculationLevelSchedule,
+        settings,  # noqa: ANN001 — validado pelo diálogo
+    ) -> None:
+        catalog = self._circuit_catalog
+        configuration = self._phase_configuration
+        allocations = self._allocation_model
+        measurements = self._allocation_measurements
+        if (
+            catalog is None
+            or configuration is None
+            or allocations is None
+            or measurements is None
+        ):
+            return
+        use_library = self._uses_opendss_library_parameters()
+        worker = OpenDssAllocationExportWorker(
+            catalog,
+            self._cable_model,
+            configuration,
+            circuit_index,
+            allocations,
+            measurements,
+            curve,
+            schedule,
+            settings,
+            regulators=self._regulator_model,
+            load_settings=self._opendss_load_settings,
+            line_parameter_mode=self._opendss_line_parameter_mode,
+            library_catalog=(
+                self.opendss_library_session.saved_catalog() if use_library else None
+            ),
+            library_mappings=(
+                self.opendss_mapping_session.mappings if use_library else None
+            ),
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        progress = QProgressDialog(
+            "Preparando quatro circuitos de alocação…",
+            "Cancelar",
+            0,
+            100,
+            self,
+        )
+        progress.setWindowTitle("Exportando alocação OpenDSS")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._export_thread = thread
+        self._export_worker = worker
+        self._export_progress_dialog = progress
+        self._export_directory = destination
+        self._sync_export_availability()
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_export_progress)
+        worker.finished.connect(self._on_opendss_allocation_export_finished)
+        worker.failed.connect(self._on_export_failed)
+        worker.cancelled.connect(self._on_export_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(worker.cancel)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_export_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_opendss_allocation_export_finished(
+        self,
+        result: OpenDssAllocationExportBundle,
+    ) -> None:
+        self._close_export_progress()
+        destination = self._export_directory
+        if destination is None:
+            return
+        try:
+            paths = write_allocation_export(destination, result)
+        except Exception as exc:  # noqa: BLE001 — rollback já ocorreu no núcleo
+            QMessageBox.critical(
+                self,
+                "Falha na exportação de alocação",
+                f"Nenhum conjunto parcial foi mantido em {destination}: {exc}",
+            )
+            return
+        transformer_count = (
+            result.levels[0].transformer_count if result.levels else 0
+        )
+        object_count = result.levels[0].load_count if result.levels else 0
+        warning_count = (
+            len(result.warnings)
+            + len(result.network.issues)
+            + result.network.omitted_issues
+        )
+        if result.has_warnings and warning_count == 0:
+            warning_count = result.network.discarded_count
+        warning_suffix = (
+            ""
+            if not result.has_warnings
+            else f"; {warning_count:n} aviso(s)"
+        )
+        self.statusBar().showMessage(
+            f"Quatro circuitos de alocação exportados para {destination}: "
+            f"{transformer_count:n} transformador(es) e {object_count:n} "
+            f"objetos Load por patamar{warning_suffix}.",
+            10_000,
+        )
+        summary = (
+            "Foram geradas quatro pastas autocontidas, sem executar o motor "
+            "OpenDSS. Ao compilar cada Master, ele executará Solve, "
+            "AllocateLoads e o Solve final."
+        )
+        if not result.has_warnings:
+            QMessageBox.information(
+                self,
+                "Alocação OpenDSS exportada",
+                summary + "\n\n" + "\n".join(str(path) for path in paths),
+            )
+            return
+
+        message = QMessageBox(self)
+        message.setWindowTitle("Alocação OpenDSS exportada com avisos")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText(summary)
+        message.setInformativeText(
+            f"Transformadores exportados: {transformer_count:n}\n"
+            f"Transformadores ignorados: {result.skipped_transformer_count:n}\n"
+            f"Objetos Load por patamar: {object_count:n}\n\n"
+            + "\n".join(str(path) for path in paths)
+        )
+        details = [*result.warnings]
+        details.extend(
+            f"Rede, elemento {issue.segment_id}: {issue.reason}"
+            for issue in result.network.issues
+        )
+        if result.network.omitted_issues:
+            details.append(
+                f"… e mais {result.network.omitted_issues:n} ocorrências da rede."
+            )
+        if result.network.discarded_count and not result.network.issues:
+            details.append(
+                f"Rede: {result.network.discarded_count:n} elemento(s) descartado(s)."
+            )
+        if details:
+            message.setDetailedText("\n".join(details))
+        message.exec()
 
     def _expected_simplified_export_filenames(
         self,

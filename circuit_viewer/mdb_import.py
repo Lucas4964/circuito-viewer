@@ -21,6 +21,17 @@ from dataclasses import dataclass
 from itertools import islice
 from typing import Any, Callable, Iterator, Sequence
 
+from .allocation import (
+    BT_CONSUMER_DIAGNOSTIC_HEADER,
+    BT_CONSUMER_HEADER,
+    BT_ET_HEADER,
+    BT_GENERATOR_HEADER,
+    MT_CONSUMER_ENERGY_HEADER,
+    MT_GENERATOR_ENERGY_HEADER,
+    AllocationTable,
+    TransformerAllocationModel,
+    build_transformer_allocations,
+)
 from .cable_import import CableCsvResult, parse_cable_rows
 from .circuit_import import CircuitLoadResult, parse_circuit_rows
 from .circuit_level_import import CircuitLevelCsvResult, parse_circuit_level_rows
@@ -47,6 +58,7 @@ from .mdb_mapping import (
     resolve_mapping,
 )
 from .model import UtmCrs
+from .phase_config import PhaseConfiguration
 from .regulator_import import RegulatorLoadResult, parse_regulator_rows
 from .segment_import import SegmentLoadResult, parse_segment_rows
 from .switch_import import SwitchLoadResult, parse_switch_rows
@@ -112,6 +124,8 @@ class MdbImportResult:
     regulators: RegulatorLoadResult | None = None
     circuits: CircuitLoadResult | None = None
     circuit_levels: CircuitLevelCsvResult | None = None
+    allocations: TransformerAllocationModel | None = None
+    allocation_error: str | None = None
     outcomes: tuple[MdbEntityOutcome, ...] = ()
     applied_scale: float = 1.0
 
@@ -137,7 +151,11 @@ class MdbImportResult:
         precisa saber o que não veio.
         """
 
-        if self.failures:
+        if (
+            self.failures
+            or self.allocation_error is not None
+            or (self.allocations is not None and bool(self.allocations.issues))
+        ):
             return True
         results = (
             self.bars,
@@ -282,6 +300,7 @@ def load_database(
     scale: float = 1.0,
     cancel_event: threading.Event | None = None,
     progress: ProgressCallback | None = None,
+    phase_configuration: PhaseConfiguration | None = None,
 ) -> MdbImportResult:
     """Importa as dez entidades lógicas de um banco, na ordem de dependência.
 
@@ -418,6 +437,22 @@ def load_database(
     if bars is None:  # pragma: no cover - garantido pelo raise acima
         raise CsvImportError("As barras não puderam ser importadas do banco.")
 
+    allocations = None
+    allocation_error = None
+    if phase_configuration is not None and results.get("cargas") is not None:
+        try:
+            allocations = _load_transformer_allocations(
+                database,
+                results["cargas"].model,
+                phase_configuration,
+                source_path=source_path,
+                cancel_event=cancel_event,
+            )
+        except InterruptedError:
+            raise CsvImportCancelled("Importação cancelada.")
+        except Exception as exc:  # noqa: BLE001 — agregado não derruba a rede
+            allocation_error = str(exc)
+
     return MdbImportResult(
         source_path=source_path,
         bars=bars,
@@ -430,9 +465,118 @@ def load_database(
         regulators=results.get("reguladores"),
         circuits=results.get("circuitos"),
         circuit_levels=results.get("patamares_circuitos"),
+        allocations=allocations,
+        allocation_error=allocation_error,
         outcomes=tuple(outcomes),
         applied_scale=scale,
     )
+
+
+_ALLOCATION_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("BT_ET", BT_ET_HEADER),
+    ("BT_CONS", BT_CONSUMER_HEADER),
+    ("BT_GERADOR_CONS", BT_GENERATOR_HEADER),
+    ("MT_CONS", MT_CONSUMER_ENERGY_HEADER),
+    ("MT_GERADOR_CONS", MT_GENERATOR_ENERGY_HEADER),
+)
+
+_ALLOCATION_DIAGNOSTIC_COLUMNS: dict[str, tuple[str, ...]] = {
+    "BT_CONS": BT_CONSUMER_DIAGNOSTIC_HEADER,
+}
+
+
+def _load_transformer_allocations(
+    database: AccessDatabase,
+    loads,  # noqa: ANN001 — LoadModel já garantido pelo resultado de cargas
+    phase_configuration: PhaseConfiguration,
+    *,
+    source_path: str,
+    cancel_event: threading.Event | None,
+) -> TransformerAllocationModel | None:
+    """Lê o agregado opcional quando ``BT_ET`` identifica o banco estendido."""
+
+    table_by_name = {name.casefold(): name for name in database.tables()}
+    if "bt_et" not in table_by_name:
+        return None
+
+    resolved: dict[
+        str,
+        tuple[str, tuple[str, ...], tuple[str, ...]],
+    ] = {}
+    missing_tables: list[str] = []
+    missing_columns: list[str] = []
+    for canonical_table, required in _ALLOCATION_TABLES:
+        table = table_by_name.get(canonical_table.casefold())
+        if table is None:
+            missing_tables.append(canonical_table)
+            continue
+        columns = database.columns(table)
+        by_name = {column.casefold(): column for column in columns}
+        absent = [name for name in required if name.casefold() not in by_name]
+        if absent:
+            missing_columns.append(f"{canonical_table}: {', '.join(absent)}")
+            continue
+        optional = tuple(
+            name
+            for name in _ALLOCATION_DIAGNOSTIC_COLUMNS.get(canonical_table, ())
+            if name.casefold() in by_name and name not in required
+        )
+        logical_columns = (*required, *optional)
+        resolved[canonical_table] = (
+            table,
+            logical_columns,
+            tuple(by_name[name.casefold()] for name in logical_columns),
+        )
+    if missing_tables or missing_columns:
+        details: list[str] = []
+        if missing_tables:
+            details.append("tabelas ausentes: " + ", ".join(missing_tables))
+        if missing_columns:
+            details.append("colunas ausentes em " + "; ".join(missing_columns))
+        raise ValueError(
+            "Dados de alocação por energia incompletos; " + "; ".join(details) + "."
+        )
+
+    iterators: list[Iterator[tuple[str, ...]]] = []
+
+    def allocation_table(name: str, header: tuple[str, ...]) -> AllocationTable:
+        table, logical_columns, columns = resolved[name]
+        if logical_columns[: len(header)] != header:  # pragma: no cover - constante
+            raise AssertionError(f"Cabeçalho interno inesperado para {name}.")
+        rows = database.iter_rows(table, columns)
+        iterators.append(rows)
+        return AllocationTable(
+            logical_columns,
+            rows,
+            source_label(source_path, table),
+            FIRST_ROW_NUMBER,
+        )
+
+    try:
+        return build_transformer_allocations(
+            loads,
+            phase_configuration,
+            bt_et=allocation_table("BT_ET", BT_ET_HEADER),
+            bt_consumers=allocation_table("BT_CONS", BT_CONSUMER_HEADER),
+            bt_generators=allocation_table(
+                "BT_GERADOR_CONS", BT_GENERATOR_HEADER
+            ),
+            mt_consumers=allocation_table(
+                "MT_CONS", MT_CONSUMER_ENERGY_HEADER
+            ),
+            mt_generators=allocation_table(
+                "MT_GERADOR_CONS", MT_GENERATOR_ENERGY_HEADER
+            ),
+            source_path=source_path,
+            cancel_check=(
+                None if cancel_event is None else cancel_event.is_set
+            ),
+        )
+    finally:
+        for rows in iterators:
+            close = getattr(rows, "close", None)
+            if close is not None:
+                close()
 
 
 def _import_entity(

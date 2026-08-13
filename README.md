@@ -467,6 +467,84 @@ energiza um alimentador só. Em seguida é pedida **uma única pasta de destino*
 que recebe todos os arquivos gerados; se algum deles já existir, a substituição
 é confirmada antes.
 
+### Alocação nativa por energia
+
+**Exportar > OpenDSS — Alocação por energia…** é um modo independente que
+não altera a exportação acima. Ele usa os agregados por transformador lidos do
+MDB (`BT_ET`, `BT_CONS`, `BT_GERADOR_CONS`, `MT_CONS` e
+`MT_GERADOR_CONS`), uma curva horária salva e um CSV de correntes. Esse CSV é
+importado por **Arquivo > Importar CSV… > Importar correntes para alocação
+OpenDSS…**, usa `;` como separador e exige o cabeçalho
+`CODIGO;NPAT;ID;IE;IF`, com exatamente os NPAT 0, 1, 2 e 3 de cada circuito
+incluído. O cabeçalho é **obrigatório**. `CODIGO` é o texto exibido para o
+circuito e preserva zeros à esquerda, por exemplo:
+
+```csv
+CODIGO;NPAT;ID;IE;IF
+004011;0;120.5;98.2;101.7
+004011;1;110.0;90.0;95.0
+004011;2;135.0;105.0;112.0
+004011;3;80.0;65.0;70.0
+```
+
+As correntes são módulos em ampères, finitos e não negativos. O código deve
+existir e ser único no catálogo importado.
+
+Assim que a rede base estiver disponível, a ação de exportação permanece
+clicável mesmo que falte algum desses insumos complementares. Nesse caso, o
+clique informa explicitamente se faltam os agregados do MDB, o CSV de correntes
+ou uma curva salva, incluindo o caminho de menu para resolver cada pendência.
+
+Para o circuito escolhido são criadas quatro pastas
+`OpenDSS_<CIRCUITO>_NPAT<n>_<NOME>`. Cada uma contém uma cópia completa da
+rede, Buscoords, Master, `cargas_energia.dss`, `geracao_bt.dss` e
+`geracao_mt.dss`. A aplicação apenas grava os arquivos; não inicia o motor. Ao
+ser compilado, cada Master cria um medidor na linha sintética de cabeça, aplica
+seu `PeakCurrent`, resolve em `snapshot`, executa `AllocateLoads` e resolve
+novamente.
+
+Cada fase real do transformador recebe três objetos `Load`: energia total com
+`kWh`, `kWhDays`, `CFactor` e `PF`; GD BT com `kW` negativo; e GD MT com `kW`
+negativo. Somente o primeiro é alocável. Os dois equivalentes de geração usam
+`kvar=0` e `status=fixed`, não possuem `kWh` e permanecem constantes durante a
+alocação. Assim, um transformador trifásico produz nove objetos, um bifásico
+seis e um monofásico três, inclusive quando um dos grupos vale zero.
+
+Nesta agregação, o `FASES2` de `BT_CONS` descreve a ligação no secundário, ao
+passo que o `FASES2` da `CARGA` descreve as fases primárias do transformador.
+Por isso, em transformador monofásico, todo o `CONSUMO` de cada cliente BT é
+atribuído à única fase primária, mesmo que o cliente seja bifásico. Nos
+transformadores bi/trifásicos, consumidores BT continuam divididos pelas suas
+próprias fases e precisam ser compatíveis com as fases da `CARGA`; consumidores
+MT seguem sempre essa validação de compatibilidade.
+
+Ocorrências de incompatibilidade identificam o registro por valores estáveis,
+além da posição de leitura: para BT, o relatório inclui `ID`, `CODIGO`, `ET_ID`
+e `FASES2` do consumidor; para o transformador, inclui `CARGA_ID`, `CODIGO` e
+`FASES2`. As letras de fase interpretadas também são exibidas nos dois lados.
+
+Erros individuais não bloqueiam os quatro circuitos. Um consumidor ou gerador
+inválido é omitido sozinho; o transformador continua usando seus demais
+elementos válidos. O transformador inteiro só é omitido quando o problema está
+nele próprio, como fase/terminal/nome DSS inválido, barra compartilhada ou
+colisão de nome. Em colisões, todos os transformadores envolvidos são
+desconsiderados. A conclusão da exportação mostra os descartes aplicáveis ao
+circuito com os mesmos identificadores estáveis do relatório de importação.
+
+Corrente positiva numa fase sem qualquer `kWh` alocável também é apenas aviso,
+identificado por NPAT, fase e corrente. A exportação só é impedida por uma falha
+global — por exemplo, medições incompletas, modelos incompatíveis, rede/circuito
+inválido — ou quando nenhum transformador válido restar.
+
+`kWhDays` (30), `CFactor` inicial (4), PF (0,92) e iterações (2) podem ser
+alterados no diálogo e ficam salvos. A relação inicial usada pelo OpenDSS é
+`kW = kWh / (24 × kWhDays) × CFactor`; `AllocateLoads` corrige o
+`CFactor` para aproximar as correntes medidas.
+
+> `PeakCurrent` não informa o sentido da corrente. Se a GD causar fluxo
+> reverso, a alocação pode convergir para uma solução de sentido oposto. O
+> diálogo e os quatro Masters registram explicitamente essa limitação.
+
 ### Modos dos parâmetros das linhas
 
 O modo é escolhido em **Configurações → OpenDSS… → Parâmetros das linhas**

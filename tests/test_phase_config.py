@@ -49,6 +49,7 @@ class PhaseConfigurationTests(unittest.TestCase):
                 ("7", "DE", 2, "1.2"),
                 ("8", "EF", 2, "2.3"),
                 ("9", "FD", 2, "1.3"),
+                ("10", "DE", 2, "1.2"),
                 ("13", "DEF", 3, "1.2.3"),
                 ("14", "DEFN", 3, "1.2.3.0"),
             ],

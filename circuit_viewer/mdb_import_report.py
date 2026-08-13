@@ -50,6 +50,14 @@ def issue_lines(result: MdbImportResult) -> tuple[str, ...]:
 
     lines: list[str] = []
     omitted = 0
+    if result.allocation_error is not None:
+        lines.append("Alocação por energia: " + result.allocation_error)
+    if result.allocations is not None:
+        for issue in result.allocations.issues:
+            if len(lines) >= MAX_REPORTED_LINES:
+                omitted += 1
+                continue
+            lines.append("Alocação por energia: " + issue.description)
     for entity in ENTITY_ORDER:
         outcome = result.outcome_for(entity)
         if outcome is None:

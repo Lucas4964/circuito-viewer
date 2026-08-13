@@ -15,6 +15,7 @@ from circuit_viewer.mdb_import import (
 )
 from circuit_viewer.mdb_mapping import ENTITY_ORDER, resolve_mapping
 from circuit_viewer.model import UtmCrs
+from circuit_viewer.phase_config import load_phase_configuration
 
 
 CRS = UtmCrs(zone=21, northern=False)
@@ -158,6 +159,42 @@ def run(database: FakeDatabase, **kwargs):  # noqa: ANN001, ANN201
 
 
 class LoadDatabaseTests(unittest.TestCase):
+    def test_imports_optional_transformer_allocation_tables(self) -> None:
+        database = network_database(
+            BT_ET=(["ID", "MT_CAR_ID"], [(501, 2)]),
+            BT_CONS=(
+                ["ID", "CODIGO", "ET_ID", "FASES2", "CONSUMO"],
+                [(901, "UC-901", 501, 7, 600.0)],
+            ),
+            BT_GERADOR_CONS=(
+                ["ET_ID", "GERACAO_KWH"],
+                [(501, 720.0)],
+            ),
+            MT_CONS=(
+                ["ID", "CARGA_ID", "CODIGO", "EXTERN_ID", "NOME", "FASES2", "CONSUMO"],
+                [(101, 2, "GEN-COD", "EXT-GEN", "Usina", 13, 300.0)],
+            ),
+        )
+
+        result = run(
+            database,
+            phase_configuration=load_phase_configuration(),
+        )
+
+        self.assertIsNotNone(result.allocations)
+        self.assertIsNone(result.allocation_error)
+        record = result.allocations.record(0)
+        self.assertEqual(record.total_energy.d, 400.0)
+        self.assertEqual(record.total_energy.e, 400.0)
+        self.assertEqual(record.total_energy.f, 100.0)
+        self.assertEqual(record.generation_bt_kwh, 720.0)
+        self.assertEqual(record.generation_mt_kwh, 1000.5)
+        by_table = dict(database.statements)
+        self.assertEqual(
+            by_table["BT_CONS"],
+            ("ET_ID", "FASES2", "CONSUMO", "ID", "CODIGO"),
+        )
+
     def test_imports_every_entity(self) -> None:
         result = run(network_database())
         self.assertEqual(result.imported_entities, ENTITY_ORDER)

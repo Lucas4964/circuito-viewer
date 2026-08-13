@@ -1280,6 +1280,48 @@ quando uma contagem de fases não tem elementos. Geradores importados sem esse
 retrato não são recalculados implicitamente: a UI confirma a operação e segue
 sem eles ou cancela sem iniciar o worker.
 
+#### Modo independente de alocação por energia
+
+`allocation.py` incorpora a agregação antes prototipada em
+`CODIGO_TRAFOS.py`: consumidores BT e MT são divididos pelas próprias fases,
+exceto clientes BT ligados a transformadores monofásicos. Nesse caso,
+`BT_CONS.FASES2` continua sendo validado como configuração secundária, mas 100%
+do consumo é atribuído à única fase primária indicada por `CARGA.FASES2`. As
+energias de GD BT e MT permanecem separadas e são associadas às fases reais do
+transformador somente no exportador. `mdb_import.py` lê as cinco tabelas
+complementares depois de construir `LoadModel`. Uma falha estrutural nesse
+agregado não desfaz a rede importada, mas deixa o modo novo indisponível.
+
+`allocation_measurements.py` mantém um retrato denso ligado por identidade a
+`CircuitCatalogModel`: cada circuito presente possui exatamente quatro
+`AllocationMeasurementRecord`, ordenados por NPAT. O CSV identifica cada grupo
+pelo `CODIGO` textual do circuito, com o cabeçalho obrigatório
+`CODIGO;NPAT;ID;IE;IF`; trocar o catálogo invalida
+esse retrato; trocar as cargas invalida `TransformerAllocationModel`.
+
+`opendss_allocation_export.py` chama `build_export()` sem cargas nem geradores
+convencionais para obter somente a rede. Sobre ela monta quatro diretórios, um
+por patamar, com três arquivos de `Load`: energia alocável por `kWh` e duas GDs
+fixas por `kW` negativo. Cada Master instala o `EnergyMeter` na linha de cabeça,
+define `PeakCurrent`, executa `Solve`, `AllocateLoads` e o `Solve` final. A
+gravação prepara os quatro diretórios em staging e possui rollback da troca,
+evitando um conjunto parcial.
+
+As ocorrências da agregação são diagnósticos, não exceções de exportação. Cada
+linha inválida de consumidor ou gerador já fica fora do agregado; o exportador
+consulta apenas as ocorrências atribuíveis ao circuito e as devolve em
+`OpenDssAllocationExportBundle.warnings`. Uma pré-validação resolve fase,
+terminal, barra e todos os nomes DSS de cada transformador; falhas locais
+removem somente o transformador e colisões removem todos os envolvidos. O
+bundle registra também `skipped_transformer_count`. Corrente positiva sem
+energia alocável acrescenta aviso por NPAT/fase, mas não impede os arquivos.
+Ausência de qualquer transformador válido e falhas de insumos globais continuam
+fatais.
+
+O mecanismo nativo corrige `CFactor` somente nas cargas energéticas; as GDs têm
+`status=fixed`, `kW`/`kvar` explícitos e nenhum `kWh`. A ambiguidade de
+`PeakCurrent` sob fluxo reverso é documentada no diálogo e dentro dos Masters.
+
 `OpenDssLoadExportResult` é compartilhado pelos três arquivos de carga. Nele,
 `exported_count` conta **cargas de origem**, não linhas `Load`: uma trifásica
 rende três `Load` e ainda assim soma 1, para o relatório falar a mesma língua do

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -19,8 +20,11 @@ try:
     )
 
     from circuit_viewer.cable_import import CableCsvResult
+    from circuit_viewer.allocation import AllocationTable, build_transformer_allocations
+    from circuit_viewer.allocation_measurements import parse_allocation_measurement_rows
     from circuit_viewer.circuit_import import CircuitLoadResult
     from circuit_viewer.csv_import import CsvLoadResult
+    from circuit_viewer.curvas import Curve
     from circuit_viewer.load_import import LoadCsvResult
     from circuit_viewer.load_pattern_import import LoadPatternCsvResult
     from circuit_viewer.main_window import MainWindow
@@ -51,6 +55,10 @@ try:
         build_export,
     )
     from circuit_viewer.opendss_export_dialog import OpenDssExportDialog
+    from circuit_viewer.opendss_allocation_dialog import OpenDssAllocationDialog
+    from circuit_viewer.opendss_allocation_export import (
+        allocation_export_directory_names,
+    )
     from circuit_viewer.opendss_line_mode import OpenDssLineParameterMode
     from circuit_viewer.opendss_settings_dialog import (
         OpenDssSettingsDialog,
@@ -206,6 +214,35 @@ class OpenDssExportUiTests(unittest.TestCase):
             )
         self.app.processEvents()
 
+    def _install_allocation_inputs(self, window: MainWindow) -> None:
+        def empty(header, name):  # noqa: ANN001, ANN202
+            return AllocationTable(header, (), name)
+
+        allocation = build_transformer_allocations(
+            window._load_model,
+            window._phase_configuration,
+            bt_et=empty(("ID", "MT_CAR_ID"), "BT_ET"),
+            bt_consumers=empty(("ET_ID", "FASES2", "CONSUMO"), "BT_CONS"),
+            bt_generators=empty(("ET_ID", "GERACAO_KWH"), "BT_GD"),
+            mt_consumers=empty(
+                ("ID", "CARGA_ID", "FASES2", "CONSUMO"), "MT_CONS"
+            ),
+            mt_generators=empty(
+                ("MT_CONS_ID", "GERACAO_KWH"), "MT_GD"
+            ),
+        )
+        measurements = parse_allocation_measurement_rows(
+            ("CODIGO", "NPAT", "ID", "IE", "IF"),
+            [("ALIMENTADOR", str(npat), "0", "0", "0") for npat in range(4)],
+            window._circuit_catalog,
+            source_label="medicoes.csv",
+            encoding="utf-8",
+        ).model
+        window._set_allocation_model(allocation)
+        window._set_allocation_measurements(measurements)
+        window._saved_curves = (Curve("C", "Curva", (1.0,) * 24),)
+        window._sync_export_availability()
+
     def test_menu_entry_requires_every_source(self) -> None:
         window = self._window()
 
@@ -216,16 +253,111 @@ class OpenDssExportUiTests(unittest.TestCase):
         )
         self.assertIn(window.opendss_export_action, export_menu.actions())
         self.assertIn(window.simplified_opendss_export_action, export_menu.actions())
+        self.assertIn(window.opendss_allocation_export_action, export_menu.actions())
         self.assertFalse(window.opendss_export_action.isEnabled())
         self.assertFalse(window.simplified_opendss_export_action.isEnabled())
+        self.assertFalse(window.opendss_allocation_export_action.isEnabled())
 
         self._load_everything(window)
         self.assertTrue(window.opendss_export_action.isEnabled())
         self.assertTrue(window.simplified_opendss_export_action.isEnabled())
+        self.assertTrue(window.opendss_allocation_export_action.isEnabled())
+        self.assertIn(
+            "dados pendentes",
+            window.opendss_allocation_export_action.toolTip(),
+        )
+
+        self._install_allocation_inputs(window)
+        self.assertTrue(window.opendss_allocation_export_action.isEnabled())
 
         window._set_cable_model(None)
         self.assertFalse(window.opendss_export_action.isEnabled())
         self.assertFalse(window.simplified_opendss_export_action.isEnabled())
+        self.assertFalse(window.opendss_allocation_export_action.isEnabled())
+
+    def test_allocation_action_reports_every_missing_requirement(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        window._saved_curves = ()
+        window._sync_export_availability()
+
+        with patch(
+            "circuit_viewer.main_window.QMessageBox.warning"
+        ) as warning:
+            window._export_opendss_allocation()
+
+        warning.assert_called_once()
+        self.assertEqual(
+            warning.call_args.args[1],
+            "Alocação por energia — dados pendentes",
+        )
+        details = warning.call_args.args[2]
+        self.assertIn("agregados de energia do MDB", details)
+        self.assertIn("Importar correntes para alocação OpenDSS", details)
+        self.assertIn("Configurações > Curvas", details)
+
+    def test_allocation_export_confirms_replacing_the_four_directories(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self._install_allocation_inputs(window)
+        names = allocation_export_directory_names(
+            window._circuit_catalog,
+            0,
+            window.calculation_level_schedule,
+        )
+        (self.destination / names[0]).mkdir()
+
+        with patch.object(
+            OpenDssAllocationDialog, "exec", accept_dialog
+        ), patch(
+            "circuit_viewer.main_window.QFileDialog.getExistingDirectory",
+            return_value=str(self.destination),
+        ), patch(
+            "circuit_viewer.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as question, patch.object(
+            window, "_start_opendss_allocation_export"
+        ) as start:
+            window._export_opendss_allocation()
+
+        self.assertIn(names[0], question.call_args.args[2])
+        start.assert_not_called()
+
+    def test_allocation_completion_reports_ignored_elements(self) -> None:
+        window = self._window()
+        window._export_directory = self.destination
+        result = SimpleNamespace(
+            levels=(SimpleNamespace(transformer_count=2, load_count=12),),
+            warnings=(
+                "Elemento ignorado: consumidor BT ID=913, CODIGO=396000",
+            ),
+            skipped_transformer_count=1,
+            has_warnings=True,
+            network=SimpleNamespace(
+                issues=(),
+                omitted_issues=0,
+                discarded_count=0,
+            ),
+        )
+        paths = tuple(self.destination / f"NPAT{npat}" for npat in range(4))
+
+        with patch(
+            "circuit_viewer.main_window.write_allocation_export",
+            return_value=paths,
+        ), patch("circuit_viewer.main_window.QMessageBox") as message_box:
+            window._on_opendss_allocation_export_finished(result)
+
+        dialog = message_box.return_value
+        dialog.setWindowTitle.assert_called_once_with(
+            "Alocação OpenDSS exportada com avisos"
+        )
+        informative = dialog.setInformativeText.call_args.args[0]
+        self.assertIn("Transformadores exportados: 2", informative)
+        self.assertIn("Transformadores ignorados: 1", informative)
+        details = dialog.setDetailedText.call_args.args[0]
+        self.assertIn("ID=913", details)
+        self.assertIn("CODIGO=396000", details)
+        dialog.exec.assert_called_once_with()
 
     def test_library_mode_exports_without_legacy_cables_but_simplified_does_not(self) -> None:
         window = self._window()

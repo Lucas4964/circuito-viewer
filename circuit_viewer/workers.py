@@ -9,6 +9,11 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from .branch_analysis import BranchAnalysisResult, analyze_branches
 from .branch_json_export import export_branches_json
 from .branch_table_export import export_branches_csv
+from .allocation import TransformerAllocationModel
+from .allocation_measurements import (
+    AllocationMeasurementModel,
+    load_allocation_measurements_csv,
+)
 from .cable_import import load_cables_csv
 from .circuit_import import load_circuits_csv
 from .circuit_level_import import load_circuit_levels_csv
@@ -39,6 +44,8 @@ from .model import (
     UtmCrs,
 )
 from .opendss_engine import acquire_engine, ascii_workspace
+from .opendss_allocation_export import build_allocation_export
+from .opendss_allocation_settings import OpenDssAllocationSettings
 from .opendss_export import build_export
 from .opendss_library import OpenDssLibraryCatalog
 from .opendss_line_mode import OpenDssLineParameterMode
@@ -410,6 +417,42 @@ class CircuitLevelImportWorker(QObject):
             self.finished.emit(result)
 
 
+class AllocationMeasurementImportWorker(QObject):
+    """Importa as quatro correntes NPAT de cada circuito informado no CSV."""
+
+    progress = pyqtSignal(int, int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, path: str, circuits: CircuitCatalogModel) -> None:
+        super().__init__()
+        self.path = path
+        self.circuits = circuits
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = load_allocation_measurements_csv(
+                self.path,
+                self.circuits,
+                cancel_event=self._cancel_event,
+                progress=lambda rows, current, total: self.progress.emit(
+                    rows, current, total
+                ),
+            )
+        except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
 class MdbImportWorker(QObject):
     """Importa as dez entidades lógicas de um banco Access numa única execução.
 
@@ -435,6 +478,7 @@ class MdbImportWorker(QObject):
         entities: tuple[str, ...] | None = None,
         overrides: dict[str, str] | None = None,
         scale: float = 1.0,
+        phase_configuration: PhaseConfiguration | None = None,
     ) -> None:
         super().__init__()
         self.path = path
@@ -444,6 +488,7 @@ class MdbImportWorker(QObject):
         self.entities = entities
         self.overrides = dict(overrides or {})
         self.scale = float(scale)
+        self.phase_configuration = phase_configuration
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -464,6 +509,7 @@ class MdbImportWorker(QObject):
                     progress=lambda rows, current, total: self.progress.emit(
                         rows, current, total
                     ),
+                    phase_configuration=self.phase_configuration,
                 )
         except CsvImportCancelled:
             self.cancelled.emit()
@@ -573,6 +619,83 @@ class OpenDssExportWorker(QObject):
                 loads=self.loads,
                 patterns=self.patterns,
                 generator_updates=self.generator_updates,
+                regulators=self.regulators,
+                load_settings=self.load_settings,
+                line_parameter_mode=self.line_parameter_mode,
+                library_catalog=self.library_catalog,
+                library_mappings=self.library_mappings,
+                cancel_check=self._cancel_event.is_set,
+                progress=lambda current, total: self.progress.emit(current, total),
+            )
+        except InterruptedError:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class OpenDssAllocationExportWorker(QObject):
+    """Gera os quatro circuitos de alocação sem executar o OpenDSS."""
+
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        catalog: CircuitCatalogModel,
+        cables: CableModel | None,
+        phase_configuration: PhaseConfiguration,
+        circuit_index: int,
+        allocations: TransformerAllocationModel,
+        measurements: AllocationMeasurementModel,
+        curve: Curve,
+        schedule: CalculationLevelSchedule,
+        settings: OpenDssAllocationSettings,
+        *,
+        regulators: RegulatorModel | None = None,
+        load_settings: OpenDssLoadSettings | None = None,
+        line_parameter_mode: OpenDssLineParameterMode = (
+            OpenDssLineParameterMode.ORIGINAL
+        ),
+        library_catalog: OpenDssLibraryCatalog | None = None,
+        library_mappings: OpenDssLibraryMappings | None = None,
+    ) -> None:
+        super().__init__()
+        self.catalog = catalog
+        self.cables = cables
+        self.phase_configuration = phase_configuration
+        self.circuit_index = int(circuit_index)
+        self.allocations = allocations
+        self.measurements = measurements
+        self.curve = curve
+        self.schedule = schedule
+        self.settings = settings
+        self.regulators = regulators
+        self.load_settings = load_settings
+        self.line_parameter_mode = line_parameter_mode
+        self.library_catalog = library_catalog
+        self.library_mappings = library_mappings
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = build_allocation_export(
+                self.catalog,
+                self.cables,
+                self.phase_configuration,
+                self.circuit_index,
+                self.allocations,
+                self.measurements,
+                self.curve,
+                self.schedule,
+                self.settings,
                 regulators=self.regulators,
                 load_settings=self.load_settings,
                 line_parameter_mode=self.line_parameter_mode,
