@@ -26,12 +26,14 @@ from .generator_update import (
 )
 from .curvas import Curve
 from .calculation_levels import CalculationLevelSchedule
+from .capacitor_import import load_capacitors_csv
 from .load_import import load_loads_csv
 from .load_pattern_import import load_load_patterns_csv
 from .equivalent_network import EquivalentNetworkResult, build_equivalent_network
 from .mdb_engine import open_database
 from .mdb_import import load_database
 from .model import (
+    CapacitorModel,
     CableModel,
     CircuitCatalogModel,
     CircuitModel,
@@ -150,6 +152,40 @@ class LoadImportWorker(QObject):
     def run(self) -> None:
         try:
             result = load_loads_csv(
+                self.path,
+                self.bars,
+                cancel_event=self._cancel_event,
+                progress=lambda rows, current, total: self.progress.emit(
+                    rows, current, total
+                ),
+            )
+        except CsvImportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
+class CapacitorImportWorker(QObject):
+    progress = pyqtSignal(int, int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, path: str, bars: CircuitModel) -> None:
+        super().__init__()
+        self.path = path
+        self.bars = bars
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = load_capacitors_csv(
                 self.path,
                 self.bars,
                 cancel_event=self._cancel_event,
@@ -583,6 +619,7 @@ class OpenDssExportWorker(QObject):
         patterns: LoadPatternModel | None = None,
         generator_updates: GeneratorUpdateModel | None = None,
         regulators: RegulatorModel | None = None,
+        capacitors: CapacitorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
         line_parameter_mode: OpenDssLineParameterMode = (
             OpenDssLineParameterMode.ORIGINAL
@@ -599,6 +636,7 @@ class OpenDssExportWorker(QObject):
         self.patterns = patterns
         self.generator_updates = generator_updates
         self.regulators = regulators
+        self.capacitors = capacitors
         self.load_settings = load_settings
         self.line_parameter_mode = line_parameter_mode
         self.library_catalog = library_catalog
@@ -620,6 +658,7 @@ class OpenDssExportWorker(QObject):
                 patterns=self.patterns,
                 generator_updates=self.generator_updates,
                 regulators=self.regulators,
+                capacitors=self.capacitors,
                 load_settings=self.load_settings,
                 line_parameter_mode=self.line_parameter_mode,
                 library_catalog=self.library_catalog,
@@ -732,6 +771,7 @@ class SimplifiedOpenDssExportWorker(QObject):
         patterns: LoadPatternModel | None = None,
         generator_updates: GeneratorUpdateModel | None = None,
         regulators: RegulatorModel | None = None,
+        capacitors: CapacitorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
     ) -> None:
         super().__init__()
@@ -744,6 +784,7 @@ class SimplifiedOpenDssExportWorker(QObject):
         self.patterns = patterns
         self.generator_updates = generator_updates
         self.regulators = regulators
+        self.capacitors = capacitors
         self.load_settings = load_settings
         self._cancel_event = threading.Event()
 
@@ -763,6 +804,7 @@ class SimplifiedOpenDssExportWorker(QObject):
                 patterns=self.patterns,
                 generator_updates=self.generator_updates,
                 regulators=self.regulators,
+                capacitors=self.capacitors,
                 load_settings=self.load_settings,
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
@@ -890,6 +932,7 @@ class PowerFlowWorker(QObject):
         patterns: LoadPatternModel | None = None,
         generator_updates: GeneratorUpdateModel | None = None,
         regulators: RegulatorModel | None = None,
+        capacitors: CapacitorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
         line_parameter_mode: OpenDssLineParameterMode = (
             OpenDssLineParameterMode.ORIGINAL
@@ -906,6 +949,7 @@ class PowerFlowWorker(QObject):
         self.patterns = patterns
         self.generator_updates = generator_updates
         self.regulators = regulators
+        self.capacitors = capacitors
         self.load_settings = load_settings
         self.line_parameter_mode = line_parameter_mode
         self.library_catalog = library_catalog
@@ -932,6 +976,7 @@ class PowerFlowWorker(QObject):
                     patterns=self.patterns,
                     generator_updates=self.generator_updates,
                     regulators=self.regulators,
+                    capacitors=self.capacitors,
                     load_settings=self.load_settings,
                     line_parameter_mode=self.line_parameter_mode,
                     library_catalog=self.library_catalog,

@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
 from .model import (
     CableModel,
+    CapacitorModel,
     CircuitCatalogModel,
     LoadModel,
     LoadPatternModel,
@@ -77,6 +78,9 @@ THREE_PHASE_LOADS_FILENAME = "cargastrifasicas.dss"
 SINGLE_PHASE_GENERATORS_FILENAME = "geradoresmonofasicos.dss"
 TWO_PHASE_GENERATORS_FILENAME = "geradoresbifasicos.dss"
 THREE_PHASE_GENERATORS_FILENAME = "geradorestrifasicos.dss"
+# Arquivo único: bancos de capacitores são poucos e não se dividem por
+# contagem de fases como cargas e geradores.
+CAPACITORS_FILENAME = "capacitores.dss"
 # O master e as coordenadas levam o código do circuito no nome, então só o
 # sufixo é constante.
 MASTER_FILENAME_SUFFIX = "_Master.dss"
@@ -124,6 +128,10 @@ _PATTERN_COLUMNS_BY_PHASE = {
 # cada um ganha o seu RegControl. Os valores abaixo são a modelagem adotada; o
 # CSV traz apenas VNOM e SNOM.
 REGULATOR_NAME_PREFIX = "REG-"
+# Prefixo próprio, no espírito do regulador: torna o arquivo
+# autoexplicativo e afasta a colisão com cargas e geradores, que dividem o
+# mesmo namespace ``Load.*``.
+CAPACITOR_NAME_PREFIX = "CAP-"
 REGULATOR_CONTROL_NAME_PREFIX = "CTRL-"
 # Transformador quase ideal: o regulador injeta tensão em série, não impedância.
 REGULATOR_XHL_PERCENT = 0.01
@@ -281,6 +289,27 @@ class OpenDssLoadExportResult:
 
 
 @dataclass(frozen=True, slots=True)
+class OpenDssCapacitorExportResult:
+    """Resultado do arquivo único de bancos de capacitores.
+
+    ``exported_count`` conta **bancos de origem**, não linhas ``Load``: um banco
+    trifásico vira três ``Load`` e ainda assim soma 1, para o relatório falar a
+    mesma língua do cadastro.
+    """
+
+    text: str
+    exported_count: int
+    discarded_count: int
+    issues: tuple[OpenDssExportIssue, ...]
+    omitted_issues: int
+    used_names: frozenset[str] = frozenset()
+
+    @property
+    def has_warnings(self) -> bool:
+        return self.discarded_count > 0 or bool(self.issues)
+
+
+@dataclass(frozen=True, slots=True)
 class OpenDssGeneratorExportResult:
     """Resultado de um arquivo de geradores agrupado por número de fases."""
 
@@ -342,6 +371,7 @@ class OpenDssExportBundle:
     single_phase_generators: OpenDssGeneratorExportResult | None = None
     two_phase_generators: OpenDssGeneratorExportResult | None = None
     three_phase_generators: OpenDssGeneratorExportResult | None = None
+    capacitors: OpenDssCapacitorExportResult | None = None
     master: OpenDssMasterExportResult | None = None
     library: OpenDssLibraryExportResult | None = None
 
@@ -392,6 +422,7 @@ class OpenDssExportBundle:
         """
 
         regulators = self.regulators
+        capacitors = self.capacitors
         library = self.library
         return (
             *(
@@ -418,6 +449,11 @@ class OpenDssExportBundle:
                 (_GENERATOR_FILES[count][0], result.text)
                 for count, result in self.generators_by_phase_count
             ),
+            *(
+                ()
+                if capacitors is None or not capacitors.exported_count
+                else ((CAPACITORS_FILENAME, capacitors.text),)
+            ),
         )
 
     @property
@@ -443,6 +479,7 @@ class OpenDssExportBundle:
                 for result in self._generator_results
                 for issue in result.issues
             ),
+            *(() if self.capacitors is None else self.capacitors.issues),
             *(() if self.master is None else self.master.issues),
         )
 
@@ -452,6 +489,7 @@ class OpenDssExportBundle:
         total += 0 if self.regulators is None else self.regulators.omitted_issues
         total += sum(result.omitted_issues for result in self._load_results)
         total += sum(result.omitted_issues for result in self._generator_results)
+        total += 0 if self.capacitors is None else self.capacitors.omitted_issues
         return total + (0 if self.master is None else self.master.omitted_issues)
 
     @property
@@ -460,6 +498,7 @@ class OpenDssExportBundle:
         total += 0 if self.regulators is None else self.regulators.discarded_count
         total += sum(result.discarded_count for result in self._load_results)
         total += sum(result.discarded_count for result in self._generator_results)
+        total += 0 if self.capacitors is None else self.capacitors.discarded_count
         return total + (
             0 if self.master is None else self.master.discarded_count
         )
@@ -472,6 +511,7 @@ class OpenDssExportBundle:
             or (self.regulators is not None and self.regulators.has_warnings)
             or any(result.has_warnings for result in self._load_results)
             or any(result.has_warnings for result in self._generator_results)
+            or (self.capacitors is not None and self.capacitors.has_warnings)
             or (self.master is not None and self.master.has_warnings)
         )
 
@@ -2422,6 +2462,222 @@ def _master_base_name(definition) -> str:  # noqa: ANN001
     )
 
 
+def build_capacitor_export(
+    catalog: CircuitCatalogModel,
+    capacitors: CapacitorModel,
+    phase_configuration: PhaseConfiguration,
+    circuit_indices: Sequence[int] | Iterable[int],
+    *,
+    reserved_names: frozenset[str] = frozenset(),
+    include_bar_indices: frozenset[int] | None = None,
+    cancel_check: CancelCheck | None = None,
+    progress: ProgressCallback | None = None,
+) -> OpenDssCapacitorExportResult:
+    """Emite ``capacitores.dss``: cada banco vira ``Load`` de reativo negativo.
+
+    O banco é modelado como carga porque o projeto inteiro fala esse dialeto:
+    uma ``Load`` por fase, tensão de fase, potência no ``LoadShape``. A
+    compensação entra por ``qmult`` negativo — ``kW=0`` com ``mult`` zerado anula
+    a potência ativa, e ``kvar=1`` deixa o perfil entregar o valor absoluto.
+
+    ``Q1..Q4`` do cadastro é a potência do **banco inteiro**, e não por fase como
+    o ``QD``/``QE``/``QF`` das cargas, então é dividida pelo número de fases: sem
+    isso um banco de 600 kvar injetaria 1800.
+
+    ``include_bar_indices`` restringe a exportação às barras informadas. É o que
+    a rede simplificada usa para deixar de fora os bancos que caíram dentro de um
+    ramal, cuja compensação ainda não tem tratamento definido.
+
+    Um banco sai completo ou não sai: qualquer problema em uma das fases descarta
+    todas, pela mesma razão das cargas.
+    """
+
+    selected = _selected_indices(catalog, circuit_indices)
+    terminals = _terminals_by_phase_letter(phase_configuration)
+    report = _ExportReport()
+    bus_name = bus_namer(catalog)
+    owner_by_bar, _ = _bar_owners(catalog, selected)
+
+    total = len(capacitors)
+    processed = 0
+    shapes: list[str] = []
+    entries: list[str] = []
+    used_names: dict[str, str] = {}
+    exported = 0
+
+    for capacitor_index in range(total):
+        if cancel_check is not None and processed % 4_096 == 0 and cancel_check():
+            raise InterruptedError("Exportação cancelada.")
+        processed += 1
+        if progress is not None and processed % 1_000 == 0:
+            progress(processed, total)
+
+        bar_index = int(capacitors.bar_indices[capacitor_index])
+        owner = owner_by_bar.get(bar_index)
+        if owner is None:
+            # O banco está fora dos circuitos selecionados.
+            continue
+        owner_id, nominal_voltage = owner
+        record = capacitors.record(capacitor_index)
+        capacitor_id = record.capacitor_id
+
+        if include_bar_indices is not None and bar_index not in include_bar_indices:
+            # Diagnosticado, nunca silencioso: é o que permite medir o efeito de
+            # deixar a compensação de fora enquanto o tratamento não é decidido.
+            report.add(
+                capacitor_id,
+                "banco em barra removida pela redução, isto é, dentro de um "
+                "ramal; a compensação reativa dele não foi representada",
+            )
+            continue
+
+        # A fase vem em FASES, a string de letras do cadastro, e não no código
+        # numérico FASES2 das cargas. O N de DEFN é ignorado, como no resto do
+        # exportador.
+        raw_phases = record.phases.strip().upper()
+        present = tuple(
+            letter for letter in raw_phases if letter in _PATTERN_COLUMNS_BY_PHASE
+        )
+        letters = _phase_letters(raw_phases, len(present)) if present else None
+        if letters is None:
+            report.add(
+                capacitor_id,
+                f"FASES '{record.phases.strip() or '<vazio>'}' não resolve fases "
+                "distintas entre D, E e F",
+            )
+            continue
+        missing = next(
+            (letter for letter in letters if letter not in terminals),
+            None,
+        )
+        if missing is not None:
+            report.add(
+                capacitor_id,
+                f"fase '{missing}' sem terminal DSS: nenhuma entrada monofásica "
+                "de fases2.json a define",
+            )
+            continue
+
+        if nominal_voltage is None:
+            report.add(capacitor_id, f"circuito {owner_id} sem VNOM numérica positiva")
+            continue
+
+        phase_count = len(letters)
+        reactive: list[float] = []
+        invalid_column: str | None = None
+        for position, value in enumerate(record.reactive_powers, start=1):
+            parsed = parse_number(value)
+            if parsed is None:
+                invalid_column = f"Q{position}"
+                break
+            # `-0.0` seria formatado como "-0.000000" no arquivo; zero
+            # não tem sinal para quem lê o .dss.
+            reactive.append(-parsed / phase_count if parsed else 0.0)
+        if invalid_column is not None:
+            report.add(
+                capacitor_id,
+                f"{invalid_column} não numérica; o banco inteiro foi descartado",
+            )
+            continue
+
+        base_name = sanitize_dss_name(record.code)
+        if not base_name:
+            base_name = sanitize_dss_name(capacitor_id)
+            report.add(
+                capacitor_id,
+                "CODIGO do capacitor vazio ou sem caracteres válidos; o nome das "
+                "cargas usou o CAPAC_ID",
+                discarded=False,
+            )
+        if not base_name:
+            report.add(
+                capacitor_id, "CAPAC_ID sem caracteres válidos para um nome DSS"
+            )
+            continue
+
+        phase_names = [
+            f"{CAPACITOR_NAME_PREFIX}{base_name}-{phase_count}F-{letter}"
+            for letter in letters
+        ]
+        taken = next(
+            (
+                name
+                for name in phase_names
+                if name in reserved_names or name in used_names
+            ),
+            None,
+        )
+        if taken is not None:
+            owner_note = (
+                f"pelo capacitor {used_names[taken]}"
+                if taken in used_names
+                else "por uma carga ou gerador"
+            )
+            report.add(
+                capacitor_id,
+                f"nome '{taken}' já usado {owner_note}; o banco inteiro foi "
+                "descartado",
+            )
+            continue
+
+        bus = bus_name(bar_index)
+        voltage = _format(phase_voltage_kv(nominal_voltage))
+        zeros = " ".join(_format_pattern(0.0) for _ in range(LOAD_PATTERN_COUNT))
+        profile = " ".join(_format_pattern(value) for value in reactive)
+        for name, letter in zip(phase_names, letters):
+            node = terminals[letter]
+            shape_name = f"{LOAD_SHAPE_PREFIX}{name}"
+            shapes.append(
+                f"New LoadShape.{shape_name}"
+                f" npts={LOAD_PATTERN_COUNT}"
+                " interval=1"
+                f" mult=[{zeros}]"
+                f" qmult=[{profile}]"
+            )
+            entries.append(
+                f"New Load.{name}"
+                " phases=1"
+                f" bus1={bus}.{node}"
+                " conn=wye"
+                f" kV={voltage}"
+                " model=1 kW=0 kvar=1"
+                f" daily={shape_name}"
+                f" class={phase_count}"
+            )
+            used_names[name] = capacitor_id
+        exported += 1
+
+    if progress is not None:
+        progress(total, total)
+
+    header = (
+        "! Bancos de capacitores exportados pelo Visualizador de Circuitos Eletricos",
+        "! Cada banco vira uma Load monofasica por fase, com reativo negativo",
+        "! kW=0 e mult zerado: o banco nao consome potencia ativa",
+        "! kvar=1 e fixo: a compensacao de cada patamar vem do qmult do LoadShape",
+        "! Q do cadastro e do banco inteiro, entao e dividido pelo numero de fases",
+        "! kV e a tensao de fase do circuito (VNOM de linha dividida por raiz de 3)",
+        "! Circuitos: "
+        + ", ".join(
+            sanitize_dss_name(catalog.definition(index).circuit_id)
+            for index in selected
+        ),
+        "",
+    )
+    body = (*shapes, *(("",) if shapes and entries else ()), *entries)
+    text = "\n".join((*header, *body))
+    if body:
+        text += "\n"
+    return OpenDssCapacitorExportResult(
+        text=text,
+        exported_count=exported,
+        discarded_count=report.discarded,
+        issues=tuple(report.issues),
+        omitted_issues=report.omitted,
+        used_names=frozenset(used_names),
+    )
+
+
 def master_filenames(
     catalog: CircuitCatalogModel,
     circuit_indices: Sequence[int] | Iterable[int],
@@ -2612,6 +2868,7 @@ def build_export(
     patterns: LoadPatternModel | None = None,
     generator_updates: GeneratorUpdateModel | None = None,
     regulators: RegulatorModel | None = None,
+    capacitors: CapacitorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
     line_parameter_mode: OpenDssLineParameterMode = OpenDssLineParameterMode.ORIGINAL,
     library_catalog: OpenDssLibraryCatalog | None = None,
@@ -2622,7 +2879,8 @@ def build_export(
     """Monta todos os arquivos de uma exportação.
 
     Arquivos que compartilham namespace no OpenDSS reservam nomes entre si:
-    trechos e chaves em ``Line.*``; cargas e geradores em ``Load.*``.
+    trechos e chaves em ``Line.*``; cargas, geradores e capacitores em
+    ``Load.*``, nesta ordem de prioridade.
     Sem a reserva, a segunda definição sobrescreveria a primeira em silêncio.
     Entre os arquivos de carga o infixo ``-1F-``/``-2F-``/``-3F-`` já torna a
     coincidência impossível na prática; a reserva permanece porque essa
@@ -2773,6 +3031,24 @@ def build_export(
             )
             reserved |= result.used_names
             generator_results[count] = result
+    capacitor_result: OpenDssCapacitorExportResult | None = None
+    if capacitors is not None:
+        # Último da fila em ``Load.*``: cargas e geradores têm prioridade
+        # por compatibilidade com o que já era exportado.
+        reserved = frozenset(
+            name
+            for result in (*load_results.values(), *generator_results.values())
+            for name in result.used_names
+        )
+        capacitor_result = build_capacitor_export(
+            catalog,
+            capacitors,
+            phase_configuration,
+            selected,
+            reserved_names=reserved,
+            cancel_check=cancel_check,
+            progress=progress,
+        )
     bundle = OpenDssExportBundle(
         lines=line_result,
         switches=switch_result,
@@ -2783,6 +3059,7 @@ def build_export(
         single_phase_generators=generator_results.get(1),
         two_phase_generators=generator_results.get(2),
         three_phase_generators=generator_results.get(3),
+        capacitors=capacitor_result,
         library=library_result,
     )
     # O master vem por último: ele chama os arquivos de elementos e por isso
@@ -2792,7 +3069,9 @@ def build_export(
         selected,
         redirects=[name for name, _ in bundle.element_files],
         load_settings=(
-            load_settings if load_results or generator_results else None
+            load_settings
+            if load_results or generator_results or capacitor_result
+            else None
         ),
     )
     return OpenDssExportBundle(
@@ -2805,6 +3084,7 @@ def build_export(
         single_phase_generators=generator_results.get(1),
         two_phase_generators=generator_results.get(2),
         three_phase_generators=generator_results.get(3),
+        capacitors=capacitor_result,
         master=master_result,
         library=library_result,
     )

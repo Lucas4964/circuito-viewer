@@ -99,6 +99,19 @@ indicado por `TRECHO_ID`: ele passa a ser desenhado em vermelho e exibe uma
 segunda tabela de propriedades quando selecionado. Trechos comuns usam linha
 cosmética de 3 pixels; trechos-chave usam linha vermelha de 1 pixel.
 
+Depois das barras, a tabela **CAPACITOR** carrega os bancos de capacitores, com
+as colunas `CAPAC_ID`, `BARRA_ID`, `EXTERN_ID`, `CODIGO`, `VNOM`, `Q1` a `Q4`,
+`FASES` e `LIGACAO`. Cada banco é vinculado à barra indicada por `BARRA_ID`;
+`CAPAC_ID` vazio ou duplicado e barra inexistente são descartados e relatados.
+Como nas demais entidades, os campos são preservados como texto.
+
+No diagrama, o banco aparece pendurado na barra com o símbolo de **duas placas
+paralelas**, distinto do retângulo da carga e do círculo do gerador, e divide com
+eles a mesma grade por barra. **Visualizar > Mostrar capacitores** liga e desliga
+a camada. Ao selecionar um banco, o painel lateral exibe **Dados do banco de
+capacitores** com todas as colunas do cadastro, mais a nota de que `Q1..Q4` é a
+potência do banco inteiro e que a exportação a divide pelo número de fases.
+
 Ainda depois dos trechos, **Importar reguladores…** carrega os reguladores de
 tensão. O CSV deve conter `REGU_ID`, `TRECHO_ID`, `EXTERN_ID`, `CODIGO`,
 `LIGACAO`, `SNOM`, `FAIXA`, `NPASSOS`, `TAP`, `INOM` e `VNOM`. Cada registro é
@@ -237,7 +250,7 @@ As entidades são importadas numa passada só, na ordem imposta pelas dependênc
 entre elas:
 
 ```
-barras → cabos → trechos → cargas → geradores → patamares → chaves → reguladores → circuitos → patamares dos circuitos
+barras → cabos → trechos → cargas → capacitores → geradores → patamares → chaves → reguladores → circuitos → patamares dos circuitos
 ```
 
 As chaves vêm antes dos circuitos porque a topologia energizada depende delas.
@@ -722,6 +735,35 @@ verificados em conjunto: uma chave cujo nome coincida com o de um trecho já
 exportado é descartada e reportada, em vez de sobrescrever a definição anterior
 silenciosamente. As cargas ficam fora dessa verificação por viverem em `Load.*`,
 um namespace separado.
+
+### capacitores.dss
+
+Cada banco de capacitores da tabela `CAPACITOR` vira **uma `Load` monofásica por
+fase**, com reativo negativo — a compensação modelada como carga, no mesmo
+dialeto do resto da exportação. Todos os bancos ficam num arquivo só, sem divisão
+por número de fases.
+
+- **`kW=0`** e o `mult` do `LoadShape` zerado: o banco não consome potência ativa.
+- **`kvar=1`** fixo, com a compensação de cada patamar vindo do **`qmult`**, que
+  é negativo porque o banco injeta reativo.
+- **`Q1..Q4` é a potência do banco inteiro** e é **dividida pelo número de
+  fases**: um banco trifásico de 600 kvar sai como três `Load` de 200 kvar. Sem a
+  divisão ele injetaria 1800 kvar.
+- **`kV`** é a tensão de fase do circuito (`VNOM` de linha dividida por raiz de
+  três), igual à das demais cargas.
+- A fase vem da coluna **`FASES`** (letras, como `DEFN`), e não do código
+  numérico `FASES2` das cargas; o `N` do neutro é ignorado.
+
+Nomes `CAP-<CODIGO>-<N>F-<FASE>`, com `CAPAC_ID` como reserva quando o `CODIGO`
+está vazio. Não são exportados, com o motivo na lista de ocorrências: bancos cuja
+`FASES` não resolve fases distintas, com algum `Q` não numérico, com nome já
+usado por uma carga ou gerador, ou em circuito sem `VNOM` utilizável.
+
+Na **rede simplificada**, um banco só é exportado se estiver numa barra que
+sobreviveu à redução — ou seja, no tronco. Bancos que caíram dentro de um ramal
+ficam de fora, porque a carga equivalente que substitui o ramal não representa
+compensação reativa; eles aparecem na lista de ocorrências, nunca somem em
+silêncio. A exportação por alocação de energia não inclui capacitores.
 
 ### reguladores.dss
 

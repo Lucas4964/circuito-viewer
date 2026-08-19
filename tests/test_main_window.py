@@ -144,6 +144,7 @@ class MainWindowSelectionTests(unittest.TestCase):
             (
                 window.load_virtualizer,
                 window.generator_virtualizer,
+                window.capacitor_virtualizer,
                 window.equivalent_load_virtualizer,
             ),
         )

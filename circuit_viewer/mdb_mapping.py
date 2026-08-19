@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from .cable_import import EXPECTED_CABLE_HEADER
+from .capacitor_import import EXPECTED_CAPACITOR_HEADER
 from .circuit_import import EXPECTED_CIRCUIT_HEADER
 from .circuit_level_import import EXPECTED_CIRCUIT_LEVEL_HEADER
 from .csv_import import EXPECTED_HEADER as EXPECTED_BAR_HEADER
@@ -42,6 +43,7 @@ ENTITY_ORDER: tuple[str, ...] = (
     "cabos",
     "trechos",
     "cargas",
+    "capacitores",
     "geradores",
     "patamares",
     "chaves",
@@ -67,6 +69,7 @@ REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "cabos": EXPECTED_CABLE_HEADER,
     "trechos": EXPECTED_SEGMENT_HEADER,
     "cargas": EXPECTED_LOAD_HEADER,
+    "capacitores": EXPECTED_CAPACITOR_HEADER,
     "geradores": GENERATOR_HEADER,
     GENERATOR_CONSUMER_ENTITY: CONSUMER_HEADER,
     "patamares": EXPECTED_LOAD_PATTERN_HEADER,
@@ -82,6 +85,7 @@ ENTITY_LABELS: Mapping[str, str] = {
     "cabos": "Cabos",
     "trechos": "Trechos",
     "cargas": "Cargas",
+    "capacitores": "Capacitores",
     "geradores": "Geradores",
     GENERATOR_CONSUMER_ENTITY: "MT_CONS dos geradores",
     "patamares": "Patamares de carga",

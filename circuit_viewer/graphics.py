@@ -43,6 +43,7 @@ from PyQt6.QtWidgets import (
 from .model import (
     BoolArray,
     Bounds,
+    CapacitorModel,
     CircuitCatalogModel,
     CircuitModel,
     FeatureSelection,
@@ -68,7 +69,9 @@ except ModuleNotFoundError:  # pragma: no cover - dependência obrigatória do p
     Transformer = None  # type: ignore[assignment]
 
 
-LoadRenderModel = LoadModel | EquivalentNetworkModel | GeneratorModel
+LoadRenderModel = (
+    LoadModel | EquivalentNetworkModel | GeneratorModel | CapacitorModel
+)
 
 
 POINT_DIAMETER_PX = 5.0
@@ -112,6 +115,13 @@ LOAD_VERTICAL_PITCH_PX = 12.0
 LOAD_OVERVIEW_DIAMETER_PX = 7.0
 LOAD_COLOR = QColor("#202020")
 GENERATOR_DIAMETER_PX = 10.0
+# Banco de capacitores: duas placas paralelas, o desenho convencional do
+# componente. Distingue-se de imediato do retângulo da carga e do círculo do
+# gerador sem introduzir cor nova na camada.
+CAPACITOR_WIDTH_PX = 11.0
+CAPACITOR_PLATE_THICKNESS_PX = 1.6
+CAPACITOR_PLATE_GAP_PX = 3.4
+CAPACITOR_HEIGHT_PX = 2.0 * CAPACITOR_PLATE_THICKNESS_PX + CAPACITOR_PLATE_GAP_PX
 ATTACHED_VERTICAL_PITCH_PX = 14.0
 # Barra inicial do circuito: anel maior que o do regulador (9 px) e na cor do
 # próprio circuito, para não competir com o laranja fixo do regulador e para
@@ -126,6 +136,8 @@ ROOT_BAR_RING_STEP_PX = 4.0
 def _feature_ids(model: LoadRenderModel) -> tuple[str, ...]:
     if isinstance(model, GeneratorModel):
         return model.generator_ids
+    if isinstance(model, CapacitorModel):
+        return model.capacitor_ids
     return model.load_ids
 
 
@@ -254,6 +266,36 @@ def _load_rect(x_offset: float, y_offset: float) -> QRectF:
         y_offset,
         LOAD_WIDTH_PX,
         LOAD_HEIGHT_PX,
+    )
+
+
+def _capacitor_rect(x_offset: float, y_offset: float) -> QRectF:
+    return QRectF(
+        x_offset - CAPACITOR_WIDTH_PX / 2.0,
+        y_offset,
+        CAPACITOR_WIDTH_PX,
+        CAPACITOR_HEIGHT_PX,
+    )
+
+
+def _draw_capacitor_plates(painter: QPainter, rect: QRectF) -> None:
+    """Duas placas paralelas preenchidas, sem contorno."""
+
+    painter.drawRect(
+        QRectF(
+            rect.left(),
+            rect.top(),
+            rect.width(),
+            CAPACITOR_PLATE_THICKNESS_PX,
+        )
+    )
+    painter.drawRect(
+        QRectF(
+            rect.left(),
+            rect.bottom() - CAPACITOR_PLATE_THICKNESS_PX,
+            rect.width(),
+            CAPACITOR_PLATE_THICKNESS_PX,
+        )
     )
 
 
@@ -423,6 +465,9 @@ class LoadsOverviewItem(QGraphicsItem):
                 if self._symbol_kind == "generator"
                 else Qt.PenCapStyle.SquareCap
             )
+            # Neste nivel o capacitor divide o traco quadrado da carga:
+            # nenhum simbolo e distinguivel com este zoom, e o que importa e
+            # a densidade de elementos por barra.
             pen.setCosmetic(True)
             painter.setPen(pen)
             painter.drawPoints(points)
@@ -453,6 +498,8 @@ class LoadsOverviewItem(QGraphicsItem):
                         GENERATOR_DIAMETER_PX,
                     )
                 )
+            elif self._symbol_kind == "capacitor":
+                _draw_capacitor_plates(painter, _capacitor_rect(x, y))
             else:
                 painter.drawRect(
                     QRectF(
@@ -1240,7 +1287,7 @@ class LoadItem(QGraphicsObject):
 
     def __init__(self, *, symbol_kind: str = "load") -> None:
         super().__init__()
-        if symbol_kind not in {"load", "generator"}:
+        if symbol_kind not in {"load", "generator", "capacitor"}:
             raise ValueError(f"Símbolo associado desconhecido: {symbol_kind}")
         self._symbol_kind = symbol_kind
         self.index = -1
@@ -1290,6 +1337,8 @@ class LoadItem(QGraphicsObject):
                 GENERATOR_DIAMETER_PX,
                 GENERATOR_DIAMETER_PX,
             )
+        if self._symbol_kind == "capacitor":
+            return _capacitor_rect(self._x_offset, self._y_offset)
         return _load_rect(self._x_offset, self._y_offset)
 
     def boundingRect(self) -> QRectF:  # noqa: N802
@@ -1303,6 +1352,8 @@ class LoadItem(QGraphicsObject):
         if self._symbol_kind == "generator":
             path.addEllipse(self.symbol_rect)
         else:
+            # O capacitor usa o retangulo que envolve as duas placas: a area
+            # entre elas e vazia no desenho, mas precisa ser clicavel.
             path.addRect(self.symbol_rect)
         return path
 
@@ -1323,6 +1374,17 @@ class LoadItem(QGraphicsObject):
         if self._symbol_kind == "generator":
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.drawEllipse(self.symbol_rect)
+        elif self._symbol_kind == "capacitor":
+            rect = self.symbol_rect
+            painter.setPen(Qt.PenStyle.NoPen)
+            if selected:
+                # Fundo amarelo como nos demais simbolos, para a selecao ter
+                # a mesma leitura em toda a camada.
+                painter.drawRect(rect)
+            painter.setBrush(
+                QBrush(SELECTED_OUTLINE if selected else LOAD_COLOR)
+            )
+            _draw_capacitor_plates(painter, rect)
         else:
             painter.drawRect(self.symbol_rect)
         painter.restore()
@@ -1355,6 +1417,10 @@ class LoadSelectionOverlayItem(LoadItem):
             painter.drawEllipse(self.symbol_rect)
         else:
             painter.drawRect(self.symbol_rect)
+        if self._symbol_kind == "capacitor":
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(SELECTED_OUTLINE))
+            _draw_capacitor_plates(painter, self.symbol_rect)
         painter.restore()
 
 
@@ -1375,6 +1441,8 @@ class DiagramView(QGraphicsView):
         self._load_layer: LoadVirtualizer | None = None
         self._generator_model: GeneratorModel | None = None
         self._generator_layer: LoadVirtualizer | None = None
+        self._capacitor_model: CapacitorModel | None = None
+        self._capacitor_layer: LoadVirtualizer | None = None
         self._equivalent_load_model: EquivalentNetworkModel | None = None
         self._equivalent_load_layer: LoadVirtualizer | None = None
         self._bar_visibility_mask: BoolArray | None = None
@@ -1583,6 +1651,11 @@ class DiagramView(QGraphicsView):
         ):
             self._generator_model = None
         if (
+            self._capacitor_model is not None
+            and self._capacitor_model.bars is not model
+        ):
+            self._capacitor_model = None
+        if (
             self._equivalent_load_model is not None
             and self._equivalent_load_model.bars is not model
         ):
@@ -1621,6 +1694,16 @@ class DiagramView(QGraphicsView):
 
     def set_generator_layer(self, layer: LoadVirtualizer | None) -> None:
         self._generator_layer = layer
+
+    def set_capacitor_model(self, model: CapacitorModel | None) -> None:
+        if model is not None and model.bars is not self._model:
+            raise ValueError(
+                "Os capacitores devem referenciar as barras exibidas na view."
+            )
+        self._capacitor_model = model
+
+    def set_capacitor_layer(self, layer: LoadVirtualizer | None) -> None:
+        self._capacitor_layer = layer
 
     def set_equivalent_load_model(
         self,
@@ -1915,6 +1998,7 @@ class DiagramView(QGraphicsView):
         tolerance = CLICK_TOLERANCE_PX / max(scale, 1e-12)
         load_layers = (
             ("generator", self._generator_layer, self._generator_model),
+            ("capacitor", self._capacitor_layer, self._capacitor_model),
             (
                 "equivalent_load",
                 self._equivalent_load_layer,
@@ -2764,7 +2848,7 @@ class LoadVirtualizer(QObject):
         self.scene = scene
         self.view = view
         self.max_active_items = max_active_items
-        if symbol_kind not in {"load", "generator"}:
+        if symbol_kind not in {"load", "generator", "capacitor"}:
             raise ValueError(f"Símbolo associado desconhecido: {symbol_kind}")
         self.symbol_kind = symbol_kind
         self.model: LoadRenderModel | None = None
@@ -3206,19 +3290,23 @@ class LoadVirtualizer(QObject):
             )
             local_x = float(position.x() - anchor.x())
             local_y = float(position.y() - anchor.y())
-            rect = (
-                QRectF(
+            if self.symbol_kind == "generator":
+                rect = QRectF(
                     float(self._x_offsets[index]) - GENERATOR_DIAMETER_PX / 2.0,
                     float(self._y_offsets[index]),
                     GENERATOR_DIAMETER_PX,
                     GENERATOR_DIAMETER_PX,
                 )
-                if self.symbol_kind == "generator"
-                else _load_rect(
+            elif self.symbol_kind == "capacitor":
+                rect = _capacitor_rect(
                     float(self._x_offsets[index]),
                     float(self._y_offsets[index]),
                 )
-            )
+            else:
+                rect = _load_rect(
+                    float(self._x_offsets[index]),
+                    float(self._y_offsets[index]),
+                )
             if not rect.contains(QPointF(local_x, local_y)):
                 continue
             center = rect.center()

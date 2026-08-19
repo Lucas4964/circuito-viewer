@@ -42,13 +42,14 @@ class FakeDatabase:
 
 
 def full_database(**extra: list[str]) -> FakeDatabase:
-    """Banco com as fontes das dez entidades lógicas, mais o que for pedido."""
+    """Banco com as fontes de todas as entidades lógicas, mais o que for pedido."""
 
     tables = {
         "BARRA": [*REQUIRED_COLUMNS["barras"], "BLOCO_ID", "PL_ANO"],
         "CABOS": [*REQUIRED_COLUMNS["cabos"], "K", "COLOR"],
         "TRECHO": [*REQUIRED_COLUMNS["trechos"], "POSBAR1", "INFO"],
         "CARGA": [*REQUIRED_COLUMNS["cargas"], "MC1_TIPO", "FATDEM"],
+        "CAPACITOR": [*REQUIRED_COLUMNS["capacitores"], "QNOM", "CTRL_TIPO"],
         "MT_GERADOR_CONS": [*REQUIRED_COLUMNS["geradores"], "OBS"],
         "MT_CONS": [*REQUIRED_COLUMNS[GENERATOR_CONSUMER_ENTITY], "TIPO"],
         "MODELO_CARGA": ["CENARIO_ID", *REQUIRED_COLUMNS["patamares"]],

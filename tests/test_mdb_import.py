@@ -51,7 +51,7 @@ class FakeDatabase:
 
 
 def network_database(**overrides) -> FakeDatabase:
-    """Uma rede mínima com as dez entidades, em tipos nativos do Access.
+    """Uma rede mínima com todas as entidades, em tipos nativos do Access.
 
     Os tipos imitam a base real: identificadores inteiros, FASES2 e ESTADO
     inteiros, COMPR e VNOM em ponto flutuante.
@@ -95,6 +95,16 @@ def network_database(**overrides) -> FakeDatabase:
                 "VLINHASEC", "FASES2", "TIPO_LIG", "FATDEM",
             ],
             [(2, 9, 34722450, "CARGA-1", 30.0, 30.0, 220.0, 13, 2, None)],
+        ),
+        "CAPACITOR": (
+            [
+                "CAPAC_ID", "BARRA_ID", "EXTERN_ID", "CODIGO", "VNOM",
+                "Q1", "Q2", "Q3", "Q4", "FASES", "LIGACAO",
+            ],
+            # FASES vem em letras no cadastro, e nao no codigo numerico das
+            # cargas; o N e o neutro, ignorado pela exportacao.
+            [(239, 9, 34559653, "CAP-1", 13.8, 600.0, 600.0, 600.0, 600.0,
+              "DEFN", 0)],
         ),
         "MT_CONS": (
             ["ID", "CARGA_ID", "CODIGO", "EXTERN_ID", "NOME", "FASES2"],

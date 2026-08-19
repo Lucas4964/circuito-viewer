@@ -33,6 +33,7 @@ from .allocation import (
     build_transformer_allocations,
 )
 from .cable_import import CableCsvResult, parse_cable_rows
+from .capacitor_import import CapacitorCsvResult, parse_capacitor_rows
 from .circuit_import import CircuitLoadResult, parse_circuit_rows
 from .circuit_level_import import CircuitLevelCsvResult, parse_circuit_level_rows
 from .csv_import import (
@@ -80,6 +81,7 @@ ENTITY_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "cabos": (),
     "trechos": ("barras",),
     "cargas": ("barras",),
+    "capacitores": ("barras",),
     "geradores": ("cargas",),
     "patamares": ("cargas",),
     "chaves": ("trechos",),
@@ -118,6 +120,7 @@ class MdbImportResult:
     cables: CableCsvResult | None = None
     segments: SegmentLoadResult | None = None
     loads: LoadCsvResult | None = None
+    capacitors: CapacitorCsvResult | None = None
     generators: GeneratorCsvResult | None = None
     patterns: LoadPatternCsvResult | None = None
     switches: SwitchLoadResult | None = None
@@ -162,6 +165,7 @@ class MdbImportResult:
             self.cables,
             self.segments,
             self.loads,
+            self.capacitors,
             self.generators,
             self.patterns,
             self.switches,
@@ -459,6 +463,7 @@ def load_database(
         cables=results.get("cabos"),
         segments=results.get("trechos"),
         loads=results.get("cargas"),
+        capacitors=results.get("capacitores"),
         generators=results.get("geradores"),
         patterns=results.get("patamares"),
         switches=results.get("chaves"),
@@ -642,6 +647,10 @@ def _import_entity(
         return parse_segment_rows(header, rows, results["barras"].model, **common)
     if entity == "cargas":
         return parse_load_rows(header, rows, results["barras"].model, **common)
+    if entity == "capacitores":
+        return parse_capacitor_rows(
+            header, rows, results["barras"].model, **common
+        )
     if entity == "patamares":
         return parse_load_pattern_rows(header, rows, results["cargas"].model, **common)
     if entity == "chaves":

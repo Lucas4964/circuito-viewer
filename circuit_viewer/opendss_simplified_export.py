@@ -8,8 +8,16 @@ from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
 from .branch_analysis import BranchType
 from .equivalent_network import EquivalentNetworkResult
-from .model import CableModel, CircuitCatalogModel, LoadModel, LoadPatternModel, RegulatorModel
+from .model import (
+    CableModel,
+    CapacitorModel,
+    CircuitCatalogModel,
+    LoadModel,
+    LoadPatternModel,
+    RegulatorModel,
+)
 from .opendss_export import (
+    CAPACITORS_FILENAME,
     GENERATOR_PHASE_COUNTS,
     LINES_FILENAME,
     LOAD_PATTERN_COUNT,
@@ -23,6 +31,7 @@ from .opendss_export import (
     THREE_PHASE_LOADS_FILENAME,
     TWO_PHASE_GENERATORS_FILENAME,
     TWO_PHASE_LOADS_FILENAME,
+    OpenDssCapacitorExportResult,
     OpenDssExportIssue,
     OpenDssGeneratorExportResult,
     OpenDssLineExportResult,
@@ -36,6 +45,7 @@ from .opendss_export import (
     _phase_letters,
     _phase_nodes,
     _terminals_by_phase_letter,
+    build_capacitor_export,
     build_generator_export,
     build_line_export,
     build_load_export,
@@ -110,6 +120,7 @@ class SimplifiedOpenDssExportBundle:
     single_phase_generators: OpenDssGeneratorExportResult | None = None
     two_phase_generators: OpenDssGeneratorExportResult | None = None
     three_phase_generators: OpenDssGeneratorExportResult | None = None
+    capacitors: OpenDssCapacitorExportResult | None = None
     master: OpenDssMasterExportResult | None = None
 
     @property
@@ -148,6 +159,7 @@ class SimplifiedOpenDssExportBundle:
     @property
     def element_files(self) -> tuple[tuple[str, str], ...]:
         regulators = self.regulators
+        capacitors = self.capacitors
         return (
             (LINES_FILENAME, self.lines.text),
             (SWITCHES_FILENAME, self.switches.text),
@@ -163,6 +175,11 @@ class SimplifiedOpenDssExportBundle:
             *(
                 (_GENERATOR_FILES[count], result.text)
                 for count, result in self.generators_by_phase_count
+            ),
+            *(
+                ()
+                if capacitors is None or not capacitors.exported_count
+                else ((CAPACITORS_FILENAME, capacitors.text),)
             ),
             (SINGLE_PHASE_BRANCHES_FILENAME, self.single_phase_branches.text),
             (TWO_PHASE_BRANCHES_FILENAME, self.two_phase_branches.text),
@@ -186,6 +203,7 @@ class SimplifiedOpenDssExportBundle:
             *(() if self.regulators is None else (self.regulators,)),
             *(result for _, result in self.loads_by_phase_count),
             *(result for _, result in self.generators_by_phase_count),
+            *(() if self.capacitors is None else (self.capacitors,)),
             self.single_phase_branches,
             self.two_phase_branches,
             *((self.master,) if self.master is not None else ()),
@@ -200,6 +218,7 @@ class SimplifiedOpenDssExportBundle:
             *(() if self.regulators is None else (self.regulators,)),
             *(result for _, result in self.loads_by_phase_count),
             *(result for _, result in self.generators_by_phase_count),
+            *(() if self.capacitors is None else (self.capacitors,)),
             self.single_phase_branches,
             self.two_phase_branches,
             *((self.master,) if self.master is not None else ()),
@@ -400,6 +419,7 @@ def build_simplified_export(
     patterns: LoadPatternModel | None = None,
     generator_updates: GeneratorUpdateModel | None = None,
     regulators: RegulatorModel | None = None,
+    capacitors: CapacitorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: Callable[[int, int], None] | None = None,
@@ -583,6 +603,24 @@ def build_simplified_export(
         reserved |= result.used_names
         branch_results[count] = result
 
+    capacitor_result: OpenDssCapacitorExportResult | None = None
+    if capacitors is not None:
+        # Só os bancos que sobreviveram à redução, isto é, os do tronco.
+        # Um banco dentro de um ramal foi absorvido pela carga equivalente,
+        # que não representa compensação reativa — ele sai da exportação
+        # com ocorrência registrada, nunca em silêncio.
+        capacitor_result = build_capacitor_export(
+            catalog,
+            capacitors,
+            phase_configuration,
+            selected,
+            reserved_names=reserved,
+            include_bar_indices=retained_bars,
+            cancel_check=cancel_check,
+            progress=progress,
+        )
+        reserved |= capacitor_result.used_names
+
     partial = SimplifiedOpenDssExportBundle(
         line_result,
         switch_result,
@@ -595,6 +633,7 @@ def build_simplified_export(
         generator_results.get(1),
         generator_results.get(2),
         generator_results.get(3),
+        capacitor_result,
     )
     master = build_master_export(
         catalog,
@@ -602,7 +641,10 @@ def build_simplified_export(
         redirects=[name for name, _ in partial.element_files],
         load_settings=(
             load_settings
-            if load_results or generator_results or any(
+            if load_results
+            or generator_results
+            or capacitor_result
+            or any(
                 result.exported_count for result in branch_results.values()
             )
             else None
@@ -626,5 +668,6 @@ def build_simplified_export(
         generator_results.get(1),
         generator_results.get(2),
         generator_results.get(3),
+        capacitor_result,
         master,
     )

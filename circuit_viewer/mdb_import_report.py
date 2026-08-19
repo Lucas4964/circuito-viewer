@@ -36,6 +36,7 @@ def _result_for(result: MdbImportResult, entity: str):  # noqa: ANN202
         "cabos": result.cables,
         "trechos": result.segments,
         "cargas": result.loads,
+        "capacitores": result.capacitors,
         "geradores": result.generators,
         "patamares": result.patterns,
         "chaves": result.switches,

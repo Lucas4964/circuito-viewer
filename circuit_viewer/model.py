@@ -152,6 +152,34 @@ class LoadRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class CapacitorRecord:
+    """Atributos de um banco de capacitores associado a uma barra.
+
+    ``phases`` guarda a coluna ``FASES`` do cadastro, que é a string de letras
+    (``DEFN``) e não o código numérico ``FASES2`` das cargas. ``q1``..``q4`` são
+    a potência reativa do **banco inteiro** em cada patamar, não por fase.
+    """
+
+    capacitor_id: str
+    bar_id: str
+    external_id: str
+    code: str
+    nominal_voltage: str
+    q1: str
+    q2: str
+    q3: str
+    q4: str
+    phases: str
+    connection_type: str
+
+    @property
+    def reactive_powers(self) -> tuple[str, str, str, str]:
+        """Q1..Q4 na ordem dos patamares NPAT 0..3."""
+
+        return (self.q1, self.q2, self.q3, self.q4)
+
+
+@dataclass(frozen=True, slots=True)
 class GeneratorRecord:
     """Gerador de MT, seu consumidor associado e a barra resolvida."""
 
@@ -245,7 +273,9 @@ class CircuitMembership:
 class FeatureSelection:
     """Referência leve para um elemento selecionado em um dos modelos."""
 
-    kind: Literal["bar", "segment", "load", "equivalent_load", "generator"]
+    kind: Literal[
+        "bar", "segment", "load", "equivalent_load", "generator", "capacitor"
+    ]
     index: int
 
     def __post_init__(self) -> None:
@@ -255,6 +285,7 @@ class FeatureSelection:
             "load",
             "equivalent_load",
             "generator",
+            "capacitor",
         }:
             raise ValueError(f"Tipo de elemento desconhecido: {self.kind}")
         if self.index < 0:
@@ -736,6 +767,155 @@ class LoadModel:
             snom=self._snom_values[index],
             sadm=self._sadm_values[index],
             secondary_line_voltage=self._secondary_line_voltages[index],
+            phases=self._phases[index],
+            connection_type=self._connection_types[index],
+        )
+
+
+class CapacitorModel:
+    """Bancos de capacitores que reutilizam as coordenadas das barras.
+
+    Estruturalmente igual ao :class:`LoadModel` — mesma associação por índice de
+    barra e o mesmo ``StaticPointIndex`` herdado — porque os dois compartilham
+    toda a camada de render e as máscaras de visibilidade por circuito.
+    """
+
+    __slots__ = (
+        "bars",
+        "_capacitor_ids",
+        "_bar_indices",
+        "_external_ids",
+        "_codes",
+        "_nominal_voltages",
+        "_q1_values",
+        "_q2_values",
+        "_q3_values",
+        "_q4_values",
+        "_phases",
+        "_connection_types",
+        "_by_id",
+        "_spatial_index",
+        "source_path",
+    )
+
+    def __init__(
+        self,
+        bars: CircuitModel,
+        capacitor_ids: Iterable[str],
+        bar_indices: Iterable[int] | IndexArray,
+        external_ids: Iterable[str],
+        codes: Iterable[str],
+        nominal_voltages: Iterable[str],
+        q1_values: Iterable[str],
+        q2_values: Iterable[str],
+        q3_values: Iterable[str],
+        q4_values: Iterable[str],
+        phases: Iterable[str],
+        connection_types: Iterable[str],
+        *,
+        source_path: str | None = None,
+    ) -> None:
+        ids = tuple(str(value) for value in capacitor_ids)
+        text_columns = tuple(
+            tuple(str(value) for value in values)
+            for values in (
+                external_ids,
+                codes,
+                nominal_voltages,
+                q1_values,
+                q2_values,
+                q3_values,
+                q4_values,
+                phases,
+                connection_types,
+            )
+        )
+        associated_bars = np.ascontiguousarray(bar_indices, dtype=np.intp)
+        size = len(ids)
+        if size == 0:
+            raise ValueError("O modelo deve conter ao menos um capacitor.")
+        if any(len(values) != size for values in text_columns):
+            raise ValueError(
+                "Todos os campos do capacitor devem possuir o mesmo tamanho."
+            )
+        if associated_bars.ndim != 1 or associated_bars.size != size:
+            raise ValueError("Os índices de barras devem formar um vetor compatível.")
+        if (associated_bars < 0).any() or (associated_bars >= len(bars)).any():
+            raise ValueError("Um capacitor referencia uma barra inexistente.")
+
+        by_id: dict[str, int] = {}
+        for index, capacitor_id in enumerate(ids):
+            if not capacitor_id:
+                raise ValueError("CAPAC_ID não pode ser vazio.")
+            if capacitor_id in by_id:
+                raise ValueError(f"CAPAC_ID duplicado no modelo: {capacitor_id}")
+            by_id[capacitor_id] = index
+
+        associated_bars.setflags(write=False)
+        self.bars = bars
+        self._capacitor_ids = ids
+        self._bar_indices = associated_bars
+        (
+            self._external_ids,
+            self._codes,
+            self._nominal_voltages,
+            self._q1_values,
+            self._q2_values,
+            self._q3_values,
+            self._q4_values,
+            self._phases,
+            self._connection_types,
+        ) = text_columns
+        self._by_id = by_id
+        self._spatial_index = StaticPointIndex(
+            bars.x[associated_bars],
+            bars.y[associated_bars],
+        )
+        self.source_path = source_path
+
+    def __len__(self) -> int:
+        return len(self._capacitor_ids)
+
+    @property
+    def capacitor_ids(self) -> tuple[str, ...]:
+        return self._capacitor_ids
+
+    @property
+    def bar_indices(self) -> IndexArray:
+        return self._bar_indices
+
+    @property
+    def codes(self) -> tuple[str, ...]:
+        return self._codes
+
+    @property
+    def nominal_voltages(self) -> tuple[str, ...]:
+        return self._nominal_voltages
+
+    @property
+    def phases(self) -> tuple[str, ...]:
+        return self._phases
+
+    @property
+    def spatial_index(self) -> StaticPointIndex:
+        return self._spatial_index
+
+    def index_for_id(self, capacitor_id: str) -> int | None:
+        return self._by_id.get(capacitor_id)
+
+    def record(self, index: int) -> CapacitorRecord:
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        return CapacitorRecord(
+            capacitor_id=self._capacitor_ids[index],
+            bar_id=self.bars.bar_ids[int(self._bar_indices[index])],
+            external_id=self._external_ids[index],
+            code=self._codes[index],
+            nominal_voltage=self._nominal_voltages[index],
+            q1=self._q1_values[index],
+            q2=self._q2_values[index],
+            q3=self._q3_values[index],
+            q4=self._q4_values[index],
             phases=self._phases[index],
             connection_type=self._connection_types[index],
         )

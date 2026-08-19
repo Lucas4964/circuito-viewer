@@ -57,6 +57,7 @@ from .circuit_calculation_levels import (
     CircuitCalculationLevelsModel,
 )
 from .cable_import import CableCsvResult
+from .capacitor_import import CapacitorCsvResult
 from .cables_window import (
     CablesWindow,
     CableTableModel,
@@ -232,6 +233,7 @@ from .theme import (
     save_theme_preference,
 )
 from .workers import (
+    CapacitorImportWorker,
     AllocationMeasurementImportWorker,
     BranchAnalysisWorker,
     BranchCsvExportWorker,
@@ -697,6 +699,7 @@ class MainWindow(QMainWindow):
         self._allocation_model: TransformerAllocationModel | None = None
         self._load_pattern_model: LoadPatternModel | None = None
         self._generator_model: GeneratorModel | None = None
+        self._capacitor_model: CapacitorModel | None = None
         self._generator_update_result: GeneratorUpdateResult | None = None
         self._switch_model: SwitchModel | None = None
         self._switch_item: SwitchNetworkItem | None = None
@@ -841,6 +844,14 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.view.set_generator_layer(self.generator_virtualizer)
+        self.capacitor_virtualizer = LoadVirtualizer(
+            self.scene,
+            self.view,
+            symbol_kind="capacitor",
+            lod_coordinator=self.load_lod_coordinator,
+            parent=self,
+        )
+        self.view.set_capacitor_layer(self.capacitor_virtualizer)
         self.equivalent_load_virtualizer = LoadVirtualizer(
             self.scene,
             self.view,
@@ -1045,6 +1056,14 @@ class MainWindow(QMainWindow):
         self.show_generators_action.setChecked(True)
         self.show_generators_action.setEnabled(False)
         self.show_generators_action.toggled.connect(self._set_generators_visible)
+
+        self.show_capacitors_action = QAction("Mostrar capacitores", self)
+        self.show_capacitors_action.setCheckable(True)
+        self.show_capacitors_action.setChecked(True)
+        self.show_capacitors_action.setEnabled(False)
+        self.show_capacitors_action.toggled.connect(
+            self._set_capacitors_visible
+        )
 
         self.root_bar_action = QAction("Visualizar Barra Inicial", self)
         self.root_bar_action.setCheckable(True)
@@ -1276,6 +1295,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.show_bars_action)
         view_menu.addAction(self.show_loads_action)
         view_menu.addAction(self.show_generators_action)
+        view_menu.addAction(self.show_capacitors_action)
         view_menu.addAction(self.root_bar_action)
         view_menu.addAction(self.phase_coloring_action)
         view_menu.addAction(self.simplified_network_action)
@@ -1611,6 +1631,48 @@ class MainWindow(QMainWindow):
         load_layout.addStretch(1)
         self.load_details_page.setWidget(self.load_details_body)
         self.details_stack.addWidget(self.load_details_page)
+
+        capacitor_fields = (
+            ("capacitor_id", "CAPAC_ID:"),
+            ("bar_id", "BARRA_ID:"),
+            ("external_id", "EXTERN_ID:"),
+            ("code", "CODIGO:"),
+            ("nominal_voltage", "VNOM:"),
+            ("q1", "Q1:"),
+            ("q2", "Q2:"),
+            ("q3", "Q3:"),
+            ("q4", "Q4:"),
+            ("phases", "FASES:"),
+            ("connection_type", "LIGACAO:"),
+        )
+        self.capacitor_details_page = QScrollArea(self.details_stack)
+        self.capacitor_details_page.setFrameShape(QFrame.Shape.NoFrame)
+        self.capacitor_details_page.setWidgetResizable(True)
+        self.capacitor_details_page.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.capacitor_details_body = QWidget(self.capacitor_details_page)
+        capacitor_layout = QVBoxLayout(self.capacitor_details_body)
+        self.capacitor_table_title = QLabel("Dados do banco de capacitores")
+        capacitor_layout.addWidget(self.capacitor_table_title)
+        (
+            self.capacitor_details_table,
+            self.capacitor_detail_labels,
+            self.capacitor_caption_labels,
+            self.capacitor_details_grid,
+            _,
+        ) = create_table(capacitor_fields, self.capacitor_details_body)
+        capacitor_layout.addWidget(self.capacitor_details_table)
+        # Q1..Q4 e do banco inteiro; a exportacao divide pelo numero de
+        # fases. Sem esta nota o painel e o .dss pareceriam divergir.
+        self.capacitor_note_label = QLabel(
+            "Q1..Q4 é a potência reativa do banco inteiro, em kvar. Na exportação OpenDSS ela é dividida pelo número de fases e entra como reativo negativo no LoadShape."
+        )
+        self.capacitor_note_label.setWordWrap(True)
+        capacitor_layout.addWidget(self.capacitor_note_label)
+        capacitor_layout.addStretch(1)
+        self.capacitor_details_page.setWidget(self.capacitor_details_body)
+        self.details_stack.addWidget(self.capacitor_details_page)
 
         self.generator_details_page = QScrollArea(self.details_stack)
         self.generator_details_page.setFrameShape(QFrame.Shape.NoFrame)
@@ -1983,6 +2045,7 @@ class MainWindow(QMainWindow):
         self.segment_status = QLabel("Trechos: 0")
         self.load_status = QLabel("Cargas: 0")
         self.generator_status = QLabel("Geradores: 0")
+        self.capacitor_status = QLabel("Capacitores: 0")
         self.active_status = QLabel("Itens ativos: 0")
         self.mode_status = QLabel("Visão geral")
         self.overlap_status = QLabel("Sobreposições: 0")
@@ -1992,6 +2055,7 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self.segment_status)
         status.addPermanentWidget(self.load_status)
         status.addPermanentWidget(self.generator_status)
+        status.addPermanentWidget(self.capacitor_status)
         status.addPermanentWidget(self.overlap_status)
         status.addPermanentWidget(self.active_status)
         status.addPermanentWidget(self.mode_status)
@@ -2424,6 +2488,7 @@ class MainWindow(QMainWindow):
 
         # As barras substituem tudo: trechos e cargas antigos referenciam o
         # modelo anterior e precisam sair antes.
+        self._set_capacitor_model(None)
         self._set_load_model(None)
         self._set_line_model(None)
         self._model = result.bars.model
@@ -2443,6 +2508,8 @@ class MainWindow(QMainWindow):
             self._set_line_model(result.segments.model)
         if result.loads is not None:
             self._set_load_model(result.loads.model)
+        if result.capacitors is not None:
+            self._set_capacitor_model(result.capacitors.model)
         if result.allocations is not None:
             self._set_allocation_model(result.allocations)
         if result.generators is not None:
@@ -2925,6 +2992,7 @@ class MainWindow(QMainWindow):
 
         # Trechos e cargas referenciam o modelo anterior e só são removidos
         # depois que a nova importação de barras foi concluída com sucesso.
+        self._set_capacitor_model(None)
         self._set_load_model(None)
         self._set_line_model(None)
         self._model = result.model
@@ -3221,6 +3289,37 @@ class MainWindow(QMainWindow):
         self._apply_circuit_visibility()
         if model is not None and self.show_generators_action.isChecked():
             self.generator_virtualizer.refresh(force=True)
+        self.view.viewport().update()
+
+    def _set_capacitor_model(self, model: CapacitorModel | None) -> None:
+        """Instala os bancos de capacitores.
+
+        Eles penduram direto na barra, como as cargas, e não na carga como os
+        geradores — por isso a cascata de cima é a das barras, não a das cargas.
+        Como são exportados e injetam reativo, um fluxo de potência calculado com
+        outro conjunto deixa de valer.
+        """
+
+        if model is not None and model.bars is not self._model:
+            raise ValueError("Os capacitores devem referenciar as barras exibidas.")
+        if model is not self._capacitor_model:
+            self._invalidate_power_flow()
+        if (
+            self._selected_feature is not None
+            and self._selected_feature.kind == "capacitor"
+        ):
+            self._set_selection(None)
+        self._capacitor_model = model
+        self.view.set_capacitor_model(model)
+        self.capacitor_virtualizer.reset_model(model)
+        self._sync_load_layout()
+        self.show_capacitors_action.setEnabled(model is not None)
+        self.capacitor_status.setText(
+            f"Capacitores: {len(model) if model is not None else 0:n}"
+        )
+        self._apply_circuit_visibility()
+        if model is not None and self.show_capacitors_action.isChecked():
+            self.capacitor_virtualizer.refresh(force=True)
         self.view.viewport().update()
 
     def _set_load_pattern_model(self, model: LoadPatternModel | None) -> None:
@@ -3669,6 +3768,11 @@ class MainWindow(QMainWindow):
             if controller is None or self._generator_model is None
             else controller.bar_visible_mask[self._generator_model.bar_indices]
         )
+        capacitor_mask = (
+            None
+            if controller is None or self._capacitor_model is None
+            else controller.bar_visible_mask[self._capacitor_model.bar_indices]
+        )
         equivalent_mask = None
         simplified = (
             self.simplified_network_action.isChecked()
@@ -3696,6 +3800,7 @@ class MainWindow(QMainWindow):
         self.virtualizer.set_visibility_mask(bar_mask)
         self.load_virtualizer.set_visibility_mask(load_mask)
         self.generator_virtualizer.set_visibility_mask(generator_mask)
+        self.capacitor_virtualizer.set_visibility_mask(capacitor_mask)
         if self._equivalent_network_result is not None:
             self.equivalent_load_virtualizer.set_visibility_mask(equivalent_mask)
         if self._line_item is not None:
@@ -4803,6 +4908,7 @@ class MainWindow(QMainWindow):
             patterns=patterns,
             generator_updates=self._exportable_generators(),
             regulators=self._regulator_model,
+            capacitors=self._capacitor_model,
             load_settings=self._opendss_load_settings,
         )
         thread = QThread(self)
@@ -4951,6 +5057,7 @@ class MainWindow(QMainWindow):
             patterns=patterns,
             generator_updates=generator_updates,
             regulators=self._regulator_model,
+            capacitors=self._capacitor_model,
             load_settings=self._opendss_load_settings,
             line_parameter_mode=self._opendss_line_parameter_mode,
             library_catalog=library_catalog,
@@ -5267,6 +5374,7 @@ class MainWindow(QMainWindow):
             patterns=patterns,
             generator_updates=generator_updates,
             regulators=self._regulator_model,
+            capacitors=self._capacitor_model,
             load_settings=self._opendss_load_settings,
             line_parameter_mode=self._opendss_line_parameter_mode,
             library_catalog=library_catalog,
@@ -5479,6 +5587,7 @@ class MainWindow(QMainWindow):
         candidates = (
             (self._load_model, None),
             (self._generator_model, None),
+            (self._capacitor_model, None),
             (
                 equivalent_model if show_equivalent else None,
                 (
@@ -5501,6 +5610,9 @@ class MainWindow(QMainWindow):
             layout_index += 1
         if self._generator_model is not None:
             self.generator_virtualizer.set_layout_offsets(*layouts[layout_index])
+            layout_index += 1
+        if self._capacitor_model is not None:
+            self.capacitor_virtualizer.set_layout_offsets(*layouts[layout_index])
             layout_index += 1
         if show_equivalent:
             self.equivalent_load_virtualizer.set_layout_offsets(
@@ -7185,6 +7297,19 @@ class MainWindow(QMainWindow):
         state = "visíveis" if visible else "ocultas"
         self.statusBar().showMessage(f"Cargas {state}.", 3_000)
 
+    def _set_capacitors_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if (
+            not visible
+            and self._selected_feature is not None
+            and self._selected_feature.kind == "capacitor"
+            and not self._search_focus_active
+        ):
+            self._set_selection(None)
+        self.capacitor_virtualizer.set_loads_visible(visible)
+        state = "visíveis" if visible else "ocultos"
+        self.statusBar().showMessage(f"Capacitores {state}.", 3_000)
+
     def _set_generators_visible(self, visible: bool) -> None:
         visible = bool(visible)
         if (
@@ -7226,12 +7351,14 @@ class MainWindow(QMainWindow):
             self.load_virtualizer.set_selected_index(None)
             self.equivalent_load_virtualizer.set_selected_index(None)
             self.generator_virtualizer.set_selected_index(None)
+            self.capacitor_virtualizer.set_selected_index(None)
             self.segment_selection_overlay.clear()
             for label in (
                 *self.bar_detail_labels.values(),
                 *self.load_detail_labels.values(),
                 *self.generator_detail_labels.values(),
                 *self.generator_consumer_detail_labels.values(),
+                *self.capacitor_detail_labels.values(),
                 *self.equivalent_detail_labels.values(),
                 *self.segment_detail_labels.values(),
                 *self.switch_detail_labels.values(),
@@ -7245,6 +7372,8 @@ class MainWindow(QMainWindow):
 
         if selection.kind != "generator":
             self.generator_virtualizer.set_selected_index(None)
+        if selection.kind != "capacitor":
+            self.capacitor_virtualizer.set_selected_index(None)
 
         if selection.kind == "bar":
             if not 0 <= selection.index < len(self._model):
@@ -7387,6 +7516,40 @@ class MainWindow(QMainWindow):
             self.equivalent_details_page.verticalScrollBar().setValue(0)
             return
 
+        if selection.kind == "capacitor":
+            if self._capacitor_model is None or not 0 <= selection.index < len(
+                self._capacitor_model
+            ):
+                return
+            self._selected_feature = selection
+            self.virtualizer.set_selected_index(None)
+            self.load_virtualizer.set_selected_index(None)
+            self.equivalent_load_virtualizer.set_selected_index(None)
+            self.segment_selection_overlay.clear()
+            self.capacitor_virtualizer.set_selected_index(
+                selection.index, reveal_hidden=reveal_hidden
+            )
+            record = self._capacitor_model.record(selection.index)
+            capacitor_values = {
+                "capacitor_id": record.capacitor_id,
+                "bar_id": record.bar_id,
+                "external_id": record.external_id,
+                "code": record.code,
+                "nominal_voltage": record.nominal_voltage,
+                "q1": record.q1,
+                "q2": record.q2,
+                "q3": record.q3,
+                "q4": record.q4,
+                "phases": record.phases,
+                "connection_type": record.connection_type,
+            }
+            for key, value in capacitor_values.items():
+                self.capacitor_detail_labels[key].setText(value or "—")
+            self.details_dock.setWindowTitle("Capacitor selecionado")
+            self.details_stack.setCurrentWidget(self.capacitor_details_page)
+            self.capacitor_details_page.verticalScrollBar().setValue(0)
+            return
+
         if selection.kind == "generator":
             if self._generator_model is None or not 0 <= selection.index < len(
                 self._generator_model
@@ -7481,6 +7644,7 @@ class MainWindow(QMainWindow):
         self.load_virtualizer.set_selected_index(None)
         self.equivalent_load_virtualizer.set_selected_index(None)
         self.generator_virtualizer.set_selected_index(None)
+        self.capacitor_virtualizer.set_selected_index(None)
         self.segment_selection_overlay.bind(self._line_model, selection.index)
         record = self._line_model.record(selection.index)
         values = {

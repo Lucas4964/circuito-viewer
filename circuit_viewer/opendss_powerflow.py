@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
 
 from .model import (
     CableModel,
+    CapacitorModel,
     CircuitCatalogModel,
     LoadModel,
     LoadPatternModel,
@@ -820,6 +821,7 @@ def run_power_flow(
     patterns: LoadPatternModel | None = None,
     generator_updates: GeneratorUpdateModel | None = None,
     regulators: RegulatorModel | None = None,
+    capacitors: CapacitorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
     line_parameter_mode: OpenDssLineParameterMode = (
         OpenDssLineParameterMode.ORIGINAL
@@ -868,6 +870,7 @@ def run_power_flow(
             patterns=patterns,
             generator_updates=generator_updates,
             regulators=regulators,
+            capacitors=capacitors,
             load_settings=load_settings,
             line_parameter_mode=line_parameter_mode,
             library_catalog=library_catalog,

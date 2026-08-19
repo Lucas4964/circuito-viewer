@@ -819,7 +819,7 @@ Durante a materialização o agregado permanece visível e só é ocultado após
 | Classe | Z | Técnica |
 |---|---|---|
 | `BarsOverviewItem` | −10 | `QPolygonF` de pontos + `drawPoints` com pen cosmético `RoundCap` |
-| `LoadsOverviewItem` | −11 | `SquareCap` para cargas e `RoundCap` para geradores, diâmetro 7 px |
+| `LoadsOverviewItem` | −11 | `SquareCap` para cargas e capacitores, `RoundCap` para geradores, diâmetro 7 px |
 | `LineNetworkItem` | −20 | `dict[categoria → QPainterPath]` com subcaminhos desconectados; 1 `drawPath` por cor |
 | `SwitchNetworkItem` | −15 | `_red_path` único no modo circuito; `_colored_paths` por categoria no modo fases |
 | `RegulatorNetworkItem` | −12 | pontos médios pré-calculados; um `drawEllipse` por regulador, raio derivado da escala do painter |
@@ -1631,6 +1631,51 @@ colisão descarta o gerador inteiro antes de emitir qualquer uma de suas fases.
 No `element_files`, os três geradores aparecem depois dos três arquivos de
 carga, fixando a mesma ordem nos `Redirect` do master.
 
+#### Bancos de capacitores (`capacitores.dss`)
+
+`build_capacitor_export()` emite **um arquivo só**, sem divisão por contagem de
+fases: bancos são poucos e não justificam três arquivos. Cada banco vira uma
+`Load` monofásica por fase, com `kW=0`, `kvar=1`, `model=1`, `conn=wye` e o
+`LoadShape` do sempre presente par `mult`/`qmult` — `mult` zerado e `qmult`
+negativo. É a modelagem de compensação reativa como carga, no mesmo dialeto do
+resto do exportador; nenhum mecanismo novo foi necessário, porque a `LoadShape`
+de carga já carregava os dois vetores.
+
+Três diferenças em relação às cargas merecem registro:
+
+- **A fase vem em `FASES`, não em `FASES2`.** O cadastro de capacitor traz a
+  string de letras (`DEFN`), e não o código numérico que as cargas usam. O
+  `_phase_letters` já ignora letras fora de D/E/F, então o neutro é absorvido
+  sem tratamento especial, e a contagem de fases sai do próprio texto.
+- **`Q1..Q4` é do banco inteiro**, e não por fase como o `QD`/`QE`/`QF` das
+  cargas. Por isso é dividido pelo número de fases antes de virar `qmult`: sem a
+  divisão, um banco de 600 kvar injetaria 1800. É o mesmo tratamento que a
+  exportação de alocação dá à geração BT/MT.
+- **O sinal é invertido no exportador**, ao contrário dos geradores, cuja
+  inversão já vem do `generator_update.py`. O cadastro guarda a potência
+  positiva; quem injeta reativo é a modelagem.
+
+Nomes `CAP-<CODIGO>-<N>F-<FASE>`, com `CAPAC_ID` como fallback. O banco é o
+**último** da cadeia de reserva de `Load.*`: cargas e geradores têm prioridade
+por compatibilidade com o que já era exportado. No `element_files` o arquivo
+aparece depois dos geradores, e só quando há banco exportado — um arquivo vazio
+mudaria o master de exportações sem capacitores.
+
+**Na rede simplificada o filtro é a barra retida.** `include_bar_indices=
+retained_bars` deixa de fora os bancos que caíram dentro de um ramal, porque a
+carga equivalente que substitui o ramal não representa compensação reativa, e
+transferir o banco para a conexão do ramal é uma decisão de modelagem ainda em
+aberto. O descarte **nunca é silencioso**: cada banco omitido entra em `issues`
+dizendo que está dentro de um ramal — é o que permite medir o efeito antes de
+decidir o tratamento definitivo. As barras retidas são as do tronco, que é
+trifásico por construção da análise de ramais, então "não está em ramal" e "está
+num lugar trifásico" são a mesma condição e um teste só basta.
+
+**A exportação de alocação não recebe capacitores.** Ela monta a rede com
+`build_export()` sem cargas nem patamares e acrescenta as suas próprias `Load`
+por energia; incluir compensação ali mudaria um estudo já validado, então ficou
+de fora até haver decisão explícita.
+
 #### Master e coordenadas (`<CODIGO>_Master.dss`, `<CODIGO>_Buscoords.csv`)
 
 **O único arquivo executável.** Os arquivos anteriores só definem elementos; o
@@ -2419,9 +2464,12 @@ e evita que uma heurística errada corrompa silenciosamente toda a importação.
 7. Exportar em `__init__.py`; adicionar testes e (se for escala grande) benchmark.
 8. Para que a entidade também venha de banco: acrescentar a entrada em
    `config/mdb_tabelas.json`, o nome em `ENTITY_ORDER`, `REQUIRED_COLUMNS`,
-   `ENTITY_LABELS` e `ENTITY_DEPENDENCIES`, e o ramo em
-   `mdb_import._import_entity`. O diálogo e o relatório se ajustam sozinhos,
-   porque ambos percorrem `ENTITY_ORDER`.
+   `ENTITY_LABELS` e `ENTITY_DEPENDENCIES`, o campo em `MdbImportResult` (mais a
+   tupla de `has_warnings` e o retorno de `load_database`), e o ramo em
+   `mdb_import._import_entity`. O **diálogo** se ajusta sozinho, porque percorre
+   `ENTITY_ORDER`; o **relatório não**: `mdb_import_report._result_for` é um
+   dicionário literal, e sem a chave nova a linha da entidade aparece na tabela
+   mas as ocorrências dela somem em silêncio.
 
 ### Adicionar um modo de coloração
 
