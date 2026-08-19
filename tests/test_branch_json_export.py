@@ -152,6 +152,83 @@ def make_snapshot(
     return branches, equivalent
 
 
+def make_linear_branch_snapshot(
+    *,
+    branch_segment_count: int,
+    switch_at: int | None,
+    switch_code: str = "CHAVE-1",
+):
+    """Tronco ``DEF`` B0-B1-B2 com um ramal ``D`` linear pendurado em B1.
+
+    ``switch_at`` é a posição (1-based, igual à distância em saltos do tronco)
+    do trecho do ramal que recebe a chave, ou ``None`` para um ramal sem chave.
+    """
+
+    bar_count = branch_segment_count + 3
+    bars = CircuitModel(
+        [f"B{index}" for index in range(bar_count)],
+        [f"CB{index}" for index in range(bar_count)],
+        [float(index) for index in range(bar_count)],
+        [0.0] * bar_count,
+        UtmCrs(21, northern=False),
+    )
+    starts = [0, 1]
+    ends = [1, 2]
+    for position in range(1, branch_segment_count + 1):
+        starts.append(1 if position == 1 else position + 1)
+        ends.append(position + 2)
+    segment_count = len(starts)
+    segments = LineNetworkModel(
+        bars,
+        [f"T{index}" for index in range(segment_count)],
+        [f"CT{index}" for index in range(segment_count)],
+        ["DEF", "DEF", *["D"] * branch_segment_count],
+        starts,
+        ends,
+        [""] * segment_count,
+        [""] * segment_count,
+        [""] * segment_count,
+        [10.0] * segment_count,
+    )
+    switches = (
+        None
+        if switch_at is None
+        else SwitchModel(
+            segments,
+            ["CH1"],
+            ["TIPO"],
+            ["C1"],
+            [switch_at + 1],
+            [switch_code],
+            ["1"],
+            ["1"],
+            [""],
+            [""],
+            [""],
+        )
+    )
+    catalog = CircuitCatalogModel.build(
+        segments,
+        switches,
+        [CircuitDefinition("C1", "B0", "", "")],
+    )
+    loads = LoadModel(
+        bars,
+        ["L1"],
+        [bar_count - 1],
+        [""],
+        ["CARGA-1"],
+        ["1"],
+        ["1"],
+        [""],
+        ["d"],
+        [""],
+    )
+    branches = analyze_branches(catalog, PHASES, loads)
+    equivalent = build_equivalent_network(branches, loads)
+    return branches, equivalent
+
+
 class BranchJsonExportTests(unittest.TestCase):
     def test_payload_uses_only_cached_indices_and_codes(self) -> None:
         branches, equivalent = make_snapshot()
@@ -164,11 +241,14 @@ class BranchJsonExportTests(unittest.TestCase):
                 "ramais_interesse": [],
                 "RAMAL-1": {
                     "barra_inicio": "CB1",
+                    "nivel_topologico": 1,
                     "barras": ["CB3", "CB4"],
                     "trechos": ["CT2"],
+                    "trecho_ini": "CT2",
                     "cargas": ["CARGA-1", "CARGA-2"],
                     "geradores": ["GERAÇÃO-1"],
                     "chaves": ["CHAVE-Á"],
+                    "chave_ini": "CHAVE-Á",
                     "fase": "D",
                     "remanejavel": True,
                 }
@@ -184,6 +264,53 @@ class BranchJsonExportTests(unittest.TestCase):
             equivalent.model.record(0).maximum_active_demand,
             Decimal("43"),
         )
+
+    def test_chave_ini_ignores_removable_gate(self) -> None:
+        """``chave_ini`` é sempre a primeira chave, mesmo em ramal não remanejável."""
+
+        branches, equivalent = make_linear_branch_snapshot(
+            branch_segment_count=6,
+            switch_at=6,
+            switch_code="CHAVE-LONGE",
+        )
+        record = branches.records[0]
+        self.assertEqual(record.first_switch_position, 6)
+        self.assertFalse(record.removable)
+
+        payload = build_branch_json_payload(branches, equivalent, (0,))["RAMAL-1"]
+
+        self.assertEqual(payload["chave_ini"], "CHAVE-LONGE")
+        self.assertEqual(payload["chaves"], ["CHAVE-LONGE"])
+        self.assertFalse(payload["remanejavel"])
+        self.assertEqual(payload["nivel_topologico"], 1)
+        self.assertEqual(payload["trecho_ini"], "CT2")
+
+    def test_first_codes_are_empty_without_switch(self) -> None:
+        branches, equivalent = make_linear_branch_snapshot(
+            branch_segment_count=2,
+            switch_at=None,
+        )
+
+        payload = build_branch_json_payload(branches, equivalent, (0,))["RAMAL-1"]
+
+        self.assertEqual(payload["chaves"], [])
+        self.assertEqual(payload["chave_ini"], "")
+        self.assertEqual(payload["trecho_ini"], "CT2")
+        self.assertEqual(payload["trechos"][0], "CT2")
+
+    def test_trecho_ini_is_the_topological_first_of_trechos(self) -> None:
+        """O trecho com chave é pulado, igual ao filtro da lista ``trechos``."""
+
+        branches, equivalent = make_linear_branch_snapshot(
+            branch_segment_count=3,
+            switch_at=1,
+        )
+
+        payload = build_branch_json_payload(branches, equivalent, (0,))["RAMAL-1"]
+
+        self.assertNotIn("CT2", payload["trechos"])
+        self.assertEqual(payload["trecho_ini"], "CT3")
+        self.assertEqual(payload["chave_ini"], "CHAVE-1")
 
     def test_interest_ids_are_first_sorted_and_limited_to_exported_branches(self) -> None:
         branches, equivalent = make_snapshot()

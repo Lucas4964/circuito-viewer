@@ -308,6 +308,105 @@ class BranchesUiTests(unittest.TestCase):
         model.set_result(branches)
         self.assertEqual(model.interest_branch_ids(), ())
 
+    def test_current_row_is_highlighted_across_every_column(self) -> None:
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        branch_window = window.branches_window
+        branch_window.set_result(branches)
+        model = window.branch_table_model
+        self.app.processEvents()
+
+        self.assertEqual(model.highlight_row(), -1)
+
+        branch_window.table.setCurrentIndex(branch_window.proxy_model.index(1, 3))
+        self.app.processEvents()
+
+        highlighted = model.highlight_row()
+        self.assertGreaterEqual(highlighted, 0)
+        for column in range(model.columnCount()):
+            self.assertIsNotNone(
+                model.data(
+                    model.index(highlighted, column),
+                    Qt.ItemDataRole.BackgroundRole,
+                ),
+                f"coluna {column} sem faixa na linha corrente",
+            )
+        for row in range(model.rowCount()):
+            if row == highlighted:
+                continue
+            self.assertIsNone(
+                model.data(
+                    model.index(row, 0),
+                    Qt.ItemDataRole.BackgroundRole,
+                )
+            )
+
+    def test_highlight_maps_visible_row_to_source_row_when_sorted(self) -> None:
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        branch_window = window.branches_window
+        branch_window.set_result(branches)
+        model = window.branch_table_model
+        self.assertGreater(model.rowCount(), 1)
+
+        branch_window.proxy_model.sort(1, Qt.SortOrder.DescendingOrder)
+        self.app.processEvents()
+        branch_window.table.setCurrentIndex(branch_window.proxy_model.index(0, 1))
+        self.app.processEvents()
+
+        expected = branch_window.proxy_model.mapToSource(
+            branch_window.proxy_model.index(0, 1)
+        ).row()
+        self.assertEqual(model.highlight_row(), expected)
+        self.assertEqual(
+            model.record(expected).branch_id,
+            max(record.branch_id for record in branches.records),
+        )
+
+    def test_clear_selection_drops_the_highlight(self) -> None:
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        branch_window = window.branches_window
+        branch_window.set_result(branches)
+        model = window.branch_table_model
+        branch_window.table.setCurrentIndex(branch_window.proxy_model.index(0, 1))
+        self.app.processEvents()
+        self.assertGreaterEqual(model.highlight_row(), 0)
+
+        branch_window.clear_selection()
+        self.app.processEvents()
+
+        self.assertEqual(model.highlight_row(), -1)
+        self.assertIsNone(
+            model.data(model.index(0, 0), Qt.ItemDataRole.BackgroundRole)
+        )
+
+    def test_set_result_resets_the_highlight(self) -> None:
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        branch_window = window.branches_window
+        branch_window.set_result(branches)
+        model = window.branch_table_model
+        branch_window.table.setCurrentIndex(branch_window.proxy_model.index(0, 1))
+        self.app.processEvents()
+        self.assertGreaterEqual(model.highlight_row(), 0)
+
+        model.set_result(branches)
+
+        self.assertEqual(model.highlight_row(), -1)
+
     def test_table_copies_selected_cells_as_tsv_without_checkbox(self) -> None:
         window, _, _, catalog = self.make_window(two_circuits=True)
         branches = analyze_branches(

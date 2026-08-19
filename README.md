@@ -1365,14 +1365,31 @@ O botão **Exportar JSON** grava os ramais atualmente aceitos pelo filtro do
 ComboBox: um circuito específico ou todos os circuitos exibidos. O primeiro
 campo do objeto raiz é `ramais_interesse`, uma lista numérica ordenada apenas
 com os ramais marcados que também fazem parte da exportação. Em seguida vêm as
-chaves `RAMAL-<ID>`; cada entrada contém `barra_inicio`, `barras`, `trechos`,
-`cargas`, `geradores`, `chaves`, `fase` e o booleano `remanejavel`. A ordem é
+chaves `RAMAL-<ID>`; cada entrada contém `barra_inicio`, `nivel_topologico`,
+`barras`, `trechos`, `trecho_ini`, `cargas`, `geradores`, `chaves`, `chave_ini`,
+`fase` e o booleano `remanejavel`. A ordem é
 determinística e ramais zerados ou eletricamente incompletos continuam presentes,
 pois o arquivo descreve a topologia. Qualquer `CODIGO` vazio bloqueia o arquivo
 inteiro, sem substituição por IDs. A escrita usa UTF-8 e substituição atômica;
 cancelamento ou erro preserva um arquivo anterior.
 Trechos que possuem chave associada são excluídos de `trechos` e aparecem
 exclusivamente em `chaves`, evitando duplicidade lógica entre as duas listas.
+
+`nivel_topologico` repete a coluna `NIVEL_TOPOLOGICO` da tabela: a distância em
+saltos, ao longo do tronco trifásico, entre a barra fonte do circuito e a barra
+de conexão do ramal. `trecho_ini` e `chave_ini` identificam, respectivamente, o
+primeiro trecho e a primeira chave do ramal, medidos pela distância até o
+tronco; ambos são `""` quando o elemento não existe. Como `trecho_ini` ignora os
+trechos que modelam chaves — o mesmo filtro aplicado a `trechos` —, ele é sempre
+o primeiro item de `trechos` em ordem topológica.
+
+> **Atenção:** `chave_ini` **não** é equivalente à coluna `CHAVE_CODIGO` da
+> tabela. A coluna só exibe a primeira chave quando o ramal é remanejável
+> (primeira chave a até cinco saltos do tronco) e fica vazia caso contrário,
+> enquanto `chave_ini` traz sempre a primeira chave do ramal. Em um ramal não
+> remanejável com chaves, portanto, o JSON preenche `chave_ini` e a tabela
+> mostra `CHAVE_CODIGO` vazio — divergência intencional, para que `chave_ini`
+> seja coerente com a lista `chaves` do próprio arquivo.
 
 O botão **Exportar CSV (Excel)** grava exatamente as linhas aceitas pelo filtro
 e na ordem atualmente exibida na tabela, incluindo `CHAVE_ID` e

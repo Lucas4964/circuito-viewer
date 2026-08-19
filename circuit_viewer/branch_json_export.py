@@ -205,11 +205,14 @@ def build_branch_json_payload(
         )
         payload[f"RAMAL-{branch.branch_id}"] = {
             "barra_inicio": start_code,
+            "nivel_topologico": int(branch.topological_level),
             "barras": bar_codes,
             "trechos": segment_codes,
+            "trecho_ini": str(branch.first_common_segment_code),
             "cargas": load_codes,
             "geradores": generator_codes,
             "chaves": switch_codes,
+            "chave_ini": str(branch.first_switch_code),
             "fase": branch.phase,
             "remanejavel": bool(branch.removable),
         }

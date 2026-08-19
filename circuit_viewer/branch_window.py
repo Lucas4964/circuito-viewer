@@ -11,7 +11,13 @@ from PyQt6.QtCore import (
     Qt,
     pyqtSignal,
 )
-from PyQt6.QtGui import QGuiApplication, QKeyEvent, QKeySequence
+from PyQt6.QtGui import (
+    QBrush,
+    QGuiApplication,
+    QKeyEvent,
+    QKeySequence,
+    QPalette,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -39,6 +45,10 @@ from .equivalent_network import EquivalentNetworkResult
 
 BRANCH_INTEREST_COLUMN = 0
 BRANCH_DATA_COLUMN_OFFSET = 1
+# Alfa da faixa da linha corrente: forte o bastante para guiar o olho ao
+# rolar as colunas, fraco o bastante para não competir com a célula
+# selecionada, que o Qt pinta com Highlight opaco.
+BRANCH_HIGHLIGHT_ALPHA = 50
 
 
 class BranchTableModel(QAbstractTableModel):
@@ -57,12 +67,14 @@ class BranchTableModel(QAbstractTableModel):
         self.result: BranchAnalysisResult | None = None
         self._maximum_demand_by_branch: dict[int, Decimal | None] = {}
         self._interest_branch_ids: set[int] = set()
+        self._highlight_row = -1
 
     def set_result(self, result: BranchAnalysisResult | None) -> None:
         self.beginResetModel()
         self.result = result
         self._maximum_demand_by_branch = {}
         self._interest_branch_ids.clear()
+        self._highlight_row = -1
         self.endResetModel()
 
     def set_equivalent_result(
@@ -125,6 +137,37 @@ class BranchTableModel(QAbstractTableModel):
                 return Qt.AlignmentFlag.AlignCenter
         return None
 
+    def highlight_row(self) -> int:
+        return self._highlight_row
+
+    def set_highlight_row(self, row: int) -> None:
+        """Marca a linha do modelo fonte que recebe a faixa de destaque."""
+
+        normalized = int(row)
+        if not 0 <= normalized < self.rowCount():
+            normalized = -1
+        if normalized == self._highlight_row:
+            return
+        previous = self._highlight_row
+        self._highlight_row = normalized
+        last_column = self.columnCount() - 1
+        for changed in (previous, normalized):
+            if not 0 <= changed < self.rowCount():
+                continue
+            self.dataChanged.emit(
+                self.index(changed, 0),
+                self.index(changed, last_column),
+                (Qt.ItemDataRole.BackgroundRole,),
+            )
+
+    @staticmethod
+    def _highlight_brush() -> QBrush:
+        """Deriva a faixa da paleta ativa para acompanhar claro/escuro."""
+
+        color = QGuiApplication.palette().color(QPalette.ColorRole.Highlight)
+        color.setAlpha(BRANCH_HIGHLIGHT_ALPHA)
+        return QBrush(color)
+
     def record(self, row: int) -> BranchRecord:
         if self.result is None or not 0 <= int(row) < len(self.result.records):
             raise IndexError(row)
@@ -177,6 +220,10 @@ class BranchTableModel(QAbstractTableModel):
         if not index.isValid() or self.result is None:
             return None
         record = self.record(index.row())
+        if role == Qt.ItemDataRole.BackgroundRole:
+            if index.row() != self._highlight_row:
+                return None
+            return self._highlight_brush()
         if index.column() == BRANCH_INTEREST_COLUMN:
             if role == Qt.ItemDataRole.CheckStateRole:
                 return (
@@ -581,6 +628,7 @@ class BranchesWindow(QDialog):
     def clear_selection(self) -> None:
         self.table.clearSelection()
         self.table.setCurrentIndex(QModelIndex())
+        self._highlight_source_row(QModelIndex())
         self.selectionCleared.emit()
 
     def _apply_filter(self) -> None:
@@ -597,9 +645,25 @@ class BranchesWindow(QDialog):
             return None
         return source.record(source_index.row())
 
+    def _highlight_source_row(self, index: QModelIndex) -> None:
+        """Traduz a linha visível para a linha fonte antes de destacá-la.
+
+        A tradução é obrigatória: a tabela ordena e filtra por circuito, de
+        modo que a linha do proxy não corresponde à do modelo fonte.
+        """
+
+        source = self.proxy_model.sourceModel()
+        if not isinstance(source, BranchTableModel):
+            return
+        source_index = self.proxy_model.mapToSource(index)
+        source.set_highlight_row(
+            source_index.row() if source_index.isValid() else -1
+        )
+
     def _current_row_changed(self, current: QModelIndex, previous: QModelIndex) -> None:
         del previous
         record = self._record_for_index(current)
+        self._highlight_source_row(current)
         if record is None:
             self.selectionCleared.emit()
         else:

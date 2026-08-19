@@ -279,7 +279,7 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | `mdb_import_report.py` | Relatório consolidado das dez entidades lógicas — não modal, como o de sobreposições, porque os dois abrem sozinhos ao fim de uma operação |
 | `main_window.py` | Dono de todo o estado da aplicação; coordena importações, invalidações em cascata, máscaras efetivas, painel de detalhes e menus |
 | `circuits_window.py` | `QAbstractTableModel` fino sobre `CircuitVisibilityController` + delegate de cor |
-| `branch_window.py` | Tabela de ramais com `QSortFilterProxyModel` (ordenação por `UserRole`, filtro por circuito), demanda máxima cacheada e exportações JSON/CSV das linhas visíveis |
+| `branch_window.py` | Tabela de ramais com `QSortFilterProxyModel` (ordenação por `UserRole`, filtro por circuito), demanda máxima cacheada, faixa de destaque da linha corrente e exportações JSON/CSV das linhas visíveis |
 | `overlap_report.py` | Tabela derivada de `overlapping_segment_indices` |
 | `cables_window.py` | Tabela do catálogo de cabos (ordenação numérica por `UserRole`) + rótulos `cable_summary`/`cable_tooltip` reutilizados no painel de trechos |
 | `opendss_export_dialog.py` | Lista de circuitos com caixas de seleção **mutuamente exclusivas**; devolve o índice escolhido para a exportação |
@@ -1663,6 +1663,30 @@ bundle inteiro antes da gravação. A UI cria somente após sucesso a subpasta
 e os dois arquivos de ramais nessa ordem. O fluxo de potência interno continua
 usando exclusivamente o bundle convencional.
 
+#### Destaque da linha corrente na tabela de ramais
+
+A tabela usa `SelectionBehavior.SelectItems`, porque o Ctrl+C de
+`BranchTableView.copy_selection()` copia o retângulo de células selecionadas.
+Com 24 colunas e rolagem horizontal, porém, a marcação de uma única célula some
+de vista ao inspecionar as colunas à direita. `BranchTableModel` resolve isso
+guardando `_highlight_row` — uma linha **do modelo fonte** — e respondendo
+`BackgroundRole` com uma faixa para toda aquela linha, antes do desvio da coluna
+do checkbox, de modo que a coluna 0 também seja coberta. `set_highlight_row()`
+ignora chamadas redundantes e emite `dataChanged` restrito a `BackgroundRole`
+para a linha antiga e a nova, evitando repintura da tabela inteira.
+
+`BranchesWindow._highlight_source_row()` traduz o índice do proxy com
+`mapToSource()` antes de repassá-lo. A tradução é obrigatória: a tabela ordena e
+filtra por circuito, logo a linha visível não corresponde à linha fonte. O
+destaque é zerado em `clear_selection()` e em `set_result()`, onde os índices
+deixam de valer.
+
+A cor sai de `QGuiApplication.palette()` (papel `Highlight`) com alfa reduzido,
+nunca de um hexadecimal fixo — `apply_theme()` troca a paleta e faz
+`unpolish/polish`, então a faixa acompanha os temas claro e escuro sozinha, e o
+alfa mantém legível tanto o texto quanto a célula realmente selecionada, que o
+Qt pinta com `Highlight` opaco.
+
 #### Exportação JSON dos ramais (`branch_json_export.py`)
 
 O botão da janela de ramais entrega ao worker apenas os índices das linhas
@@ -1674,6 +1698,17 @@ Não há nova BFS nem recálculo dos patamares.
 Antes da serialização, `SwitchModel.record_indices_by_segment` separa em tempo
 linear os trechos comuns daqueles que modelam chaves; estes aparecem somente em
 `chaves` e nunca também em `trechos`.
+
+Os escalares `nivel_topologico`, `trecho_ini` e `chave_ini` saem direto de
+`BranchRecord.topological_level`, `first_common_segment_code` e
+`first_switch_code`, sem consulta adicional ao catálogo. Não recebem validação
+própria porque o trecho e a chave que representam já pertencem, respectivamente,
+às listas `trechos` e `chaves` e portanto já passam por `_checked_codes`; a
+string vazia só ocorre quando `first_common_segment_index`/
+`first_switch_record_index` é `None`, isto é, quando o elemento não existe.
+`chave_ini` ignora de propósito o portão `removable` que a coluna `CHAVE_CODIGO`
+aplica em `branch_table_values`, de modo que o JSON permaneça coerente consigo
+mesmo: se `chaves` não está vazia, `chave_ini` também não está.
 
 Cada entrada `RAMAL-<ID>` preserva a topologia mesmo quando a equivalência é
 zerada ou incompleta. Antes de tocar no destino, a validação acumula todas as
