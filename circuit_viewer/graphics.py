@@ -43,6 +43,7 @@ from PyQt6.QtWidgets import (
 from .model import (
     BoolArray,
     Bounds,
+    CircuitCatalogModel,
     CircuitModel,
     FeatureSelection,
     GeneratorModel,
@@ -112,6 +113,14 @@ LOAD_OVERVIEW_DIAMETER_PX = 7.0
 LOAD_COLOR = QColor("#202020")
 GENERATOR_DIAMETER_PX = 10.0
 ATTACHED_VERTICAL_PITCH_PX = 14.0
+# Barra inicial do circuito: anel maior que o do regulador (9 px) e na cor do
+# próprio circuito, para não competir com o laranja fixo do regulador e para
+# que, com vários circuitos, cada origem se identifique sem legenda nova.
+ROOT_BAR_DIAMETER_PX = 14.0
+ROOT_BAR_RING_WIDTH_PX = 2.0
+# Dois circuitos podem partir da mesma barra; os anéis coincidiriam e um
+# esconderia o outro. Cada circuito adicional naquela barra ganha este passo.
+ROOT_BAR_RING_STEP_PX = 4.0
 
 
 def _feature_ids(model: LoadRenderModel) -> tuple[str, ...]:
@@ -895,6 +904,139 @@ class RegulatorNetworkItem(QGraphicsItem):
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         for center in self._centers:
+            painter.drawEllipse(center, radius, radius)
+        painter.restore()
+
+
+class RootBarNetworkItem(QGraphicsItem):
+    """Anel na barra inicial de cada circuito, na cor daquele circuito.
+
+    Segue o contrato dos demais itens agregados: um único ``QGraphicsItem`` para
+    todos os anéis, geometria recompilada só quando cores ou visibilidade mudam,
+    e raio fixo **em pixels** derivado da escala do ``painter``.
+
+    Fica fora da virtualização de propósito — são dezenas de circuitos, não os
+    milhares de barras que justificam materializar itens sob demanda.
+    """
+
+    def __init__(self, catalog: CircuitCatalogModel) -> None:
+        super().__init__()
+        self._catalog = catalog
+        # (ponto, cor, ordem do anel naquela barra) por circuito visível.
+        self._rings: list[tuple[QPointF, QColor, int]] = []
+        self._colors: tuple[str, ...] = ()
+        self._checked: tuple[bool, ...] = ()
+        self._geometry_revision = 0
+
+        bars = catalog.segments.bars
+        # Índice da barra raiz por circuito, resolvido uma vez: o construtor do
+        # catálogo já garante que toda barra inicial existe.
+        self._root_indices = tuple(
+            bars.index_for_id(definition.root_bar_id)
+            for definition in catalog.definitions
+        )
+        bounds = bars.bounds
+        width = max(bounds.width, 1.0)
+        height = max(bounds.height, 1.0)
+        # Folga maior que a dos demais agregados, e por um motivo concreto: os
+        # anéis nascem em barras de subestação, que ficam tipicamente na borda
+        # da rede, e o raio é medido em pixels — quanto mais afastado o zoom,
+        # mais unidades de cena ele ocupa. Com o enquadramento total da rede o
+        # raio chega perto de 2% do maior vão; 3% cobre o pior caso sem deixar
+        # o anel ser cortado pelo próprio boundingRect.
+        padding = max(max(width, height) * 0.03, float(ROOT_BAR_DIAMETER_PX))
+        self._bounds = QRectF(
+            bounds.left, -bounds.bottom, width, height
+        ).adjusted(-padding, -padding, padding, padding)
+        self.setZValue(-9.0)
+        self.setVisible(False)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self.setCacheMode(
+            QGraphicsItem.CacheMode.DeviceCoordinateCache,
+            QSize(4_096, 4_096),
+        )
+
+    def _rebuild_rings(self) -> None:
+        bars = self._catalog.segments.bars
+        rings: list[tuple[QPointF, QColor, int]] = []
+        # Quantos anéis já saíram em cada barra, para empilhar concentricamente
+        # quando mais de um circuito parte da mesma origem.
+        seen: dict[int, int] = {}
+        for circuit_index, root_index in enumerate(self._root_indices):
+            if root_index is None:
+                continue
+            if circuit_index < len(self._checked) and not self._checked[circuit_index]:
+                continue
+            color = QColor(
+                self._colors[circuit_index]
+                if circuit_index < len(self._colors)
+                else POINT_COLOR.name()
+            )
+            if not color.isValid():
+                color = QColor(POINT_COLOR)
+            order = seen.get(int(root_index), 0)
+            seen[int(root_index)] = order + 1
+            rings.append((_scene_point(bars, int(root_index)), color, order))
+        self._rings = rings
+        self._geometry_revision += 1
+
+    @property
+    def circuit_count(self) -> int:
+        return len(self._root_indices)
+
+    @property
+    def visible_ring_count(self) -> int:
+        return len(self._rings)
+
+    @property
+    def geometry_revision(self) -> int:
+        return self._geometry_revision
+
+    def set_circuit_styles(
+        self,
+        colors: Sequence[str],
+        checked: Sequence[bool],
+    ) -> None:
+        """Cores e visibilidade **por circuito**.
+
+        O critério é ``checked``, e não a máscara de barras: uma barra
+        compartilhada por dois circuitos continua visível enquanto qualquer dono
+        estiver marcado, e pela máscara o anel de um circuito desmarcado
+        sobreviveria.
+        """
+
+        new_colors = tuple(str(value) for value in colors)
+        new_checked = tuple(bool(value) for value in checked)
+        if new_colors == self._colors and new_checked == self._checked:
+            return
+        self._colors = new_colors
+        self._checked = new_checked
+        self._rebuild_rings()
+        self.update()
+
+    def boundingRect(self) -> QRectF:  # noqa: N802
+        return self._bounds
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
+        del option, widget
+        if not self._rings:
+            return
+        # Mesma tradução de pixels para unidades de cena do anel do regulador.
+        scale = abs(painter.worldTransform().m11())
+        unit = 1.0 / max(scale, 1e-12)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        pen = QPen()
+        pen.setWidthF(ROOT_BAR_RING_WIDTH_PX)
+        pen.setCosmetic(True)
+        for center, color, order in self._rings:
+            radius = (
+                ROOT_BAR_DIAMETER_PX / 2.0 + order * ROOT_BAR_RING_STEP_PX
+            ) * unit
+            pen.setColor(color)
+            painter.setPen(pen)
             painter.drawEllipse(center, radius, radius)
         painter.restore()
 

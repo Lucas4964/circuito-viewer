@@ -776,6 +776,7 @@ repaint do viewport
   │     -20 LineNetworkItem · -15 SwitchNetworkItem
   │     -12 RegulatorNetworkItem
   │     -11 LoadsOverviewItem · -10 BarsOverviewItem
+  │      -9 RootBarNetworkItem
   │      10 BarraItem ·  20 LoadItem
   │      90 SegmentSelectionOverlay · 95 BranchHighlightOverlay
   │     100 SelectionOverlay · 110 LoadSelectionOverlay
@@ -822,6 +823,7 @@ Durante a materialização o agregado permanece visível e só é ocultado após
 | `LineNetworkItem` | −20 | `dict[categoria → QPainterPath]` com subcaminhos desconectados; 1 `drawPath` por cor |
 | `SwitchNetworkItem` | −15 | `_red_path` único no modo circuito; `_colored_paths` por categoria no modo fases |
 | `RegulatorNetworkItem` | −12 | pontos médios pré-calculados; um `drawEllipse` por regulador, raio derivado da escala do painter |
+| `RootBarNetworkItem` | −9 | um anel por circuito visível, na cor do circuito; raio derivado da escala do painter |
 
 Todos usam `DeviceCoordinateCache(4096×4096)`: entre mudanças de máscara, o Qt
 reaproveita a rasterização em pan e repaints, sem repercorrer os pontos.
@@ -840,6 +842,34 @@ materialização de um item por regulador. A saída é derivar o raio da escala 
 próprio painter (`worldTransform().m11()`), o mesmo idioma que o hit-test já usa
 para converter `CLICK_TOLERANCE_PX`. O anel não tem cor por circuito nem por
 fase: ele só some junto com o trecho que o hospeda.
+
+`RootBarNetworkItem` marca a barra inicial de cada circuito e segue o mesmo
+contrato, com três diferenças que valem registro:
+
+- **Z −9, e não −12.** Fica acima do `BarsOverviewItem` (−10) e abaixo da
+  `BarraItem` materializada (10), de modo que o ponto escuro da barra continue
+  visível **dentro** do anel; e abaixo dos overlays de seleção (90+), para o
+  amarelo da seleção sempre vencer.
+- **Cor por circuito**, vinda de `CircuitVisibilityController.color(i)` — a
+  mesma dos trechos e editável na tabela. Com vários circuitos carregados, cada
+  origem se identifica sem legenda nova, e `colorChanged` já roteia para
+  `_apply_circuit_visibility`, então o anel acompanha a edição de graça.
+- **Visibilidade por circuito, não por barra.** O critério é `checked_states[i]`
+  e **não** `bar_visible_mask[root]`: uma barra compartilhada por dois circuitos
+  permanece no `bar_mask` enquanto qualquer dono estiver marcado, e pela máscara
+  de barra o anel de um circuito desmarcado sobreviveria.
+
+Dois circuitos podem partir da mesma barra — duas saídas na mesma barra de
+subestação. Os anéis coincidiriam e um esconderia o outro, então cada circuito
+adicional naquela barra soma `ROOT_BAR_RING_STEP_PX` ao raio, mantendo as duas
+cores visíveis.
+
+A folga do `boundingRect` é maior que a dos demais agregados (3% do maior vão,
+contra 0,1%) por um motivo concreto: barras iniciais são barras de subestação e
+ficam tipicamente na **borda** da rede, enquanto o raio, medido em pixels, ocupa
+mais unidades de cena quanto mais afastado o zoom. Com a rede inteira enquadrada
+o raio chega perto de 2% do maior vão; com a folga dos outros itens o anel seria
+cortado pelo próprio `boundingRect`.
 
 ### Sistema de coordenadas
 

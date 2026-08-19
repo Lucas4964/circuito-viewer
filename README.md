@@ -314,6 +314,14 @@ chave fechada virar aberta, e `FASES2` como `"13.0"` não casaria com o
 - **Visualizar > Mostrar cargas**: alterna somente a camada de cargas. Elas
   continuam acompanhando os filtros de circuito da barra associada, mas não são
   ocultadas pela opção **Mostrar barras**.
+- **Visualizar > Visualizar Barra Inicial**: destaca com um anel discreto a
+  barra inicial de cada circuito **visível**, na cor do próprio circuito — a
+  mesma dos trechos e editável na coluna **Cor**. Com vários circuitos
+  carregados cada origem se identifica sem legenda, e desmarcar um circuito
+  remove só o anel dele. Quando dois circuitos partem da mesma barra, os anéis
+  saem concêntricos para as duas cores continuarem visíveis. O anel mantém o
+  tamanho em pixels em qualquer zoom, deixa o ponto da barra visível no centro e
+  não intercepta cliques. A preferência vale para a sessão atual.
 - **Visualizar > Colorir trechos por fases**: substitui temporariamente as cores
   dos circuitos pela classificação configurada em `FASES2`. Monofásicos usam
   azul, bifásicos verde, trifásicos vermelho e valores sem relação ficam cinza.
@@ -339,7 +347,11 @@ chave fechada virar aberta, e `FASES2` como `"13.0"` não casaria com o
 - **Visualizar > Circuitos…**: abre a tabela não modal de circuitos. Desmarcar um
   circuito oculta suas barras, trechos e chaves sem apagar a associação calculada.
   A coluna **Cor** mostra a cor automática do circuito e abre um seletor ao ser
-  clicada; alterar a cor não recalcula a topologia.
+  clicada; alterar a cor não recalcula a topologia. **Duplo clique na coluna
+  `BARRA_ID`** enquadra e centraliza a barra inicial daquele circuito no mapa,
+  sem alterar a seleção atual nem o painel lateral. Se o circuito estiver
+  desmarcado, ele é reativado antes do enquadramento — do contrário o zoom
+  cairia numa área vazia — e a barra de status avisa.
 - **Visualizar > Sobreposições…**: lista os trechos associados a mais de um
   circuito. O relatório também é aberto automaticamente quando uma sobreposição
   é encontrada.

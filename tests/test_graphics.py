@@ -27,7 +27,10 @@ try:
         NORMAL_SEGMENT_WIDTH_PX,
         REGULATOR_COLOR,
         REGULATOR_DIAMETER_PX,
+        ROOT_BAR_DIAMETER_PX,
+        ROOT_BAR_RING_STEP_PX,
         RegulatorNetworkItem,
+        RootBarNetworkItem,
         SEGMENT_SELECTION_WIDTH_PX,
         SegmentSelectionOverlayItem,
         SWITCH_COLOR,
@@ -40,6 +43,8 @@ except ModuleNotFoundError:
     PYQT_AVAILABLE = False
 
 from circuit_viewer.model import (
+    CircuitCatalogModel,
+    CircuitDefinition,
     CircuitModel,
     FeatureSelection,
     LineNetworkModel,
@@ -595,6 +600,144 @@ class GraphicsTests(unittest.TestCase):
         # O anel é medido em pixels de tela: dobrar o zoom não pode engordá-lo.
         self.assertEqual(REGULATOR_DIAMETER_PX, 9.0)
         self.assertAlmostEqual(ring_pixels(1.0), ring_pixels(2.0), delta=6)
+
+    # ------------------------------------------- anel da barra inicial
+
+    def _root_bar_catalog(self, shared: bool = False):  # noqa: ANN202, FBT002
+        """Dois circuitos; com ``shared``, ambos partem da mesma barra."""
+
+        bars = CircuitModel(
+            ["B0", "B1", "B2", "B3"],
+            ["A", "B", "C", "D"],
+            [0.0, 100.0, 0.0, 100.0],
+            [0.0, 0.0, 200.0, 200.0],
+            UtmCrs(21, northern=False),
+        )
+        network = LineNetworkModel(
+            bars,
+            ["T0", "T1"],
+            ["TR-0", "TR-1"],
+            ["13", "13"],
+            [0, 0 if shared else 2],
+            [1, 3],
+            ["", ""],
+            ["", ""],
+            ["", ""],
+            [100.0, 100.0],
+        )
+        return CircuitCatalogModel.build(
+            network,
+            None,
+            [
+                CircuitDefinition("C1", "B0", "ALIM-1", "13.8"),
+                CircuitDefinition("C2", "B0" if shared else "B2", "ALIM-2", "13.8"),
+            ],
+        )
+
+    def test_root_bar_ring_draws_one_ring_per_visible_circuit(self) -> None:
+        item = RootBarNetworkItem(self._root_bar_catalog())
+
+        self.assertEqual(item.circuit_count, 2)
+        # Nasce sem estilos: nenhum anel até o mapa informar cores e marcações.
+        item.set_circuit_styles(("#FF0000", "#0000FF"), (True, True))
+        self.assertEqual(item.visible_ring_count, 2)
+
+        item.set_circuit_styles(("#FF0000", "#0000FF"), (True, False))
+
+        self.assertEqual(item.visible_ring_count, 1)
+
+    def test_each_circuit_keeps_its_own_colour(self) -> None:
+        item = RootBarNetworkItem(self._root_bar_catalog())
+
+        item.set_circuit_styles(("#FF0000", "#0000FF"), (True, True))
+
+        self.assertEqual(
+            [color.name().upper() for _, color, _ in item._rings],
+            ["#FF0000", "#0000FF"],
+        )
+
+    def test_circuits_sharing_a_root_bar_get_concentric_rings(self) -> None:
+        """Sem o passo concêntrico, um anel esconderia o outro por completo."""
+
+        item = RootBarNetworkItem(self._root_bar_catalog(shared=True))
+
+        item.set_circuit_styles(("#FF0000", "#0000FF"), (True, True))
+
+        centers = {(point.x(), point.y()) for point, _, _ in item._rings}
+        self.assertEqual(len(centers), 1)
+        self.assertEqual([order for _, _, order in item._rings], [0, 1])
+        self.assertGreater(ROOT_BAR_RING_STEP_PX, 0.0)
+
+    def test_root_bar_ring_is_one_cached_item_below_the_bars(self) -> None:
+        item = RootBarNetworkItem(self._root_bar_catalog())
+
+        self.assertEqual(
+            item.cacheMode(), QGraphicsItem.CacheMode.DeviceCoordinateCache
+        )
+        # Acima do agregado de barras (-10), abaixo da barra materializada (10),
+        # para o ponto escuro continuar visível dentro do anel.
+        self.assertEqual(item.zValue(), -9.0)
+        self.assertFalse(item.isVisible())
+        self.assertFalse(
+            item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+        )
+        self.assertEqual(
+            item.acceptedMouseButtons(), Qt.MouseButton.NoButton
+        )
+
+    def test_same_styles_do_not_recompile_the_geometry(self) -> None:
+        item = RootBarNetworkItem(self._root_bar_catalog())
+        item.set_circuit_styles(("#FF0000", "#0000FF"), (True, True))
+        revision = item.geometry_revision
+
+        item.set_circuit_styles(("#FF0000", "#0000FF"), (True, True))
+
+        self.assertEqual(item.geometry_revision, revision)
+
+        item.set_circuit_styles(("#FF0000", "#00FF00"), (True, True))
+
+        self.assertGreater(item.geometry_revision, revision)
+
+    def test_root_bar_ring_keeps_its_pixel_size_across_zoom(self) -> None:
+        item = RootBarNetworkItem(self._root_bar_catalog())
+        # Só o circuito da barra B0, que fica na origem da cena e portanto no
+        # mesmo pixel em qualquer escala: com dois anéis, o segundo sairia da
+        # imagem ao dobrar o zoom e a contagem mediria enquadramento, não
+        # espessura.
+        item.set_circuit_styles(("#FF0000", "#0000FF"), (True, False))
+
+        def ring_pixels(scale: float) -> int:
+            image = QImage(300, 300, QImage.Format.Format_RGB32)
+            image.fill(Qt.GlobalColor.white)
+            painter = QPainter(image)
+            painter.translate(60.0, 260.0)
+            painter.scale(scale, scale)
+            item.paint(painter, None)
+            painter.end()
+            return sum(
+                QColor(image.pixel(x, y)).name().upper() == "#FF0000"
+                for x in range(300)
+                for y in range(300)
+            )
+
+        self.assertEqual(ROOT_BAR_DIAMETER_PX, 14.0)
+        self.assertGreater(ring_pixels(1.0), 0)
+        # Medido em pixels de tela: dobrar o zoom não pode engordar o anel.
+        self.assertAlmostEqual(ring_pixels(1.0), ring_pixels(2.0), delta=8)
+
+    def test_root_bar_ring_is_hollow(self) -> None:
+        item = RootBarNetworkItem(self._root_bar_catalog())
+        item.set_circuit_styles(("#FF0000", "#0000FF"), (True, True))
+
+        image = QImage(300, 300, QImage.Format.Format_RGB32)
+        image.fill(Qt.GlobalColor.white)
+        painter = QPainter(image)
+        painter.translate(60.0, 260.0)
+        item.paint(painter, None)
+        painter.end()
+
+        # O centro mostra o que está por baixo: a barra continua visível.
+        self.assertEqual(QColor(image.pixel(60, 260)).name(), "#ffffff")
 
     def test_branch_highlight_is_one_yellow_cosmetic_path_and_can_be_focused(self) -> None:
         bars = CircuitModel(

@@ -10,7 +10,7 @@ try:
     from PyQt6.QtGui import QColor, QKeyEvent
     from PyQt6.QtWidgets import QApplication, QDialog
 
-    from circuit_viewer.circuits_window import CircuitTableModel
+    from circuit_viewer.circuits_window import ROOT_BAR_COLUMN, CircuitTableModel
     from circuit_viewer.csv_import import CsvLoadResult
     from circuit_viewer.main_window import ImportChoiceDialog, MainWindow
     from circuit_viewer.model import (
@@ -71,6 +71,201 @@ class CircuitsWindowTests(unittest.TestCase):
         window._set_circuit_catalog(catalog)
         self.app.processEvents()
         return window, bars, network, catalog
+
+    def make_two_circuit_window(self):  # noqa: ANN201
+        """Dois circuitos: C1 parte de B0, C2 de B2, longe um do outro."""
+
+        bars = CircuitModel(
+            ["B0", "B1", "B2", "B3"],
+            ["", "", "", ""],
+            [500_000.0, 500_050.0, 500_000.0, 500_050.0],
+            [8_000_000.0, 8_000_000.0, 8_000_400.0, 8_000_400.0],
+            UtmCrs(21, northern=False),
+        )
+        network = LineNetworkModel(
+            bars,
+            ["T0", "T1"],
+            ["", ""],
+            ["ABC", "ABC"],
+            [0, 2],
+            [1, 3],
+            ["", ""],
+            ["", ""],
+            ["", ""],
+            [50.0, 50.0],
+        )
+        window = MainWindow()
+        self.addCleanup(window.close)
+        window.show()
+        window._on_import_finished(CsvLoadResult(bars, "utf-8-sig", 4, 4, 0, (), 0))
+        window._on_segment_import_finished(
+            SegmentLoadResult(network, "utf-8-sig", 2, 2, 0, (), 0)
+        )
+        catalog = CircuitCatalogModel.build(
+            network,
+            None,
+            [
+                CircuitDefinition("C1", "B0", "ALIM-1", "13.8"),
+                CircuitDefinition("C2", "B2", "ALIM-2", "13.8"),
+            ],
+        )
+        window._set_circuit_catalog(catalog)
+        self.app.processEvents()
+        return window, catalog
+
+    # --------------------------------------- duplo clique na barra inicial
+
+    def test_double_click_on_the_root_bar_frames_it_on_the_map(self) -> None:
+        window, _ = self.make_two_circuit_window()
+        model = window.circuit_table_model
+        before = abs(window.view.transform().m11())
+
+        window.circuits_window.table.doubleClicked.emit(
+            model.index(1, ROOT_BAR_COLUMN)
+        )
+        self.app.processEvents()
+
+        after = abs(window.view.transform().m11())
+        self.assertNotEqual(after, before)
+        self.assertLessEqual(after, 4.0)
+        self.assertIn("B2", window.statusBar().currentMessage())
+
+    def test_double_click_outside_the_root_bar_column_does_nothing(self) -> None:
+        """A coluna \"Cor\" tem delegate próprio; enquadrar dali seria colisão."""
+
+        window, _ = self.make_two_circuit_window()
+        model = window.circuit_table_model
+        before = abs(window.view.transform().m11())
+
+        for column in (0, 1, 2, 4, 5):
+            window.circuits_window.table.doubleClicked.emit(
+                model.index(1, column)
+            )
+        self.app.processEvents()
+
+        self.assertEqual(abs(window.view.transform().m11()), before)
+
+    def test_framing_a_hidden_circuit_reactivates_it(self) -> None:
+        window, _ = self.make_two_circuit_window()
+        model = window.circuit_table_model
+        model.setData(
+            model.index(1, 0),
+            Qt.CheckState.Unchecked,
+            Qt.ItemDataRole.CheckStateRole,
+        )
+        window._circuit_visibility_timer.stop()
+        window._apply_circuit_visibility()
+        self.assertFalse(window._circuit_visibility.is_visible(1))
+
+        window.circuits_window.table.doubleClicked.emit(
+            model.index(1, ROOT_BAR_COLUMN)
+        )
+        self.app.processEvents()
+
+        self.assertTrue(window._circuit_visibility.is_visible(1))
+        self.assertIn("reativado", window.statusBar().currentMessage())
+
+    def test_the_root_bar_column_announces_the_double_click(self) -> None:
+        window, _ = self.make_two_circuit_window()
+
+        tooltip = window.circuit_table_model.headerData(
+            ROOT_BAR_COLUMN,
+            Qt.Orientation.Horizontal,
+            Qt.ItemDataRole.ToolTipRole,
+        )
+
+        self.assertIn("Duplo clique", tooltip)
+        self.assertEqual(
+            window.circuit_table_model.headerData(
+                ROOT_BAR_COLUMN,
+                Qt.Orientation.Horizontal,
+                Qt.ItemDataRole.DisplayRole,
+            ),
+            "BARRA_ID",
+        )
+
+    # ------------------------------------------ Visualizar Barra Inicial
+
+    def test_the_root_bar_action_needs_a_catalog_and_lives_in_the_view_menu(
+        self,
+    ) -> None:
+        empty = MainWindow()
+        self.addCleanup(empty.close)
+        view_menu = next(
+            action.menu()
+            for action in empty.menuBar().actions()
+            if action.text() == "Visualizar"
+        )
+
+        self.assertIn(empty.root_bar_action, view_menu.actions())
+        self.assertTrue(empty.root_bar_action.isCheckable())
+        self.assertFalse(empty.root_bar_action.isChecked())
+        self.assertFalse(empty.root_bar_action.isEnabled())
+
+        window, _ = self.make_two_circuit_window()
+
+        self.assertTrue(window.root_bar_action.isEnabled())
+
+    def test_toggling_the_action_shows_one_ring_per_visible_circuit(self) -> None:
+        window, _ = self.make_two_circuit_window()
+        item = window._root_bar_item
+        self.assertIsNotNone(item)
+        self.assertFalse(item.isVisible())
+
+        window.root_bar_action.setChecked(True)
+        self.app.processEvents()
+
+        self.assertTrue(item.isVisible())
+        self.assertEqual(item.visible_ring_count, 2)
+        self.assertEqual(
+            [color.name().upper() for _, color, _ in item._rings],
+            [value.upper() for value in window._circuit_visibility.colors],
+        )
+
+        window.root_bar_action.setChecked(False)
+        self.app.processEvents()
+
+        self.assertFalse(item.isVisible())
+
+    def test_hiding_a_circuit_removes_only_its_ring(self) -> None:
+        window, _ = self.make_two_circuit_window()
+        window.root_bar_action.setChecked(True)
+        self.app.processEvents()
+        model = window.circuit_table_model
+
+        model.setData(
+            model.index(1, 0),
+            Qt.CheckState.Unchecked,
+            Qt.ItemDataRole.CheckStateRole,
+        )
+        window._circuit_visibility_timer.stop()
+        window._apply_circuit_visibility()
+
+        self.assertEqual(window._root_bar_item.visible_ring_count, 1)
+
+    def test_recolouring_a_circuit_recolours_its_ring(self) -> None:
+        window, _ = self.make_two_circuit_window()
+        window.root_bar_action.setChecked(True)
+        self.app.processEvents()
+        model = window.circuit_table_model
+
+        model.setData(model.index(0, 1), "#123456", Qt.ItemDataRole.EditRole)
+        window._circuit_visibility_timer.stop()
+        window._apply_circuit_visibility()
+
+        self.assertEqual(
+            window._root_bar_item._rings[0][1].name().upper(), "#123456"
+        )
+
+    def test_dropping_the_catalog_removes_the_ring_item(self) -> None:
+        window, _ = self.make_two_circuit_window()
+        window.root_bar_action.setChecked(True)
+        self.app.processEvents()
+
+        window._set_circuit_catalog(None)
+
+        self.assertIsNone(window._root_bar_item)
+        self.assertFalse(window.root_bar_action.isEnabled())
 
     def test_import_choice_and_modeless_table(self) -> None:
         empty = MainWindow()

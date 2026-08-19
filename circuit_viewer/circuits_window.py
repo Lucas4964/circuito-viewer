@@ -52,12 +52,19 @@ class CircuitTableModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.HEADERS)
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):  # noqa: ANN001, ANN201, N802
-        if (
-            role == Qt.ItemDataRole.DisplayRole
-            and orientation == Qt.Orientation.Horizontal
-            and 0 <= int(section) < len(self.HEADERS)
+        if orientation != Qt.Orientation.Horizontal or not (
+            0 <= int(section) < len(self.HEADERS)
         ):
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
             return self.HEADERS[int(section)]
+        # Sem o aviso no cabeçalho o duplo clique seria indescobrível: nada na
+        # célula sugere que ela é interativa.
+        if (
+            role == Qt.ItemDataRole.ToolTipRole
+            and int(section) == ROOT_BAR_COLUMN
+        ):
+            return "Barra inicial do circuito. Duplo clique enquadra a barra no mapa."
         return None
 
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):  # noqa: ANN201
@@ -150,6 +157,10 @@ class CircuitTableModel(QAbstractTableModel):
         return False
 
 
+# Derivada do cabeçalho para as duas definições não divergirem.
+ROOT_BAR_COLUMN = CircuitTableModel.HEADERS.index("BARRA_ID")
+
+
 class CircuitColorDelegate(QStyledItemDelegate):
     """Amostra a cor e abre o seletor nativo diretamente na célula."""
 
@@ -189,6 +200,9 @@ class CircuitColorDelegate(QStyledItemDelegate):
 class CircuitsWindow(QDialog):
     """Janela não modal e reutilizável para a tabela de circuitos."""
 
+    #: Índice do circuito cuja barra inicial deve ser enquadrada no mapa.
+    rootBarActivated = pyqtSignal(int)
+
     def __init__(self, table_model: CircuitTableModel, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
         self.setWindowTitle("Circuitos")
@@ -224,4 +238,19 @@ class CircuitsWindow(QDialog):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        # `doubleClicked`, e não `activated`: o alvo é uma célula específica, e
+        # a ativação do `activated` depende da plataforma. `DoubleClicked` está
+        # fora de `setEditTriggers`, então não disputa com nenhum editor.
+        self.table.doubleClicked.connect(self._double_clicked)
         layout.addWidget(self.table)
+
+    def _double_clicked(self, index: QModelIndex) -> None:
+        """Só a coluna da barra inicial enquadra.
+
+        O filtro de coluna é obrigatório: `CircuitColorDelegate` responde ao
+        clique na coluna "Cor", e sem ele um duplo clique ali abriria o seletor
+        de cores duas vezes.
+        """
+
+        if index.isValid() and index.column() == ROOT_BAR_COLUMN:
+            self.rootBarActivated.emit(index.row())

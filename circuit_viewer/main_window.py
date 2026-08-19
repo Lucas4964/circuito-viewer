@@ -94,6 +94,7 @@ from .graphics import (
     LoadVirtualizer,
     load_layout_offsets_for_models,
     RegulatorNetworkItem,
+    RootBarNetworkItem,
     SegmentSelectionOverlayItem,
     SwitchNetworkItem,
 )
@@ -706,6 +707,7 @@ class MainWindow(QMainWindow):
         self._regulator_source_model: RegulatorModel | None = None
         self._regulator_overrides = RegulatorOverrides()
         self._regulator_item: RegulatorNetworkItem | None = None
+        self._root_bar_item: RootBarNetworkItem | None = None
         self._cable_model: CableModel | None = None
         self._circuit_catalog: CircuitCatalogModel | None = None
         self._allocation_measurements: AllocationMeasurementModel | None = None
@@ -1044,6 +1046,15 @@ class MainWindow(QMainWindow):
         self.show_generators_action.setEnabled(False)
         self.show_generators_action.toggled.connect(self._set_generators_visible)
 
+        self.root_bar_action = QAction("Visualizar Barra Inicial", self)
+        self.root_bar_action.setCheckable(True)
+        self.root_bar_action.setEnabled(False)
+        self.root_bar_action.setToolTip(
+            "Destacar a barra inicial de cada circuito visível, na cor do "
+            "circuito"
+        )
+        self.root_bar_action.toggled.connect(self._set_root_bar_highlight_enabled)
+
         self.phase_coloring_action = QAction("Colorir trechos por fases", self)
         self.phase_coloring_action.setCheckable(True)
         self.phase_coloring_action.setEnabled(False)
@@ -1265,6 +1276,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.show_bars_action)
         view_menu.addAction(self.show_loads_action)
         view_menu.addAction(self.show_generators_action)
+        view_menu.addAction(self.root_bar_action)
         view_menu.addAction(self.phase_coloring_action)
         view_menu.addAction(self.simplified_network_action)
         view_menu.addSeparator()
@@ -2008,6 +2020,9 @@ class MainWindow(QMainWindow):
         )
         self.circuit_table_model.colorChanged.connect(
             self._schedule_circuit_visibility_update
+        )
+        self.circuits_window.rootBarActivated.connect(
+            self._focus_circuit_root_bar
         )
         self.search_palette.resultActivated.connect(self._activate_search_result)
         self.search_palette.closed.connect(self.view.setFocus)
@@ -3526,6 +3541,15 @@ class MainWindow(QMainWindow):
             self._circuit_visibility,
         )
         self.circuits_action.setEnabled(catalog is not None)
+        # A geometria dos anéis deriva do catálogo, então o item nasce e morre
+        # com ele — mesmo ciclo do anel de regulador.
+        if self._root_bar_item is not None:
+            self.scene.removeItem(self._root_bar_item)
+            self._root_bar_item = None
+        if catalog is not None:
+            self._root_bar_item = RootBarNetworkItem(catalog)
+            self.scene.addItem(self._root_bar_item)
+        self.root_bar_action.setEnabled(catalog is not None)
         overlap_count = (
             0 if catalog is None else int(catalog.overlapping_segment_indices.size)
         )
@@ -3704,6 +3728,16 @@ class MainWindow(QMainWindow):
             # O anel não tem cor por circuito nem por fase: só some junto com o
             # trecho que o hospeda.
             self._regulator_item.set_visibility_mask(segment_mask)
+        if self._root_bar_item is not None:
+            controller = self._circuit_visibility
+            # Visibilidade por circuito, não por barra: uma barra compartilhada
+            # segue no `bar_mask` enquanto qualquer dono estiver marcado, e o
+            # anel de um circuito desmarcado sobreviveria.
+            self._root_bar_item.set_circuit_styles(
+                () if controller is None else controller.colors,
+                () if controller is None else controller.checked_states,
+            )
+            self._root_bar_item.setVisible(self.root_bar_action.isChecked())
         self.phase_legend.setVisible(phase_mode and self._line_item is not None)
         if self.phase_legend.isVisible():
             self._position_phase_legend()
@@ -3808,6 +3842,62 @@ class MainWindow(QMainWindow):
         if issue is None:
             return
         QMessageBox.warning(self, "Curvas", issue)
+
+    def _focus_circuit_root_bar(self, circuit_index: int) -> None:
+        """Enquadra a barra inicial de um circuito, sem tocar na seleção.
+
+        Só enquadra: a seleção corrente e o painel direito ficam como estavam,
+        ao contrário da busca global, que também seleciona o alvo.
+        """
+
+        catalog = self._circuit_catalog
+        if catalog is None or not 0 <= int(circuit_index) < len(catalog):
+            return
+        definition = catalog.definition(int(circuit_index))
+        root_index = catalog.segments.bars.index_for_id(definition.root_bar_id)
+        if root_index is None:
+            self.statusBar().showMessage(
+                f"Barra inicial {definition.root_bar_id} do circuito "
+                f"{definition.circuit_id} não existe nas barras exibidas.",
+                5_000,
+            )
+            return
+        # Circuito oculto: enquadrar mostraria uma área vazia. Reativar é o que
+        # o app já faz ao selecionar um ramal de circuito desmarcado.
+        reactivated = False
+        if (
+            self._circuit_visibility is not None
+            and not self._circuit_visibility.is_visible(int(circuit_index))
+        ):
+            reactivated = self.circuit_table_model.setData(
+                self.circuit_table_model.index(int(circuit_index), 0),
+                Qt.CheckState.Checked,
+                Qt.ItemDataRole.CheckStateRole,
+            )
+            # Sem parar o timer, a reativação só chegaria ao mapa 50 ms depois
+            # do enquadramento.
+            self._circuit_visibility_timer.stop()
+            self._apply_circuit_visibility()
+        try:
+            self.view.focus_bar(int(root_index))
+        except IndexError:
+            self.statusBar().showMessage(
+                "A barra inicial não está mais disponível após a "
+                "substituição dos dados.",
+                5_000,
+            )
+            return
+        self.virtualizer.refresh(force=True)
+        self.load_virtualizer.refresh(force=True)
+        self.equivalent_load_virtualizer.refresh(force=True)
+        self.view.setFocus(Qt.FocusReason.OtherFocusReason)
+        message = (
+            f"Barra inicial {definition.root_bar_id} do circuito "
+            f"{definition.circuit_id} enquadrada."
+        )
+        if reactivated:
+            message += " O circuito foi reativado para exibi-la."
+        self.statusBar().showMessage(message, 5_000)
 
     def _show_circuits_window(self) -> None:
         if self._circuit_catalog is None:
@@ -6699,6 +6789,15 @@ class MainWindow(QMainWindow):
             f"O modo de coloração por fases foi desabilitado.\n\n"
             f"Arquivo: {self.phase_configuration_path}\n\n"
             f"{self._phase_configuration_error}",
+        )
+
+    def _set_root_bar_highlight_enabled(self, enabled: bool) -> None:
+        self._apply_circuit_visibility()
+        self.statusBar().showMessage(
+            "Barras iniciais destacadas na cor de cada circuito."
+            if enabled
+            else "Destaque das barras iniciais desligado.",
+            4_000,
         )
 
     def _set_phase_coloring_enabled(self, enabled: bool) -> None:
