@@ -1383,6 +1383,56 @@ nunca aparece ali — o que é correto, já que naquele ponto não há mais linh
 `FAIXA`, `NPASSOS` e `TAP` do CSV continuam sem consumidor: a faixa de regulação
 é a padrão do `Transformer` do OpenDSS (±10 %, 32 passos).
 
+**`VNOM` zerada herda a do circuito.** Cadastros reais de MDB trazem
+`REGULADOR.VNOM = 0` com frequência, e exigir um valor positivo descartava o
+regulador inteiro: sem `Transformer` e sem `RegControl`, o trecho continuava
+saindo como `Line` e o equipamento não regulava nada — indistinguível de um
+defeito, porque o painel lateral mostra o regulador **sem** aplicar nenhum
+filtro de exportabilidade. A tensão nominal do equipamento é a do alimentador
+onde ele está, então `build_regulator_export` usa `circuit_voltage` e registra a
+substituição com `discarded=False`. Só descarta se o circuito também não
+informar VNOM. `SNOM` continua exigindo valor positivo, e a mensagem aponta o
+painel do trecho, onde ele pode ser digitado.
+
+**Iterações de controle.** Cada regulador vira três `RegControl`, então poucos
+reguladores já passam do teto padrão de 10 do OpenDSS; estourá-lo aborta a
+solução e nenhum tap comuta. `MAX_CONTROL_ITER` e `CONTROL_MODE`
+(`opendss_export.py`) saem em **todo** master — o de `build_master_export`, que
+serve exportação normal, simplificada e fluxo de potência, e o master por
+patamar de `opendss_allocation_export.py` — e são reaplicados em
+`_STEP_MODE_COMMANDS` porque o fluxo de potência configura o engine **depois**
+do `Compile`, sobre um singleton que pode carregar estado da execução anterior.
+`Static` já é o padrão do OpenDSS: declará-lo é defesa contra esse estado, não
+mudança de comportamento.
+
+#### Edições voláteis do cadastro (`regulator_overrides.py`)
+
+O MDB é retrato somente leitura, mas um cadastro incompleto não pode travar o
+estudo. `RegulatorOverrides` guarda o que o usuário digita no painel, por
+`REGU_ID` e campo, e `apply_overrides()` produz o **modelo efetivo**
+reconstruindo o `RegulatorModel` com as colunas trocadas — em vez de espalhar
+consultas de sobreposição por cada ponto de leitura. Assim continua existindo um
+único modelo em memória, e painel, exportações, fluxo de potência e desenho no
+mapa passam a ler o valor editado sem saber que a camada existe.
+
+Três decisões sustentam a garantia de que o banco nunca muda:
+
+- **Não há store.** Nenhum JSON, nenhum caminho de gravação. Reabrir o
+  aplicativo restaura o original por construção, não por uma rotina de limpeza
+  que alguém possa esquecer de chamar.
+- **`MainWindow._set_regulator_source_model()`** é o único ponto por onde o
+  retrato do MDB entra, e ele zera as sobreposições. Recarregar o circuito ou
+  trocar os trechos devolve exatamente o que está gravado.
+- **`apply_overrides()` devolve o próprio modelo** quando nada há a sobrepor, ou
+  quando o valor digitado coincide com o do banco. A identidade importa:
+  `_set_regulator_model()` invalida o fluxo de potência ao ver um objeto
+  diferente, e reconstruir à toa descartaria um resultado ainda válido.
+
+Só `VNOM` e `SNOM` são editáveis, porque são os únicos campos que a exportação
+consome; oferecer `FAIXA` ou `TAP` seria uma armadilha, já que mudá-los não
+alteraria o `.dss`. O campo editado aparece em negrito, com tooltip citando o
+valor do banco, e um botão restaura o registro à origem.
+
 O filtro de chaves **não é implementado aqui**: os dois arquivos consomem as
 duas metades que o `trace()` já separa — `membership.common_segment_indices`
 (trechos comuns) e `membership.switch_segment_indices` (trechos-chave).

@@ -21,7 +21,9 @@ from .curvas import Curve
 from .generator_update import curve_value_at_reference
 from .model import CableModel, CircuitCatalogModel, RegulatorModel
 from .opendss_export import (
+    CONTROL_MODE,
     FREQUENCY_HZ,
+    MAX_CONTROL_ITER,
     SOURCE_SHORT_CIRCUIT_MVA,
     OpenDssExportBundle,
     build_export,
@@ -515,6 +517,8 @@ def _master_text(
         [
             f"Set Voltagebases=[{_format(voltage)}]",
             "calcvoltagebases",
+            f"Set ControlMode={CONTROL_MODE}",
+            f"Set MaxControlIter={MAX_CONTROL_ITER}",
             "Set mode=snapshot",
             "Set number=1",
             "Solve",

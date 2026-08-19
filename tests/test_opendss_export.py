@@ -878,21 +878,56 @@ class RegulatorExportTests(unittest.TestCase):
             result.issues,
         )
 
-    def test_non_numeric_vnom_and_snom_are_discarded(self) -> None:
+    def test_non_numeric_snom_is_discarded_pointing_to_the_panel(self) -> None:
         network = self._network()
-        for field, regulators in (
-            ("VNOM", make_regulators(network, vnom_values=("",))),
-            ("SNOM", make_regulators(network, snom_values=("zero",))),
-        ):
-            with self.subTest(field=field):
+        regulators = make_regulators(network, snom_values=("zero",))
+
+        result = self._export(network=network, regulators=regulators)
+
+        self.assertEqual(result.exported_count, 0)
+        self.assertEqual(result.discarded_count, 1)
+        self.assertTrue(
+            any("SNOM" in issue.reason for issue in result.issues),
+            result.issues,
+        )
+        self.assertTrue(
+            any("painel do trecho" in issue.reason for issue in result.issues),
+            result.issues,
+        )
+
+    def test_missing_vnom_inherits_the_circuit_voltage(self) -> None:
+        """Cadastro de MDB com VNOM zerada é comum e não pode descartar o
+        regulador: a tensão nominal do equipamento é a do alimentador."""
+
+        network = self._network()
+        expected = control_entries(self._export(network=network).text)
+        for label, values in (("vazia", ("",)), ("zero", ("0",))):
+            with self.subTest(vnom=label):
+                regulators = make_regulators(network, vnom_values=values)
+
                 result = self._export(network=network, regulators=regulators)
 
-                self.assertEqual(result.exported_count, 0)
-                self.assertEqual(result.discarded_count, 1)
+                self.assertEqual(result.exported_count, 1)
+                self.assertEqual(result.discarded_count, 0)
+                # Saída idêntica à de um cadastro com a VNOM preenchida.
+                self.assertEqual(control_entries(result.text), expected)
                 self.assertTrue(
-                    any(field in issue.reason for issue in result.issues),
+                    any("herdou a VNOM" in issue.reason for issue in result.issues),
                     result.issues,
                 )
+
+    def test_missing_vnom_without_circuit_voltage_is_discarded(self) -> None:
+        network = self._network()
+        regulators = make_regulators(network, vnom_values=("",))
+
+        result = self._export(network=network, regulators=regulators, voltage="")
+
+        self.assertEqual(result.exported_count, 0)
+        self.assertEqual(result.discarded_count, 1)
+        self.assertTrue(
+            any("também não informa" in issue.reason for issue in result.issues),
+            result.issues,
+        )
 
     def test_empty_code_falls_back_to_the_regulator_id(self) -> None:
         network = self._network()
@@ -1945,6 +1980,8 @@ class MasterExportTests(unittest.TestCase):
                 "",
                 "Set Voltagebases=[13.8]",
                 "calcvoltagebases",
+                "Set ControlMode=Static",
+                "Set MaxControlIter=100",
                 "Set mode=daily",
                 "Set stepsize=1h",
                 "Set number=4",

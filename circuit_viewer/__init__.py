@@ -137,6 +137,10 @@ from .regulator_import import (
     RegulatorLoadResult,
     load_regulators_csv,
 )
+from .regulator_overrides import (
+    RegulatorOverrides,
+    apply_overrides as apply_regulator_overrides,
+)
 from .phase_config import (
     PHASE_COLORS,
     UNMAPPED_PHASE_COLOR,
@@ -522,7 +526,9 @@ __all__ = [
     "RegulatorIssue",
     "RegulatorLoadResult",
     "RegulatorModel",
+    "RegulatorOverrides",
     "RegulatorRecord",
+    "apply_regulator_overrides",
     "load_regulators_csv",
     "DEFAULT_OPENDSS_LINE_PARAMETER_MODE",
     "OpenDssLineParameterMode",

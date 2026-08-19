@@ -113,6 +113,15 @@ regulador**, abaixo da tabela de chave quando as duas existirem. Os reguladores
 também entram na busca global: procurar pelo `REGU_ID` ou pelo `CODIGO` enquadra
 o trecho e rola o painel até a seção.
 
+**`VNOM` e `SNOM` podem ser corrigidos ali mesmo**, quando o cadastro vem
+incompleto. A edição vale **somente para a sessão atual**: o `.mdb` nunca é
+escrito, e recarregar o circuito ou reabrir o aplicativo devolve exatamente o
+valor gravado no banco. Enquanto durar, porém, é ela que vale — a exportação
+OpenDSS e o fluxo de potência usam o valor que está na tela, não o do arquivo.
+O campo editado fica em negrito, com o valor original no tooltip, e o botão
+**Restaurar do banco** desfaz as alterações do regulador selecionado. Os demais
+campos seguem somente leitura, porque a exportação não os consome.
+
 No diagrama, cada trecho com regulador ganha um **anel laranja no seu ponto
 médio** — é como se localiza o equipamento na rede sem precisar clicar trecho a
 trecho. O anel tem tamanho fixo em pixels, então continua legível em qualquer
@@ -739,13 +748,26 @@ injeção de tensão. Consequência: aquele trecho não tem corrente no painel d
 fluxo de potência, e a impedância dele sai do modelo — se for longo, um aviso
 avisa.
 
+**`VNOM` ausente ou zerada não descarta o regulador**: ela é herdada da `VNOM`
+do circuito, já que a tensão nominal do equipamento é a do alimentador onde ele
+está. Cadastros de MDB com `REGULADOR.VNOM = 0` são comuns, e antes derrubavam o
+regulador inteiro — o equipamento aparecia no painel mas saía como linha comum,
+sem comutar tap e sem diferença de tensão, o que é difícil de distinguir de um
+defeito. A herança fica registrada na lista de ocorrências, sem descarte.
+
 Não são exportados, com o motivo na lista de ocorrências: reguladores em trecho
-**não trifásico** (por ora), sem `VNOM`/`SNOM` numéricos positivos, em trecho que
-já representa uma chave, ou com `VNOM` incompatível com a do circuito — esta
-última pega a troca de unidade (volts em vez de kV), que geraria um modelo aceito
-pelo OpenDSS e completamente errado. Em todos esses casos **o trecho continua
-saindo como linha comum**. `FAIXA`, `NPASSOS` e `TAP` ainda não são usados: a
-faixa de regulação é a padrão do OpenDSS (±10 %, 32 passos).
+**não trifásico** (por ora), sem `SNOM` numérico positivo — informe-o no painel
+do trecho —, em trecho que já representa uma chave, com `VNOM` ausente **e**
+circuito sem `VNOM` utilizável, ou com `VNOM` incompatível com a do circuito —
+esta última pega a troca de unidade (volts em vez de kV), que geraria um modelo
+aceito pelo OpenDSS e completamente errado. Em todos esses casos **o trecho
+continua saindo como linha comum**. `FAIXA`, `NPASSOS` e `TAP` ainda não são
+usados: a faixa de regulação é a padrão do OpenDSS (±10 %, 32 passos).
+
+Todo master emite `Set ControlMode=Static` e `Set MaxControlIter=100` antes do
+`Solve`. Cada regulador vira três `RegControl`, então poucos reguladores já
+passam do teto padrão de 10 do OpenDSS — e estourá-lo aborta a solução, deixando
+todos os taps parados.
 
 ### Arquivos de carga
 

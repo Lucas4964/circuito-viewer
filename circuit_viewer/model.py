@@ -1555,6 +1555,41 @@ class RegulatorModel:
     def codes(self) -> tuple[str, ...]:
         return self._codes
 
+    # As colunas restantes ficam expostas para permitir reconstruir o modelo com
+    # um campo trocado (ver ``regulator_overrides.apply_overrides``), sem que
+    # ninguém precise alcançar os atributos privados.
+    @property
+    def external_ids(self) -> tuple[str, ...]:
+        return self._external_ids
+
+    @property
+    def connections(self) -> tuple[str, ...]:
+        return self._connections
+
+    @property
+    def snom_values(self) -> tuple[str, ...]:
+        return self._snom_values
+
+    @property
+    def regulation_ranges(self) -> tuple[str, ...]:
+        return self._regulation_ranges
+
+    @property
+    def step_counts(self) -> tuple[str, ...]:
+        return self._step_counts
+
+    @property
+    def tap_values(self) -> tuple[str, ...]:
+        return self._tap_values
+
+    @property
+    def inom_values(self) -> tuple[str, ...]:
+        return self._inom_values
+
+    @property
+    def vnom_values(self) -> tuple[str, ...]:
+        return self._vnom_values
+
     @property
     def segment_indices(self) -> IndexArray:
         return self._segment_indices

@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QGraphicsScene,
     QGridLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
@@ -152,6 +153,7 @@ from .opendss_export import (
     TWO_PHASE_LOADS_FILENAME,
     OpenDssExportBundle,
     master_filenames,
+    parse_number,
     phase_letters_by_node,
 )
 from .opendss_export_dialog import OpenDssExportDialog
@@ -210,6 +212,12 @@ from .phase_config import (
 )
 from .phase_legend import PhaseLegend
 from .regulator_import import RegulatorLoadResult
+from .regulator_overrides import (
+    EDITABLE_FIELDS as REGULATOR_EDITABLE_FIELDS,
+    FIELD_LABELS as REGULATOR_FIELD_LABELS,
+    RegulatorOverrides,
+    apply_overrides as apply_regulator_overrides,
+)
 from .search import GlobalSearchIndex, SearchResult
 from .search_palette import SearchPalette
 from .segment_import import SegmentLoadResult
@@ -692,6 +700,11 @@ class MainWindow(QMainWindow):
         self._switch_model: SwitchModel | None = None
         self._switch_item: SwitchNetworkItem | None = None
         self._regulator_model: RegulatorModel | None = None
+        # Retrato intocado do MDB e as edições voláteis da sessão. O efetivo
+        # (`_regulator_model`) é sempre a composição dos dois, e é ele que a
+        # exportação e o fluxo de potência consomem.
+        self._regulator_source_model: RegulatorModel | None = None
+        self._regulator_overrides = RegulatorOverrides()
         self._regulator_item: RegulatorNetworkItem | None = None
         self._cable_model: CableModel | None = None
         self._circuit_catalog: CircuitCatalogModel | None = None
@@ -1343,6 +1356,7 @@ class MainWindow(QMainWindow):
             parent: QWidget,
             *,
             with_companion: bool = False,
+            editable: Sequence[str] = (),
         ):
             # A terceira coluna existe para valores derivados de outro catálogo
             # (hoje, o cabo de CABOF_ID/CABON_ID). Os rótulos nascem ocultos e o
@@ -1358,7 +1372,11 @@ class MainWindow(QMainWindow):
             grid.setColumnStretch(1, 1)
             if with_companion:
                 grid.setColumnStretch(2, 1)
-            labels: dict[str, QLabel] = {}
+            # Campos editáveis viram QLineEdit e entram no mesmo dicionário
+            # dos rótulos: os dois respondem a setText(), então o preenchimento
+            # do painel não precisa distinguir um do outro.
+            editable_keys = frozenset(editable)
+            labels: dict[str, QLabel | QLineEdit] = {}
             caption_labels: dict[str, QLabel] = {}
             companion_labels: dict[str, QLabel] = {}
             for row, (key, caption) in enumerate(fields):
@@ -1367,14 +1385,20 @@ class MainWindow(QMainWindow):
                 caption_value.setProperty("detailColumn", "caption")
                 caption_value.setStyleSheet(cell_style(row, 0))
                 caption_value.setWordWrap(True)
-                value = QLabel("—")
+                if key in editable_keys:
+                    value = QLineEdit()
+                    value.setFrame(False)
+                    value.setPlaceholderText("—")
+                    value.setClearButtonEnabled(False)
+                else:
+                    value = QLabel("—")
+                    value.setTextInteractionFlags(
+                        Qt.TextInteractionFlag.TextSelectableByMouse
+                    )
+                    value.setWordWrap(True)
                 value.setProperty("detailCell", True)
                 value.setProperty("detailColumn", "value")
                 value.setStyleSheet(cell_style(row, 1))
-                value.setTextInteractionFlags(
-                    Qt.TextInteractionFlag.TextSelectableByMouse
-                )
-                value.setWordWrap(True)
                 caption_labels[key] = caption_value
                 labels[key] = value
                 grid.addWidget(caption_value, row, 0)
@@ -1841,8 +1865,37 @@ class MainWindow(QMainWindow):
             self.regulator_caption_labels,
             self.regulator_details_grid,
             _,
-        ) = create_table(regulator_fields, self.regulator_details_section)
+        ) = create_table(
+            regulator_fields,
+            self.regulator_details_section,
+            editable=REGULATOR_EDITABLE_FIELDS,
+        )
         regulator_layout.addWidget(self.regulator_details_table)
+        # Editores dos campos que a exportação consome. O MDB nunca é escrito:
+        # o valor digitado vive só nesta sessão (ver `regulator_overrides`).
+        self.regulator_value_editors = {
+            key: self.regulator_detail_labels[key]
+            for key in REGULATOR_EDITABLE_FIELDS
+        }
+        for key, editor in self.regulator_value_editors.items():
+            editor.setObjectName(f"regulator_{key}_editor")
+            editor.editingFinished.connect(
+                lambda key=key: self._commit_regulator_editor(key)
+            )
+        self.regulator_restore_button = QPushButton(
+            "Restaurar do banco",
+            self.regulator_details_section,
+        )
+        self.regulator_restore_button.setObjectName("regulator_restore")
+        self.regulator_restore_button.setToolTip(
+            "Descarta os valores digitados nesta sessão e volta ao que está "
+            "gravado no MDB."
+        )
+        self.regulator_restore_button.clicked.connect(
+            self._restore_selected_regulator
+        )
+        self.regulator_restore_button.setVisible(False)
+        regulator_layout.addWidget(self.regulator_restore_button)
         # Tap resolvido pelo fluxo de potência; só aparece quando há resultado.
         self.regulator_tap_label = QLabel("")
         self.regulator_tap_label.setObjectName("regulator_tap")
@@ -2384,7 +2437,7 @@ class MainWindow(QMainWindow):
         if result.switches is not None:
             self._set_switch_model(result.switches.model)
         if result.regulators is not None:
-            self._set_regulator_model(result.regulators.model)
+            self._set_regulator_source_model(result.regulators.model)
         if result.circuits is not None:
             self._set_circuit_catalog(result.circuits.model)
         if result.circuit_levels is not None:
@@ -2957,7 +3010,7 @@ class MainWindow(QMainWindow):
                 "Os trechos foram alterados durante a importação dos reguladores.",
             )
             return
-        self._set_regulator_model(result.model)
+        self._set_regulator_source_model(result.model)
         self._show_regulator_import_report(result)
 
     def _on_circuit_import_finished(self, result: CircuitLoadResult) -> None:
@@ -3043,7 +3096,7 @@ class MainWindow(QMainWindow):
         self._set_switch_model(None)
         # Reguladores referenciam os trechos antigos por índice; trechos novos
         # os invalidam. É a única cascata que eles têm.
-        self._set_regulator_model(None)
+        self._set_regulator_source_model(None)
         if (
             self._selected_feature is not None
             and self._selected_feature.kind == "segment"
@@ -3275,6 +3328,131 @@ class MainWindow(QMainWindow):
         self._apply_circuit_visibility()
         self._sync_export_availability()
         self.view.viewport().update()
+
+    def _selected_regulator_record(self):  # noqa: ANN201
+        """Regulador do trecho selecionado, no modelo efetivo."""
+
+        selection = self._selected_feature
+        if (
+            selection is None
+            or selection.kind != "segment"
+            or self._regulator_model is None
+        ):
+            return None
+        return self._regulator_model.record_for_segment(selection.index)
+
+    def _commit_regulator_editor(self, field: str) -> None:
+        """Valida o texto do painel e o aplica ao modelo em memória."""
+
+        record = self._selected_regulator_record()
+        if record is None:
+            return
+        editor = self.regulator_value_editors[field]
+        text = editor.text().strip()
+        if text and parse_number(text) is None:
+            QMessageBox.warning(
+                self,
+                "Valor inválido",
+                f"{REGULATOR_FIELD_LABELS[field]} deve ser um número. Use ponto "
+                "ou vírgula como separador decimal, não os dois.",
+            )
+            # Recarrega o valor corrente: texto inválido nunca fica na tela.
+            self._sync_regulator_editors(record)
+            editor.setFocus()
+            return
+        self._apply_regulator_override(record.regulator_id, field, text)
+
+    def _restore_selected_regulator(self) -> None:
+        record = self._selected_regulator_record()
+        if record is not None:
+            self._restore_regulator_from_database(record.regulator_id)
+
+    def _sync_regulator_editors(self, record) -> None:  # noqa: ANN001
+        """Reflete o registro efetivo nos editores e marca o que foi editado."""
+
+        source = self._regulator_source_model
+        index = (
+            None
+            if source is None
+            else source.index_for_id(record.regulator_id)
+        )
+        edited_any = False
+        for field, editor in self.regulator_value_editors.items():
+            value = getattr(record, field)
+            if editor.text() != value:
+                editor.setText(value)
+            original = (
+                ""
+                if index is None
+                else getattr(source, f"{field}_values")[index]
+            )
+            edited = index is not None and value.strip() != original.strip()
+            edited_any = edited_any or edited
+            font = editor.font()
+            font.setBold(edited)
+            editor.setFont(font)
+            editor.setToolTip(
+                f"Editado nesta sessão; o banco mantém "
+                f"{original.strip() or '<vazio>'}. A alteração não é gravada e "
+                "some ao recarregar o circuito."
+                if edited
+                else f"{REGULATOR_FIELD_LABELS[field]} como está no banco. "
+                "Editar aqui vale só para esta sessão."
+            )
+        self.regulator_restore_button.setVisible(edited_any)
+
+    def _set_regulator_source_model(self, model: RegulatorModel | None) -> None:
+        """Instala o retrato do banco e descarta as edições da sessão.
+
+        Chamado sempre que os reguladores vêm do MDB — importação isolada,
+        importação completa ou troca de trechos. É aqui que a garantia do
+        usuário se cumpre: recarregar o circuito devolve exatamente o que está
+        gravado no banco, porque as sobreposições morrem junto com o retrato
+        anterior. Fechar o aplicativo não precisa de nada, já que nada disso
+        chega ao disco.
+        """
+
+        self._regulator_source_model = model
+        self._regulator_overrides.clear_all()
+        self._set_regulator_model(model)
+
+    def _apply_regulator_override(
+        self,
+        regulator_id: str,
+        field: str,
+        text: str,
+    ) -> None:
+        """Aplica uma edição do painel ao modelo efetivo, só em memória."""
+
+        source = self._regulator_source_model
+        if source is None:
+            return
+        index = source.index_for_id(str(regulator_id))
+        if index is None:
+            return
+        original = getattr(source, f"{field}_values")[index]
+        value = str(text).strip()
+        # Voltar ao valor do banco é o mesmo que nunca ter editado: sem isso, a
+        # marca de "editado" ficaria presa no campo para sempre.
+        if value == original.strip():
+            changed = self._regulator_overrides.clear(regulator_id, field)
+        else:
+            changed = self._regulator_overrides.set(regulator_id, field, value)
+        if not changed:
+            return
+        self._set_regulator_model(
+            apply_regulator_overrides(source, self._regulator_overrides)
+        )
+
+    def _restore_regulator_from_database(self, regulator_id: str) -> None:
+        """Descarta as edições de um regulador, voltando ao valor do banco."""
+
+        source = self._regulator_source_model
+        if source is None or not self._regulator_overrides.clear(regulator_id):
+            return
+        self._set_regulator_model(
+            apply_regulator_overrides(source, self._regulator_overrides)
+        )
 
     def _set_regulator_model(self, model: RegulatorModel | None) -> None:
         """Instala os reguladores do trecho selecionável.
@@ -7253,8 +7431,9 @@ class MainWindow(QMainWindow):
             else self._regulator_model.record_for_segment(selection.index)
         )
         if regulator_record is None:
-            for label in self.regulator_detail_labels.values():
-                label.setText("—")
+            for key, widget in self.regulator_detail_labels.items():
+                widget.setText("" if key in REGULATOR_EDITABLE_FIELDS else "—")
+            self.regulator_restore_button.setVisible(False)
             self.regulator_tap_label.setVisible(False)
             self.regulator_tap_label.setText("")
             self.regulator_tap_table_model.clear()
@@ -7276,7 +7455,10 @@ class MainWindow(QMainWindow):
                 "vnom": regulator_record.vnom,
             }
             for key, value in regulator_values.items():
+                if key in REGULATOR_EDITABLE_FIELDS:
+                    continue
                 self.regulator_detail_labels[key].setText(value or "—")
+            self._sync_regulator_editors(regulator_record)
             self._apply_regulator_tap(selection.index)
             self.regulator_details_section.setVisible(True)
 

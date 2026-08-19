@@ -88,6 +88,15 @@ MAX_REPORTED_ISSUES = 200
 LOAD_SHAPE_PREFIX = "PERFIL-"
 # NPAT 0..3: o LoadShape diário tem exatamente quatro pontos.
 LOAD_PATTERN_COUNT = 4
+# Cada regulador vira três RegControl (um por fase), então um alimentador com
+# poucos reguladores já passa do teto padrão de 10 do OpenDSS. Estourá-lo aborta
+# a solução e nenhum tap comuta — teto folgado em todo master, não só onde há
+# regulador, porque qualquer controle (RegControl, CapControl) divide o limite.
+MAX_CONTROL_ITER = 100
+# Padrão do OpenDSS, declarado para não depender do estado do engine singleton:
+# a ação de controle é executada dentro do laço de iterações, ignorando atraso,
+# até nenhum controle ficar pendente. É o modo de regime permanente.
+CONTROL_MODE = "Static"
 # Um arquivo por contagem de fases, com o rótulo usado no cabeçalho.
 _LOAD_FILES = {
     1: (SINGLE_PHASE_LOADS_FILENAME, "monofasicas"),
@@ -1734,18 +1743,35 @@ def build_regulator_export(
 
             voltage = parse_number(regulator.vnom)
             if voltage is None or voltage <= 0.0:
+                # Cadastro de regulador com VNOM zerada é comum no MDB. A
+                # tensão nominal do equipamento é a do alimentador onde ele
+                # está, então herdá-la é a leitura correta — e evita descartar
+                # o regulador, que sairia como trecho comum sem regular nada.
+                if circuit_voltage is None or circuit_voltage <= 0.0:
+                    report.add(
+                        segment_id,
+                        f"regulador {regulator.regulator_id} sem VNOM numérica "
+                        f"positiva ({regulator.vnom.strip() or '<vazio>'}) e o "
+                        f"circuito {definition.circuit_id} também não informa "
+                        "VNOM utilizável",
+                    )
+                    continue
                 report.add(
                     segment_id,
                     f"regulador {regulator.regulator_id} sem VNOM numérica "
-                    f"positiva ({regulator.vnom.strip() or '<vazio>'})",
+                    f"positiva ({regulator.vnom.strip() or '<vazio>'}); herdou "
+                    f"a VNOM {definition.nominal_voltage.strip()} do circuito "
+                    f"{definition.circuit_id}",
+                    discarded=False,
                 )
-                continue
+                voltage = circuit_voltage
             power = parse_number(regulator.snom)
             if power is None or power <= 0.0:
                 report.add(
                     segment_id,
                     f"regulador {regulator.regulator_id} sem SNOM numérica "
-                    f"positiva ({regulator.snom.strip() or '<vazio>'})",
+                    f"positiva ({regulator.snom.strip() or '<vazio>'}); informe "
+                    "o valor no painel do trecho para exportá-lo",
                 )
                 continue
             # VNOM do regulador e do circuito são a mesma tensão de linha em kV.
@@ -2527,6 +2553,8 @@ def build_master_export(
         [
             f"Set Voltagebases=[{voltage}]",
             "calcvoltagebases",
+            f"Set ControlMode={CONTROL_MODE}",
+            f"Set MaxControlIter={MAX_CONTROL_ITER}",
             "Set mode=daily",
             "Set stepsize=1h",
             # Um passo por patamar: o LoadShape tem npts=4 e interval=1 hora.

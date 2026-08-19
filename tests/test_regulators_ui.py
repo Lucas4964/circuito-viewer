@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtWidgets import QApplication, QMessageBox
 
     from circuit_viewer.csv_import import CsvLoadResult
     from circuit_viewer.main_window import ImportChoiceDialog, MainWindow
@@ -153,6 +154,110 @@ class RegulatorUiTests(unittest.TestCase):
 
         window._set_selection(FeatureSelection("segment", 1))
         self.assertFalse(window.regulator_details_section.isVisible())
+
+    def test_editable_fields_are_line_edits_showing_the_registry(self) -> None:
+        window = self._window()
+        self._load_network(window)
+        self._load_regulators(window)
+
+        window._set_selection(FeatureSelection("segment", 0))
+
+        self.assertEqual(set(window.regulator_value_editors), {"vnom", "snom"})
+        self.assertEqual(window.regulator_value_editors["vnom"].text(), "13800")
+        self.assertEqual(window.regulator_value_editors["snom"].text(), "1000")
+        self.assertFalse(window.regulator_restore_button.isVisible())
+
+    def test_an_edit_reaches_the_effective_model_without_touching_the_source(
+        self,
+    ) -> None:
+        """O OpenDSS passa a ler o valor da tela; o retrato do MDB fica igual."""
+
+        window = self._window()
+        self._load_network(window)
+        source = self._load_regulators(window)
+        window._set_selection(FeatureSelection("segment", 0))
+
+        editor = window.regulator_value_editors["snom"]
+        editor.setText("276")
+        editor.editingFinished.emit()
+        self.app.processEvents()
+
+        self.assertEqual(window._regulator_model.record(0).snom, "276")
+        self.assertIsNot(window._regulator_model, source)
+        # A fonte importada permanece exatamente como veio do banco.
+        self.assertIs(window._regulator_source_model, source)
+        self.assertEqual(source.record(0).snom, "1000")
+        self.assertTrue(window.regulator_restore_button.isVisible())
+
+    def test_an_invalid_number_is_refused_and_the_editor_reloads(self) -> None:
+        window = self._window()
+        self._load_network(window)
+        self._load_regulators(window)
+        window._set_selection(FeatureSelection("segment", 0))
+        editor = window.regulator_value_editors["snom"]
+
+        editor.setText("1.234,5")
+        with patch.object(QMessageBox, "warning") as warning:
+            editor.editingFinished.emit()
+        self.app.processEvents()
+
+        warning.assert_called_once()
+        self.assertEqual(editor.text(), "1000")
+        self.assertEqual(window._regulator_model.record(0).snom, "1000")
+
+    def test_typing_the_registry_value_back_clears_the_override(self) -> None:
+        window = self._window()
+        self._load_network(window)
+        source = self._load_regulators(window)
+        window._set_selection(FeatureSelection("segment", 0))
+        editor = window.regulator_value_editors["snom"]
+
+        editor.setText("276")
+        editor.editingFinished.emit()
+        editor.setText("1000")
+        editor.editingFinished.emit()
+        self.app.processEvents()
+
+        self.assertTrue(window._regulator_overrides.is_empty)
+        self.assertIs(window._regulator_model, source)
+        self.assertFalse(window.regulator_restore_button.isVisible())
+
+    def test_the_restore_button_returns_to_the_database_value(self) -> None:
+        window = self._window()
+        self._load_network(window)
+        source = self._load_regulators(window)
+        window._set_selection(FeatureSelection("segment", 0))
+        editor = window.regulator_value_editors["snom"]
+        editor.setText("276")
+        editor.editingFinished.emit()
+        self.app.processEvents()
+
+        window.regulator_restore_button.click()
+        self.app.processEvents()
+
+        self.assertTrue(window._regulator_overrides.is_empty)
+        self.assertIs(window._regulator_model, source)
+        self.assertEqual(window.regulator_value_editors["snom"].text(), "1000")
+
+    def test_reimporting_the_regulators_discards_the_session_edits(self) -> None:
+        """Recarregar o circuito devolve exatamente o que está no banco."""
+
+        window = self._window()
+        self._load_network(window)
+        self._load_regulators(window)
+        window._set_selection(FeatureSelection("segment", 0))
+        editor = window.regulator_value_editors["snom"]
+        editor.setText("276")
+        editor.editingFinished.emit()
+        self.app.processEvents()
+        self.assertFalse(window._regulator_overrides.is_empty)
+
+        reloaded = self._load_regulators(window)
+        window._set_selection(FeatureSelection("segment", 0))
+
+        self.assertTrue(window._regulator_overrides.is_empty)
+        self.assertIs(window._regulator_model, reloaded)
+        self.assertEqual(window.regulator_value_editors["snom"].text(), "1000")
 
     def test_every_column_reaches_the_panel(self) -> None:
         window = self._window()

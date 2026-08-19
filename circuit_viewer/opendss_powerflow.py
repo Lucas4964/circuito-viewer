@@ -51,7 +51,9 @@ from .model import (
 )
 from .opendss_engine import DssEngine
 from .opendss_export import (
+    CONTROL_MODE,
     LOAD_PATTERN_COUNT,
+    MAX_CONTROL_ITER,
     MAX_REPORTED_ISSUES,
     OpenDssExportBundle,
     OpenDssLibraryExportError,
@@ -78,7 +80,13 @@ _CANCEL_CHECK_INTERVAL = 4_096
 # Comandos que reconduzem a solução ao primeiro patamar, um passo por vez. A
 # ordem importa: `number` e `stepsize` são lidos pelo Solve, e `time` precisa
 # ser o último para não ser reposicionado pelos anteriores.
+#
+# O modo e o teto de controle são repetidos aqui de propósito: eles já saem no
+# master, mas isto roda **depois** do Compile, sobre um engine singleton que
+# pode carregar estado da execução anterior.
 _STEP_MODE_COMMANDS = (
+    f"Set ControlMode={CONTROL_MODE}",
+    f"Set MaxControlIter={MAX_CONTROL_ITER}",
     "Set mode=daily",
     "Set stepsize=1h",
     "Set number=1",
