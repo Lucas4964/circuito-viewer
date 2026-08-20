@@ -96,7 +96,7 @@ CIRCUITO_VIEWER/
 │   ├── generator_update.py    # cálculo derivado das demandas dos geradores
 │   │
 │   ├── opendss_export.py      # geração dos .dss de rede e de cargas
-│   ├── opendss_settings.py    # parâmetros globais das cargas (Vminpu/Vmaxpu)
+│   ├── opendss_settings.py    # modelo das cargas (potência constante/ZIPV) e Vminpu/Vmaxpu
 │   ├── opendss_engine.py      # único acesso ao py_dss_interface (opcional)
 │   ├── opendss_powerflow.py   # execução do fluxo e associação dos resultados
 │   ├── branch_analysis.py     # análise topológica de ramais
@@ -272,7 +272,7 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | Módulo | Responsabilidade |
 |---|---|
 | `graphics.py` | Toda a pintura, virtualização, hit-test geométrico, zoom/pan, desenho do fundo de satélite |
-| `opendss_settings.py` | Valor imutável dos parâmetros globais das cargas (`Vminpu`/`Vmaxpu`), com a invariante que o OpenDSS não impõe e a tradução para os comandos `BatchEdit` |
+| `opendss_settings.py` | Valor imutável dos parâmetros globais das cargas — modelo (potência constante ou ZIPV) e `Vminpu`/`Vmaxpu` —, com as invariantes que o OpenDSS não impõe, a tradução para os comandos `BatchEdit` e a diretiva `model=` da linha `New Load` |
 | `opendss_engine.py` | Contenção dos efeitos globais do `py_dss_interface`: singleton com trava, diretório corrente preservado, `SystemExit` capturado, pasta temporária ASCII |
 | `workers.py` | 19 workers `QObject` que apenas encapsulam funções puras e emitem `progress/finished/failed/cancelled` |
 | `mdb_import_dialog.py` | Tabelas detectadas com ajuste manual, senha mascarada e metadados UTM; `MdbPasswordDialog` é separado porque a senha só se sabe necessária **depois** da primeira tentativa de conexão |
@@ -1734,7 +1734,8 @@ não das bases de tensão das barras.
 
 **Por que isso não é cosmético.** `Vminpu`/`Vmaxpu` delimitam a faixa em que a
 `Load` respeita o seu `model`; fora dela o OpenDSS a converte para impedância
-constante. Como o exportador emite `model=1`, a faixa padrão (0,95–1,05) faz
+constante — e isso vale para os dois modelos, inclusive o ZIPV. Com o
+exportador emitindo `model=1`, a faixa padrão (0,95–1,05) faz
 toda barra abaixo de 0,95 pu ter a carga convertida **em silêncio**, e o estudo
 subestima a queda de tensão exatamente onde ela interessa. Medido num
 alimentador de 20 km carregado: a ponta fica em **0,8970 pu** com o padrão e em
@@ -1764,6 +1765,53 @@ segunda barra de um nome repetido é descartada com diagnóstico, já que no
 arquivo ela apenas sobrescreveria a primeira. A função é pública exatamente por
 ser essa definição única: a leitura dos resultados do fluxo de potência
 (seção 12.4) precisa concordar com ela.
+
+#### Modelo de carga: potência constante ou ZIPV
+
+O usuário escolhe, na aba **Cargas**, entre `model=1` (potência constante, o
+comportamento histórico) e `model=8` (ZIPV). A escolha vale **só para as cargas
+de consumo**.
+
+**Por que o ZIPV não pode usar o `BatchEdit`.** O caminho de `Vminpu`/`Vmaxpu` é
+`BatchEdit Load..*`, e esse padrão atinge *toda* `Load` — inclusive as sintéticas
+de gerador (`GER-*`), de capacitor (`CAP-*`) e de ramal equivalente. Para os
+limites de tensão isso é aceitável e é o comportamento histórico; para o modelo
+não é, porque um banco de capacitores ou uma injeção de GD não têm a
+sensibilidade à tensão de um consumo. Por isso o modelo é emitido **por
+elemento**, em `build_load_export`, onde o `model=1` já era literal. Nenhuma
+outra emissão muda: `build_generator_export`, `build_capacitor_export`,
+`build_branch_export` e as três da alocação seguem com `model=1` fixo.
+
+O ramal equivalente merece nota própria: ele é o *líquido* de carga menos
+geração, pode ser negativo em todos os patamares e ainda absorve capacitores
+internos — não existe um ZIPV correto para o agregado. E a carga de energia da
+alocação vive dentro do laço de convergência do `AllocateLoads`, que ajusta o
+`CFactor` comparando corrente com o `PeakCurrent` do medidor; trocar o modelo ali
+mudaria o que o alocador enxerga a cada iteração.
+
+**A ordem do vetor é a do OpenDSS**, e está travada por teste: três pesos Z/I/P
+da ativa, três da reativa, e a tensão de corte por último. O corte é aplicado por
+um sigmoide, e **só quando maior que zero** — por isso o padrão de fábrica
+`(0, 0, 1, 0, 0, 1, 0)` é potência constante pura com o corte desligado, e trocar
+para ZIPV sem editar nada não muda resultado nenhum.
+
+**`Vminpu`/`Vmaxpu` valem nos dois modelos.** No `DoZIPVModel` do `Load.pas` os
+coeficientes só entram no ramo entre `VBase95` e `VBase105`, derivados desses
+dois parâmetros; fora da janela o OpenDSS troca por impedância. Por isso os
+campos continuam visíveis e aplicáveis no modo ZIPV — escondê-los faria o
+simulador usar 0,95 e 1,05 em silêncio como fronteira do ZIPV.
+
+**A soma dos pesos não é invariante da dataclass, de propósito.** O diálogo
+reconstrói o valor a cada tecla para atualizar a pré-visualização, e uma
+invariante que levantasse faria o preview cair no padrão no meio da digitação. A
+checagem vive em `zipv_sum_error()` e serve a dois consumidores: o diálogo, que
+bloqueia o OK (o OpenDSS aceita qualquer vetor sem avisar, e um erro de digitação
+alteraria a potência de todo o circuito), e `settings_from_mapping`, que descarta
+uma preferência incoerente em vez de exportá-la.
+
+**Compatibilidade.** Em potência constante a linha `New Load` sai byte a byte
+igual à de antes do recurso existir — mesma garantia que a configuração de
+tensão já dava, e travada por teste de regressão.
 
 #### Exportação da projeção simplificada (`opendss_simplified_export.py`)
 
@@ -2594,6 +2642,8 @@ lido por uma build anterior.
 | `test_opendss_export.py` | linhas de trecho, de chave e das cargas de uma, duas e três fases, conversão de `C1` e do `kV` pela tensão de fase, ordem `New`/`Open` e `LoadShape`/`Load`, nomenclatura `-NF-<FASE>`, terminal por letra, neutro preservado só na monofásica, colunas de patamar por fase, patamar zerado, descarte integral da carga, reserva de nomes entre os arquivos, arredondamento, saneamento, master (ordem das seções, `Redirect` conforme os arquivos gerados, coordenadas em casas fixas) e diagnósticos |
 | `test_opendss_generator_export.py` | três arquivos de geradores, perfis ativos negativos sem dupla inversão, classes negativas, terminais e tensão de fase, seleção por circuito, fallback, descarte integral, namespace `Load.*` compartilhado e ordem dos `Redirect` |
 | `test_opendss_settings.py` | invariante da faixa (`0 < vminpu <= 1 <= vmaxpu`), comandos `BatchEdit` exatos e sem vírgula decimal, desabilitado não emite nada, ida e volta pelo mapeamento e recuperação de preferência corrompida |
+| `test_opendss_load_model.py` | ordem do vetor `ZIPV`, números de `model` do OpenDSS, soma dos pesos verificada fora da invariante, padrão de fábrica equivalente a potência constante e descarte de preferência incoerente |
+| `test_opendss_zipv_export.py` | potência constante byte a byte igual ao comportamento anterior, `model=8` com o vetor só nas cargas de consumo, e geradores, capacitores e ramais intactos |
 | `test_opendss_engine.py` | detecção da biblioteca opcional, memoização do erro de import, reuso do motor único, diretório corrente restaurado (inclusive após falha) e escolha da pasta ASCII |
 | `test_opendss_powerflow.py` | com um **motor falso**: arquivos gravados iguais aos da exportação, inclusão e identidade do retrato de geradores, ordem `Clear`/`Compile`/`Set …`, um `Solve` por patamar, corrente no trecho certo (inclusive em chaves), só o terminal 1, tensões e pu por nó, neutro descartado, `IADM` ausente, patamar não convergido, colisão de caixa em nome de linha e de barra, circuito sem master, sobreposição resolvida pelo primeiro circuito, progresso e cancelamento |
 | `test_mdb_engine.py` | `cell_to_text` exaustivo (o inteiro sem `.0`, o decimal íntegro, Sim/Não, nulo, binário), sniff de formato por versão do Access, detecção de senha, cadeia de conexão somente leitura **sem chaves em `DBQ` nem em `PWD`** e comparada com a forma comprovadamente funcional, recuo do `SQL_MODE_READ_ONLY`, senha fora das mensagens, e a garantia de que só `SELECT` é emitido |

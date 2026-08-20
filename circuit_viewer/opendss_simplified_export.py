@@ -532,6 +532,7 @@ def build_simplified_export(
                 phase_count=count,
                 reserved_names=reserved_load_names,
                 include_load_indices=outside_loads,
+                load_settings=load_settings,
                 cancel_check=cancel_check,
                 progress=progress,
             )

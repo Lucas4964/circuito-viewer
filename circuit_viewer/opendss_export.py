@@ -2003,6 +2003,7 @@ def build_load_export(
     phase_count: int,
     reserved_names: frozenset[str] = frozenset(),
     include_load_indices: frozenset[int] | None = None,
+    load_settings: OpenDssLoadSettings | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssLoadExportResult:
@@ -2028,6 +2029,15 @@ def build_load_export(
 
     if phase_count not in _LOAD_FILES:
         raise ValueError(f"Contagem de fases sem arquivo: {phase_count}")
+
+    # O modelo vale só para as cargas de consumo. Geradores, capacitores e
+    # ramais equivalentes são Load por dialeto do exportador, não por
+    # natureza, e continuam em potência constante.
+    model_directive = (
+        "model=1"
+        if load_settings is None
+        else load_settings.load_model_directive()
+    )
 
     selected = _selected_indices(catalog, circuit_indices)
     entries_by_value = _entries_by_value(phase_configuration)
@@ -2193,7 +2203,7 @@ def build_load_export(
                 f" bus1={bus}.{node}"
                 " conn=wye"
                 f" kV={voltage}"
-                " model=1 kW=1 kvar=1"
+                f" {model_directive} kW=1 kvar=1"
                 f" daily={shape_name}"
                 f" class={phase_count}"
             )
@@ -2218,6 +2228,14 @@ def build_load_export(
         ),
         "! kW=1 e kvar=1 sao fixos: a potencia de cada patamar vem do LoadShape",
         "! kV e a tensao de fase do circuito (VNOM de linha dividida por raiz de 3)",
+        *(
+            (
+                "! ZIPV: pesos Z/I/P da ativa, depois da reativa, e a tensao "
+                "de corte em pu",
+            )
+            if entries and model_directive.startswith("model=8")
+            else ()
+        ),
         "! Circuitos: "
         + ", ".join(
             sanitize_dss_name(catalog.definition(index).circuit_id)
@@ -2996,6 +3014,7 @@ def build_export(
                 selected,
                 phase_count=count,
                 reserved_names=reserved,
+                load_settings=load_settings,
                 cancel_check=cancel_check,
                 progress=progress,
             )

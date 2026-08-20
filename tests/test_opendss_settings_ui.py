@@ -17,7 +17,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PyQt6.QtCore import QSettings
-    from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox
+    from PyQt6.QtWidgets import (
+        QApplication,
+        QComboBox,
+        QDialog,
+        QDialogButtonBox,
+        QGridLayout,
+        QLabel,
+    )
 
     from circuit_viewer.main_window import MainWindow
     from circuit_viewer.opendss_line_mode import (
@@ -25,6 +32,9 @@ try:
         OpenDssLineParameterMode,
     )
     from circuit_viewer.opendss_settings import (
+    DEFAULT_ZIPV_COEFFICIENTS,
+    OpenDssLoadModel,
+    ZipvCoefficients,
         DEFAULT_OPENDSS_LOAD_SETTINGS,
         DEFAULT_VMAXPU,
         DEFAULT_VMINPU,
@@ -79,6 +89,16 @@ class PersistenceTests(unittest.TestCase):
             voltage_limits_enabled=True,
             vminpu=0.82,
             vmaxpu=1.18,
+        )
+
+        save_opendss_settings(self.settings, chosen)
+
+        self.assertEqual(load_opendss_settings(self.settings), chosen)
+
+    def test_round_trip_preserves_the_load_model_and_the_vector(self) -> None:
+        chosen = OpenDssLoadSettings(
+            load_model=OpenDssLoadModel.ZIPV,
+            zipv=ZipvCoefficients(0.5, 0.2, 0.3, 0.4, 0.3, 0.3, 0.7),
         )
 
         save_opendss_settings(self.settings, chosen)
@@ -257,15 +277,15 @@ class DialogTests(unittest.TestCase):
     def test_preview_shows_the_commands_that_will_be_emitted(self) -> None:
         dialog = self._dialog()
 
-        # Desmarcado, a pré-visualização diz que nada será acrescentado.
-        self.assertIn("nenhum", dialog.preview_label.text())
+        # Desmarcado, a pré-visualização diz que nenhum limite sai no master.
+        self.assertIn("sem limites de tensão", dialog.preview_label.text())
 
         dialog.apply_limits_check.setChecked(True)
         dialog.vminpu_input.setValue(0.8)
         dialog.vmaxpu_input.setValue(1.2)
 
         self.assertEqual(
-            dialog.preview_label.text().splitlines(),
+            dialog.preview_label.text().splitlines()[:2],
             [
                 "BatchEdit Load..* vminpu=0.8",
                 "BatchEdit Load..* vmaxpu=1.2",
@@ -277,10 +297,148 @@ class DialogTests(unittest.TestCase):
         dialog.apply_limits_check.setChecked(True)
         dialog.vminpu_input.setValue(0.875)
 
+        lines = dialog.preview_label.text().splitlines()
+
         self.assertEqual(
-            dialog.preview_label.text().splitlines(),
-            list(dialog.settings().batch_edit_commands()),
+            lines[:2], list(dialog.settings().batch_edit_commands())
         )
+        # O modelo não é comando de master: a última linha mostra o efeito na
+        # linha New Load, que é onde ele de fato vive.
+        self.assertIn(dialog.settings().load_model_directive(), lines[-1])
+
+    def test_preview_shows_the_zipv_vector_of_the_load_line(self) -> None:
+        dialog = self._dialog()
+        dialog.zipv_radio.setChecked(True)
+        for name, value in (
+            ("z_p", 0.5), ("i_p", 0.2), ("p_p", 0.3),
+            ("z_q", 0.4), ("i_q", 0.3), ("p_q", 0.3),
+            ("cutoff", 0.7),
+        ):
+            dialog.zipv_inputs[name].setValue(value)
+
+        self.assertIn(
+            "model=8 ZIPV=[0.5, 0.2, 0.3, 0.4, 0.3, 0.3, 0.7]",
+            dialog.preview_label.text(),
+        )
+
+    def test_the_zipv_fields_appear_only_in_the_zipv_mode(self) -> None:
+        dialog = self._dialog()
+        dialog.show()
+
+        self.assertTrue(dialog.constant_power_radio.isChecked())
+        self.assertFalse(dialog.zipv_fields.isVisible())
+        self.assertEqual(len(dialog.zipv_inputs), 7)
+
+        dialog.zipv_radio.setChecked(True)
+
+        self.assertTrue(dialog.zipv_fields.isVisible())
+        self.assertIs(dialog.settings().load_model, OpenDssLoadModel.ZIPV)
+
+    def test_the_voltage_band_stays_available_in_both_modes(self) -> None:
+        """No OpenDSS a faixa delimita onde o ZIPV vale, não só a potência constante."""
+
+        dialog = self._dialog(OpenDssLoadSettings(voltage_limits_enabled=True))
+        dialog.show()
+        dialog.zipv_radio.setChecked(True)
+
+        self.assertTrue(dialog.fields.isVisible())
+        self.assertTrue(dialog.fields.isEnabled())
+
+    def test_the_weights_are_laid_out_as_a_three_by_two_table(self) -> None:
+        """Linhas Z/I/P e colunas P/Q: a forma do próprio modelo ZIP."""
+
+        dialog = self._dialog()
+        grid = dialog.zipv_fields.findChild(QGridLayout)
+
+        def at(row, column):  # noqa: ANN001, ANN202
+            item = grid.itemAtPosition(row, column)
+            return None if item is None else item.widget()
+
+        self.assertEqual(at(0, 1).text(), "P")
+        self.assertEqual(at(0, 2).text(), "Q")
+        for row, header in enumerate(("Z", "I", "P"), start=1):
+            with self.subTest(row=header):
+                self.assertEqual(at(row, 0).text(), header)
+                self.assertIs(
+                    at(row, 1), dialog.zipv_inputs[f"{header.lower()}_p"]
+                )
+                self.assertIs(
+                    at(row, 2), dialog.zipv_inputs[f"{header.lower()}_q"]
+                )
+
+    def test_the_tab_carries_no_explanatory_prose(self) -> None:
+        """Só o essencial na tela; a explicação virá numa janela de ajuda."""
+
+        dialog = self._dialog()
+
+        texts = [
+            label.text()
+            for label in dialog.voltage_tab.findChildren(QLabel)
+            if label is not dialog.preview_label
+        ]
+        for text in texts:
+            with self.subTest(text=text):
+                # Nenhum rótulo é um parágrafo: os que restam são cabeçalhos e
+                # nomes de campo.
+                self.assertLessEqual(len(text), 40)
+
+    def test_the_sum_label_shows_up_only_when_it_blocks_the_ok(self) -> None:
+        dialog = self._dialog()
+        dialog.show()
+        dialog.zipv_radio.setChecked(True)
+
+        self.assertFalse(dialog.zipv_sum_label.isVisible())
+
+        dialog.zipv_inputs["p_p"].setValue(0.5)
+
+        self.assertTrue(dialog.zipv_sum_label.isVisible())
+
+        dialog.zipv_inputs["p_p"].setValue(1.0)
+
+        self.assertFalse(dialog.zipv_sum_label.isVisible())
+
+    def test_a_sum_other_than_one_blocks_the_ok_button(self) -> None:
+        dialog = self._dialog()
+        ok = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        dialog.zipv_radio.setChecked(True)
+        self.assertTrue(ok.isEnabled())
+
+        dialog.zipv_inputs["p_p"].setValue(0.5)
+
+        self.assertFalse(ok.isEnabled())
+        self.assertIn("somar 1", dialog.zipv_sum_label.text())
+
+        dialog.zipv_inputs["p_p"].setValue(1.0)
+
+        self.assertTrue(ok.isEnabled())
+
+    def test_an_incoherent_sum_does_not_block_in_constant_power(self) -> None:
+        """Ali os coeficientes ficam guardados sem efeito nenhum."""
+
+        dialog = self._dialog()
+        ok = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        dialog.zipv_radio.setChecked(True)
+        dialog.zipv_inputs["p_p"].setValue(0.5)
+        self.assertFalse(ok.isEnabled())
+
+        dialog.constant_power_radio.setChecked(True)
+
+        self.assertTrue(ok.isEnabled())
+        self.assertIsNone(dialog.zipv_validation_error())
+
+    def test_restore_defaults_also_resets_the_model(self) -> None:
+        dialog = self._dialog()
+        dialog.zipv_radio.setChecked(True)
+        dialog.zipv_inputs["cutoff"].setValue(0.7)
+
+        dialog.buttons.button(
+            QDialogButtonBox.StandardButton.RestoreDefaults
+        ).click()
+
+        self.assertIs(
+            dialog.settings().load_model, OpenDssLoadModel.CONSTANT_POWER
+        )
+        self.assertEqual(dialog.settings().zipv, DEFAULT_ZIPV_COEFFICIENTS)
 
     def test_restore_defaults(self) -> None:
         dialog = self._dialog(
@@ -304,7 +462,7 @@ class DialogTests(unittest.TestCase):
         self.assertEqual(
             [dialog.tabs.tabText(index) for index in range(dialog.tabs.count())],
             [
-                "Tensão das cargas",
+                "Cargas",
                 "Parâmetros das linhas",
                 "Mapa de Cabos",
                 "Mapa de Arranjos",

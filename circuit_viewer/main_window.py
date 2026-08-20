@@ -193,7 +193,7 @@ from .opendss_powerflow import (
     three_phase_power,
     voltage_unbalance,
 )
-from .opendss_settings import OpenDssLoadSettings
+from .opendss_settings import OpenDssLoadModel, OpenDssLoadSettings
 from .opendss_settings_dialog import (
     OpenDssSettingsDialog,
     load_opendss_line_parameter_mode,
@@ -7100,13 +7100,18 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _opendss_settings_summary(settings: OpenDssLoadSettings) -> str:
-        if settings.is_default:
+        model = (
+            "modelo ZIPV"
+            if settings.load_model is OpenDssLoadModel.ZIPV
+            else "potência constante"
+        )
+        if not settings.voltage_limits_enabled:
             return (
-                "Limites de tensão das cargas desativados; o OpenDSS usará "
-                "0,95 e 1,05."
+                f"Cargas em {model}; limites de tensão desativados, o OpenDSS "
+                "usará 0,95 e 1,05."
             )
         return (
-            "Limites de tensão das cargas: "
+            f"Cargas em {model}; limites de tensão "
             f"vminpu={settings.vminpu:n} e vmaxpu={settings.vmaxpu:n}."
         )
 

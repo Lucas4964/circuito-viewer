@@ -849,6 +849,13 @@ New Load.CARGA-1-3F-E phases=1 bus1=COD-B.2 conn=wye kV=7.96743 model=1 kW=1 kva
 New Load.CARGA-1-3F-F phases=1 bus1=COD-B.3 conn=wye kV=7.96743 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-F class=3
 ```
 
+No modo ZIPV o `model=1` é substituído pelo modelo 8 com o vetor de sete
+coeficientes, e o resto da linha permanece igual:
+
+```
+New Load.CARGA-1-3F-D phases=1 bus1=COD-B.1 conn=wye kV=7.96743 model=8 ZIPV=[0.5, 0.2, 0.3, 0.4, 0.3, 0.3, 0.7] kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-D class=3
+```
+
 #### Nome
 
 Toda carga exportada segue `<CODIGO>-<N>F-<FASE>`, onde `N` é a contagem de
@@ -1009,24 +1016,52 @@ sobrescreveria a primeira.
 
 ## Configurações do OpenDSS
 
-O menu **Configurações → OpenDSS…** é organizado nas abas **Tensão das cargas**,
+O menu **Configurações → OpenDSS…** é organizado nas abas **Cargas**,
 **Parâmetros das linhas**, **Mapa de Cabos** e **Mapa de Arranjos**. A primeira
-aba define parâmetros globais aplicados a **todos os elementos `Load`** do modelo
-— cargas de consumo e geradores — tanto na exportação quanto no fluxo de
-potência. Os dois caminhos geram o mesmo arquivo master.
+aba define o **modelo de simulação das cargas** e a faixa de tensão em que ele
+vale, tanto na exportação quanto no fluxo de potência. Os dois caminhos geram o
+mesmo arquivo master.
+
+### Modelo de carga
+
+| Modelo | `model` do OpenDSS | Efeito |
+|---|---|---|
+| Potência constante | `1` | A carga entrega a potência do patamar independentemente da tensão. É o padrão e o comportamento histórico da exportação. |
+| ZIPV | `8` | A carga é composta por parcelas de impedância, corrente e potência constantes, com tensão de corte própria. |
+
+No modo ZIPV a interface pede os **sete coeficientes**, na ordem exata em que o
+OpenDSS os lê: os pesos Z, I e P da **potência ativa**, depois os três da
+**reativa**, e por último a **tensão de corte em pu**. Cada trio precisa somar 1 —
+a aplicação bloqueia o OK enquanto não somarem, porque o OpenDSS aceita qualquer
+valor sem avisar e um erro de digitação alteraria a potência de todo o circuito.
+A tensão de corte zera a carga abaixo dela; deixá-la em **0 desliga** o
+mecanismo, que só é aplicado quando o valor é maior que zero.
+
+O padrão de fábrica é `(0, 0, 1, 0, 0, 1, 0)` — potência constante pura. Trocar
+para ZIPV sem editar nada não muda o resultado.
+
+**O modelo vale só para as cargas de consumo.** Geradores, capacitores, ramais
+equivalentes da rede simplificada e as cargas de energia da alocação continuam em
+`model=1`: eles saem como `Load` por dialeto do exportador, não por natureza. Um
+banco de capacitores ou uma injeção de geração distribuída não têm a
+sensibilidade à tensão de um consumo, e o ramal equivalente é o *líquido* de
+carga menos geração, que pode ser negativo em todos os patamares.
+
+### Faixa de tensão
 
 | Parâmetro | Padrão do OpenDSS | Efeito |
 |---|---|---|
 | `Vminpu` | 0,95 | Abaixo desta tensão a carga deixa de respeitar o seu `model` |
 | `Vmaxpu` | 1,05 | Acima desta tensão, idem |
 
-**Por que isso importa.** O exportador emite todas as cargas com `model=1`
-(potência constante). Fora da faixa `Vminpu`–`Vmaxpu`, o OpenDSS converte a carga
-para **impedância constante** — e não avisa. Num alimentador carregado, isso faz
-o estudo subestimar a queda de tensão justamente nas barras críticas. Num caso de
-20 km medido aqui, a barra de ponta aparece com **0,897 pu** usando o padrão e
-com **0,881 pu** ao baixar `Vminpu` para 0,80, que mantém a carga como potência
-constante.
+**Por que isso importa, e por que vale nos dois modelos.** Fora da faixa
+`Vminpu`–`Vmaxpu`, o OpenDSS converte a carga para **impedância constante** — e
+não avisa. Isso não é exclusivo da potência constante: no `DoZIPVModel` do
+`Load.pas`, os coeficientes ZIPV só entram no ramo entre `VBase95` e `VBase105`,
+derivados justamente destes dois parâmetros. Num alimentador carregado, a faixa
+padrão faz o estudo subestimar a queda de tensão justamente nas barras críticas.
+Num caso de 20 km medido aqui, a barra de ponta aparece com **0,897 pu** usando o
+padrão e com **0,881 pu** ao baixar `Vminpu` para 0,80.
 
 **A configuração é opcional.** A caixa *Aplicar limites de tensão às cargas*
 nasce **desmarcada**: nesse estado nenhum comando é acrescentado e o arquivo sai
