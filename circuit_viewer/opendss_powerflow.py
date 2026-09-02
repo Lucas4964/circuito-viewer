@@ -67,6 +67,10 @@ from .opendss_library import OpenDssLibraryCatalog
 from .opendss_line_mode import OpenDssLineParameterMode
 from .opendss_mapping_store import OpenDssLibraryMappings
 from .opendss_settings import OpenDssLoadSettings
+from .opendss_solution import (
+    DEFAULT_MAX_POWER_FLOW_ITER,
+    parse_max_power_flow_iterations,
+)
 from .phase_config import PhaseConfiguration
 
 if TYPE_CHECKING:
@@ -78,21 +82,36 @@ ProgressCallback = Callable[[int, int], None]
 # Mesma cadência de verificação das demais análises do projeto.
 _CANCEL_CHECK_INTERVAL = 4_096
 
-# Comandos que reconduzem a solução ao primeiro patamar, um passo por vez. A
-# ordem importa: `number` e `stepsize` são lidos pelo Solve, e `time` precisa
-# ser o último para não ser reposicionado pelos anteriores.
-#
-# O modo e o teto de controle são repetidos aqui de propósito: eles já saem no
-# master, mas isto roda **depois** do Compile, sobre um engine singleton que
-# pode carregar estado da execução anterior.
-_STEP_MODE_COMMANDS = (
-    f"Set ControlMode={CONTROL_MODE}",
-    f"Set MaxControlIter={MAX_CONTROL_ITER}",
-    "Set mode=daily",
-    "Set stepsize=1h",
-    "Set number=1",
-    "Set time=(0, 0)",
-)
+# Abaixo disto o nó não está energizado — é o neutro, a terra, ou uma barra que
+# ficou fora por chave aberta. Não é uma tensão baixa; é a ausência de tensão.
+_DEAD_NODE_PU = 1e-9
+
+# O que o OpenDSS usa quando ninguém configura ``Vminpu`` na ``Load``. Precisa
+# ser conhecido aqui porque o corte relatado tem de ser o que **valeu**, não o
+# que o usuário digitou — com os limites desligados, quem vale é este.
+DEFAULT_DSS_VMINPU = 0.95
+
+def _step_mode_commands(max_power_flow_iterations: int) -> tuple[str, ...]:
+    """Comandos que reconduzem a solução ao primeiro patamar, um passo por vez.
+
+    A ordem importa: ``number`` e ``stepsize`` são lidos pelo Solve, e ``time``
+    precisa ser o último para não ser reposicionado pelos anteriores.
+
+    O modo e os dois tetos são repetidos aqui de propósito: eles já saem no
+    master, mas isto roda **depois** do Compile, sobre um engine singleton que
+    pode carregar estado da execução anterior. Vale com mais força para o
+    ``MaxIter``, que uma execução anterior pode ter deixado em outro valor.
+    """
+
+    return (
+        f"Set ControlMode={CONTROL_MODE}",
+        f"Set MaxControlIter={MAX_CONTROL_ITER}",
+        f"Set MaxIter={parse_max_power_flow_iterations(max_power_flow_iterations)}",
+        "Set mode=daily",
+        "Set stepsize=1h",
+        "Set number=1",
+        "Set time=(0, 0)",
+    )
 
 # Pares fase-fase da tensão de linha, na ordem em que o painel os apresenta:
 # VDE, VEF, VFD. Os números são os nós DSS das fases D, E e F.
@@ -231,6 +250,30 @@ class BarVoltages:
 
 
 @dataclass(frozen=True, slots=True)
+class StepVoltages:
+    """Extremos de tensão de um patamar, em pu, sobre o sistema inteiro.
+
+    Sai do mesmo vetor que ``_harvest_bus_voltages`` já lê para distribuir as
+    tensões pelas barras, então não custa solução nem leitura extra.
+
+    Nós com tensão nula ficam de fora: são o neutro/terra e as barras
+    desenergizadas, e nenhum dos dois é uma tensão que tenha afundado.
+
+    ``nodes_below`` conta os nós abaixo de ``vminpu`` — o limite em que o
+    OpenDSS converte a carga para impedância constante. É o número que diz se a
+    faixa configurada está sendo exercida, e em que escala: um punhado de nós é
+    a ponta de um ramal, um terço do sistema é outra história.
+    """
+
+    circuit_id: str
+    step: int
+    minimum_pu: float
+    maximum_pu: float
+    nodes_below: int
+    vminpu: float
+
+
+@dataclass(frozen=True, slots=True)
 class PowerFlowResult:
     """Resultado de uma execução, pronto para ser associado à tela.
 
@@ -263,12 +306,64 @@ class PowerFlowResult:
     solved_circuits: tuple[str, ...] = ()
     skipped_circuits: tuple[str, ...] = ()
     unconverged: tuple[tuple[str, int], ...] = ()
+    # Teto de iterações efetivamente usado, para o relatório poder dizê-lo: sem
+    # isso não há como saber, olhando a aplicação, qual valor estava valendo.
+    max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER
+    # (circuito, patamar, iterações de controle) do OpenDSS. Fica no resultado
+    # como dado bruto de diagnóstico. **Não** serve para concluir que o laço de
+    # controle não rodou: uma iteração é também o desfecho normal de um passo
+    # que convergiu com todos os controles dentro da banda. O que de fato
+    # aborta o laço é a não convergência — ``CheckControls`` do OpenDSS faz
+    # ``ControlActionsDone := TRUE`` quando a solução falha —, e isso já está
+    # em ``unconverged``.
+    control_iterations: tuple[tuple[str, int, int], ...] = ()
+    # Um registro por (circuito, patamar): é o que permite dizer *quanto* um
+    # patamar reprovado afundou, em vez de só que ele reprovou.
+    step_voltages: tuple[StepVoltages, ...] = ()
     issues: tuple[PowerFlowIssue, ...] = ()
     omitted_issues: int = 0
 
     @property
     def has_warnings(self) -> bool:
         return bool(self.issues or self.unconverged or self.skipped_circuits)
+
+    @property
+    def saturated_regulators(self) -> tuple[tuple[int, int, tuple[str, ...]], ...]:
+        """``(trecho, patamar, fases)`` de cada unidade no fim do curso.
+
+        Medido, não inferido: vem do tap que o OpenDSS resolveu, pela mesma
+        :attr:`RegulatorTap.at_limit` que o painel do trecho já usa. Um
+        regulador encostado no limite **parou de regular**, e é a explicação
+        mais direta para uma tensão que não sobe.
+        """
+
+        return tuple(
+            sorted(
+                (
+                    (
+                        segment_index,
+                        step,
+                        tuple(tap.phase for tap in units if tap.at_limit),
+                    )
+                    for segment_index, steps in self.regulator_taps.items()
+                    for step, units in enumerate(steps)
+                    if any(tap.at_limit for tap in units)
+                ),
+                key=lambda item: (item[1], item[0]),
+            )
+        )
+
+    def voltages_for(self, circuit_id: str, step: int) -> StepVoltages | None:
+        """Extremos de um patamar, ou ``None`` se ele não foi medido."""
+
+        return next(
+            (
+                item
+                for item in self.step_voltages
+                if item.circuit_id == circuit_id and item.step == step
+            ),
+            None,
+        )
 
     @property
     def is_empty(self) -> bool:
@@ -617,7 +712,9 @@ def _harvest_bus_voltages(
     circuit_id: str,
     *,
     first_step: bool,
-) -> None:
+    vminpu: float,
+    step: int,
+) -> StepVoltages | None:
     """Distribui ``AllBusVMag``/``AllBusVMagPu`` pelas barras da aplicação.
 
     Os vetores do OpenDSS são paralelos e cobrem o sistema inteiro, então uma
@@ -627,6 +724,10 @@ def _harvest_bus_voltages(
     ``py_dss_interface``, e é dele que sai o fasor de que a tensão de linha
     precisa. Ele traz **dois** doubles por nó (parte real e imaginária), daí a
     conferência de tamanho ser contra o dobro.
+
+    Devolve os extremos do patamar de brinde: o vetor em pu já está em mãos, e
+    resumi-lo aqui evita uma segunda travessia da DLL só para dizer quanto o
+    circuito afundou.
     """
 
     values = engine.circuit.buses_vmag
@@ -642,7 +743,7 @@ def _harvest_bus_voltages(
             "o OpenDSS devolveu tensões em quantidade diferente da lista de "
             "nós; as tensões deste circuito foram descartadas",
         )
-        return
+        return None
     for position, node_name in enumerate(node_names):
         bus, _, node_text = node_name.rpartition(".")
         bar_index = bar_by_bus_name.get(bus.casefold())
@@ -665,6 +766,144 @@ def _harvest_bus_voltages(
             math.degrees(math.atan2(imaginary, real))
         )
 
+    # Nó com tensão nula é neutro/terra ou barra desenergizada; nenhum dos dois
+    # é uma tensão que afundou, e deixá-los entrar fixaria o mínimo em zero.
+    energized = tuple(
+        float(value) for value in pu_values if float(value) > _DEAD_NODE_PU
+    )
+    if not energized:
+        return None
+    return StepVoltages(
+        circuit_id=circuit_id,
+        step=step,
+        minimum_pu=min(energized),
+        maximum_pu=max(energized),
+        nodes_below=sum(1 for value in energized if value < vminpu),
+        vminpu=vminpu,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalReadings:
+    """Grandezas do terminal 1 do elemento ativo, já sem o nó de terra.
+
+    Serve tanto para a ``Line`` de um trecho comum quanto para o
+    ``Transformer`` de uma unidade de regulador: o recorte do terminal e o
+    filtro de nó são idênticos nos dois, e é isso que permite um trecho
+    regulado chegar à tabela do painel pelo mesmo caminho dos demais.
+    """
+
+    nodes: tuple[int, ...]
+    magnitudes: tuple[float, ...]
+    angles: tuple[float, ...]
+    active: tuple[float, ...]
+    reactive: tuple[float, ...]
+    active_loss: float
+    reactive_loss: float
+
+    @property
+    def has_power(self) -> bool:
+        """``True`` quando a potência acompanhou a corrente em todos os nós."""
+
+        return len(self.active) == len(self.magnitudes)
+
+
+def _terminal_one_readings(engine: DssEngine) -> _TerminalReadings | None:
+    """Lê corrente, potência e perdas do terminal 1 do elemento ativo.
+
+    ``powers`` tem o mesmo layout do ``currents_mag_ang`` — dois doubles por
+    condutor, terminais em sequência —, só que o par é ``(kW, kvar)`` em vez de
+    módulo e ângulo. Por isso as duas leituras andam juntas: mesmo recorte de
+    terminal, mesmo filtro de nó, mesma indexação.
+
+    Devolve ``None`` quando o terminal não expõe nenhum nó de fase: sem nó não
+    há corrente a atribuir a trecho nenhum.
+    """
+
+    conductors = int(engine.cktelement.num_conductors)
+    readings = engine.cktelement.currents_mag_ang
+    order = engine.cktelement.node_order
+    # currents_mag_ang intercala módulo e ângulo por condutor, com os terminais
+    # em sequência; o terminal 1 são os primeiros condutores.
+    powers = engine.cktelement.powers
+    terminal_nodes: list[int] = []
+    row: list[float] = []
+    angle_row: list[float] = []
+    active_row: list[float] = []
+    reactive_row: list[float] = []
+    for position in range(min(conductors, len(order))):
+        node = int(order[position])
+        if node <= 0:
+            continue
+        magnitude_at = 2 * position
+        # O ângulo é o segundo double do par; ler os dois juntos mantém módulo
+        # e fase do mesmo condutor sempre alinhados.
+        if magnitude_at + 1 >= len(readings):
+            break
+        terminal_nodes.append(node)
+        row.append(float(readings[magnitude_at]))
+        angle_row.append(float(readings[magnitude_at + 1]))
+        # Sinal preservado: positivo entra pelo terminal 1.
+        if magnitude_at + 1 < len(powers):
+            active_row.append(float(powers[magnitude_at]))
+            reactive_row.append(float(powers[magnitude_at + 1]))
+    if not row:
+        return None
+    # As perdas vêm do elemento inteiro, não por condutor — e em **watts**, ao
+    # contrário de ``powers``, que vem em kW. Medido contra 3·R·I² de um trecho
+    # conhecido: a razão deu exatamente 1000. Sem esta divisão a coluna erraria
+    # por três ordens de grandeza sem nada denunciar.
+    losses = engine.cktelement.losses
+    return _TerminalReadings(
+        nodes=tuple(terminal_nodes),
+        magnitudes=tuple(row),
+        angles=tuple(angle_row),
+        active=tuple(active_row),
+        reactive=tuple(reactive_row),
+        active_loss=float(losses[0]) / 1_000.0 if len(losses) > 1 else 0.0,
+        reactive_loss=float(losses[1]) / 1_000.0 if len(losses) > 1 else 0.0,
+    )
+
+
+def _accumulate_terminal_readings(
+    segment_index: int,
+    measured: _TerminalReadings,
+    nodes: dict[int, tuple[int, ...]],
+    magnitudes: dict[int, list[float]],
+    angles: dict[int, list[float]],
+    active: dict[int, list[float]],
+    reactive: dict[int, list[float]],
+    active_losses: dict[int, list[float]],
+    reactive_losses: dict[int, list[float]],
+) -> None:
+    """Empilha a leitura de um patamar nos acumuladores achatados do trecho.
+
+    O primeiro patamar fixa quais nós o trecho tem; os seguintes só entram se
+    trouxerem exatamente os mesmos, porque ``_rows`` reparte a sequência por
+    largura fixa e uma linha de tamanho diferente desalinharia tudo em silêncio.
+    """
+
+    known = nodes.get(segment_index)
+    if known is None:
+        nodes[segment_index] = measured.nodes
+        magnitudes[segment_index] = list(measured.magnitudes)
+        angles[segment_index] = list(measured.angles)
+        if measured.has_power:
+            active[segment_index] = list(measured.active)
+            reactive[segment_index] = list(measured.reactive)
+            active_losses[segment_index] = [measured.active_loss]
+            reactive_losses[segment_index] = [measured.reactive_loss]
+        return
+    if known != measured.nodes:
+        return
+    magnitudes[segment_index].extend(measured.magnitudes)
+    angles[segment_index].extend(measured.angles)
+    if measured.has_power and segment_index in active:
+        active[segment_index].extend(measured.active)
+        reactive[segment_index].extend(measured.reactive)
+        active_losses[segment_index].append(measured.active_loss)
+        reactive_losses[segment_index].append(measured.reactive_loss)
+
 
 def _harvest_line_currents(
     engine: DssEngine,
@@ -681,12 +920,8 @@ def _harvest_line_currents(
     """Percorre as ``Line`` do circuito lendo corrente e potência do terminal 1.
 
     Chaves também são ``Line`` no modelo exportado, então elas vêm de graça
-    neste mesmo laço.
-
-    ``powers`` tem o mesmo layout do ``currents_mag_ang`` — dois doubles por
-    condutor, terminais em sequência —, só que o par é ``(kW, kvar)`` em vez de
-    módulo e ângulo. Por isso as duas leituras andam juntas: mesmo recorte de
-    terminal, mesmo filtro de nó, mesma indexação.
+    neste mesmo laço. Os trechos **regulados** não passam por aqui: eles são
+    ``Transformer``, e quem os colhe é :func:`_harvest_regulators`.
     """
 
     processed = 0
@@ -701,66 +936,34 @@ def _harvest_line_currents(
         processed += 1
         segment_index = segment_by_line_name.get(engine.lines.name.casefold())
         if segment_index is not None:
-            conductors = int(engine.cktelement.num_conductors)
-            readings = engine.cktelement.currents_mag_ang
-            order = engine.cktelement.node_order
-            # currents_mag_ang intercala módulo e ângulo por condutor, com os
-            # terminais em sequência; o terminal 1 são os primeiros condutores.
-            powers = engine.cktelement.powers
-            row: list[float] = []
-            angle_row: list[float] = []
-            active_row: list[float] = []
-            reactive_row: list[float] = []
-            terminal_nodes: list[int] = []
-            for position in range(min(conductors, len(order))):
-                node = int(order[position])
-                if node <= 0:
-                    continue
-                magnitude_at = 2 * position
-                # O ângulo é o segundo double do par; ler os dois juntos mantém
-                # módulo e fase do mesmo condutor sempre alinhados.
-                if magnitude_at + 1 >= len(readings):
-                    break
-                terminal_nodes.append(node)
-                row.append(float(readings[magnitude_at]))
-                angle_row.append(float(readings[magnitude_at + 1]))
-                # Sinal preservado: positivo entra pelo terminal 1.
-                if magnitude_at + 1 < len(powers):
-                    active_row.append(float(powers[magnitude_at]))
-                    reactive_row.append(float(powers[magnitude_at + 1]))
-            if row:
-                known = nodes.get(segment_index)
-                complete = len(active_row) == len(row)
-                # As perdas vêm do elemento inteiro, não por condutor — e em
-                # **watts**, ao contrário de ``powers``, que vem em kW. Medido
-                # contra 3·R·I² de um trecho conhecido: a razão deu exatamente
-                # 1000. Sem esta divisão a coluna erraria por três ordens de
-                # grandeza sem nada denunciar.
-                losses = engine.cktelement.losses
-                loss_active = (
-                    float(losses[0]) / 1_000.0 if len(losses) > 1 else 0.0
+            measured = _terminal_one_readings(engine)
+            if measured is not None:
+                _accumulate_terminal_readings(
+                    segment_index,
+                    measured,
+                    nodes,
+                    magnitudes,
+                    angles,
+                    active,
+                    reactive,
+                    active_losses,
+                    reactive_losses,
                 )
-                loss_reactive = (
-                    float(losses[1]) / 1_000.0 if len(losses) > 1 else 0.0
-                )
-                if known is None:
-                    nodes[segment_index] = tuple(terminal_nodes)
-                    magnitudes[segment_index] = list(row)
-                    angles[segment_index] = list(angle_row)
-                    if complete:
-                        active[segment_index] = list(active_row)
-                        reactive[segment_index] = list(reactive_row)
-                        active_losses[segment_index] = [loss_active]
-                        reactive_losses[segment_index] = [loss_reactive]
-                elif known == tuple(terminal_nodes):
-                    magnitudes[segment_index].extend(row)
-                    angles[segment_index].extend(angle_row)
-                    if complete and segment_index in active:
-                        active[segment_index].extend(active_row)
-                        reactive[segment_index].extend(reactive_row)
-                        active_losses[segment_index].append(loss_active)
-                        reactive_losses[segment_index].append(loss_reactive)
         has_line = bool(engine.lines.next())
+
+
+def _control_iterations(engine: DssEngine) -> int:
+    """Iterações de controle do último ``solve()``, ou 0 se o motor não disser.
+
+    Um motor falso — e versões antigas da biblioteca — pode não expor a
+    propriedade. Ela alimenta um diagnóstico, então a ausência vira 0 em vez de
+    derrubar uma execução que já produziu resultados válidos.
+    """
+
+    try:
+        return int(engine.solution.control_iterations)
+    except (AttributeError, TypeError, ValueError):
+        return 0
 
 
 def _regulator_unit_index(bundle) -> dict[str, tuple[int, str]]:  # noqa: ANN001
@@ -775,26 +978,85 @@ def _regulator_unit_index(bundle) -> dict[str, tuple[int, str]]:  # noqa: ANN001
     }
 
 
-def _harvest_regulator_taps(
+def _merge_unit_readings(
+    units: Sequence[_TerminalReadings],
+) -> _TerminalReadings | None:
+    """Junta as unidades monofásicas de um regulador numa leitura de trecho.
+
+    Um regulador trifásico são três ``Transformer`` independentes, um por fase;
+    o trecho é um só. Ordenar por nó dá a mesma forma que uma ``Line`` trifásica
+    produziria — e a mesma ordem em todos os patamares, que é o que
+    ``_accumulate_terminal_readings`` exige para não desalinhar as linhas.
+
+    As perdas são somadas: elas vêm por elemento, e o elemento aqui é o banco.
+    """
+
+    entries = sorted(
+        (
+            (node, position, unit)
+            for unit in units
+            for position, node in enumerate(unit.nodes)
+        ),
+        key=lambda item: item[0],
+    )
+    if not entries:
+        return None
+    has_power = all(unit.has_power for unit in units)
+    return _TerminalReadings(
+        nodes=tuple(node for node, _, _ in entries),
+        magnitudes=tuple(unit.magnitudes[at] for _, at, unit in entries),
+        angles=tuple(unit.angles[at] for _, at, unit in entries),
+        active=(
+            tuple(unit.active[at] for _, at, unit in entries) if has_power else ()
+        ),
+        reactive=(
+            tuple(unit.reactive[at] for _, at, unit in entries) if has_power else ()
+        ),
+        active_loss=math.fsum(unit.active_loss for unit in units),
+        reactive_loss=math.fsum(unit.reactive_loss for unit in units),
+    )
+
+
+def _harvest_regulators(
     engine: DssEngine,
     unit_by_name: Mapping[str, tuple[int, str]],
     taps: dict[int, list[RegulatorTap]],
+    nodes: dict[int, tuple[int, ...]],
+    magnitudes: dict[int, list[float]],
+    angles: dict[int, list[float]],
+    active: dict[int, list[float]],
+    reactive: dict[int, list[float]],
+    active_losses: dict[int, list[float]],
+    reactive_losses: dict[int, list[float]],
 ) -> None:
-    """Percorre os ``Transformer`` lendo o tap do enrolamento 2.
+    """Percorre os ``Transformer`` colhendo o tap e as grandezas do trecho.
 
     Os reguladores nunca aparecem no laço de ``lines``: no modelo exportado eles
-    são ``Transformer``. O vínculo nome→trecho vem do índice reverso do
-    exportador, como o das linhas — nunca de uma segunda implementação das
-    regras de nome.
+    são ``Transformer``, e o trecho regulado **não sai como ``Line``** — se
+    saísse, a linha ficaria em paralelo com o regulador e curto-circuitaria a
+    injeção de tensão. Sem esta função o trecho ficaria sem corrente e sem
+    potência no painel, que era o estado até aqui.
+
+    As duas leituras saem da mesma visita porque ``cktelement`` acompanha o
+    ``Transformer`` ativo, e ``transformers.wdg`` não troca o elemento ativo —
+    ambos medidos contra a DLL. A corrente é lida **antes** de mexer em ``wdg``
+    de qualquer forma: nada no protocolo do OpenDSS promete essa independência.
+
+    O vínculo nome→trecho vem do índice reverso do exportador, como o das
+    linhas — nunca de uma segunda implementação das regras de nome.
     """
 
     if not unit_by_name:
         return
+    readings_by_segment: dict[int, list[_TerminalReadings]] = {}
     has_transformer = bool(engine.transformers.first())
     while has_transformer:
         found = unit_by_name.get(engine.transformers.name.casefold())
         if found is not None:
             segment_index, phase = found
+            measured = _terminal_one_readings(engine)
+            if measured is not None:
+                readings_by_segment.setdefault(segment_index, []).append(measured)
             # Enrolamento 2 é o regulado, o mesmo que o RegControl monitora.
             engine.transformers.wdg = 2
             taps.setdefault(segment_index, []).append(
@@ -807,6 +1069,22 @@ def _harvest_regulator_taps(
                 )
             )
         has_transformer = bool(engine.transformers.next())
+
+    for segment_index, units in readings_by_segment.items():
+        merged = _merge_unit_readings(units)
+        if merged is None:
+            continue
+        _accumulate_terminal_readings(
+            segment_index,
+            merged,
+            nodes,
+            magnitudes,
+            angles,
+            active,
+            reactive,
+            active_losses,
+            reactive_losses,
+        )
 
 
 def run_power_flow(
@@ -823,6 +1101,7 @@ def run_power_flow(
     regulators: RegulatorModel | None = None,
     capacitors: CapacitorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
+    max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     line_parameter_mode: OpenDssLineParameterMode = (
         OpenDssLineParameterMode.ORIGINAL
     ),
@@ -843,6 +1122,22 @@ def run_power_flow(
     que ele gera ficam no master e são aplicados pelo ``Compile``. Nada precisa
     ser reemitido entre os quatro ``solve()`` — foi medido que as propriedades
     das ``Load`` sobrevivem às soluções seguintes.
+
+    ``max_power_flow_iterations``, ao contrário, precisa dos dois caminhos: ele
+    entra no master pelo ``build_export`` e é reemitido depois do ``Compile``,
+    porque o engine é um singleton. Um teto baixo demais não é um detalhe de
+    desempenho — a solução é abandonada antes de terminar a primeira passada, o
+    laço de controle nunca roda e os taps dos reguladores ficam onde estavam.
+
+    **Mas o teto não é a única causa desse sintoma, nem a mais comum nas redes
+    grandes.** Um patamar cuja carga esteja além do limite de carregabilidade do
+    alimentador **diverge**: não há solução a encontrar, e o resultado é o mesmo
+    laço de controle abortado — com a diferença de que subir o teto não muda
+    nada. Medido num alimentador de 23.857 barras e 2.250 km com ``vminpu=0,7``:
+    dois patamares não convergem nem com 20.000 iterações, e a tensão mínima
+    **oscila** entre as tentativas em vez de se aproximar de um valor. Por isso
+    ``step_voltages`` acompanha ``unconverged`` no resultado: sem saber quanto o
+    patamar afundou, os dois casos são indistinguíveis para quem lê o relatório.
     """
 
     if step_count <= 0:
@@ -872,9 +1167,13 @@ def run_power_flow(
             regulators=regulators,
             capacitors=capacitors,
             load_settings=load_settings,
+            max_power_flow_iterations=max_power_flow_iterations,
             line_parameter_mode=line_parameter_mode,
             library_catalog=library_catalog,
             library_mappings=library_mappings,
+            # Ver o docstring de build_master_export: Compile executa o
+            # arquivo, e o laço abaixo é quem resolve os patamares.
+            include_solve=False,
             cancel_check=cancel_check,
         )
 
@@ -906,6 +1205,15 @@ def run_power_flow(
     solved: list[str] = []
     skipped: list[str] = []
     unconverged: list[tuple[str, int]] = []
+    control_iterations: list[tuple[str, int, int]] = []
+    step_voltages: list[StepVoltages] = []
+    # O corte que de fato vale nas Loads: com os limites desligados nenhum
+    # BatchEdit sai no master, então quem vale é o padrão do próprio OpenDSS.
+    effective_vminpu = (
+        load_settings.vminpu
+        if load_settings is not None and load_settings.voltage_limits_enabled
+        else DEFAULT_DSS_VMINPU
+    )
     exported_generators = 0
     discarded_generators = 0
     total = len(selected) * step_count
@@ -956,7 +1264,7 @@ def run_power_flow(
         # do master, que é o que faz os Redirect internos e o Buscoords
         # relativo do fim do arquivo resolverem.
         engine.text(f"Compile [{master_path}]")
-        for command in _STEP_MODE_COMMANDS:
+        for command in _step_mode_commands(max_power_flow_iterations):
             engine.text(command)
 
         node_names = tuple(engine.circuit.nodes_names)
@@ -982,7 +1290,17 @@ def run_power_flow(
             engine.solution.solve()
             if not engine.solution.converged:
                 unconverged.append((definition.circuit_id, step))
-            _harvest_bus_voltages(
+            # Lido junto do converged, do mesmo objeto e do mesmo passo. Um
+            # motor que não exponha a propriedade não pode derrubar a execução:
+            # a contagem é diagnóstico, não resultado.
+            control_iterations.append(
+                (
+                    definition.circuit_id,
+                    step,
+                    _control_iterations(engine),
+                )
+            )
+            measured = _harvest_bus_voltages(
                 engine,
                 node_names,
                 bar_by_bus_name,
@@ -993,7 +1311,11 @@ def run_power_flow(
                 report,
                 definition.circuit_id,
                 first_step=step == 0,
+                vminpu=effective_vminpu,
+                step=step,
             )
+            if measured is not None:
+                step_voltages.append(measured)
             _harvest_line_currents(
                 engine,
                 segment_by_line_name,
@@ -1010,7 +1332,18 @@ def run_power_flow(
             # tabela de passos por patamar do painel precisa de todos, não só
             # do último.
             step_taps: dict[int, list[RegulatorTap]] = {}
-            _harvest_regulator_taps(engine, regulator_unit_index, step_taps)
+            _harvest_regulators(
+                engine,
+                regulator_unit_index,
+                step_taps,
+                line_nodes,
+                line_magnitudes,
+                line_angles,
+                line_active,
+                line_reactive,
+                line_active_losses,
+                line_reactive_losses,
+            )
             for segment_index, units in step_taps.items():
                 circuit_taps.setdefault(segment_index, []).append(tuple(units))
             completed += 1
@@ -1063,6 +1396,11 @@ def run_power_flow(
         solved_circuits=tuple(solved),
         skipped_circuits=tuple(skipped),
         unconverged=tuple(unconverged),
+        max_power_flow_iterations=parse_max_power_flow_iterations(
+            max_power_flow_iterations
+        ),
+        control_iterations=tuple(control_iterations),
+        step_voltages=tuple(step_voltages),
         issues=tuple(report.issues),
         omitted_issues=report.omitted,
     )

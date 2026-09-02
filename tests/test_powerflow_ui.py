@@ -35,6 +35,7 @@ try:
         LoadModel,
         LoadPatternModel,
         LoadPatternRecord,
+        RegulatorModel,
         SwitchModel,
         UtmCrs,
     )
@@ -42,8 +43,10 @@ try:
         BarVoltages,
         PowerFlowIssue,
         PowerFlowResult,
+        RegulatorTap,
         SegmentCurrents,
         SegmentPowers,
+        StepVoltages,
     )
     from circuit_viewer.opendss_line_mode import OpenDssLineParameterMode
     from circuit_viewer.phase_config import (
@@ -879,6 +882,144 @@ class PowerFlowUiTests(unittest.TestCase):
 
         self.assertTrue(message_box.called)
         self.assertIsNotNone(window._power_flow_result)
+
+    def _report_text(self, window: MainWindow, result) -> str:  # noqa: ANN001
+        """O texto informativo do diálogo, sem abri-lo."""
+
+        captured: list[str] = []
+        with patch(
+            "circuit_viewer.main_window.QMessageBox.setInformativeText",
+            side_effect=lambda text: captured.append(text),
+        ), patch("circuit_viewer.main_window.QMessageBox.exec", return_value=0):
+            window._show_power_flow_report(result)
+        return captured[0] if captured else window.statusBar().currentMessage()
+
+    def test_report_always_states_the_iteration_ceiling(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        result = self._result(window)
+        warned = replace(result, unconverged=(("C1", 2),), max_power_flow_iterations=120)
+
+        text = self._report_text(window, warned)
+
+        self.assertIn("Máximo de iterações do fluxo: 120", text)
+
+    def test_divergence_is_not_blamed_on_the_iteration_ceiling(self) -> None:
+        # Medido: um patamar além do limite de carregamento do alimentador não
+        # converge nem com 20.000 iterações. Recomendar mais iterações é mandar
+        # o usuário rodar em círculo, e era o que o relatório fazia.
+        window = self._window()
+        self._load_everything(window)
+        result = replace(
+            self._result(window),
+            unconverged=(("C1", 0),),
+            step_voltages=(
+                StepVoltages(
+                    circuit_id="C1",
+                    step=0,
+                    minimum_pu=0.5902,
+                    maximum_pu=1.0,
+                    nodes_below=13_202,
+                    vminpu=0.7,
+                ),
+            ),
+        )
+
+        text = self._report_text(window, result)
+
+        self.assertIn("1 patamar(es) não convergiram", text)
+        self.assertIn("Aumentar o máximo de iterações não resolve", text)
+        self.assertNotIn("Configurações → OpenDSS… → Solução", text)
+
+    def test_a_diverged_step_reports_how_far_it_sank(self) -> None:
+        # É o número que distingue "faltou iteração" de "não existe solução".
+        window = self._window()
+        self._load_everything(window)
+        result = replace(
+            self._result(window),
+            unconverged=(("C1", 0),),
+            step_voltages=(
+                StepVoltages(
+                    circuit_id="C1",
+                    step=0,
+                    minimum_pu=0.5902,
+                    maximum_pu=1.0,
+                    nodes_below=13_202,
+                    vminpu=0.7,
+                ),
+            ),
+        )
+
+        text = self._report_text(window, result)
+
+        # Formatado como o resto da aplicação (``:n``), então a asserção usa a
+        # mesma expressão em vez de fixar o separador decimal de um locale.
+        self.assertIn(f"C1 (NPAT 0): tensão mínima {0.59:n} pu", text)
+        self.assertIn(f"{13_202:n} nó(s) abaixo do vminpu de {0.7:n}", text)
+        # O tap de um patamar que não convergiu é herdado, não resolvido.
+        self.assertIn("é o que sobrou do patamar anterior", text)
+
+    def test_a_converged_step_with_one_control_iteration_is_not_news(self) -> None:
+        # Uma iteração de controle é o desfecho **normal** de um passo que
+        # convergiu com todos os controles dentro da banda. Acusá-lo era o
+        # defeito: dois patamares perfeitos apareciam no diálogo de avisos.
+        window = self._window()
+        self._load_everything(window)
+        regulators = RegulatorModel(
+            window._line_model,
+            ["RG1"],
+            [0],
+            [""],
+            ["X"],
+            ["Y"],
+            ["333"],
+            ["10"],
+            ["32"],
+            ["0"],
+            ["100"],
+            ["13,8"],
+        )
+        result = replace(
+            self._result(window),
+            regulators=regulators,
+            control_iterations=(("C1", 0, 1), ("C1", 1, 3)),
+        )
+
+        self._install_result(window, result)
+
+        self.assertIn(
+            "1 circuito(s) resolvido(s)",
+            window.statusBar().currentMessage(),
+        )
+
+    def test_report_names_the_regulators_at_the_end_of_travel(self) -> None:
+        # Vem do tap resolvido, não de inferência: era essa a informação de
+        # engenharia que o aviso antigo apagava ao afirmar que todo tap estava
+        # em 1,0.
+        window = self._window()
+        self._load_everything(window)
+        result = replace(
+            self._result(window),
+            unconverged=(("C1", 0),),
+            regulator_taps={
+                0: (
+                    (
+                        RegulatorTap(
+                            phase="D", tap=1.1, minimum=0.9, maximum=1.1, num_taps=32
+                        ),
+                        RegulatorTap(
+                            phase="E", tap=1.0, minimum=0.9, maximum=1.1, num_taps=32
+                        ),
+                    ),
+                ),
+            },
+        )
+
+        text = self._report_text(window, result)
+
+        self.assertIn("Reguladores no fim do curso", text)
+        self.assertIn("fase(s) D", text)
+        self.assertNotIn("fase(s) D, E", text)
 
     def test_running_blocks_the_other_heavy_actions(self) -> None:
         window = self._window()

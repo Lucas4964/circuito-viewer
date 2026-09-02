@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
 import re
@@ -11,6 +11,10 @@ from typing import Literal
 import numpy as np
 
 from .branch_analysis import BranchAnalysisResult, BranchRecord, BranchType
+from .branch_power_source import (
+    DEFAULT_BRANCH_POWER_SOURCE,
+    BranchPowerSource,
+)
 from .generator_update import GeneratorUpdateModel
 from .model import (
     BoolArray,
@@ -38,6 +42,10 @@ _FIELD_PHASE = {
     "qf": "F",
 }
 ZERO_POWER_TOLERANCE = Decimal("1e-9")
+# Marcador do diagnóstico informativo: a carga não tem tabela e foi contada como
+# zero. Não é bloqueio, ao contrário dos demais campos de EquivalentNetworkIssue,
+# e é por ele que a interface distingue os dois casos.
+ZEROED_PATTERNS_FIELD = "PATAMARES_ZERADOS"
 
 
 def _readonly_indices(values: Sequence[int] | np.ndarray) -> IndexArray:
@@ -209,6 +217,8 @@ class EquivalentNetworkModel:
         "source_loads",
         "source_patterns",
         "source_generator_updates",
+        "power_source",
+        "source_power_flow",
         "_records",
         "_patterns",
         "_load_ids",
@@ -233,6 +243,9 @@ class EquivalentNetworkModel:
         source_generator_updates: GeneratorUpdateModel | None,
         records: Sequence[EquivalentLoadRecord],
         patterns: Sequence[Sequence[EquivalentLoadPatternRecord] | None],
+        *,
+        power_source: BranchPowerSource = DEFAULT_BRANCH_POWER_SOURCE,
+        source_power_flow: object | None = None,
     ) -> None:
         record_values = tuple(records)
         pattern_values = tuple(None if group is None else tuple(group) for group in patterns)
@@ -257,6 +270,11 @@ class EquivalentNetworkModel:
         self.source_loads = source_loads
         self.source_patterns = source_patterns
         self.source_generator_updates = source_generator_updates
+        # Proveniência do valor elétrico, ao lado da proveniência dos modelos:
+        # é por ela que a interface descobre que um equivalente medido ficou
+        # obsoleto quando o fluxo de potência é descartado.
+        self.power_source = BranchPowerSource(power_source)
+        self.source_power_flow = source_power_flow
         self._records = record_values
         self._patterns = pattern_values
         self._load_ids = tuple(record.load_id for record in record_values)
@@ -500,11 +518,40 @@ def build_equivalent_network(
     patterns: LoadPatternModel | None = None,
     generator_updates: GeneratorUpdateModel | None = None,
     *,
+    power_source: BranchPowerSource = DEFAULT_BRANCH_POWER_SOURCE,
+    measured_patterns: (
+        Mapping[int, Sequence[EquivalentLoadPatternRecord]] | None
+    ) = None,
+    measurement_issues: Mapping[int, str] | None = None,
+    source_power_flow: object | None = None,
     cancel_check: CancelCheck | None = None,
     progress: ProgressCallback | None = None,
 ) -> EquivalentNetworkResult:
-    """Agrega as cargas dos ramais em um snapshot lógico independente de Qt."""
+    """Agrega as cargas dos ramais em um snapshot lógico independente de Qt.
 
+    ``power_source`` escolhe de onde vem a potência de cada ramal. Em
+    ``TABLE`` — o padrão — as tabelas de patamares das cargas e as potências dos
+    geradores internos são somadas por ``NPAT``. Em ``POWER_FLOW`` os patamares
+    chegam prontos em ``measured_patterns``, medidos no elemento de conexão do
+    ramal por :func:`~circuit_viewer.branch_power_flow.measure_branch_powers`;
+    ``measurement_issues`` traz o motivo de cada ramal que ficou sem medição.
+
+    No modo medido os geradores **não** são somados de novo: a potência que
+    atravessa o elemento de conexão já é líquida de tudo que está a jusante —
+    cargas, geradores, capacitores e as perdas do ramal. A proveniência em
+    ``source_generator_indices`` continua sendo preenchida, porque é dela que
+    saem a redução e as máscaras de visibilidade.
+
+    **Carga ausente de ``MODELO_CARGA`` vale zero.** No modo por tabela, uma
+    carga sem grupo de patamares contribui zero e deixa um diagnóstico
+    informativo (``ZEROED_PATTERNS_FIELD``), sem tornar o ramal incompleto — é
+    dado que falta, não dado errado. Patamares não importados de todo
+    (``patterns is None``) continuam bloqueando, porque aí não é uma carga sem
+    tabela: é a tabela inteira ausente, e zerar todos os ramais de uma vez seria
+    silenciosamente errado.
+    """
+
+    power_source = BranchPowerSource(power_source)
     catalog = branches.source_catalog
     if catalog is None:
         raise ValueError("A análise de ramais não informa seu catálogo de origem.")
@@ -661,15 +708,23 @@ def build_equivalent_network(
                     complete = False
                     continue
                 group = patterns.records_for_load(load_index)
-                if len(group) != 4:
+                if not group:
+                    # Carga ausente de MODELO_CARGA: vale zero. Os totais já
+                    # começam em zero, então não somar é somar zero, e o ramal
+                    # continua completo — dado que falta não é dado errado.
+                    #
+                    # Vazio é a única forma de ausência possível: LoadPatternModel
+                    # recusa na construção qualquer grupo que não tenha
+                    # exatamente os NPAT 0 a 3, então um grupo parcial nunca
+                    # chega até aqui.
                     assert loads is not None
                     add_issue(
                         branch.branch_id,
-                        "PATAMARES",
-                        "Tabela equivalente indisponível: carga sem os quatro patamares.",
+                        ZEROED_PATTERNS_FIELD,
+                        "Carga sem tabela em MODELO_CARGA; considerada zero na "
+                        "agregação do ramal.",
                         loads.load_ids[load_index],
                     )
-                    complete = False
                     continue
                 for source in group:
                     for field_index, field in enumerate(_PATTERN_FIELDS):
@@ -745,6 +800,69 @@ def build_equivalent_network(
             True,
         )
 
+    def measured_group(
+        branch: BranchRecord,
+        branch_index: int,
+        load_id: str,
+    ) -> tuple[tuple[EquivalentLoadPatternRecord, ...] | None, bool]:
+        """Adota a medição do fluxo de potência como patamares do ramal."""
+
+        complete = branch_index not in ambiguous_branches
+        group = (
+            None
+            if measured_patterns is None
+            else measured_patterns.get(branch.branch_id)
+        )
+        if group is None:
+            reason = (
+                ""
+                if measurement_issues is None
+                else str(measurement_issues.get(branch.branch_id, "")).strip()
+            )
+            add_issue(
+                branch.branch_id,
+                "FLUXO",
+                reason
+                or (
+                    "Potência indisponível: o fluxo de potência não mediu o "
+                    "elemento de conexão do ramal."
+                ),
+            )
+            return None, False
+        ordered = tuple(sorted(group, key=lambda record: record.npat))
+        if tuple(record.npat for record in ordered) != (0, 1, 2, 3):
+            add_issue(
+                branch.branch_id,
+                "FLUXO",
+                "Potência indisponível: a medição não cobriu os quatro patamares.",
+            )
+            return None, False
+        if not complete:
+            return None, False
+        # Reconstruído com o CARGA_ID daqui: quem mede não precisa conhecer a
+        # regra de nome das cargas equivalentes.
+        return (
+            tuple(
+                EquivalentLoadPatternRecord(
+                    load_id,
+                    record.npat,
+                    record.pd,
+                    record.pe,
+                    record.pf,
+                    record.qd,
+                    record.qe,
+                    record.qf,
+                )
+                for record in ordered
+            ),
+            True,
+        )
+
+    build_patterns = (
+        measured_group
+        if power_source is BranchPowerSource.POWER_FLOW
+        else aggregate_patterns
+    )
     equivalent_records: list[EquivalentLoadRecord] = []
     equivalent_patterns: list[tuple[EquivalentLoadPatternRecord, ...] | None] = []
     total_branches = len(branches.records)
@@ -752,7 +870,7 @@ def build_equivalent_network(
         if cancelled():
             raise InterruptedError("Construção da rede equivalente cancelada.")
         load_id = f"RAMAL-{branch.branch_id}"
-        pattern_group, complete = aggregate_patterns(branch, index, load_id)
+        pattern_group, complete = build_patterns(branch, index, load_id)
         phase_letters = (
             None
             if branches.phase_configuration is None
@@ -816,5 +934,7 @@ def build_equivalent_network(
         generator_updates,
         equivalent_records,
         equivalent_patterns,
+        power_source=power_source,
+        source_power_flow=source_power_flow,
     )
     return EquivalentNetworkResult(model, tuple(issues), omitted_issues)

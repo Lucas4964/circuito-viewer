@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 
 from circuit_viewer.branch_analysis import analyze_branches
+from circuit_viewer.branch_power_flow import measure_branch_powers
+from circuit_viewer.branch_power_source import BranchPowerSource
 from circuit_viewer.calculation_levels import default_calculation_levels
 from circuit_viewer.curvas import Curve
 from circuit_viewer.equivalent_network import build_equivalent_network
@@ -22,6 +24,7 @@ from circuit_viewer.model import (
     LoadPatternRecord,
     UtmCrs,
 )
+from circuit_viewer.opendss_powerflow import PowerFlowResult, SegmentPowers
 from circuit_viewer.opendss_simplified_export import (
     SINGLE_PHASE_BRANCHES_FILENAME,
     TWO_PHASE_BRANCHES_FILENAME,
@@ -163,6 +166,51 @@ def build_system_export(**kwargs):
     return catalog, equivalent, result
 
 
+def build_measured_system_export(active: float, **kwargs):
+    """Refaz o mesmo sistema com a potência do ramal medida no primeiro trecho."""
+
+    catalog, loads, patterns, updates, aggregated = make_system(**kwargs)
+    branches = aggregated.model.branches
+    flow = PowerFlowResult(
+        catalog=catalog,
+        cables=None,
+        phase_configuration=PHASES,
+        loads=loads,
+        patterns=patterns,
+        step_count=4,
+        segment_powers={
+            branches.records[0].first_segment_index: SegmentPowers(
+                nodes=(1,),
+                active=((active,),) * 4,
+                reactive=((0.0,),) * 4,
+            )
+        },
+        solved_circuits=("C1",),
+    )
+    measured, failures = measure_branch_powers(branches, flow)
+    equivalent = build_equivalent_network(
+        branches,
+        loads,
+        patterns,
+        updates,
+        power_source=BranchPowerSource.POWER_FLOW,
+        measured_patterns=measured,
+        measurement_issues=failures,
+        source_power_flow=flow,
+    )
+    result = build_simplified_export(
+        catalog,
+        make_cables(),
+        PHASES,
+        (0,),
+        equivalent=equivalent,
+        loads=loads,
+        patterns=patterns,
+        generator_updates=updates,
+    )
+    return catalog, equivalent, result
+
+
 class SimplifiedOpenDssExportTests(unittest.TestCase):
     def test_exports_retained_trunk_external_sources_and_net_branch(self) -> None:
         catalog, _, result = build_system_export()
@@ -217,14 +265,42 @@ class SimplifiedOpenDssExportTests(unittest.TestCase):
         self.assertEqual(result.single_phase_branches.zero_count, 1)
         self.assertNotIn("New Load.", result.single_phase_branches.text)
 
-    def test_incomplete_nonzero_branch_blocks_the_whole_export(self) -> None:
+    def test_load_without_a_table_is_zeroed_and_no_longer_blocks(self) -> None:
+        # L2 não está em MODELO_CARGA. Antes isso deixava o ramal incompleto e
+        # bloqueava a exportação inteira; agora ela vale zero e o ramal sai.
         catalog, loads, patterns, updates, equivalent = make_system(
             incomplete_branch=True
         )
 
+        self.assertTrue(equivalent.model.record(0).electrical_complete)
+        result = build_simplified_export(
+            catalog,
+            make_cables(),
+            PHASES,
+            (0,),
+            equivalent=equivalent,
+            loads=loads,
+            patterns=patterns,
+            generator_updates=updates,
+        )
+
+        # L2 é a base do gerador do ramal e valia zero de consumo; o líquido do
+        # ramal continua sendo o de L1 menos a geração.
+        self.assertEqual(result.single_phase_branches.exported_count, 1)
+        self.assertEqual(result.single_phase_branches.discarded_count, 0)
+
+    def test_patterns_not_imported_at_all_still_block(self) -> None:
+        # Tabela inteira ausente não é "carga sem tabela": o ramal fica
+        # incompleto na agregação e a exportação é recusada — aqui pela guarda
+        # de entrada, que cobre o caso antes de chegar aos ramais.
+        catalog, loads, _patterns, updates, _equivalent = make_system()
+        branches = analyze_branches(catalog, PHASES, loads)
+        equivalent = build_equivalent_network(branches, loads, None, updates)
+
+        self.assertFalse(equivalent.model.record(0).electrical_complete)
         with self.assertRaisesRegex(
             SimplifiedOpenDssExportError,
-            "equivalência elétrica incompleta",
+            "Importe os quatro patamares",
         ):
             build_simplified_export(
                 catalog,
@@ -233,9 +309,31 @@ class SimplifiedOpenDssExportTests(unittest.TestCase):
                 (0,),
                 equivalent=equivalent,
                 loads=loads,
-                patterns=patterns,
                 generator_updates=updates,
             )
+
+    def test_measured_branch_exports_even_without_load_tables(self) -> None:
+        # Exatamente o sistema que o teste anterior mostra bloqueado: L2 não tem
+        # patamares. Medindo no primeiro elemento do ramal, a exportação sai.
+        _, equivalent, result = build_measured_system_export(
+            4.0,
+            incomplete_branch=True,
+        )
+
+        self.assertTrue(equivalent.model.record(0).electrical_complete)
+        self.assertEqual(result.single_phase_branches.exported_count, 1)
+        self.assertIn(
+            "mult=[4.000000 4.000000 4.000000 4.000000]",
+            result.single_phase_branches.text,
+        )
+        self.assertIn(
+            "qmult=[0.000000 0.000000 0.000000 0.000000]",
+            result.single_phase_branches.text,
+        )
+        # A redução da rede não muda com o método: o ramal continua ausente das
+        # linhas e das cargas de consumo.
+        self.assertNotIn("TR-2", result.lines.text)
+        self.assertNotIn("CARGA-RAMAL", result.single_phase_loads.text)
 
     def test_shared_load_namespace_collision_blocks_branch_export(self) -> None:
         catalog, loads, patterns, updates, equivalent = make_system(

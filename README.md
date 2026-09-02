@@ -657,6 +657,11 @@ topologia, mas não cria símbolo nem `Load` no OpenDSS. Equivalência incomplet
 associação ambígua, colisão de nome ou fase incompatível bloqueia toda a
 exportação antes da gravação.
 
+Quando cargas do ramal não têm tabela de patamares, a agregação fica incompleta
+e a exportação é bloqueada. O método **por fluxo de potência** descrito em
+[Potências dos ramais](#potências-dos-ramais) mede o valor no primeiro elemento
+do ramal e destrava esse caso.
+
 Esta modalidade simplificada continua usando **sempre os parâmetros originais**
 do catálogo importado de cabos. A preferência de bibliotecas afeta somente
 **Exportar > OpenDSS…** e o fluxo de potência interno.
@@ -1016,8 +1021,9 @@ sobrescreveria a primeira.
 
 ## Configurações do OpenDSS
 
-O menu **Configurações → OpenDSS…** é organizado nas abas **Cargas**,
-**Parâmetros das linhas**, **Mapa de Cabos** e **Mapa de Arranjos**. A primeira
+O menu **Configurações → OpenDSS…** é organizado nas abas **Cargas**, **Ramais**,
+**Parâmetros das linhas**, **Solução**, **Mapa de Cabos** e **Mapa de
+Arranjos**. A primeira
 aba define o **modelo de simulação das cargas** e a faixa de tensão em que ele
 vale, tanto na exportação quanto no fluxo de potência. Os dois caminhos geram o
 mesmo arquivo master.
@@ -1086,12 +1092,102 @@ Os valores ficam guardados entre sessões, como a preferência de tema. Alterá-
 descarta um resultado de fluxo de potência já calculado, porque ele descreveria o
 modelo anterior.
 
+### Potências dos ramais
+
+A aba **Ramais** escolhe de onde vem a potência de cada carga equivalente de
+ramal. A escolha vale para tudo que deriva dos ramais — a coluna
+`DEMANDA_MAXIMA` da janela **Ramais**, as exportações CSV e JSON e a exportação
+da rede simplificada — porque a rede equivalente é um snapshot único.
+
+| Método | Origem dos patamares |
+|---|---|
+| Agregar as tabelas de patamares das cargas | Soma `PD/PE/PF` e `QD/QE/QF` de cada carga do ramal por `NPAT`, mais as potências dos geradores internos. É o padrão e o comportamento histórico. |
+| Medir no primeiro elemento do ramal | Resolve o fluxo de potência do circuito completo e usa a potência que entra pelo primeiro elemento do ramal, seja ele uma **chave** ou um **trecho de rede**. |
+
+**Carga sem tabela vale zero na agregação.** Uma carga que não tenha nenhuma
+linha em `MODELO_CARGA` entra na soma como zero e deixa apenas um diagnóstico
+informativo — *"Carga sem tabela em MODELO_CARGA; considerada zero na agregação
+do ramal"*. Ela **não** torna o ramal incompleto nem bloqueia a exportação
+simplificada. Numa base medida aqui, com 296 das 1.384 cargas fora da tabela,
+isso levou a agregação de 135 para **200 de 200 ramais completos**.
+
+A regra vale só para a agregação dos ramais: nos arquivos de carga a carga sem
+tabela continua sendo descartada, com o aviso que já existia. E ela não se
+estende à tabela inteira ausente — sem os patamares importados, os ramais
+continuam incompletos, porque zerar todos de uma vez seria silenciosamente
+errado.
+
+**Por que o segundo método existe.** Zerar preserva a exportação, mas o ramal
+passa a valer menos do que consome de verdade. Medir no fluxo devolve a potência
+real que entra no ramal, incluindo o que essas cargas puxam.
+
+A medição é feita no elemento que liga o ramal ao tronco e já é **líquida** de
+tudo que está a jusante: cargas, geradores, capacitores e as perdas do próprio
+ramal. Por isso os geradores internos **não** são somados de novo — fazê-lo os
+contaria duas vezes. Quando o ramal toca o tronco em mais de um ponto, as
+parcelas de todos os elementos de conexão são somadas.
+
+O método exige o motor do OpenDSS (`py-dss-interface`). Estando ele instalado e
+não havendo um resultado de fluxo vigente, a aplicação **pergunta** antes de
+executá-lo e retoma o cálculo dos ramais assim que ele termina; recusar não
+deixa nada pendente. Um resultado já calculado é reaproveitado, e descartá-lo —
+ao mudar os limites de tensão, o modo das linhas, o teto de iterações ou
+reimportar dados — também descarta a rede equivalente, que dele derivava.
+
+Ramal que ficar **sem medição** — circuito não resolvido ou não convergido,
+primeiro elemento substituído por um regulador ou descartado por colisão de
+nome — continua com equivalência incompleta, aparece nos diagnósticos da janela
+**Ramais** e bloqueia a exportação simplificada citando o `RAMAL-N` afetado.
+Nada sai como carga zero em silêncio.
+
+A escolha é armazenada separadamente em `opendss/branch_power_source` no
+`QSettings`, e um valor ausente ou inválido volta à agregação por tabelas.
+
 A aba **Parâmetros das linhas** oferece duas opções mutuamente exclusivas:
 **Usar parâmetros elétricos importados** e **Usar bibliotecas de cabos e
 arranjos**. A primeira vem selecionada por padrão, inclusive quando a preferência
 persistida está ausente ou inválida. A escolha é armazenada separadamente em
 `opendss/line_parameter_mode` no `QSettings`; trocá-la invalida imediatamente um
 fluxo de potência calculado com o modelo anterior.
+
+### Máximo de iterações do fluxo de potência
+
+A aba **Solução** define quantas iterações o OpenDSS pode gastar em cada solução
+antes de declarar o circuito inconvergente — o `Set MaxIter` que sai em todo
+master gerado e é reaplicado no fluxo interno. O padrão da aplicação é **500**;
+a faixa aceita vai de 15 a 10.000.
+
+**Por que 15 não basta.** 15 é o padrão do próprio OpenDSS, e num alimentador
+longo e carregado ele é atingido antes da convergência. O efeito não é um aviso
+qualquer: a solução é abandonada **antes de terminar a primeira passada**, então
+o laço de controle nem chega a rodar — os reguladores não comutam, os taps ficam
+onde estavam e as correntes e tensões lidas descrevem um circuito que não
+existe. Os ramais também ficam sem medição, porque o método por fluxo de
+potência recusa todo ramal de um circuito que não convergiu.
+
+Num alimentador rural medido aqui — 23.857 barras em 34,5 kV — o patamar de
+madrugada precisou de **49** iterações e o da noite, de **151**, com a barra de
+ponta em 0,743 pu. Com o teto em 15, dois dos quatro patamares não convergiam;
+com 500, todos convergem e os quatro reguladores passam a comutar, acusando
+inclusive as unidades que encostam no fim do curso.
+
+**Elevar o teto é barato.** O que custa são as iterações realmente executadas,
+não o limite: no mesmo caso, os quatro patamares levam 0,6 s com 500, e um
+circuito que divirja de verdade leva 1,3 s para ser recusado — contra 0,5 s com
+um teto de 200. O valor fica guardado em `opendss/max_power_flow_iter` no
+`QSettings`, e alterá-lo descarta um resultado de fluxo já calculado, porque ele
+descreveria outra solução.
+
+**Como saber qual teto valeu.** O relatório de conclusão do fluxo informa sempre
+`Máximo de iterações do fluxo: N`. E, havendo regulador no modelo, ele avisa
+quando algum patamar resolveu sem nenhuma ação de controle:
+
+> Os reguladores não comutaram em N patamar(es) — a solução terminou antes do
+> laço de controle, e os taps ficaram todos em 1,0.
+
+É exatamente o estado que chega ao painel do regulador como uma tabela de
+*"Passos de tap por patamar"* inteiramente zerada: sem laço de controle, todo tap
+fica em 1,0 pu e todo passo dá zero. Vendo esse aviso, aumente o teto.
 
 As duas últimas abas mantêm cadastros manuais entre os identificadores vindos
 da rede e os nomes salvos nas bibliotecas:
@@ -1105,7 +1201,8 @@ mesmo mapa. O nome é escolhido em uma lista que contém somente itens já salvo
 na biblioteca; o mesmo item pode atender vários IDs. O botão **OK** permanece
 desabilitado enquanto houver uma linha incompleta, duplicada ou apontando para
 uma referência inexistente. **Restaurar padrões** age apenas sobre a aba ativa:
-restaura os limites de tensão, seleciona o modo original ou limpa o respectivo
+restaura os limites de tensão, volta à agregação por tabelas, seleciona o modo
+original das linhas, devolve o teto de iterações a 500 ou limpa o respectivo
 mapa.
 
 Cada mapa possui também um botão **Salvar**, ao lado das ações de inclusão e
@@ -1445,7 +1542,9 @@ misturar o segmento que modela uma chave. Quando o ramal é remanejável,
 essas células ficam vazias. `DEMANDA_MAXIMA` é o maior
 valor algébrico de potência ativa encontrado entre as fases reais do ramal e os
 quatro NPAT; mantém o sinal, ignora integralmente potência reativa e aparece
-como `—` quando a equivalência estiver indisponível ou incompleta.
+como `—` quando a equivalência estiver indisponível ou incompleta. Ela reflete o
+método escolhido em [Potências dos ramais](#potências-dos-ramais): a agregação
+das tabelas das cargas ou a medição no primeiro elemento do ramal.
 `NIVEL_TOPOLOGICO` conta os trechos trifásicos energizados no menor caminho
 entre a barra fonte do circuito e a conexão do ramal: a própria fonte é nível
 zero. Em troncos bifurcados, o nível expressa proximidade relativa da fonte;
@@ -1465,12 +1564,14 @@ esteja oculto, sem alterar o modo de coloração por fases.
 Resultados são descartados automaticamente quando barras, trechos, cargas,
 chaves ou circuitos forem substituídos.
 
-Ao concluir **Ferramentas → Ramais…**, a agregação elétrica é iniciada em
+Ao concluir **Ferramentas → Ramais…**, a equivalência elétrica é iniciada em
 segundo plano para preencher `DEMANDA_MAXIMA`, sem ativar a visualização da rede
 simplificada. O resultado é um snapshot reutilizado pela tabela e pelas
 exportações; ordenar, filtrar ou reabrir a janela não recalcula a topologia nem
 os patamares. Se houver geradores importados, é necessário executar antes
-**Atualizar Geradores…**.
+**Atualizar Geradores…**. No método por fluxo de potência, esse é o momento em
+que a aplicação pergunta se pode resolver o circuito, quando ainda não houver um
+resultado vigente.
 
 O botão **Exportar JSON** grava os ramais atualmente aceitos pelo filtro do
 ComboBox: um circuito específico ou todos os circuitos exibidos. O primeiro

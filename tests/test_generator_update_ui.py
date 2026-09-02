@@ -123,10 +123,12 @@ def make_models(
     return generators, circuits
 
 
-def saved_curve(*, first: float = 1.0) -> Curve:
+def saved_curve(
+    *, first: float = 1.0, curve_id: str = "CURVA", name: str = "Residencial"
+) -> Curve:
     values = [1.0] * 24
     values[0] = first
-    return Curve("CURVA", "Residencial", tuple(values))
+    return Curve(curve_id, name, tuple(values))
 
 
 @unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
@@ -434,6 +436,57 @@ class GeneratorUpdateMainWindowTests(unittest.TestCase):
             (schedule, schedule),
             (GeneratorScheduleMode.DEFAULT, GeneratorScheduleMode.DEFAULT),
         )
+
+    def test_the_automatic_run_uses_the_default_curve_and_default_levels(self) -> None:
+        # Ao abrir a rede não há ninguém para responder ao diálogo, então a
+        # rotina precisa das mesmas escolhas que ele já traz pré-selecionadas.
+        window, _, circuits = self.make_window_with_models()
+        outra = saved_curve(curve_id="C1", name="GERACAO_SOLAR_PU", first=9.0)
+        padrao = saved_curve(
+            curve_id="C2", name="GERACAO_SOLAR_DEFAULT", first=2.0
+        )
+        # A padrão vem depois de propósito: o critério é o nome, não a posição.
+        window._saved_curves = (outra, padrao)
+
+        with patch.object(window, "_start_generator_update") as start:
+            window._auto_update_generators()
+
+        schedule = window.calculation_level_schedule
+        start.assert_called_once_with(
+            padrao,
+            (schedule,) * len(circuits),
+            (GeneratorScheduleMode.DEFAULT,) * len(circuits),
+        )
+
+    def test_without_a_default_marked_curve_the_first_one_is_used(self) -> None:
+        window, _, _ = self.make_window_with_models()
+        primeira = saved_curve(curve_id="C1", name="SOLAR_A")
+        segunda = saved_curve(curve_id="C2", name="SOLAR_B", first=2.0)
+        window._saved_curves = (primeira, segunda)
+
+        self.assertIs(window._default_curve(), primeira)
+
+    def test_the_automatic_run_needs_a_saved_curve(self) -> None:
+        # Sem curva não há o que aplicar; o botão continua ali para quando
+        # houver, e nada explode ao abrir a rede.
+        window, _, _ = self.make_window_with_models()
+        window._saved_curves = ()
+
+        with patch.object(window, "_start_generator_update") as start:
+            window._auto_update_generators()
+
+        self.assertIsNone(window._default_curve())
+        start.assert_not_called()
+
+    def test_the_automatic_run_stands_down_while_something_else_runs(self) -> None:
+        window, _, _ = self.make_window_with_models()
+        window._import_thread = object()
+
+        with patch.object(window, "_start_generator_update") as start:
+            window._auto_update_generators()
+
+        window._import_thread = None
+        start.assert_not_called()
 
 
 if __name__ == "__main__":

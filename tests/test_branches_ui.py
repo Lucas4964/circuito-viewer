@@ -20,6 +20,7 @@ try:
     from PyQt6.QtWidgets import QApplication, QAbstractItemView, QMessageBox
 
     from circuit_viewer.branch_analysis import analyze_branches
+    from circuit_viewer.branch_power_source import BranchPowerSource
     from circuit_viewer.equivalent_network import build_equivalent_network
     from circuit_viewer.csv_import import CsvLoadResult
     from circuit_viewer.main_window import MainWindow
@@ -209,6 +210,102 @@ class BranchesUiTests(unittest.TestCase):
         window._show_or_analyze_branches()
         self.assertIs(window._branch_analysis_result, cached)
         self.assertIsNone(window._branch_thread)
+
+    def test_measured_mode_refused_leaves_nothing_pending(self) -> None:
+        window, _, _, _ = self.make_window()
+        window._branch_power_source = BranchPowerSource.POWER_FLOW
+
+        with patch(
+            "circuit_viewer.main_window.power_flow_import_error",
+            return_value=None,
+        ), patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.No,
+        ) as question:
+            window._show_or_analyze_branches()
+            self.wait_for_analysis(window)
+
+        self.assertTrue(question.called)
+        self.assertIsNotNone(window._branch_analysis_result)
+        self.assertIsNone(window._equivalent_thread)
+        self.assertIsNone(window._equivalent_network_result)
+        self.assertFalse(window._pending_power_flow_for_equivalent)
+        self.assertFalse(window._pending_branch_metrics)
+
+    def test_measured_mode_accepted_runs_the_power_flow_and_resumes(self) -> None:
+        window, _, _, _ = self.make_window()
+        window._branch_power_source = BranchPowerSource.POWER_FLOW
+
+        def fake_run(self_) -> None:  # noqa: ANN001
+            # A execução real cria a thread; aqui basta o sinal de que começou.
+            self_._power_flow_thread = object()
+
+        with patch(
+            "circuit_viewer.main_window.power_flow_import_error",
+            return_value=None,
+        ), patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ), patch.object(MainWindow, "_run_power_flow", fake_run):
+            window._show_or_analyze_branches()
+            self.wait_for_analysis(window)
+
+        self.assertIsNotNone(window._power_flow_thread)
+        self.assertTrue(window._pending_power_flow_for_equivalent)
+        self.assertIsNone(window._equivalent_thread)
+
+        # Chegando o resultado, a construção interrompida é retomada.
+        window._power_flow_thread = None
+        window._power_flow_result = object()
+        with patch.object(window, "_start_equivalent_build") as resume:
+            window._on_power_flow_thread_finished()
+            self.app.processEvents()
+
+        resume.assert_called_once_with()
+        self.assertFalse(window._pending_power_flow_for_equivalent)
+
+    def test_equivalent_build_held_by_a_running_flow_resumes_after_it(self) -> None:
+        window, _, _, _ = self.make_window()
+        window._show_or_analyze_branches()
+        self.wait_for_analysis(window)
+        self.wait_for_equivalent(window)
+        window._equivalent_network_result = None
+        window._pending_branch_metrics = True
+
+        # Exclusão mútua: com o fluxo em execução a construção não começa.
+        window._power_flow_thread = object()
+        window._start_equivalent_build()
+        held_thread = window._equivalent_thread
+        window._power_flow_thread = None
+
+        self.assertIsNone(held_thread)
+        self.assertTrue(window._pending_branch_metrics)
+
+        window._on_power_flow_thread_finished()
+        self.app.processEvents()
+        self.wait_for_equivalent(window)
+
+        self.assertIsNotNone(window._equivalent_network_result)
+        self.assertFalse(window._pending_branch_metrics)
+
+    def test_measured_mode_without_the_engine_explains_and_stops(self) -> None:
+        window, _, _, _ = self.make_window()
+        window._branch_power_source = BranchPowerSource.POWER_FLOW
+
+        with patch(
+            "circuit_viewer.main_window.power_flow_import_error",
+            return_value="A biblioteca py-dss-interface não está disponível",
+        ), patch.object(QMessageBox, "information") as information:
+            window._show_or_analyze_branches()
+            self.wait_for_analysis(window)
+
+        information.assert_called_once()
+        self.assertIn("py-dss-interface", information.call_args.args[2])
+        self.assertIsNone(window._equivalent_thread)
+        self.assertIsNone(window._equivalent_network_result)
+        self.assertFalse(window._pending_branch_metrics)
 
     def test_json_button_exports_only_the_filtered_circuit(self) -> None:
         window, _, _, catalog = self.make_window(two_circuits=True)
@@ -609,6 +706,8 @@ class BranchesUiTests(unittest.TestCase):
             ["", ""],
         )
         window._set_load_model(loads)
+        # A camada de cargas nasce oculta; o equivalente é desenhado nela.
+        window.show_loads_action.setChecked(True)
         result = analyze_branches(
             catalog,
             load_phase_configuration(self.config_path),

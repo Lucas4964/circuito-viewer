@@ -19,6 +19,12 @@ from .branch_json_export import (
     export_branches_json,
     suggested_branch_json_filename,
 )
+from .branch_power_flow import measure_branch_powers
+from .branch_power_source import (
+    DEFAULT_BRANCH_POWER_SOURCE,
+    BranchPowerSource,
+    parse_branch_power_source,
+)
 from .branch_table_export import (
     BRANCH_TABLE_HEADERS,
     BranchCsvExportResult,
@@ -228,6 +234,11 @@ from .opendss_line_mode import (
     OpenDssLineParameterMode,
     parse_opendss_line_parameter_mode,
 )
+from .opendss_solution import (
+    DEFAULT_MAX_POWER_FLOW_ITER,
+    MAX_POWER_FLOW_ITER_RANGE,
+    parse_max_power_flow_iterations,
+)
 from .opendss_allocation_export import (
     BT_GENERATION_FILENAME,
     ENERGY_LOADS_FILENAME,
@@ -309,6 +320,7 @@ from .opendss_powerflow import (
     PowerFlowIssue,
     PowerFlowResult,
     SegmentCurrents,
+    StepVoltages,
     run_power_flow,
 )
 from .opendss_settings import (
@@ -409,11 +421,15 @@ __all__ = [
     "write_allocation_export",
     "analyze_branches",
     "build_equivalent_network",
+    "measure_branch_powers",
+    "parse_branch_power_source",
     "BarRecord",
     "BranchAnalysisResult",
     "BranchIssue",
+    "BranchPowerSource",
     "BranchRecord",
     "BranchType",
+    "DEFAULT_BRANCH_POWER_SOURCE",
     "CableCsvResult",
     "CableIssue",
     "CableModel",
@@ -561,6 +577,9 @@ __all__ = [
     "DEFAULT_OPENDSS_LINE_PARAMETER_MODE",
     "OpenDssLineParameterMode",
     "parse_opendss_line_parameter_mode",
+    "DEFAULT_MAX_POWER_FLOW_ITER",
+    "MAX_POWER_FLOW_ITER_RANGE",
+    "parse_max_power_flow_iterations",
     "ARRANGEMENTS_FILENAME",
     "CABOS_FILENAME",
     "FREQUENCY_HZ",
@@ -649,6 +668,7 @@ __all__ = [
     "PowerFlowIssue",
     "PowerFlowResult",
     "SegmentCurrents",
+    "StepVoltages",
     "acquire_engine",
     "ascii_workspace",
     "power_flow_available",

@@ -35,6 +35,7 @@ from circuit_viewer.opendss_allocation_export import (
     write_allocation_export,
 )
 from circuit_viewer.opendss_allocation_settings import OpenDssAllocationSettings
+from circuit_viewer.opendss_solution import DEFAULT_MAX_POWER_FLOW_ITER
 from circuit_viewer.opendss_engine import (
     acquire_engine,
     ascii_workspace,
@@ -497,7 +498,11 @@ class MeasurementTests(unittest.TestCase):
 
 
 class AllocationExportTests(unittest.TestCase):
-    def make_bundle(self, curve: Curve | None = None):  # noqa: ANN201
+    def make_bundle(  # noqa: ANN201
+        self,
+        curve: Curve | None = None,
+        **kwargs,  # noqa: ANN003
+    ):
         _bars, catalog, loads, cables = make_models()
         phases, allocations = make_allocations(loads)
         measurements = parse_allocation_measurement_rows(
@@ -518,6 +523,7 @@ class AllocationExportTests(unittest.TestCase):
             curve,
             default_calculation_levels(),
             OpenDssAllocationSettings(30, 4, 0.92, 2),
+            **kwargs,
         )
 
     def make_monophase_bundle(self):  # noqa: ANN201
@@ -611,6 +617,21 @@ class AllocationExportTests(unittest.TestCase):
         self.assertIn("AllocateLoads", master)
         self.assertIn("fluxo reverso", master)
         self.assertNotIn("LoadShape", "\n".join(dict(level.files)))
+        # O AllocateLoads resolve o circuito a cada iteração de alocação, e o
+        # padrão de 15 do OpenDSS abandona cada uma antes de convergir.
+        lines = master.splitlines()
+        self.assertIn(f"Set MaxIter={DEFAULT_MAX_POWER_FLOW_ITER}", lines)
+        self.assertLess(
+            lines.index(f"Set MaxIter={DEFAULT_MAX_POWER_FLOW_ITER}"),
+            lines.index("AllocateLoads"),
+        )
+
+    def test_master_honours_the_configured_iteration_ceiling(self):
+        bundle = self.make_bundle(max_power_flow_iterations=120)
+
+        for level in bundle.levels:
+            master = dict(level.files)[level.master_filename]
+            self.assertIn("Set MaxIter=120", master.splitlines())
 
     def test_uses_each_level_reference_hour_for_generation(self):
         curve = Curve(

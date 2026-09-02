@@ -57,6 +57,7 @@ from .opendss_export import (
     phase_voltage_kv,
     sanitize_dss_name,
 )
+from .opendss_solution import DEFAULT_MAX_POWER_FLOW_ITER
 from .phase_config import PhaseConfiguration
 
 if TYPE_CHECKING:
@@ -421,6 +422,7 @@ def build_simplified_export(
     regulators: RegulatorModel | None = None,
     capacitors: CapacitorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
+    max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     cancel_check: Callable[[], bool] | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> SimplifiedOpenDssExportBundle:
@@ -650,6 +652,7 @@ def build_simplified_export(
             )
             else None
         ),
+        max_power_flow_iterations=max_power_flow_iterations,
         include_bar_indices=retained_bars,
     )
     if not master.text:

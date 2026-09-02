@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QRadioButton,
+    QSpinBox,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -27,6 +28,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .branch_power_source import (
+    DEFAULT_BRANCH_POWER_SOURCE,
+    BranchPowerSource,
+    parse_branch_power_source,
+)
 from .opendss_line_mode import (
     DEFAULT_OPENDSS_LINE_PARAMETER_MODE,
     OpenDssLineParameterMode,
@@ -35,6 +41,11 @@ from .opendss_line_mode import (
 from .opendss_mapping_store import (
     LibraryNameMapping,
     OpenDssLibraryMappings,
+)
+from .opendss_solution import (
+    DEFAULT_MAX_POWER_FLOW_ITER,
+    MAX_POWER_FLOW_ITER_RANGE,
+    parse_max_power_flow_iterations,
 )
 from .opendss_settings import (
     DEFAULT_OPENDSS_LOAD_SETTINGS,
@@ -54,6 +65,10 @@ from .table_columns import EXCEL_LIKE_TABLE_STYLE
 
 SETTINGS_PREFIX = "opendss/load_"
 LINE_PARAMETER_MODE_SETTINGS_KEY = "opendss/line_parameter_mode"
+# Chave própria, e não um campo de OpenDssLoadSettings: o modo não é parâmetro
+# de carga, e a comparação de igualdade daquela dataclass não deve arrastá-lo.
+BRANCH_POWER_SOURCE_SETTINGS_KEY = "opendss/branch_power_source"
+MAX_POWER_FLOW_ITER_SETTINGS_KEY = "opendss/max_power_flow_iter"
 
 
 def load_opendss_settings(settings: QSettings) -> OpenDssLoadSettings:
@@ -95,6 +110,43 @@ def save_opendss_line_parameter_mode(
 
     mode = OpenDssLineParameterMode(value)
     settings.setValue(LINE_PARAMETER_MODE_SETTINGS_KEY, mode.value)
+    settings.sync()
+
+
+def load_branch_power_source(settings: QSettings) -> BranchPowerSource:
+    """Lê o método das potências dos ramais; corrupção usa a agregação."""
+
+    return parse_branch_power_source(
+        settings.value(BRANCH_POWER_SOURCE_SETTINGS_KEY)
+    )
+
+
+def save_branch_power_source(
+    settings: QSettings,
+    value: BranchPowerSource,
+) -> None:
+    """Persiste separadamente a fonte das potências equivalentes dos ramais."""
+
+    source = BranchPowerSource(value)
+    settings.setValue(BRANCH_POWER_SOURCE_SETTINGS_KEY, source.value)
+    settings.sync()
+
+
+def load_max_power_flow_iterations(settings: QSettings) -> int:
+    """Lê o teto de iterações; ausência ou corrupção usam o padrão."""
+
+    return parse_max_power_flow_iterations(
+        settings.value(MAX_POWER_FLOW_ITER_SETTINGS_KEY)
+    )
+
+
+def save_max_power_flow_iterations(settings: QSettings, value: int) -> None:
+    """Persiste separadamente o teto de iterações do fluxo de potência."""
+
+    settings.setValue(
+        MAX_POWER_FLOW_ITER_SETTINGS_KEY,
+        str(parse_max_power_flow_iterations(value)),
+    )
     settings.sync()
 
 
@@ -356,6 +408,8 @@ class OpenDssSettingsDialog(QDialog):
         line_parameter_mode: OpenDssLineParameterMode = (
             DEFAULT_OPENDSS_LINE_PARAMETER_MODE
         ),
+        branch_power_source: BranchPowerSource = DEFAULT_BRANCH_POWER_SOURCE,
+        max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Configurações do OpenDSS")
@@ -369,10 +423,18 @@ class OpenDssSettingsDialog(QDialog):
         self.tabs.setObjectName("opendss_settings_tabs")
         self.voltage_tab = self._build_voltage_tab(current)
         self.tabs.addTab(self.voltage_tab, "Cargas")
+        self.branches_tab = self._build_branches_tab(
+            parse_branch_power_source(branch_power_source)
+        )
+        self.tabs.addTab(self.branches_tab, "Ramais")
         self.line_parameters_tab = self._build_line_parameters_tab(
             parse_opendss_line_parameter_mode(line_parameter_mode)
         )
         self.tabs.addTab(self.line_parameters_tab, "Parâmetros das linhas")
+        self.solution_tab = self._build_solution_tab(
+            parse_max_power_flow_iterations(max_power_flow_iterations)
+        )
+        self.tabs.addTab(self.solution_tab, "Solução")
         self.cable_map_editor = MappingTableEditor(
             "CABO_ID",
             cable_names,
@@ -415,6 +477,121 @@ class OpenDssSettingsDialog(QDialog):
         self._sync_fields(self.apply_limits_check.isChecked())
         self._sync_load_model()
         self._sync_accept_enabled()
+
+    def _build_branches_tab(self, current: BranchPowerSource) -> QWidget:
+        """Escolhe de onde vem a potência das cargas equivalentes de ramal."""
+
+        tab = QWidget(self.tabs)
+        tab.setObjectName("opendss_branches_tab")
+        layout = QVBoxLayout(tab)
+
+        explanation = QLabel(
+            "Escolha como a potência de cada ramal é obtida. O método vale para "
+            "a coluna DEMANDA_MAXIMA da janela Ramais, para as exportações CSV e "
+            "JSON e para a exportação da rede simplificada.",
+            tab,
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self.branch_power_source_group = QButtonGroup(tab)
+        self.branch_power_source_group.setObjectName("opendss_branch_power_group")
+        self.branch_power_source_group.setExclusive(True)
+
+        self.branch_power_table_radio = QRadioButton(
+            "Agregar as tabelas de patamares das cargas",
+            tab,
+        )
+        self.branch_power_table_radio.setObjectName("opendss_branch_power_table")
+        self.branch_power_table_radio.setToolTip(
+            "Soma PD/PE/PF e QD/QE/QF de cada carga do ramal por NPAT. Uma carga "
+            "sem os quatro patamares deixa o ramal incompleto e bloqueia a "
+            "exportação simplificada."
+        )
+        self.branch_power_source_group.addButton(self.branch_power_table_radio)
+        layout.addWidget(self.branch_power_table_radio)
+
+        self.branch_power_flow_radio = QRadioButton(
+            "Medir no primeiro elemento do ramal (fluxo de potência)",
+            tab,
+        )
+        self.branch_power_flow_radio.setObjectName("opendss_branch_power_flow")
+        self.branch_power_flow_radio.setToolTip(
+            "Resolve o fluxo de potência do circuito completo e usa a potência "
+            "que entra pelo primeiro elemento do ramal, seja ele uma chave ou um "
+            "trecho de rede. Dispensa as tabelas das cargas internas e exige a "
+            "biblioteca py-dss-interface."
+        )
+        self.branch_power_source_group.addButton(self.branch_power_flow_radio)
+        layout.addWidget(self.branch_power_flow_radio)
+
+        if current is BranchPowerSource.POWER_FLOW:
+            self.branch_power_flow_radio.setChecked(True)
+        else:
+            self.branch_power_table_radio.setChecked(True)
+        layout.addStretch(1)
+        return tab
+
+    def _build_solution_tab(self, current: int) -> QWidget:
+        """Teto de iterações do fluxo de potência, aplicado a toda solução."""
+
+        tab = QWidget(self.tabs)
+        tab.setObjectName("opendss_solution_tab")
+        layout = QVBoxLayout(tab)
+
+        explanation = QLabel(
+            "Quantas iterações o OpenDSS pode gastar em cada solução antes de "
+            "declarar o circuito inconvergente. O padrão do próprio OpenDSS é "
+            "15, insuficiente em alimentador longo e carregado: estourado o "
+            "teto, a solução é abandonada antes de terminar a primeira passada, "
+            "os reguladores não chegam a comutar e os ramais não podem ser "
+            "medidos pelo fluxo.",
+            tab,
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        fields = QWidget(tab)
+        form = QFormLayout(fields)
+        form.setContentsMargins(0, 0, 0, 0)
+        low, high = MAX_POWER_FLOW_ITER_RANGE
+        self.max_power_flow_iterations_input = QSpinBox(fields)
+        self.max_power_flow_iterations_input.setObjectName(
+            "opendss_max_power_flow_iterations"
+        )
+        self.max_power_flow_iterations_input.setRange(low, high)
+        self.max_power_flow_iterations_input.setSingleStep(50)
+        self.max_power_flow_iterations_input.setValue(current)
+        self.max_power_flow_iterations_input.setToolTip(
+            f"Entre {low:n} e {high:n}. Elevar custa pouco: o que pesa são as "
+            "iterações realmente executadas, não o teto."
+        )
+        form.addRow("Máximo de iterações:", self.max_power_flow_iterations_input)
+        layout.addWidget(fields)
+
+        layout.addWidget(QLabel("Efeito nos arquivos gerados:", tab))
+        self.solution_preview_label = QLabel(tab)
+        self.solution_preview_label.setObjectName("opendss_solution_preview")
+        self.solution_preview_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.solution_preview_label.setStyleSheet(
+            "font-family: monospace; padding: 6px;border: 1px solid palette(mid);"
+        )
+        self.solution_preview_label.setWordWrap(True)
+        layout.addWidget(self.solution_preview_label)
+        layout.addStretch(1)
+
+        self.max_power_flow_iterations_input.valueChanged.connect(
+            self._sync_solution_preview
+        )
+        self._sync_solution_preview()
+        return tab
+
+    def _sync_solution_preview(self) -> None:
+        self.solution_preview_label.setText(
+            f"Set MaxIter={self.max_power_flow_iterations()}"
+        )
 
     def _build_line_parameters_tab(
         self,
@@ -736,8 +913,14 @@ class OpenDssSettingsDialog(QDialog):
                 strict=True,
             ):
                 self.zipv_inputs[name].setValue(value)
+        elif current_tab is self.branches_tab:
+            self.branch_power_table_radio.setChecked(True)
         elif current_tab is self.line_parameters_tab:
             self.original_line_parameters_radio.setChecked(True)
+        elif current_tab is self.solution_tab:
+            self.max_power_flow_iterations_input.setValue(
+                DEFAULT_MAX_POWER_FLOW_ITER
+            )
         elif current_tab is self.cable_map_editor:
             self.cable_map_editor.clear_map()
         elif current_tab is self.arrangement_map_editor:
@@ -764,6 +947,14 @@ class OpenDssSettingsDialog(QDialog):
         if self.library_line_parameters_radio.isChecked():
             return OpenDssLineParameterMode.LIBRARY
         return OpenDssLineParameterMode.ORIGINAL
+
+    def branch_power_source(self) -> BranchPowerSource:
+        if self.branch_power_flow_radio.isChecked():
+            return BranchPowerSource.POWER_FLOW
+        return BranchPowerSource.TABLE
+
+    def max_power_flow_iterations(self) -> int:
+        return int(self.max_power_flow_iterations_input.value())
 
     def mappings(self) -> OpenDssLibraryMappings:
         return OpenDssLibraryMappings(

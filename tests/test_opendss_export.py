@@ -19,6 +19,7 @@ from circuit_viewer.model import (
 from circuit_viewer.opendss_export import (
     FREQUENCY_HZ,
     LINES_FILENAME,
+    LOAD_PATTERN_COUNT,
     MAX_REPORTED_ISSUES,
     REGULATORS_FILENAME,
     SINGLE_PHASE_LOADS_FILENAME,
@@ -39,6 +40,7 @@ from circuit_viewer.opendss_export import (
     sanitize_dss_name,
 )
 from circuit_viewer.opendss_settings import OpenDssLoadSettings
+from circuit_viewer.opendss_solution import DEFAULT_MAX_POWER_FLOW_ITER
 from circuit_viewer.phase_config import PhaseConfiguration, PhaseMappingEntry
 
 
@@ -834,7 +836,9 @@ class RegulatorExportTests(unittest.TestCase):
         self.assertNotIn("New Line.TR-1 ", lines.text)
 
     def test_a_discarded_regulator_keeps_the_line_of_its_segment(self) -> None:
-        network = self._network(phases=("7", "13"))
+        # NOME que não resolve as fases declaradas: não há como saber em que
+        # nó ligar o regulador, então ele é descartado.
+        network = self._network(phases=("10", "13"))
         catalog = make_catalog(network, voltage="34,5")
 
         exported = build_regulator_export(
@@ -854,15 +858,78 @@ class RegulatorExportTests(unittest.TestCase):
         self.assertEqual(exported.replaced_segments, frozenset())
         self.assertIn("New Line.TR-1 ", lines.text)
 
-    def test_only_three_phase_segments_are_exported(self) -> None:
-        result = self._export(network=self._network(phases=("7", "13")))
+    def test_a_name_without_phase_letters_is_reported(self) -> None:
+        # FASES2 '10' tem NOME 'XY': duas fases declaradas, nenhuma letra de
+        # fase reconhecível.
+        result = self._export(network=self._network(phases=("10", "13")))
 
         self.assertEqual(result.exported_count, 0)
         self.assertEqual(result.discarded_count, 1)
         self.assertTrue(
-            any("não é trifásica" in issue.reason for issue in result.issues),
+            any("não resolve 2 fase(s)" in issue.reason for issue in result.issues),
             result.issues,
         )
+
+    def test_a_single_phase_segment_gets_one_unit_with_the_whole_snom(self) -> None:
+        # Numa rede predominantemente monofásica é justamente nas pontas que a
+        # tensão afunda; restringir o regulador ao trifásico deixaria de fora
+        # quem mais regula. O banco monofásico é uma unidade, então ela leva o
+        # SNOM inteiro.
+        result = self._export(network=self._network(phases=("1", "13")))
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertEqual(result.issues, ())
+        self.assertEqual(result.replaced_segments, frozenset({0}))
+        self.assertEqual(
+            transformer_entries(result.text),
+            [
+                "New Transformer.REG-X-D phases=1 windings=2 XHL=0.01 "
+                "%LoadLoss=0.01 Buses=[BARRA_A.1.0, BARRA_B.1.0] "
+                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[333, 333]",
+            ],
+        )
+        self.assertEqual(
+            control_entries(result.text),
+            [
+                "New RegControl.CTRL-X-D transformer=REG-X-D winding=2 "
+                "vreg=66.3953 band=3 ptratio=300",
+            ],
+        )
+
+    def test_a_two_phase_segment_splits_the_snom_in_two(self) -> None:
+        # FASES2 '7' é "DE": duas unidades, e o banco de dois divide por dois.
+        result = self._export(network=self._network(phases=("7", "13")))
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertEqual(result.issues, ())
+        self.assertEqual(
+            [entry.split("Buses=")[1] for entry in transformer_entries(result.text)],
+            [
+                "[BARRA_A.1.0, BARRA_B.1.0] conns=[wye, wye] "
+                "kVs=[19.9186, 19.9186] kVAs=[166.5, 166.5]",
+                "[BARRA_A.2.0, BARRA_B.2.0] conns=[wye, wye] "
+                "kVs=[19.9186, 19.9186] kVAs=[166.5, 166.5]",
+            ],
+        )
+
+    def test_the_single_phase_regulated_segment_stops_being_a_line(self) -> None:
+        network = self._network(phases=("1", "13"))
+        catalog = make_catalog(network, voltage="34,5")
+
+        exported = build_regulator_export(
+            catalog, make_regulators(network), PHASES, [0]
+        )
+        lines = build_line_export(
+            catalog,
+            make_cables(),
+            PHASES,
+            [0],
+            skip_segments=exported.replaced_segments,
+        )
+
+        # A linha em paralelo com o regulador curto-circuitaria a injeção de
+        # tensão — vale para uma fase como vale para três.
+        self.assertNotIn("New Line.TR-1 ", lines.text)
 
     def test_voltage_in_volts_is_refused_against_the_circuit_vnom(self) -> None:
         network = self._network()
@@ -1031,7 +1098,7 @@ class RegulatorBundleTests(unittest.TestCase):
     def test_a_fully_discarded_regulator_model_writes_no_file(self) -> None:
         # Modelo presente, nenhum regulador exportável: o arquivo não sai, e o
         # master de quem não tem regulador continua idêntico.
-        bundle = self._bundle(phases=("7", "13"))
+        bundle = self._bundle(phases=("10", "13"))
 
         self.assertEqual(bundle.regulators.exported_count, 0)
         self.assertEqual(
@@ -1040,7 +1107,7 @@ class RegulatorBundleTests(unittest.TestCase):
         )
         self.assertTrue(bundle.has_warnings)
         self.assertTrue(
-            any("não é trifásica" in issue.reason for issue in bundle.issues),
+            any("não resolve 2 fase(s)" in issue.reason for issue in bundle.issues),
             bundle.issues,
         )
 
@@ -1982,6 +2049,7 @@ class MasterExportTests(unittest.TestCase):
                 "calcvoltagebases",
                 "Set ControlMode=Static",
                 "Set MaxControlIter=100",
+                "Set MaxIter=500",
                 "Set mode=daily",
                 "Set stepsize=1h",
                 "Set number=4",
@@ -1990,6 +2058,68 @@ class MasterExportTests(unittest.TestCase):
                 "",
                 "Buscoords ALIMENTADOR_Buscoords.csv",
             ],
+        )
+
+    def test_max_iter_uses_the_configured_ceiling(self) -> None:
+        # O padrão do OpenDSS é 15, baixo demais para alimentador longo: sem a
+        # linha, a solução é abandonada antes de o laço de controle rodar.
+        result = build_master_export(
+            self._catalog(),
+            [0],
+            max_power_flow_iterations=120,
+        )
+        lines = result.text.splitlines()
+
+        self.assertIn("Set MaxIter=120", lines)
+        # Depois do teto de controle e antes do Solve: os dois são propriedades
+        # da solução, e ambas precisam valer quando ela roda.
+        self.assertLess(
+            lines.index("Set MaxControlIter=100"),
+            lines.index("Set MaxIter=120"),
+        )
+        self.assertLess(lines.index("Set MaxIter=120"), lines.index("Solve"))
+
+    def test_by_default_the_master_solves(self) -> None:
+        # Quem abre o arquivo no OpenDSS espera que ele resolva sozinho, um
+        # passo por patamar.
+        lines = build_master_export(self._catalog(), [0]).text.splitlines()
+
+        self.assertIn(f"Set number={LOAD_PATTERN_COUNT}", lines)
+        self.assertIn("Solve", lines)
+
+    def test_include_solve_off_only_assembles_the_circuit(self) -> None:
+        # O fluxo de potência interno compila este arquivo, e Compile executa o
+        # que estiver nele: um Solve aqui resolveria os quatro patamares antes
+        # do laço que os colhe, gastando o dobro do tempo e passando ao
+        # primeiro patamar o tap deixado pelo último.
+        catalog = self._catalog()
+        with_solve = build_master_export(catalog, [0]).text.splitlines()
+        without = build_master_export(
+            catalog,
+            [0],
+            include_solve=False,
+        ).text.splitlines()
+
+        self.assertNotIn("Solve", without)
+        self.assertNotIn(f"Set number={LOAD_PATTERN_COUNT}", without)
+        # Tirar o Solve não pode mudar o circuito montado: a diferença entre os
+        # dois arquivos é exatamente essas duas linhas.
+        self.assertEqual(
+            [
+                line
+                for line in with_solve
+                if line not in ("Solve", f"Set number={LOAD_PATTERN_COUNT}")
+            ],
+            without,
+        )
+
+    def test_unusable_max_iter_falls_back_to_the_default(self) -> None:
+        # Nem o master pode deixar de sair por causa de uma preferência ruim.
+        result = build_master_export(self._catalog(), [0], max_power_flow_iterations=0)
+
+        self.assertIn(
+            f"Set MaxIter={DEFAULT_MAX_POWER_FLOW_ITER}",
+            result.text.splitlines(),
         )
 
     def test_redirects_follow_the_files_that_were_generated(self) -> None:

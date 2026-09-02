@@ -199,7 +199,8 @@ class CircuitsWindowTests(unittest.TestCase):
 
         self.assertIn(empty.root_bar_action, view_menu.actions())
         self.assertTrue(empty.root_bar_action.isCheckable())
-        self.assertFalse(empty.root_bar_action.isChecked())
+        # Ligada por padrão: o anel diz por onde cada circuito é alimentado.
+        self.assertTrue(empty.root_bar_action.isChecked())
         self.assertFalse(empty.root_bar_action.isEnabled())
 
         window, _ = self.make_two_circuit_window()
@@ -210,6 +211,9 @@ class CircuitsWindowTests(unittest.TestCase):
         window, _ = self.make_two_circuit_window()
         item = window._root_bar_item
         self.assertIsNotNone(item)
+
+        window.root_bar_action.setChecked(False)
+        self.app.processEvents()
         self.assertFalse(item.isVisible())
 
         window.root_bar_action.setChecked(True)

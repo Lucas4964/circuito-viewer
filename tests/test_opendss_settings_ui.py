@@ -26,6 +26,14 @@ try:
         QLabel,
     )
 
+    from circuit_viewer.branch_power_source import (
+        DEFAULT_BRANCH_POWER_SOURCE,
+        BranchPowerSource,
+    )
+    from circuit_viewer.opendss_solution import (
+        DEFAULT_MAX_POWER_FLOW_ITER,
+        MAX_POWER_FLOW_ITER_RANGE,
+    )
     from circuit_viewer.main_window import MainWindow
     from circuit_viewer.opendss_line_mode import (
         DEFAULT_OPENDSS_LINE_PARAMETER_MODE,
@@ -41,10 +49,16 @@ try:
         OpenDssLoadSettings,
     )
     from circuit_viewer.opendss_settings_dialog import (
+        BRANCH_POWER_SOURCE_SETTINGS_KEY,
         LINE_PARAMETER_MODE_SETTINGS_KEY,
+        MAX_POWER_FLOW_ITER_SETTINGS_KEY,
         OpenDssSettingsDialog,
+        load_branch_power_source,
+        load_max_power_flow_iterations,
         load_opendss_line_parameter_mode,
         load_opendss_settings,
+        save_branch_power_source,
+        save_max_power_flow_iterations,
         save_opendss_line_parameter_mode,
         save_opendss_settings,
     )
@@ -159,6 +173,70 @@ class PersistenceTests(unittest.TestCase):
             DEFAULT_OPENDSS_LINE_PARAMETER_MODE,
         )
 
+    def test_branch_power_source_round_trip_uses_its_own_key(self) -> None:
+        save_branch_power_source(self.settings, BranchPowerSource.POWER_FLOW)
+
+        self.assertEqual(
+            self.settings.value(BRANCH_POWER_SOURCE_SETTINGS_KEY),
+            "power_flow",
+        )
+        self.assertIs(
+            load_branch_power_source(self.settings),
+            BranchPowerSource.POWER_FLOW,
+        )
+        # Nem o modo das linhas nem os parâmetros de carga são arrastados.
+        self.assertIs(
+            load_opendss_line_parameter_mode(self.settings),
+            DEFAULT_OPENDSS_LINE_PARAMETER_MODE,
+        )
+        self.assertEqual(
+            load_opendss_settings(self.settings),
+            DEFAULT_OPENDSS_LOAD_SETTINGS,
+        )
+
+    def test_missing_or_corrupt_branch_power_source_falls_back_to_table(self) -> None:
+        self.assertIs(
+            load_branch_power_source(self.settings),
+            DEFAULT_BRANCH_POWER_SOURCE,
+        )
+        self.settings.setValue(BRANCH_POWER_SOURCE_SETTINGS_KEY, "inválido")
+
+        self.assertIs(
+            load_branch_power_source(self.settings),
+            DEFAULT_BRANCH_POWER_SOURCE,
+        )
+
+    def test_max_power_flow_iterations_round_trip_uses_its_own_key(self) -> None:
+        save_max_power_flow_iterations(self.settings, 120)
+
+        self.assertEqual(
+            self.settings.value(MAX_POWER_FLOW_ITER_SETTINGS_KEY),
+            "120",
+        )
+        self.assertEqual(load_max_power_flow_iterations(self.settings), 120)
+        # Nem os parâmetros das cargas nem o modo das linhas são arrastados.
+        self.assertIs(
+            load_opendss_line_parameter_mode(self.settings),
+            DEFAULT_OPENDSS_LINE_PARAMETER_MODE,
+        )
+        self.assertEqual(
+            load_opendss_settings(self.settings),
+            DEFAULT_OPENDSS_LOAD_SETTINGS,
+        )
+
+    def test_missing_or_corrupt_max_power_flow_iterations_uses_the_default(self) -> None:
+        self.assertEqual(
+            load_max_power_flow_iterations(self.settings),
+            DEFAULT_MAX_POWER_FLOW_ITER,
+        )
+        for stored in ("muitas", "0", "999999"):
+            with self.subTest(stored=stored):
+                self.settings.setValue(MAX_POWER_FLOW_ITER_SETTINGS_KEY, stored)
+                self.assertEqual(
+                    load_max_power_flow_iterations(self.settings),
+                    DEFAULT_MAX_POWER_FLOW_ITER,
+                )
+
 
 @unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
 class DialogTests(unittest.TestCase):
@@ -213,6 +291,123 @@ class DialogTests(unittest.TestCase):
             dialog.line_parameter_mode(),
             OpenDssLineParameterMode.LIBRARY,
         )
+
+    def test_branch_power_source_defaults_to_the_table_aggregation(self) -> None:
+        dialog = self._dialog()
+
+        self.assertTrue(dialog.branch_power_table_radio.isChecked())
+        self.assertFalse(dialog.branch_power_flow_radio.isChecked())
+        self.assertIs(dialog.branch_power_source(), BranchPowerSource.TABLE)
+
+    def test_branch_power_source_opens_on_the_keyword_choice(self) -> None:
+        dialog = OpenDssSettingsDialog(
+            branch_power_source=BranchPowerSource.POWER_FLOW,
+        )
+        self.addCleanup(dialog.close)
+
+        self.assertFalse(dialog.branch_power_table_radio.isChecked())
+        self.assertTrue(dialog.branch_power_flow_radio.isChecked())
+        self.assertIs(dialog.branch_power_source(), BranchPowerSource.POWER_FLOW)
+
+    def test_branch_power_radios_are_exclusive_and_identifiable(self) -> None:
+        dialog = self._dialog()
+
+        self.assertTrue(dialog.branch_power_source_group.exclusive())
+        self.assertEqual(
+            dialog.branch_power_table_radio.objectName(),
+            "opendss_branch_power_table",
+        )
+        self.assertEqual(
+            dialog.branch_power_flow_radio.objectName(),
+            "opendss_branch_power_flow",
+        )
+        dialog.branch_power_flow_radio.setChecked(True)
+        self.assertFalse(dialog.branch_power_table_radio.isChecked())
+        dialog.branch_power_table_radio.setChecked(True)
+        self.assertFalse(dialog.branch_power_flow_radio.isChecked())
+
+    def test_solution_tab_defaults_and_shows_the_emitted_line(self) -> None:
+        dialog = self._dialog()
+
+        self.assertEqual(
+            dialog.max_power_flow_iterations(),
+            DEFAULT_MAX_POWER_FLOW_ITER,
+        )
+        self.assertEqual(
+            dialog.max_power_flow_iterations_input.objectName(),
+            "opendss_max_power_flow_iterations",
+        )
+        self.assertEqual(
+            (
+                dialog.max_power_flow_iterations_input.minimum(),
+                dialog.max_power_flow_iterations_input.maximum(),
+            ),
+            MAX_POWER_FLOW_ITER_RANGE,
+        )
+        self.assertEqual(
+            dialog.solution_preview_label.text(),
+            f"Set MaxIter={DEFAULT_MAX_POWER_FLOW_ITER}",
+        )
+
+        dialog.max_power_flow_iterations_input.setValue(120)
+        self.assertEqual(dialog.max_power_flow_iterations(), 120)
+        self.assertEqual(dialog.solution_preview_label.text(), "Set MaxIter=120")
+
+    def test_solution_tab_opens_on_the_keyword_value(self) -> None:
+        dialog = OpenDssSettingsDialog(max_power_flow_iterations=250)
+        self.addCleanup(dialog.close)
+
+        self.assertEqual(dialog.max_power_flow_iterations(), 250)
+
+    def test_solution_tab_ignores_a_corrupt_stored_value(self) -> None:
+        dialog = OpenDssSettingsDialog(max_power_flow_iterations=0)
+        self.addCleanup(dialog.close)
+
+        self.assertEqual(
+            dialog.max_power_flow_iterations(),
+            DEFAULT_MAX_POWER_FLOW_ITER,
+        )
+
+    def test_restoring_defaults_on_the_solution_tab_touches_nothing_else(self) -> None:
+        dialog = OpenDssSettingsDialog(
+            OpenDssLoadSettings(True, 0.8, 1.2),
+            branch_power_source=BranchPowerSource.POWER_FLOW,
+            line_parameter_mode=OpenDssLineParameterMode.LIBRARY,
+            max_power_flow_iterations=120,
+        )
+        self.addCleanup(dialog.close)
+
+        dialog.tabs.setCurrentWidget(dialog.solution_tab)
+        dialog.restore_defaults()
+
+        self.assertEqual(
+            dialog.max_power_flow_iterations(),
+            DEFAULT_MAX_POWER_FLOW_ITER,
+        )
+        self.assertIs(dialog.branch_power_source(), BranchPowerSource.POWER_FLOW)
+        self.assertIs(
+            dialog.line_parameter_mode(),
+            OpenDssLineParameterMode.LIBRARY,
+        )
+        self.assertEqual(dialog.settings(), OpenDssLoadSettings(True, 0.8, 1.2))
+
+    def test_restoring_defaults_on_the_branches_tab_touches_nothing_else(self) -> None:
+        dialog = OpenDssSettingsDialog(
+            OpenDssLoadSettings(True, 0.8, 1.2),
+            branch_power_source=BranchPowerSource.POWER_FLOW,
+            line_parameter_mode=OpenDssLineParameterMode.LIBRARY,
+        )
+        self.addCleanup(dialog.close)
+
+        dialog.tabs.setCurrentWidget(dialog.branches_tab)
+        dialog.restore_defaults()
+
+        self.assertIs(dialog.branch_power_source(), BranchPowerSource.TABLE)
+        self.assertIs(
+            dialog.line_parameter_mode(),
+            OpenDssLineParameterMode.LIBRARY,
+        )
+        self.assertEqual(dialog.settings(), OpenDssLoadSettings(True, 0.8, 1.2))
 
     def test_line_parameter_radios_are_exclusive_and_identifiable(self) -> None:
         dialog = self._dialog()
@@ -456,14 +651,16 @@ class DialogTests(unittest.TestCase):
 
         self.assertEqual(dialog.settings(), DEFAULT_OPENDSS_LOAD_SETTINGS)
 
-    def test_dialog_has_the_four_named_tabs(self) -> None:
+    def test_dialog_has_the_six_named_tabs(self) -> None:
         dialog = self._dialog()
 
         self.assertEqual(
             [dialog.tabs.tabText(index) for index in range(dialog.tabs.count())],
             [
                 "Cargas",
+                "Ramais",
                 "Parâmetros das linhas",
+                "Solução",
                 "Mapa de Cabos",
                 "Mapa de Arranjos",
             ],
@@ -765,6 +962,80 @@ class MainWindowIntegrationTests(unittest.TestCase):
             window._show_opendss_settings()
 
         self.assertIn("vminpu", window.statusBar().currentMessage())
+
+    def test_branch_power_source_is_stored_reloaded_and_announced(self) -> None:
+        storage = isolated_settings("branch_source")
+        self.addCleanup(storage.clear)
+        window = self._window(storage)
+        marker = object()
+        window._power_flow_result = marker
+
+        def choose_flow(dialog) -> int:  # noqa: ANN001
+            self.assertIs(dialog.branch_power_source(), BranchPowerSource.TABLE)
+            dialog.branch_power_flow_radio.setChecked(True)
+            return int(QDialog.DialogCode.Accepted)
+
+        with patch.object(OpenDssSettingsDialog, "exec", choose_flow):
+            window._show_opendss_settings()
+
+        self.assertIs(window._branch_power_source, BranchPowerSource.POWER_FLOW)
+        # O método mudou, não os dados: o fluxo já resolvido continua válido.
+        self.assertIs(window._power_flow_result, marker)
+        self.assertIn("Potências dos ramais", window.statusBar().currentMessage())
+        self.assertIs(
+            load_branch_power_source(storage),
+            BranchPowerSource.POWER_FLOW,
+        )
+        reloaded = self._window(storage)
+        self.assertIs(reloaded._branch_power_source, BranchPowerSource.POWER_FLOW)
+
+    def test_max_power_flow_iterations_is_stored_reloaded_and_invalidates(self) -> None:
+        storage = isolated_settings("iterations")
+        self.addCleanup(storage.clear)
+        window = self._window(storage)
+        window._power_flow_result = object()
+
+        def choose_ceiling(dialog) -> int:  # noqa: ANN001
+            self.assertEqual(
+                dialog.max_power_flow_iterations(),
+                DEFAULT_MAX_POWER_FLOW_ITER,
+            )
+            dialog.max_power_flow_iterations_input.setValue(120)
+            return int(QDialog.DialogCode.Accepted)
+
+        with patch.object(OpenDssSettingsDialog, "exec", choose_ceiling):
+            window._show_opendss_settings()
+
+        self.assertEqual(window._max_power_flow_iterations, 120)
+        # O resultado antigo veio de outra solução e não descreve mais o modelo.
+        self.assertIsNone(window._power_flow_result)
+        self.assertIn("iterações", window.statusBar().currentMessage())
+        self.assertEqual(load_max_power_flow_iterations(storage), 120)
+        reloaded = self._window(storage)
+        self.assertEqual(reloaded._max_power_flow_iterations, 120)
+
+    def test_discarding_the_power_flow_drops_a_measured_equivalent(self) -> None:
+        window = self._window()
+        window._branch_power_source = BranchPowerSource.POWER_FLOW
+        window._power_flow_result = object()
+        window._equivalent_network_result = object()
+
+        window._invalidate_power_flow()
+
+        self.assertIsNone(window._power_flow_result)
+        self.assertIsNone(window._equivalent_network_result)
+
+    def test_discarding_the_power_flow_keeps_an_aggregated_equivalent(self) -> None:
+        window = self._window()
+        window._power_flow_result = object()
+        equivalent = object()
+        window._equivalent_network_result = equivalent
+
+        window._invalidate_power_flow()
+
+        self.assertIsNone(window._power_flow_result)
+        # Por tabela a rede equivalente não deriva do fluxo e sobrevive a ele.
+        self.assertIs(window._equivalent_network_result, equivalent)
 
     def test_turning_the_limits_off_says_so(self) -> None:
         storage = isolated_settings("off")

@@ -55,6 +55,10 @@ from .opendss_library import (
 )
 from .opendss_line_mode import OpenDssLineParameterMode
 from .opendss_mapping_store import OpenDssLibraryMappings
+from .opendss_solution import (
+    DEFAULT_MAX_POWER_FLOW_ITER,
+    parse_max_power_flow_iterations,
+)
 from .phase_config import PhaseConfiguration
 
 if TYPE_CHECKING:
@@ -1657,11 +1661,19 @@ def build_regulator_export(
 ) -> OpenDssRegulatorExportResult:
     """Gera o conteúdo de ``reguladores.dss`` para os circuitos selecionados.
 
-    Um regulador trifásico vira **três** transformadores monofásicos, um por
-    fase, cada um com o seu ``RegControl``. As unidades monofásicas dividem a
-    grandeza trifásica: ``kV = VNOM/√3`` (a mesma
-    :func:`phase_voltage_kv` do ``C1`` dos trechos e do ``kV`` das cargas) e
-    ``kVA = SNOM/3``.
+    Um regulador vira **uma unidade monofásica por fase do trecho** — três num
+    trecho trifásico, duas num bifásico, uma num monofásico —, cada uma um
+    ``Transformer`` com o seu ``RegControl``. As unidades dividem a grandeza do
+    banco: ``kV = VNOM/√3`` (a mesma :func:`phase_voltage_kv` do ``C1`` dos
+    trechos e do ``kV`` das cargas) e ``kVA = SNOM/nº de fases``, o que devolve
+    o ``SNOM`` inteiro quando o banco é uma unidade só.
+
+    Quem decide o número de fases é o ``FASES2`` do **trecho**, não o cadastro
+    do regulador: o MDB traz ``LIGACAO`` e ``FASES`` zerados em todos os
+    registros, então eles não distinguem nada. Numa rede predominantemente
+    monofásica — o alimentador medido tem 18.647 trechos monofásicos de 23.133 —
+    restringir a exportação ao trifásico deixaria de fora justamente os
+    reguladores das pontas, que é onde a tensão afunda.
 
     **O regulador ocupa o lugar do trecho.** Os transformadores ligam as duas
     barras do trecho, exatamente como a chave de :func:`build_switch_export`
@@ -1670,8 +1682,9 @@ def build_regulator_export(
     curto-circuitando a injeção de tensão. Quem cumpre isso é
     ``replaced_segments``, consumido por :func:`build_line_export`.
 
-    Só reguladores em trecho **trifásico** são exportados; os demais viram
-    ocorrência e mantêm a linha do trecho.
+    Um trecho cujo ``FASES2`` não tenha relação em ``fases2.json``, ou cujo
+    ``NOME`` não resolva as fases declaradas, vira ocorrência e mantém a linha
+    do trecho — sem fase resolvida não há em que barra ligar o regulador.
     """
 
     selected = _selected_indices(catalog, circuit_indices)
@@ -1753,20 +1766,13 @@ def build_regulator_export(
                     "em fases2.json; o regulador não foi exportado",
                 )
                 continue
-            if entry.phase_count != 3:
-                report.add(
-                    segment_id,
-                    f"FASES2 '{entry.fases2}' não é trifásica; só reguladores "
-                    "em trecho trifásico são exportados",
-                )
-                continue
-            letters = _phase_letters(entry.name, 3)
+            letters = _phase_letters(entry.name, entry.phase_count)
             if letters is None:
                 report.add(
                     segment_id,
                     f"FASES2 '{entry.fases2}' com NOME "
                     f"'{(entry.name or '').strip() or '<vazio>'}' não resolve "
-                    "três fases distintas entre D, E e F",
+                    f"{entry.phase_count} fase(s) distinta(s) entre D, E e F",
                 )
                 continue
             missing = next(
@@ -1846,7 +1852,9 @@ def build_regulator_export(
                 continue
 
             phase_kv = _format(phase_voltage_kv(voltage))
-            phase_kva = _format(power / 3.0)
+            # O SNOM descreve o banco; num trecho monofásico o banco é uma
+            # unidade só e ela leva o valor inteiro.
+            phase_kva = _format(power / entry.phase_count)
             vreg = REGULATOR_PT_SECONDARY_V / math.sqrt(3.0)
             band = REGULATOR_BAND_V
             ptratio = voltage * 1_000.0 / REGULATOR_PT_SECONDARY_V
@@ -1900,10 +1908,10 @@ def build_regulator_export(
 
     header = (
         "! Reguladores exportados pelo Visualizador de Circuitos Eletricos",
-        "! Um regulador trifasico = tres transformadores monofasicos + tres "
-        "RegControl",
-        "! kV = VNOM/raiz(3) e kVA = SNOM/3; o trecho regulado nao sai em "
-        f"{LINES_FILENAME}",
+        "! Uma unidade monofasica (Transformer + RegControl) por fase do "
+        "trecho: 3, 2 ou 1",
+        "! kV = VNOM/raiz(3) e kVA = SNOM/(numero de fases); o trecho regulado "
+        f"nao sai em {LINES_FILENAME}",
         "! Circuitos: "
         + ", ".join(
             sanitize_dss_name(catalog.definition(index).circuit_id)
@@ -2741,7 +2749,9 @@ def build_master_export(
     *,
     redirects: Sequence[str] = (),
     load_settings: OpenDssLoadSettings | None = None,
+    max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     include_bar_indices: frozenset[int] | None = None,
+    include_solve: bool = True,
 ) -> OpenDssMasterExportResult:
     """Gera o arquivo principal e o CSV de coordenadas de barra.
 
@@ -2762,11 +2772,31 @@ def build_master_export(
     ``Vsource`` por alimentador adicional — fica para quando a exportação
     múltipla for tratada.
 
+    ``max_power_flow_iterations`` vira o ``Set MaxIter``. Sem ele o OpenDSS usa
+    o próprio padrão, 15, que é baixo demais para alimentador longo e carregado:
+    a solução é abandonada antes de terminar a primeira passada, e nem o laço de
+    controle chega a rodar. Ver ``opendss_solution``.
+
+    ``include_solve`` decide se o arquivo termina resolvendo. Ligado — o padrão,
+    e o que toda exportação em disco quer — o master traz ``Set number`` com um
+    passo por patamar e o ``Solve``, de modo que abri-lo no OpenDSS já produza
+    resultado. Desligado, o arquivo só **monta** o circuito.
+
+    Quem desliga é o fluxo de potência interno, e a razão é que ``Compile``
+    **executa** o arquivo: o ``Solve`` do master resolveria os quatro patamares
+    antes de ``run_power_flow`` resolver os seus. Além do tempo gasto duas
+    vezes, o tap de um regulador sobrevive entre soluções, então o primeiro
+    patamar do laço partiria do estado deixado pelo último patamar do master —
+    e, num patamar que não converge, o OpenDSS aborta o laço de controle e esse
+    tap emprestado é o que sobra. Medido num alimentador de 23.857 barras: os
+    quatro patamares relatavam o mesmo tap, o do master.
+
     ``text`` vazio indica que o master não pôde ser montado; o motivo está nos
     ``issues``.
     """
 
     selected = _selected_indices(catalog, circuit_indices)
+    iterations = parse_max_power_flow_iterations(max_power_flow_iterations)
     report = _ExportReport()
     if len(selected) != 1:
         report.add(
@@ -2829,12 +2859,20 @@ def build_master_export(
             "calcvoltagebases",
             f"Set ControlMode={CONTROL_MODE}",
             f"Set MaxControlIter={MAX_CONTROL_ITER}",
+            f"Set MaxIter={iterations}",
             "Set mode=daily",
             "Set stepsize=1h",
-            # Um passo por patamar: o LoadShape tem npts=4 e interval=1 hora.
-            f"Set number={LOAD_PATTERN_COUNT}",
+            *(
+                (
+                    # Um passo por patamar: o LoadShape tem npts=4 e interval
+                    # de 1 hora.
+                    f"Set number={LOAD_PATTERN_COUNT}",
+                )
+                if include_solve
+                else ()
+            ),
             "Set time=(0, 0)",
-            "Solve",
+            *(("Solve",) if include_solve else ()),
             "",
             f"Buscoords {buscoords_filename}",
             "",
@@ -2888,9 +2926,11 @@ def build_export(
     regulators: RegulatorModel | None = None,
     capacitors: CapacitorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
+    max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     line_parameter_mode: OpenDssLineParameterMode = OpenDssLineParameterMode.ORIGINAL,
     library_catalog: OpenDssLibraryCatalog | None = None,
     library_mappings: OpenDssLibraryMappings | None = None,
+    include_solve: bool = True,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssExportBundle:
@@ -2924,6 +2964,9 @@ def build_export(
     exportado toma o lugar da ``Line`` do seu trecho, e só depois de tentar
     exportá-los se sabe quais trechos não devem sair — um regulador descartado
     mantém a linha dele.
+
+    ``include_solve`` apenas atravessa até :func:`build_master_export`, que
+    documenta por que o fluxo de potência interno o desliga.
     """
 
     if isinstance(line_parameter_mode, OpenDssLineParameterMode):
@@ -3092,6 +3135,8 @@ def build_export(
             if load_results or generator_results or capacitor_result
             else None
         ),
+        max_power_flow_iterations=max_power_flow_iterations,
+        include_solve=include_solve,
     )
     return OpenDssExportBundle(
         lines=line_result,

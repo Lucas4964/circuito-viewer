@@ -136,6 +136,8 @@ class GeneratorUiTests(unittest.TestCase):
         window._set_generator_model(generators)
 
         self.assertTrue(window.show_generators_action.isEnabled())
+        # A camada nasce oculta; o realce de seleção só existe com ela ligada.
+        window.show_generators_action.setChecked(True)
         window._set_selection(FeatureSelection("generator", 1))
         self.assertEqual(window.details_dock.windowTitle(), "Gerador selecionado")
         self.assertIs(

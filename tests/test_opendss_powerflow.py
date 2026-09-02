@@ -53,6 +53,7 @@ from circuit_viewer.opendss_mapping_store import (
     OpenDssLibraryMappings,
 )
 from circuit_viewer.opendss_powerflow import (
+    DEFAULT_DSS_VMINPU,
     PowerFlowIssue,
     RegulatorTap,
     apparent_power,
@@ -63,6 +64,7 @@ from circuit_viewer.opendss_powerflow import (
     voltage_unbalance,
 )
 from circuit_viewer.opendss_settings import OpenDssLoadSettings
+from circuit_viewer.opendss_solution import DEFAULT_MAX_POWER_FLOW_ITER
 from circuit_viewer.phase_config import PhaseConfiguration, PhaseMappingEntry
 
 
@@ -271,11 +273,17 @@ class FakeLines:
 
     def first(self) -> int:
         self._position = 0
-        return 1 if self._owner.line_names else 0
+        if not self._owner.line_names:
+            return 0
+        self._owner.active_element = ("line", self.name)
+        return 1
 
     def next(self) -> int:
         self._position += 1
-        return 1 if self._position < len(self._owner.line_names) else 0
+        if self._position >= len(self._owner.line_names):
+            return 0
+        self._owner.active_element = ("line", self.name)
+        return 1
 
     @property
     def name(self) -> str:
@@ -283,6 +291,19 @@ class FakeLines:
 
 
 class FakeCktElement:
+    """Grandezas do **elemento ativo**, seja ele Line ou Transformer.
+
+    Na DLL, ``Lines.First/Next`` e ``Transformers.First/Next`` trocam o elemento
+    ativo, e ``CktElement`` sempre responde por ele — medido. O falso reproduz
+    isso porque o colhedor de reguladores depende exatamente dessa propriedade:
+    ele lê tap e corrente da mesma visita ao ``Transformer``.
+
+    Uma unidade de regulador é monofásica com dois enrolamentos, então o
+    terminal traz **dois** condutores — a fase e o neutro —, e o ``node_order``
+    sai como ``[n, 0, n, 0]`` (medido contra a DLL). O nó de terra é o que o
+    filtro do colhedor precisa descartar.
+    """
+
     def __init__(self, owner: FakeEngine) -> None:
         self._owner = owner
 
@@ -291,16 +312,48 @@ class FakeCktElement:
         return self._owner.lines.name
 
     @property
+    def _transformer(self) -> str | None:
+        active = self._owner.active_element
+        return active[1] if active is not None and active[0] == "transformer" else None
+
+    def _transformer_nodes(self, name: str) -> tuple[int, ...]:
+        return (self._owner.transformer_node(name), 0)
+
+    @property
     def num_conductors(self) -> int:
+        name = self._transformer
+        if name is not None:
+            return len(self._transformer_nodes(name))
         return len(self._owner.line_nodes[self._line])
 
     @property
     def node_order(self) -> list[int]:
         # Dois terminais: o OpenDSS lista os dois em sequência.
+        name = self._transformer
+        if name is not None:
+            return list(self._transformer_nodes(name)) * 2
         return list(self._owner.line_nodes[self._line]) * 2
 
     @property
     def currents_mag_ang(self) -> list[float]:
+        name = self._transformer
+        if name is not None:
+            magnitude = self._owner.transformer_currents[
+                name
+            ] + 100.0 * (self._owner.step - 1)
+            angle = self._owner.transformer_current_angles[name]
+            # Fase e neutro, nos dois terminais: o retorno pelo neutro leva o
+            # mesmo módulo e a fase oposta.
+            return [
+                magnitude,
+                angle,
+                magnitude,
+                angle - 180.0,
+                magnitude,
+                angle - 180.0,
+                magnitude,
+                angle,
+            ]
         nodes = self._owner.line_nodes[self._line]
         base = self._owner.line_currents[self._line]
         values: list[float] = []
@@ -326,6 +379,21 @@ class FakeCktElement:
         pelo outro. Assim um teste prova que só o terminal 1 é guardado.
         """
 
+        name = self._transformer
+        if name is not None:
+            active, reactive = self._owner.transformer_powers[name]
+            shift = 10.0 * (self._owner.step - 1)
+            # O condutor de neutro não carrega potência, como na DLL.
+            return [
+                active + shift,
+                reactive,
+                0.0,
+                0.0,
+                -(active + shift),
+                -reactive,
+                0.0,
+                0.0,
+            ]
         nodes = self._owner.line_nodes[self._line]
         base = self._owner.line_powers[self._line]
         values: list[float] = []
@@ -338,6 +406,9 @@ class FakeCktElement:
 
     @property
     def losses(self) -> list[float]:
+        name = self._transformer
+        if name is not None:
+            return list(self._owner.transformer_losses[name])
         return list(self._owner.line_losses[self._line])
 
 
@@ -357,11 +428,17 @@ class FakeTransformers:
 
     def first(self) -> int:
         self._position = 0
-        return 1 if self._owner.transformer_taps else 0
+        if not self._owner.transformer_taps:
+            return 0
+        self._owner.active_element = ("transformer", self.name)
+        return 1
 
     def next(self) -> int:
         self._position += 1
-        return 1 if self._position < len(self._owner.transformer_taps) else 0
+        if self._position >= len(self._owner.transformer_taps):
+            return 0
+        self._owner.active_element = ("transformer", self.name)
+        return 1
 
     @property
     def name(self) -> str:
@@ -448,6 +525,11 @@ class FakeEngine:
         transformer_tap_step: float = 0.0,
         transformer_tap_limits: tuple[float, float] = (0.9, 1.1),
         transformer_num_taps: int = 32,
+        transformer_nodes: dict[str, int] | None = None,
+        transformer_currents: dict[str, float] | None = None,
+        transformer_current_angles: dict[str, float] | None = None,
+        transformer_powers: dict[str, tuple[float, float]] | None = None,
+        transformer_losses: dict[str, tuple[float, float]] | None = None,
         node_names: tuple[str, ...] = (
             "barra_a.1",
             "barra_a.2",
@@ -490,11 +572,47 @@ class FakeEngine:
         self.transformer_tap_step = transformer_tap_step
         self.transformer_tap_limits = transformer_tap_limits
         self.transformer_num_taps = transformer_num_taps
+        # Qual elemento a DLL considera ativo. É o que faz cktelement responder
+        # ora pela Line, ora pelo Transformer, como no motor de verdade.
+        self.active_element: tuple[str, str] | None = None
+        self.transformer_nodes = transformer_nodes or {}
+        # Grandezas por unidade, derivadas do nó para que cada fase se
+        # distinga: sem isso um teste não provaria que as três unidades de um
+        # regulador trifásico viraram três colunas distintas do trecho.
+        names = tuple(self.transformer_taps)
+        self.transformer_currents = transformer_currents or {
+            name: 10.0 * self.transformer_node(name) for name in names
+        }
+        self.transformer_current_angles = transformer_current_angles or {
+            name: -120.0 * (self.transformer_node(name) - 1) for name in names
+        }
+        self.transformer_powers = transformer_powers or {
+            name: (100.0 * self.transformer_node(name), 30.0 * self.transformer_node(name))
+            for name in names
+        }
+        # Em watts, como o OpenDSS devolve — a mesma convenção de line_losses.
+        self.transformer_losses = transformer_losses or {
+            name: (1_000.0 * self.transformer_node(name), 2_000.0 * self.transformer_node(name))
+            for name in names
+        }
         self.circuit = FakeCircuit(self)
         self.lines = FakeLines(self)
         self.transformers = FakeTransformers(self)
         self.cktelement = FakeCktElement(self)
         self.solution = FakeSolution(self)
+
+    def transformer_node(self, name: str) -> int:
+        """Nó DSS da unidade, deduzido do sufixo de fase do nome exportado.
+
+        O exportador nomeia cada unidade ``REG-<código>-<letra>``, então a
+        última letra é a fase. É a mesma correspondência que ``fases2.json``
+        estabelece; fixá-la aqui mantém o falso legível sem uma configuração de
+        fases só para ele.
+        """
+
+        if name in self.transformer_nodes:
+            return self.transformer_nodes[name]
+        return {"D": 1, "E": 2, "F": 3}.get(name.strip()[-1:].upper(), 1)
 
     def text(self, command: str) -> str:
         self.commands.append(command)
@@ -590,6 +708,120 @@ class PowerFlowRunTests(unittest.TestCase):
         self.assertEqual(engine.solves, [1, 2, 3, 4])
         self.assertEqual(result.step_count, 4)
         self.assertEqual(result.solved_circuits, ("C1",))
+
+    def test_the_iteration_ceiling_is_reemitted_after_the_compile(self) -> None:
+        # O engine é singleton: sem reemitir, um MaxIter de outra execução
+        # continuaria valendo. E um teto baixo abandona a solução antes de o
+        # laço de controle rodar, deixando os reguladores onde estavam.
+        engine = FakeEngine()
+
+        self._run(engine, max_power_flow_iterations=120)
+
+        compile_at = next(
+            index
+            for index, command in enumerate(engine.commands)
+            if command.startswith("Compile [")
+        )
+        self.assertIn("Set MaxIter=120", engine.commands[compile_at:])
+        self.assertIn("Set MaxControlIter=100", engine.commands[compile_at:])
+        # E também no master, para quem abrir os arquivos direto no OpenDSS.
+        master = next(self.workspace.rglob("*_Master.dss"))
+        self.assertIn("Set MaxIter=120", master.read_text(encoding="utf-8"))
+
+    def test_the_default_iteration_ceiling_is_emitted(self) -> None:
+        engine = FakeEngine()
+
+        self._run(engine)
+
+        self.assertIn(
+            f"Set MaxIter={DEFAULT_MAX_POWER_FLOW_ITER}",
+            engine.commands,
+        )
+
+    def test_the_result_records_the_ceiling_it_used(self) -> None:
+        # Sem isto não há como saber, olhando a aplicação, qual teto valeu.
+        result = self._run(FakeEngine(), max_power_flow_iterations=120)
+
+        self.assertEqual(result.max_power_flow_iterations, 120)
+
+    def test_the_result_records_the_control_iterations_of_each_step(self) -> None:
+        result = self._run(FakeEngine())
+
+        self.assertEqual(
+            [circuit_id for circuit_id, _, _ in result.control_iterations],
+            ["C1"] * 4,
+        )
+        self.assertEqual(
+            [step for _, step, _ in result.control_iterations],
+            [0, 1, 2, 3],
+        )
+
+    def test_the_result_records_the_voltage_extremes_of_each_step(self) -> None:
+        # É o número que separa "faltou iteração" de "não existe solução". Sem
+        # ele o relatório só sabe dizer que o patamar reprovou, e os dois casos
+        # pedem providências opostas.
+        engine = FakeEngine(
+            node_voltages=(7_967.0, 7_000.0, 5_000.0, 4_000.0),
+        )
+
+        result = self._run(
+            engine,
+            load_settings=OpenDssLoadSettings(
+                voltage_limits_enabled=True,
+                vminpu=0.7,
+            ),
+        )
+
+        self.assertEqual(len(result.step_voltages), 4)
+        first = result.step_voltages[0]
+        self.assertEqual((first.circuit_id, first.step), ("C1", 0))
+        self.assertAlmostEqual(first.maximum_pu, 1.0)
+        self.assertAlmostEqual(first.minimum_pu, 4_000.0 / 7_967.0)
+        self.assertEqual(first.vminpu, 0.7)
+        # 5.000 V (0,628 pu) e 4.000 V (0,502 pu) estão abaixo do corte;
+        # 7.000 V (0,879 pu) não.
+        self.assertEqual(first.nodes_below, 2)
+        self.assertIs(result.voltages_for("C1", 0), first)
+        self.assertIsNone(result.voltages_for("C1", 9))
+
+    def test_the_reported_cut_is_the_one_that_applied(self) -> None:
+        # Com os limites desligados nenhum BatchEdit sai no master, então quem
+        # vale é o padrão do OpenDSS — e é ele que o relatório precisa citar,
+        # não o número guardado na preferência.
+        result = self._run(FakeEngine())
+
+        self.assertEqual(result.step_voltages[0].vminpu, DEFAULT_DSS_VMINPU)
+
+    def test_dead_nodes_do_not_become_the_minimum(self) -> None:
+        # Neutro, terra e barra fora por chave aberta dão zero. Se entrassem,
+        # a tensão mínima de todo circuito seria zero e não diria nada.
+        engine = FakeEngine(
+            node_voltages=(7_960.0, 7_950.0, 7_940.0, 0.0),
+        )
+
+        result = self._run(engine)
+
+        self.assertAlmostEqual(
+            result.step_voltages[0].minimum_pu,
+            7_940.0 / 7_967.0,
+        )
+
+    def test_the_internal_master_does_not_solve(self) -> None:
+        # Compile executa o arquivo: um Solve no master resolveria os quatro
+        # patamares antes do laço abaixo, custando o dobro do tempo e deixando
+        # o tap do último patamar como ponto de partida do primeiro.
+        engine = FakeEngine()
+
+        self._run(engine)
+
+        master = next(self.workspace.rglob("*_Master.dss")).read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("Solve", master)
+        self.assertNotIn("Set number=", master)
+        # O resto do arquivo continua montando o circuito por inteiro.
+        self.assertIn("calcvoltagebases", master)
+        self.assertIn("Set mode=daily", master)
 
     def test_currents_land_on_the_right_segment(self) -> None:
         engine = FakeEngine()
@@ -1112,9 +1344,11 @@ class LoadSettingsTests(unittest.TestCase):
             max(i for i, line in enumerate(lines) if line.startswith("Redirect")),
             min(i for i, line in enumerate(lines) if line.startswith("BatchEdit")),
         )
+        # O master do fluxo interno não resolve — quem resolve é o laço de
+        # patamares —, então a âncora é o início da seção de solução.
         self.assertLess(
             max(i for i, line in enumerate(lines) if line.startswith("BatchEdit")),
-            lines.index("Solve"),
+            lines.index("Set ControlMode=Static"),
         )
 
 
@@ -1441,6 +1675,102 @@ class RegulatorTapHarvestTests(unittest.TestCase):
 
         first_tap = result.regulator_taps[0][0][0]
         self.assertEqual(first_tap.num_taps, 16)
+
+    def test_a_tap_at_the_end_of_travel_is_reported(self) -> None:
+        # O painel do trecho já denunciava a saturação um trecho por vez; o
+        # relatório precisa dela reunida, porque um regulador que esgotou o
+        # curso é a explicação mais direta para uma tensão que não sobe.
+        engine = FakeEngine(
+            transformer_taps={
+                "REG-RG01-D": 1.1,
+                "REG-RG01-E": 1.0,
+                "REG-RG01-F": 1.0,
+            }
+        )
+
+        result = self._run(engine)
+
+        self.assertEqual(
+            result.saturated_regulators,
+            ((0, 0, ("D",)), (0, 1, ("D",)), (0, 2, ("D",)), (0, 3, ("D",))),
+        )
+
+    def test_taps_inside_the_range_report_nothing(self) -> None:
+        engine = FakeEngine(
+            transformer_taps={
+                "REG-RG01-D": 1.0,
+                "REG-RG01-E": 1.0,
+                "REG-RG01-F": 1.0,
+            }
+        )
+
+        self.assertEqual(self._run(engine).saturated_regulators, ())
+
+    def test_the_regulated_segment_gets_current_from_the_transformer(self) -> None:
+        # O trecho regulado não sai como Line — se saísse, a linha ficaria em
+        # paralelo com o regulador. Sem colher do Transformer ele ficaria sem
+        # corrente nem potência no painel, que era o estado até aqui.
+        engine = FakeEngine(
+            transformer_taps={
+                "REG-RG01-D": 1.0,
+                "REG-RG01-E": 1.0,
+                "REG-RG01-F": 1.0,
+            }
+        )
+
+        result = self._run(engine)
+
+        currents = result.segment_currents[0]
+        # As três unidades monofásicas viram as três colunas do trecho,
+        # ordenadas por nó como uma Line trifásica sairia.
+        self.assertEqual(currents.nodes, (1, 2, 3))
+        self.assertEqual(len(currents.magnitudes), 4)
+        # Padrão do motor falso: 10 A por nó, deslocados 100 A por patamar.
+        self.assertEqual(currents.magnitudes[0], (10.0, 20.0, 30.0))
+        self.assertEqual(currents.magnitudes[1], (110.0, 120.0, 130.0))
+
+    def test_the_regulated_segment_gets_power_from_the_transformer(self) -> None:
+        engine = FakeEngine(
+            transformer_taps={
+                "REG-RG01-D": 1.0,
+                "REG-RG01-E": 1.0,
+                "REG-RG01-F": 1.0,
+            }
+        )
+
+        result = self._run(engine)
+
+        powers = result.segment_powers[0]
+        self.assertEqual(powers.nodes, (1, 2, 3))
+        # Sinal preservado: positivo entra pelo terminal 1, como nas linhas.
+        self.assertEqual(powers.active[0], (100.0, 200.0, 300.0))
+        self.assertEqual(powers.reactive[0], (30.0, 60.0, 90.0))
+        # As perdas somam as três unidades e vêm em kW, não em watts.
+        self.assertAlmostEqual(powers.active_losses[0], 6.0)
+        self.assertAlmostEqual(powers.reactive_losses[0], 12.0)
+
+    def test_a_single_phase_regulator_gives_a_one_node_segment(self) -> None:
+        # Uma unidade só: o trecho sai com uma coluna, não com três de traço.
+        engine = FakeEngine(transformer_taps={"REG-RG01-D": 1.0})
+
+        result = self._run(engine)
+
+        self.assertEqual(result.segment_currents[0].nodes, (1,))
+        self.assertEqual(result.segment_currents[0].magnitudes[0], (10.0,))
+        self.assertEqual(
+            [tap.phase for tap in result.regulator_taps[0][0]],
+            ["D"],
+        )
+        self.assertAlmostEqual(result.segment_powers[0].active_losses[0], 1.0)
+
+    def test_the_regulated_segment_keeps_its_ampacity(self) -> None:
+        # O trecho continua tendo CABOF_ID mesmo virando regulador, então o
+        # carregamento percentual do painel continua calculável.
+        engine = FakeEngine(transformer_taps={"REG-RG01-D": 1.0})
+
+        result = self._run(engine)
+
+        self.assertEqual(result.segment_currents[0].ampacity, 340.0)
 
     def test_a_segment_without_a_regulator_has_no_taps(self) -> None:
         engine = FakeEngine(

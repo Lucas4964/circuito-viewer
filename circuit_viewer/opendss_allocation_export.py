@@ -36,6 +36,10 @@ from .opendss_library import OpenDssLibraryCatalog
 from .opendss_line_mode import OpenDssLineParameterMode
 from .opendss_mapping_store import OpenDssLibraryMappings
 from .opendss_settings import OpenDssLoadSettings
+from .opendss_solution import (
+    DEFAULT_MAX_POWER_FLOW_ITER,
+    parse_max_power_flow_iterations,
+)
 from .opendss_allocation_settings import OpenDssAllocationSettings
 from .phase_config import PhaseConfiguration
 
@@ -469,6 +473,7 @@ def _master_text(
     currents: tuple[float, float, float],
     settings: OpenDssAllocationSettings,
     load_settings: OpenDssLoadSettings | None,
+    max_power_flow_iterations: int,
     redirects: Iterable[str],
     buscoords_filename: str,
 ) -> str:
@@ -519,6 +524,9 @@ def _master_text(
             "calcvoltagebases",
             f"Set ControlMode={CONTROL_MODE}",
             f"Set MaxControlIter={MAX_CONTROL_ITER}",
+            # O AllocateLoads resolve o circuito a cada iteração de alocação; um
+            # teto baixo aqui abandona cada uma delas antes de convergir.
+            f"Set MaxIter={parse_max_power_flow_iterations(max_power_flow_iterations)}",
             "Set mode=snapshot",
             "Set number=1",
             "Solve",
@@ -546,6 +554,7 @@ def build_allocation_export(
     *,
     regulators: RegulatorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
+    max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     line_parameter_mode: OpenDssLineParameterMode = OpenDssLineParameterMode.ORIGINAL,
     library_catalog: OpenDssLibraryCatalog | None = None,
     library_mappings: OpenDssLibraryMappings | None = None,
@@ -626,6 +635,7 @@ def build_allocation_export(
         phase_configuration,
         (circuit_index,),
         regulators=regulators,
+        max_power_flow_iterations=max_power_flow_iterations,
         line_parameter_mode=line_parameter_mode,
         library_catalog=library_catalog,
         library_mappings=library_mappings,
@@ -676,6 +686,7 @@ def build_allocation_export(
             measurement_group[npat].currents,
             settings,
             load_settings,
+            max_power_flow_iterations,
             redirects,
             buscoords_filename,
         )

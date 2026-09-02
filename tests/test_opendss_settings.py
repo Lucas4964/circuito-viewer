@@ -9,6 +9,11 @@ from circuit_viewer.opendss_settings import (
     OpenDssLoadSettings,
     settings_from_mapping,
 )
+from circuit_viewer.opendss_solution import (
+    DEFAULT_MAX_POWER_FLOW_ITER,
+    MAX_POWER_FLOW_ITER_RANGE,
+    parse_max_power_flow_iterations,
+)
 
 
 class BatchEditCommandTests(unittest.TestCase):
@@ -160,6 +165,45 @@ class MappingTests(unittest.TestCase):
         self.assertTrue(result.voltage_limits_enabled)
         self.assertAlmostEqual(result.vminpu, 0.8)
         self.assertAlmostEqual(result.vmaxpu, 1.2)
+
+
+class MaxPowerFlowIterationsTests(unittest.TestCase):
+    """O teto de iterações é preferência, então o parser nunca pode levantar."""
+
+    def test_accepts_a_value_inside_the_range(self) -> None:
+        low, high = MAX_POWER_FLOW_ITER_RANGE
+
+        self.assertEqual(parse_max_power_flow_iterations(200), 200)
+        self.assertEqual(parse_max_power_flow_iterations(" 750 "), 750)
+        self.assertEqual(parse_max_power_flow_iterations(low), low)
+        self.assertEqual(parse_max_power_flow_iterations(high), high)
+
+    def test_missing_or_unreadable_falls_back_to_the_default(self) -> None:
+        for value in (None, "", "muitas", "1e3", 12.5, object()):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    parse_max_power_flow_iterations(value),
+                    DEFAULT_MAX_POWER_FLOW_ITER,
+                )
+
+    def test_outside_the_range_falls_back_to_the_default(self) -> None:
+        low, high = MAX_POWER_FLOW_ITER_RANGE
+        # Abaixo do piso a configuração só pioraria o padrão do próprio OpenDSS.
+        for value in (0, -1, low - 1, high + 1):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    parse_max_power_flow_iterations(value),
+                    DEFAULT_MAX_POWER_FLOW_ITER,
+                )
+
+    def test_the_default_is_generous_and_inside_its_own_range(self) -> None:
+        low, high = MAX_POWER_FLOW_ITER_RANGE
+
+        self.assertEqual(DEFAULT_MAX_POWER_FLOW_ITER, 500)
+        self.assertLessEqual(low, DEFAULT_MAX_POWER_FLOW_ITER)
+        self.assertLessEqual(DEFAULT_MAX_POWER_FLOW_ITER, high)
+        # O piso é o padrão do próprio OpenDSS.
+        self.assertEqual(low, 15)
 
 
 if __name__ == "__main__":

@@ -64,6 +64,7 @@ from .cables_window import (
     cable_summary,
     cable_tooltip,
 )
+from .branch_power_source import BranchPowerSource
 from .equivalent_network import EquivalentNetworkResult
 from .circuit_import import CircuitLoadResult
 from .circuit_level_import import CircuitLevelCsvResult
@@ -196,8 +197,12 @@ from .opendss_powerflow import (
 from .opendss_settings import OpenDssLoadModel, OpenDssLoadSettings
 from .opendss_settings_dialog import (
     OpenDssSettingsDialog,
+    load_branch_power_source,
+    load_max_power_flow_iterations,
     load_opendss_line_parameter_mode,
     load_opendss_settings,
+    save_branch_power_source,
+    save_max_power_flow_iterations,
     save_opendss_line_parameter_mode,
     save_opendss_settings,
 )
@@ -662,6 +667,22 @@ class GeneratorCsvImportDialog(QDialog):
         return self._consumer_path
 
 
+# Estado inicial das camadas do desenho. Barras, cargas e geradores são uma
+# marca por ponto: num alimentador de 23 mil barras eles viram uma mancha sobre
+# o traçado, então nascem desligados. O destaque da barra inicial é um anel por
+# circuito e responde a "por onde isso é alimentado?", então nasce ligado.
+# Marca no nome da curva que a elege para a atualização automática. Nomear é o
+# único jeito que o cadastro de curvas oferece de dizer "esta é a de sempre" —
+# não há campo de curva preferida —, e escolher pela posição na lista mudaria de
+# critério em silêncio a cada renomeação.
+DEFAULT_CURVE_NAME_MARKER = "default"
+
+SHOW_BARS_BY_DEFAULT = False
+SHOW_LOADS_BY_DEFAULT = False
+SHOW_GENERATORS_BY_DEFAULT = False
+HIGHLIGHT_ROOT_BAR_BY_DEFAULT = True
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -689,6 +710,10 @@ class MainWindow(QMainWindow):
             self._settings
         )
         self._opendss_line_parameter_mode = load_opendss_line_parameter_mode(
+            self._settings
+        )
+        self._branch_power_source = load_branch_power_source(self._settings)
+        self._max_power_flow_iterations = load_max_power_flow_iterations(
             self._settings
         )
 
@@ -773,6 +798,9 @@ class MainWindow(QMainWindow):
         ) = None
         self._progress_dialog: QProgressDialog | None = None
         self._progress_entity = "registros"
+        # Pedido de atualização automática dos geradores, atendido só quando
+        # a thread de importação sai do caminho.
+        self._pending_generator_update = False
         self._close_after_import = False
         self._branch_thread: QThread | None = None
         self._branch_worker: BranchAnalysisWorker | None = None
@@ -791,6 +819,7 @@ class MainWindow(QMainWindow):
         self._close_after_branch_csv_export = False
         self._pending_simplified_activation = False
         self._pending_simplified_export = False
+        self._pending_power_flow_for_equivalent = False
         self._restart_equivalent_after_finish = False
         self._equivalent_thread: QThread | None = None
         self._equivalent_worker: EquivalentNetworkWorker | None = None
@@ -981,6 +1010,7 @@ class MainWindow(QMainWindow):
         )
 
         self._create_actions()
+        self._apply_default_visibility()
         self._create_menus_and_toolbar()
         self._create_details_dock()
         self._create_status_bar()
@@ -995,6 +1025,25 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._show_curves_load_warning)
         if self._calculation_levels_load.issue is not None:
             QTimer.singleShot(0, self._show_calculation_levels_load_warning)
+
+    def _apply_default_visibility(self) -> None:
+        """Empurra o estado inicial das ações para a cena.
+
+        Necessário porque ``setChecked(False)`` numa ``QAction`` recém-criada
+        **não emite** ``toggled`` — o valor já era esse. Sem isto o menu diria
+        "oculto" e a cena continuaria desenhando, cada um com a sua verdade.
+
+        Roda depois de ``_create_actions`` porque os setters alcançam widgets
+        criados adiante dela, como ``simplified_network_action``.
+        """
+
+        self._set_bars_visible(self.show_bars_action.isChecked())
+        self._set_loads_visible(self.show_loads_action.isChecked())
+        self._set_generators_visible(self.show_generators_action.isChecked())
+        self._set_root_bar_highlight_enabled(self.root_bar_action.isChecked())
+        # Os setters anunciam cada mudança na barra de status; ao abrir, isso
+        # seria só ruído sobre um estado que o usuário não pediu.
+        self.statusBar().clearMessage()
 
     def _is_current_signal_source(self, expected: object | None) -> bool:
         """Aceita chamadas diretas e sinais apenas da operação ainda vigente."""
@@ -1039,21 +1088,24 @@ class MainWindow(QMainWindow):
         self.search_action.setEnabled(False)
         self.search_action.triggered.connect(self._show_search_palette)
 
+        # Barras, cargas e geradores nascem **ocultos**: num alimentador de
+        # dezenas de milhares de pontos eles cobrem a rede, e o que se quer ver
+        # ao abrir é o traçado. Quem precisa deles liga um de cada vez.
         self.show_bars_action = QAction("Mostrar barras", self)
         self.show_bars_action.setCheckable(True)
-        self.show_bars_action.setChecked(True)
+        self.show_bars_action.setChecked(SHOW_BARS_BY_DEFAULT)
         self.show_bars_action.setEnabled(False)
         self.show_bars_action.toggled.connect(self._set_bars_visible)
 
         self.show_loads_action = QAction("Mostrar cargas", self)
         self.show_loads_action.setCheckable(True)
-        self.show_loads_action.setChecked(True)
+        self.show_loads_action.setChecked(SHOW_LOADS_BY_DEFAULT)
         self.show_loads_action.setEnabled(False)
         self.show_loads_action.toggled.connect(self._set_loads_visible)
 
         self.show_generators_action = QAction("Mostrar geradores", self)
         self.show_generators_action.setCheckable(True)
-        self.show_generators_action.setChecked(True)
+        self.show_generators_action.setChecked(SHOW_GENERATORS_BY_DEFAULT)
         self.show_generators_action.setEnabled(False)
         self.show_generators_action.toggled.connect(self._set_generators_visible)
 
@@ -1067,6 +1119,13 @@ class MainWindow(QMainWindow):
 
         self.root_bar_action = QAction("Visualizar Barra Inicial", self)
         self.root_bar_action.setCheckable(True)
+        # Ligada por padrão, ao contrário das três acima: é um anel por
+        # circuito, não uma marca por ponto, e diz de onde a rede é alimentada.
+        # blockSignals porque marcá-la aqui dispararia o toggled antes de o
+        # resto da interface existir.
+        self.root_bar_action.blockSignals(True)
+        self.root_bar_action.setChecked(HIGHLIGHT_ROOT_BAR_BY_DEFAULT)
+        self.root_bar_action.blockSignals(False)
         self.root_bar_action.setEnabled(False)
         self.root_bar_action.setToolTip(
             "Destacar a barra inicial de cada circuito visível, na cor do "
@@ -2531,6 +2590,9 @@ class MainWindow(QMainWindow):
         if result.circuits is not None:
             self._show_circuits_window()
         self._show_mdb_import_report(result)
+        # O disparo real espera o teardown da thread de importação: enquanto
+        # ela existe, _busy() recusa qualquer operação pesada.
+        self._pending_generator_update = True
 
     def _show_mdb_import_report(self, result: MdbImportResult) -> None:
         imported = len(result.imported_entities)
@@ -4223,6 +4285,58 @@ class MainWindow(QMainWindow):
             return
         self._start_generator_update(curve, schedules, modes)
 
+    def _default_curve(self) -> Curve | None:
+        """A curva que a atualização automática usa, ou ``None`` se não houver.
+
+        Escolhe a que traz :data:`DEFAULT_CURVE_NAME_MARKER` no nome; sem
+        nenhuma assim, a primeira salva — que é também o que o diálogo já
+        mostra pré-selecionado, então o automático não diverge do manual.
+        """
+
+        if not self._saved_curves:
+            return None
+        return next(
+            (
+                curve
+                for curve in self._saved_curves
+                if DEFAULT_CURVE_NAME_MARKER in curve.name.casefold()
+            ),
+            self._saved_curves[0],
+        )
+
+    def _auto_update_generators(self) -> None:
+        """Atualiza a potência dos geradores sem passar pelo diálogo.
+
+        Roda ao abrir a rede, com as mesmas escolhas que o diálogo oferece
+        pré-selecionadas: a curva padrão e os patamares ``DEFAULT`` para todo
+        circuito. Um circuito com patamares próprios continua exigindo o
+        diálogo — marcá-los sozinho seria decidir pelo usuário.
+
+        Silenciosa por construção: ``_show_generator_update_report`` já resume
+        na barra de status quando não há ocorrência e só abre o relatório
+        quando há. Faltando qualquer pré-requisito — sem gerador, sem curva
+        salva, sem circuito — simplesmente não roda, e o botão continua ali.
+        """
+
+        generators = self._generator_model
+        circuits = self._circuit_catalog
+        configuration = self._phase_configuration
+        curve = self._default_curve()
+        if (
+            self._busy()
+            or generators is None
+            or circuits is None
+            or configuration is None
+            or curve is None
+        ):
+            return
+        modes = (GeneratorScheduleMode.DEFAULT,) * len(circuits)
+        schedules = (self.calculation_level_schedule,) * len(circuits)
+        self.statusBar().showMessage(
+            f'Atualizando geradores com a curva "{curve.name}"…', 4_000
+        )
+        self._start_generator_update(curve, schedules, modes)
+
     def _start_generator_update(
         self,
         curve: Curve,
@@ -4403,7 +4517,13 @@ class MainWindow(QMainWindow):
         if self._power_flow_worker is not None:
             self._power_flow_worker.cancel()
         self._power_flow_snapshot = None
+        had_result = self._power_flow_result is not None
         self._power_flow_result = None
+        # No modo medido a rede equivalente é filha deste resultado: mantê-la na
+        # tela depois de descartá-lo mostraria potências de um modelo que já não
+        # existe.
+        if had_result and self._branch_power_source is BranchPowerSource.POWER_FLOW:
+            self._invalidate_equivalent_network()
         self._segment_power_flow_currents = None
         self._segment_power_flow_powers = None
         self._bar_power_flow_voltages = None
@@ -4446,6 +4566,18 @@ class MainWindow(QMainWindow):
         ):
             return None
         return model
+
+    def _equivalent_power_flow(self) -> PowerFlowResult | None:
+        """Fluxo que alimenta as potências dos ramais, ou ``None``.
+
+        Definição única, usada tanto para construir a rede equivalente quanto
+        para detectá-la obsoleta: no modo por tabela nenhum fluxo participa, e
+        o equivalente não pode ser invalidado por um resultado descartado.
+        """
+
+        if self._branch_power_source is not BranchPowerSource.POWER_FLOW:
+            return None
+        return self._power_flow_result
 
     def _expected_export_filenames(
         self,
@@ -4652,6 +4784,7 @@ class MainWindow(QMainWindow):
             settings,
             regulators=self._regulator_model,
             load_settings=self._opendss_load_settings,
+            max_power_flow_iterations=self._max_power_flow_iterations,
             line_parameter_mode=self._opendss_line_parameter_mode,
             library_catalog=(
                 self.opendss_library_session.saved_catalog() if use_library else None
@@ -4838,6 +4971,8 @@ class MainWindow(QMainWindow):
             or equivalent.model.source_loads is not self._load_model
             or equivalent.model.source_patterns is not self._load_pattern_model
             or equivalent.model.source_generator_updates is not generator_updates
+            or equivalent.model.power_source is not self._branch_power_source
+            or equivalent.model.source_power_flow is not self._equivalent_power_flow()
         ):
             QMessageBox.information(
                 self,
@@ -4910,6 +5045,7 @@ class MainWindow(QMainWindow):
             regulators=self._regulator_model,
             capacitors=self._capacitor_model,
             load_settings=self._opendss_load_settings,
+            max_power_flow_iterations=self._max_power_flow_iterations,
         )
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -5059,6 +5195,7 @@ class MainWindow(QMainWindow):
             regulators=self._regulator_model,
             capacitors=self._capacitor_model,
             load_settings=self._opendss_load_settings,
+            max_power_flow_iterations=self._max_power_flow_iterations,
             line_parameter_mode=self._opendss_line_parameter_mode,
             library_catalog=library_catalog,
             library_mappings=library_mappings,
@@ -5376,6 +5513,7 @@ class MainWindow(QMainWindow):
             regulators=self._regulator_model,
             capacitors=self._capacitor_model,
             load_settings=self._opendss_load_settings,
+            max_power_flow_iterations=self._max_power_flow_iterations,
             line_parameter_mode=self._opendss_line_parameter_mode,
             library_catalog=library_catalog,
             library_mappings=library_mappings,
@@ -5508,9 +5646,89 @@ class MainWindow(QMainWindow):
         self.import_action.setEnabled(True)
         self._sync_power_flow_availability()
         self._sync_branches_availability()
+        # A flag cai em todos os desfechos: falha e cancelamento não podem
+        # deixar a rede equivalente esperando para sempre.
+        was_pending = self._pending_power_flow_for_equivalent
+        self._pending_power_flow_for_equivalent = False
+        if self._close_after_power_flow:
+            pass
+        elif was_pending and self._power_flow_result is None:
+            # A execução que a construção pediu não produziu resultado.
+            self._abandon_equivalent_build()
+        else:
+            # Retoma tanto a construção que pediu este fluxo quanto qualquer
+            # outra represada pela exclusão mútua. Sem pendência alguma,
+            # _start_equivalent_build é inócuo.
+            QTimer.singleShot(0, self._start_equivalent_build)
         if self._close_after_power_flow:
             self._close_after_power_flow = False
             self.close()
+
+    def _divergence_notes(self, result: PowerFlowResult) -> tuple[str, ...]:
+        """Linhas que explicam uma divergência, com os números medidos.
+
+        A distinção que estas linhas existem para fazer: **estourar o teto de
+        iterações e divergir produzem o mesmo aviso**, e só um dos dois se
+        resolve com mais iteração. Um patamar cuja carga passou do limite de
+        carregamento do alimentador não tem solução em potência constante, e
+        subir o teto apenas faz o cálculo demorar mais para falhar igual.
+
+        Por isso a tensão mínima e a contagem de nós abaixo do ``vminpu``
+        aparecem por patamar: são elas que mostram de qual dos dois casos se
+        trata, e o resultado já as traz medidas em ``step_voltages``.
+        """
+
+        notes = [
+            "Aumentar o máximo de iterações não resolve divergência: quando "
+            "não há solução, não existe iteração que a encontre.",
+        ]
+        for circuit_id, step in result.unconverged[:10]:
+            measured = result.voltages_for(circuit_id, step)
+            if measured is None:
+                continue
+            notes.append(
+                f"    {circuit_id} (NPAT {step}): tensão mínima "
+                f"{round(measured.minimum_pu, 3):n} pu, "
+                f"{measured.nodes_below:n} nó(s) abaixo do vminpu de "
+                f"{round(measured.vminpu, 3):n}."
+            )
+        notes.append(
+            "As grandezas destes patamares não descrevem um ponto de "
+            "operação. O OpenDSS abandona o laço de controle quando a solução "
+            "falha, então o tap mostrado neles é o que sobrou do patamar "
+            "anterior."
+        )
+        notes.append(
+            "Caminhos: elevar o vminpu das cargas (abaixo dele o OpenDSS "
+            "converte a carga para impedância constante, o que devolve "
+            "solução ao caso), adotar o modelo ZIPV, ou revisar a carga do "
+            "patamar."
+        )
+        return tuple(notes)
+
+    def _saturated_regulator_note(self, result: PowerFlowResult) -> str | None:
+        """Reguladores no fim do curso, por patamar, ou ``None`` se nenhum.
+
+        Vem do tap resolvido, não de inferência. É a informação de engenharia
+        mais direta diante de uma tensão que não sobe: aquele regulador **parou
+        de regular** e não tem mais o que fazer.
+        """
+
+        saturated = result.saturated_regulators
+        if not saturated:
+            return None
+        segment_ids = result.catalog.segments.segment_ids
+        parts = [
+            f"{segment_ids[segment_index]} (NPAT {step}, fase(s) "
+            f"{', '.join(phases)})"
+            for segment_index, step, phases in saturated[:10]
+        ]
+        remainder = len(saturated) - len(parts)
+        return (
+            "Reguladores no fim do curso — não conseguem corrigir mais: "
+            + ", ".join(parts)
+            + (f" e mais {remainder:n}." if remainder > 0 else ".")
+        )
 
     def _show_power_flow_report(self, result: PowerFlowResult) -> None:
         summary = (
@@ -5537,6 +5755,10 @@ class MainWindow(QMainWindow):
         message.setText(f"{summary}.")
         lines = [
             f"Patamares por circuito: {result.step_count:n}",
+            # Sempre visível: é o único jeito de saber, olhando a aplicação,
+            # qual teto valeu nesta execução.
+            "Máximo de iterações do fluxo: "
+            f"{result.max_power_flow_iterations:n}",
             *(
                 ()
                 if result.generator_updates is None
@@ -5564,6 +5786,10 @@ class MainWindow(QMainWindow):
                     for circuit_id, step in result.unconverged[:10]
                 )
             )
+            lines.extend(self._divergence_notes(result))
+        saturated = self._saturated_regulator_note(result)
+        if saturated is not None:
+            lines.append(saturated)
         message.setInformativeText("\n".join(lines))
         details = [
             f"{issue.element_id}: {issue.reason}" for issue in result.issues
@@ -5885,6 +6111,15 @@ class MainWindow(QMainWindow):
             return
         self._start_equivalent_build()
 
+    def _abandon_equivalent_build(self) -> None:
+        """Desfaz as pendências quando a construção não pode nem começar."""
+
+        self._pending_branch_metrics = False
+        self.branches_window.set_equivalent_pending(False)
+        self._pending_simplified_export = False
+        self._pending_power_flow_for_equivalent = False
+        self._cancel_simplified_request()
+
     def _start_equivalent_build(self) -> None:
         if (
             not (
@@ -5896,13 +6131,11 @@ class MainWindow(QMainWindow):
             or self._equivalent_thread is not None
             or self._import_thread is not None
             or self._branch_thread is not None
+            or self._power_flow_thread is not None
         ):
             return
         if not self._branch_analysis_result.records:
-            self._pending_branch_metrics = False
-            self.branches_window.set_equivalent_pending(False)
-            self._pending_simplified_export = False
-            self._cancel_simplified_request()
+            self._abandon_equivalent_build()
             self.statusBar().showMessage(
                 "Nenhum ramal foi identificado para simplificar.",
                 5_000,
@@ -5913,10 +6146,7 @@ class MainWindow(QMainWindow):
         patterns = self._load_pattern_model
         generator_updates = self._exportable_generators()
         if self._generator_model is not None and generator_updates is None:
-            self._pending_branch_metrics = False
-            self.branches_window.set_equivalent_pending(False)
-            self._pending_simplified_export = False
-            self._cancel_simplified_request()
+            self._abandon_equivalent_build()
             QMessageBox.information(
                 self,
                 "Atualize os geradores",
@@ -5924,12 +6154,50 @@ class MainWindow(QMainWindow):
                 "geradores. Execute primeiro Ferramentas → Atualizar Geradores…",
             )
             return
+        power_source = self._branch_power_source
+        power_flow = self._equivalent_power_flow()
+        if power_source is BranchPowerSource.POWER_FLOW:
+            engine_error = power_flow_import_error()
+            if engine_error is not None:
+                self._abandon_equivalent_build()
+                QMessageBox.information(
+                    self,
+                    "Fluxo de potência indisponível",
+                    "As potências dos ramais estão configuradas para vir do "
+                    "fluxo de potência, que precisa do motor do OpenDSS.\n\n"
+                    f"{engine_error}\n\n"
+                    "Escolha a agregação por tabelas em Configurações → "
+                    "OpenDSS… → Ramais para seguir sem ele.",
+                )
+                return
+            if power_flow is None:
+                answer = QMessageBox.question(
+                    self,
+                    "Executar o fluxo de potência",
+                    "As potências dos ramais são medidas no primeiro elemento "
+                    "de cada ramal e exigem um resultado de fluxo de potência "
+                    "vigente. Deseja executá-lo agora?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self._abandon_equivalent_build()
+                    return
+                self._pending_power_flow_for_equivalent = True
+                self._run_power_flow()
+                if self._power_flow_thread is None:
+                    # A execução desistiu — sem circuito visível, por exemplo —
+                    # e já explicou o motivo; nada pode ficar pendente.
+                    self._abandon_equivalent_build()
+                return
         thread = QThread(self)
         worker = EquivalentNetworkWorker(
             branches,
             loads,
             patterns,
             generator_updates,
+            power_source=power_source,
+            power_flow=power_flow,
         )
         worker.moveToThread(thread)
         progress = QProgressDialog(
@@ -5954,6 +6222,8 @@ class MainWindow(QMainWindow):
             loads,
             patterns,
             generator_updates,
+            power_source,
+            power_flow,
         )
         self.branches_window.set_equivalent_pending(True)
         self.import_action.setEnabled(False)
@@ -5996,6 +6266,8 @@ class MainWindow(QMainWindow):
             self._load_model,
             self._load_pattern_model,
             self._exportable_generators(),
+            self._branch_power_source,
+            self._equivalent_power_flow(),
         )
         snapshot = self._equivalent_snapshot
         if snapshot is None or any(
@@ -6873,6 +7145,10 @@ class MainWindow(QMainWindow):
         if self._close_after_import:
             self._close_after_import = False
             self.close()
+            return
+        if self._pending_generator_update:
+            self._pending_generator_update = False
+            self._auto_update_generators()
 
     def _fit_all(self) -> None:
         if self._model is None:
@@ -7012,6 +7288,8 @@ class MainWindow(QMainWindow):
             cable_map_issue=self.opendss_mapping_session.cable_issue,
             arrangement_map_issue=self.opendss_mapping_session.arrangement_issue,
             line_parameter_mode=self._opendss_line_parameter_mode,
+            branch_power_source=self._branch_power_source,
+            max_power_flow_iterations=self._max_power_flow_iterations,
         )
         dialog.cable_map_editor.saveRequested.connect(
             lambda entries: self._save_single_opendss_map(
@@ -7031,15 +7309,25 @@ class MainWindow(QMainWindow):
             return
         chosen = dialog.settings()
         chosen_mode = dialog.line_parameter_mode()
+        chosen_source = dialog.branch_power_source()
+        chosen_iterations = dialog.max_power_flow_iterations()
         chosen_maps = dialog.mappings()
         load_changed = chosen != self._opendss_load_settings
         mode_changed = chosen_mode is not self._opendss_line_parameter_mode
+        source_changed = chosen_source is not self._branch_power_source
+        iterations_changed = chosen_iterations != self._max_power_flow_iterations
         maps_changed = (
             chosen_maps != self.opendss_mapping_session.mappings
             or self.opendss_mapping_session.cable_issue is not None
             or self.opendss_mapping_session.arrangement_issue is not None
         )
-        if not load_changed and not mode_changed and not maps_changed:
+        if (
+            not load_changed
+            and not mode_changed
+            and not source_changed
+            and not iterations_changed
+            and not maps_changed
+        ):
             return
         try:
             if maps_changed:
@@ -7054,8 +7342,18 @@ class MainWindow(QMainWindow):
             self._opendss_line_parameter_mode = chosen_mode
             save_opendss_line_parameter_mode(self._settings, chosen_mode)
             self._sync_export_availability()
-        if load_changed or mode_changed:
+        if iterations_changed:
+            self._max_power_flow_iterations = chosen_iterations
+            save_max_power_flow_iterations(self._settings, chosen_iterations)
+        if load_changed or mode_changed or iterations_changed:
             self._invalidate_power_flow()
+        if source_changed:
+            # A troca é do método, não dos dados: o fluxo permanece válido, mas
+            # a rede equivalente foi montada pelo outro caminho e precisa ser
+            # refeita antes de qualquer exportação.
+            self._branch_power_source = chosen_source
+            save_branch_power_source(self._settings, chosen_source)
+            self._invalidate_equivalent_network()
         messages: list[str] = []
         if load_changed:
             messages.append(self._opendss_settings_summary(chosen))
@@ -7066,6 +7364,17 @@ class MainWindow(QMainWindow):
                 else "parâmetros originais"
             )
             messages.append(f"Parâmetros das linhas: {mode_label}.")
+        if source_changed:
+            source_label = (
+                "fluxo de potência no primeiro elemento"
+                if chosen_source is BranchPowerSource.POWER_FLOW
+                else "agregação das tabelas das cargas"
+            )
+            messages.append(f"Potências dos ramais: {source_label}.")
+        if iterations_changed:
+            messages.append(
+                f"Máximo de iterações do fluxo: {chosen_iterations:n}."
+            )
         if maps_changed:
             messages.append(
                 "Mapas OpenDSS: "

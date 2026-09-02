@@ -155,7 +155,7 @@ class MainWindowSelectionTests(unittest.TestCase):
         self.assertEqual(window.import_action.text(), "Importar CSV…")
         self.assertEqual(len(import_actions), 0)
         self.assertIn(window.import_action, window.file_menu.actions())
-        self.assertTrue(window.show_bars_action.isChecked())
+        self.assertFalse(window.show_bars_action.isChecked())
         self.assertFalse(window.show_bars_action.isEnabled())
         self.assertNotIn(window.show_bars_action, toolbar.actions())
 
@@ -198,11 +198,37 @@ class MainWindowSelectionTests(unittest.TestCase):
         self.assertEqual(with_segments.result(), QDialog.DialogCode.Accepted)
         self.assertEqual(with_segments.selected_kind, "switches")
 
+    def test_the_drawing_layers_open_with_the_intended_defaults(self) -> None:
+        # Barras, cargas e geradores são uma marca por ponto e cobririam o
+        # traçado num alimentador grande; a barra inicial é um anel por
+        # circuito e responde a "por onde isso é alimentado?".
+        window, _, _ = self._make_window()
+        self.addCleanup(window.close)
+
+        self.assertFalse(window.show_bars_action.isChecked())
+        self.assertFalse(window.show_loads_action.isChecked())
+        self.assertFalse(window.show_generators_action.isChecked())
+        self.assertTrue(window.root_bar_action.isChecked())
+
+    def test_the_scene_agrees_with_the_menu_at_startup(self) -> None:
+        # setChecked(False) numa QAction recém-criada não emite toggled, então
+        # sem a sincronização explícita o menu diria "oculto" e a cena
+        # continuaria desenhando.
+        window, _, _ = self._make_window()
+        self.addCleanup(window.close)
+
+        self.assertFalse(window.view.bars_visible)
+        self.assertFalse(window.virtualizer.bars_visible)
+        self.assertFalse(window.load_virtualizer.loads_visible)
+        self.assertFalse(window.generator_virtualizer.loads_visible)
+
     def test_show_bars_toggle_controls_selection_without_affecting_lines(self) -> None:
         window, _, network = self._make_window()
         self.addCleanup(window.close)
         self.assertTrue(window.show_bars_action.isEnabled())
-        self.assertTrue(window.show_bars_action.isChecked())
+        # Barras nascem ocultas; este teste é sobre o alternar, então liga.
+        self.assertFalse(window.show_bars_action.isChecked())
+        window.show_bars_action.setChecked(True)
 
         window._set_selection(FeatureSelection("bar", 0))
         window.show_bars_action.setChecked(False)
@@ -335,6 +361,8 @@ class MainWindowSelectionTests(unittest.TestCase):
         )
 
         self.assertTrue(window.show_loads_action.isEnabled())
+        # A camada nasce oculta; o realce de seleção só existe com ela ligada.
+        window.show_loads_action.setChecked(True)
         self.assertEqual(window.load_status.text(), "Cargas: 2")
         window._set_selection(FeatureSelection("load", 0))
         self.assertEqual(window.details_dock.windowTitle(), "Carga selecionada")
@@ -377,8 +405,10 @@ class MainWindowSelectionTests(unittest.TestCase):
         self.assertEqual(window.load_virtualizer.overview_item.visible_point_count, 0)
 
         window._set_circuit_catalog(catalog, checked=(True,))
+        window.show_loads_action.setChecked(True)
         window.show_bars_action.setChecked(False)
         self.assertTrue(window.load_virtualizer._visibility_mask[0])
+        # Esconder barras não pode arrastar as cargas junto.
         self.assertTrue(window.load_virtualizer.loads_visible)
 
     def test_load_patterns_table_is_conditional_ordered_and_read_only(self) -> None:

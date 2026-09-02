@@ -97,10 +97,13 @@ CIRCUITO_VIEWER/
 │   │
 │   ├── opendss_export.py      # geração dos .dss de rede e de cargas
 │   ├── opendss_settings.py    # modelo das cargas (potência constante/ZIPV) e Vminpu/Vmaxpu
+│   ├── opendss_solution.py    # teto de iterações do fluxo (Set MaxIter)
 │   ├── opendss_engine.py      # único acesso ao py_dss_interface (opcional)
 │   ├── opendss_powerflow.py   # execução do fluxo e associação dos resultados
 │   ├── branch_analysis.py     # análise topológica de ramais
 │   ├── equivalent_network.py  # projeção simplificada / cargas equivalentes
+│   ├── branch_power_source.py # método de obtenção da potência dos ramais
+│   ├── branch_power_flow.py   # potência do ramal medida no fluxo de potência
 │   ├── branch_json_export.py  # snapshot filtrado dos ramais em JSON atômico
 │   ├── branch_table_export.py # colunas canônicas + CSV pt-BR atômico
 │   ├── search.py              # índice de busca global (sem Qt)
@@ -262,7 +265,8 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | `branch_analysis.py` | `CircuitCatalogModel`, `PhaseConfiguration`, `LoadModel?` | `BranchAnalysisResult` (ramais + diagnósticos) |
 | `opendss_export.py` | `CircuitCatalogModel`, `CableModel`, `PhaseConfiguration`, índices dos circuitos, cargas/patamares opcionais e `GeneratorUpdateModel?` | `OpenDssExportBundle` (rede, três arquivos de carga, três de geradores, master, coordenadas e diagnósticos) |
 | `opendss_powerflow.py` | motor OpenDSS injetado + as mesmas entradas da exportação + pasta de trabalho | `PowerFlowResult` (correntes por trecho e tensões por barra, um retrato por patamar + diagnósticos) |
-| `equivalent_network.py` | `BranchAnalysisResult`, `LoadModel?`, `LoadPatternModel?` | `EquivalentNetworkResult` (cargas equivalentes + máscaras) |
+| `equivalent_network.py` | `BranchAnalysisResult`, `LoadModel?`, `LoadPatternModel?`, `BranchPowerSource` e, no modo medido, os patamares de `branch_power_flow` | `EquivalentNetworkResult` (cargas equivalentes + máscaras) |
+| `branch_power_flow.py` | `BranchAnalysisResult` e um `PowerFlowResult` do mesmo catálogo | patamares por `RAMAL_ID`, medidos no elemento de conexão, e o motivo de cada ramal sem medição |
 | `branch_json_export.py` | ramais, equivalentes e índices filtrados | objeto JSON validado e `BranchJsonExportResult` gravado atomicamente |
 | `branch_table_export.py` | ramais, equivalente opcional e índices na ordem visual | 23 colunas canônicas e `BranchCsvExportResult` pt-BR gravado atomicamente |
 | `generator_update.py` | `GeneratorModel`, `CircuitCatalogModel`, `PhaseConfiguration`, uma `Curve` e agendas efetivas | `GeneratorUpdateResult` (demanda média, quatro demandas totais e quatro potências por fase com sinal elétrico + diagnósticos) |
@@ -1244,8 +1248,18 @@ Para cada ramal gera um `EquivalentLoadRecord`:
 - `origin_kind = "branch_aggregate"`; `bar_index` = conexão com o tronco;
 - `snom`/`sadm` somados com `Decimal` em contexto de precisão 50 — qualquer
   parcela inválida torna **aquele total** `None` e gera diagnóstico, sem abortar;
-- patamares: soma `PD, PE, PF, QD, QE, QF` por `NPAT` para cargas e geradores;
-  as potências do `GeneratorUpdateModel` entram diretamente com sinal negativo;
+- patamares: dependem do `BranchPowerSource` escolhido (ver 12.2.1). Em
+  `TABLE` — o padrão — soma `PD, PE, PF, QD, QE, QF` por `NPAT` para cargas e
+  geradores, com as potências do `GeneratorUpdateModel` entrando diretamente com
+  sinal negativo. **Carga ausente de `MODELO_CARGA` vale zero**: o grupo vem
+  vazio, a parcela não é somada (os totais já começam em zero) e fica um
+  diagnóstico `ZEROED_PATTERNS_FIELD` **informativo**, sem tornar o ramal
+  incompleto — dado que falta não é dado errado. Vazio é a única ausência
+  possível: `LoadPatternModel` recusa na construção qualquer grupo que não tenha
+  exatamente os NPAT 0 a 3, então um grupo parcial nunca chega à agregação.
+  Patamares não importados de todo (`patterns is None`) continuam bloqueando,
+  porque aí é a tabela inteira que falta e zerar todos os ramais de uma vez
+  seria silenciosamente errado;
 - `maximum_active_demand`: maior valor algébrico individual entre `PD`, `PE` e
   `PF`, considerando somente as fases reais do ramal e os quatro NPAT. É
   calculado uma vez durante a agregação, ignora Q, preserva negativos e vale
@@ -1281,6 +1295,60 @@ incompleta. Quando todos os 24 valores P/Q têm módulo `<= 1e-9`, o ramal é
 O modelo expõe `bars`, `bar_indices`, `load_ids`, `spatial_index` e `record()`,
 ou seja, é **duck-type compatível com `LoadModel`** — por isso o mesmo
 `LoadVirtualizer` renderiza as duas camadas sem código condicional.
+
+#### 12.2.1 Potência medida no fluxo (`branch_power_flow.py`)
+
+**Por que existe.** Pela agregação, uma única carga sem os quatro `NPAT` deixa o
+ramal `incomplete` e `build_simplified_export()` bloqueia a exportação inteira.
+Em bases onde nem toda carga tem tabela isso inviabiliza o recurso. O
+`BranchPowerSource` (`branch_power_source.py`, mesmo molde de
+`opendss_line_mode.py`) oferece o caminho alternativo, escolhido em
+**Configurações → OpenDSS… → Ramais** e persistido em chave própria:
+
+| valor | origem dos patamares |
+| --- | --- |
+| `TABLE` (padrão) | agregação das tabelas das cargas e dos geradores |
+| `POWER_FLOW` | medição no elemento de conexão do ramal com o tronco |
+
+`measure_branch_powers(branches, power_flow)` devolve
+`(patamares por RAMAL_ID, motivo da falha por RAMAL_ID)` e é chamada pelo
+`EquivalentNetworkWorker` antes de `build_equivalent_network()`, que recebe os
+dois mapeamentos em `measured_patterns`/`measurement_issues`. O módulo depende de
+`opendss_powerflow`; `equivalent_network` **não** — por isso os patamares chegam
+já na forma de `EquivalentLoadPatternRecord`, e o grafo sem ciclos se mantém.
+
+Três regras dão forma à medição:
+
+- **Qual elemento.** `BranchRecord.bar_indices` guarda só as barras a jusante,
+  então todo trecho do ramal com um extremo fora dessa lista toca o tronco. Com
+  uma conexão só esse conjunto é exatamente `{first_segment_index}` — o primeiro
+  elemento, chave ou trecho; com `trunk_connection_count > 1` a potência entra
+  por vários pontos e as parcelas são **somadas**, porque medir apenas a primeira
+  subestimaria o ramal em silêncio.
+- **Sinal.** `SegmentPowers` traz o terminal 1, que é sempre o `Bus1` da `Line`,
+  isto é, a barra `start` do trecho. Extremo de tronco em `start` ⇒ o valor já
+  entra positivo no ramal; extremo de tronco em `end` ⇒ o valor é negado. Nesse
+  segundo caso a medição fica do lado de dentro e exclui as perdas **daquele
+  elemento** — nulas quando ele é uma chave, porque `Switch=Yes` zera os
+  parâmetros elétricos da `Line`. É o preço de ler sempre o terminal 1, e a troca
+  é deliberada: o valor do ramal passa a ser exatamente o que o painel de fluxo
+  já mostra para aquele trecho.
+- **Geradores não são somados de novo.** A potência que atravessa o elemento de
+  conexão já é líquida de tudo que está a jusante — cargas, geradores,
+  capacitores e perdas do ramal. `source_generator_indices` continua preenchido,
+  porque é dele que saem a redução e as máscaras de visibilidade.
+
+Ramal sem medição — circuito não resolvido ou não convergido, elemento ausente
+de `segment_powers` porque virou `Transformer` de regulador ou teve o nome
+descartado por colisão — fica `incomplete` com o motivo nos diagnósticos, e a
+exportação simplificada continua bloqueada. A ambiguidade de carga ou gerador
+pertencente a mais de um ramal vale nos **dois** modos: é problema topológico, e
+no modo medido contaria a mesma potência em dois equivalentes.
+
+`EquivalentNetworkModel` guarda `power_source` e `source_power_flow` ao lado das
+demais proveniências. É por identidade neles que a janela principal descobre um
+equivalente obsoleto: descartar o fluxo de potência (`_invalidate_power_flow()`)
+derruba junto a rede equivalente **só** no modo medido.
 
 ### 12.3 Exportação OpenDSS (`opendss_export.py`)
 
@@ -1430,10 +1498,37 @@ solução e nenhum tap comuta. `MAX_CONTROL_ITER` e `CONTROL_MODE`
 (`opendss_export.py`) saem em **todo** master — o de `build_master_export`, que
 serve exportação normal, simplificada e fluxo de potência, e o master por
 patamar de `opendss_allocation_export.py` — e são reaplicados em
-`_STEP_MODE_COMMANDS` porque o fluxo de potência configura o engine **depois**
+`_step_mode_commands()` porque o fluxo de potência configura o engine **depois**
 do `Compile`, sobre um singleton que pode carregar estado da execução anterior.
 `Static` já é o padrão do OpenDSS: declará-lo é defesa contra esse estado, não
 mudança de comportamento.
+
+**Iterações de fluxo de potência.** São outro teto, e o `MaxControlIter` não
+substitui: `Set MaxIter` limita a iteração do **fluxo**, e o padrão do OpenDSS é
+15. Estourá-lo é pior do que parece — a solução é abandonada antes de terminar a
+primeira passada, então o laço de controle nunca roda: `Solution.ControlIterations`
+fica em 1, os taps ficam onde estavam e as grandezas lidas descrevem um circuito
+que não existe. Medido num alimentador rural de 23.857 barras em 34,5 kV, o
+patamar de madrugada exigiu 49 iterações e o da noite 151, com `Vmin` em 0,743 pu
+— um caso legítimo, só lento para o algoritmo de ponto fixo perto do joelho da
+curva PV.
+
+`PowerFlowResult` guarda o teto usado em `max_power_flow_iterations` e as
+iterações de controle de cada passo em `control_iterations`; `idle_control_steps`
+lista os patamares em que nenhum controle atuou. O relatório da janela informa
+sempre o teto e, **havendo regulador no modelo**, denuncia esses patamares — é o
+que traduz para o usuário a tabela de passos de tap toda zerada, em vez de deixá-lo
+deduzir a causa. `_control_iterations()` tolera um motor que não exponha a
+propriedade: a contagem é diagnóstico, não resultado.
+
+O valor mora em `opendss_solution.py` (`DEFAULT_MAX_POWER_FLOW_ITER = 500`,
+faixa 15–10.000, `parse_max_power_flow_iterations` que nunca levanta), é
+escolhido em **Configurações → OpenDSS… → Solução** e atravessa por parâmetro
+somente-nome os mesmos três pontos do teto de controle. Elevá-lo é barato: o que
+custa são as iterações realmente executadas, não o teto — no mesmo caso, os
+quatro patamares levam 0,6 s com 500 e um circuito que divirja de verdade leva
+1,3 s para ser declarado inconvergente. Trocar o valor invalida o resultado de
+fluxo vigente, como os limites de tensão e o modo das linhas.
 
 #### Edições voláteis do cadastro (`regulator_overrides.py`)
 
@@ -2334,21 +2429,25 @@ na mensagem.
 __main__ → main_window → {graphics, workers, *_window, *_table, search_palette,
                           model, phase_config, mapa_tiles, *_import,
                           opendss_engine, opendss_powerflow}
-workers  → {*_import, branch_analysis, equivalent_network, model, phase_config,
-            opendss_export, opendss_engine, opendss_powerflow,
-            mdb_engine, mdb_import}
+workers  → {*_import, branch_analysis, branch_power_flow, equivalent_network,
+            model, phase_config, opendss_export, opendss_engine,
+            opendss_powerflow, mdb_engine, mdb_import}
 mdb_import   → {*_import (as parse_*_rows), csv_import, mdb_engine, mdb_mapping,
                 model}
 mdb_mapping  → {*_import (só os EXPECTED_*_HEADER), mdb_engine}
 mdb_engine   → ∅  (pyodbc entra por import tardio)
 graphics → {model, equivalent_network, mapa_tiles}
-equivalent_network → {branch_analysis, model}
+equivalent_network → {branch_analysis, branch_power_source, model}
+branch_power_flow  → {branch_analysis, equivalent_network, opendss_export,
+                      opendss_powerflow}
+branch_power_source → ∅
 branch_analysis    → {model, phase_config}
 opendss_powerflow  → {model, phase_config, opendss_export, opendss_settings,
-                      opendss_engine}
+                      opendss_solution, opendss_engine}
 opendss_settings   → opendss_export (só parse_number, para não haver duas
                      regras de leitura numérica)
-opendss_export     → {model, phase_config}
+opendss_export     → {model, phase_config, opendss_solution}
+opendss_solution   → ∅
 opendss_engine     → ∅  (py_dss_interface entra por import tardio)
 search   → model
 phase_config → model (apenas o alias de tipo IndexArray)
@@ -2639,9 +2738,10 @@ lido por uma build anterior.
 | `test_phase_config.py` | validação do `fases2.json` |
 | `test_circuit_colors.py` | paleta e contraste |
 | `test_branch_analysis.py` · `test_equivalent_network.py` · `test_branch_json_export.py` · `test_branch_table_export.py` | análise e nível topológico, demanda ativa máxima, JSON estrutural e CSV pt-BR filtrado/atômico |
+| `test_branch_power_flow.py` | medição no elemento de conexão: sinal invertido quando o trecho aponta para o tronco, soma de várias conexões, e falha explícita por circuito não resolvido, não convergido ou elemento sem potência |
 | `test_opendss_export.py` | linhas de trecho, de chave e das cargas de uma, duas e três fases, conversão de `C1` e do `kV` pela tensão de fase, ordem `New`/`Open` e `LoadShape`/`Load`, nomenclatura `-NF-<FASE>`, terminal por letra, neutro preservado só na monofásica, colunas de patamar por fase, patamar zerado, descarte integral da carga, reserva de nomes entre os arquivos, arredondamento, saneamento, master (ordem das seções, `Redirect` conforme os arquivos gerados, coordenadas em casas fixas) e diagnósticos |
 | `test_opendss_generator_export.py` | três arquivos de geradores, perfis ativos negativos sem dupla inversão, classes negativas, terminais e tensão de fase, seleção por circuito, fallback, descarte integral, namespace `Load.*` compartilhado e ordem dos `Redirect` |
-| `test_opendss_settings.py` | invariante da faixa (`0 < vminpu <= 1 <= vmaxpu`), comandos `BatchEdit` exatos e sem vírgula decimal, desabilitado não emite nada, ida e volta pelo mapeamento e recuperação de preferência corrompida |
+| `test_opendss_settings.py` | invariante da faixa (`0 < vminpu <= 1 <= vmaxpu`), comandos `BatchEdit` exatos e sem vírgula decimal, desabilitado não emite nada, ida e volta pelo mapeamento, recuperação de preferência corrompida e o teto de iterações do fluxo caindo no padrão fora da faixa |
 | `test_opendss_load_model.py` | ordem do vetor `ZIPV`, números de `model` do OpenDSS, soma dos pesos verificada fora da invariante, padrão de fábrica equivalente a potência constante e descarte de preferência incoerente |
 | `test_opendss_zipv_export.py` | potência constante byte a byte igual ao comportamento anterior, `model=8` com o vetor só nas cargas de consumo, e geradores, capacitores e ramais intactos |
 | `test_opendss_engine.py` | detecção da biblioteca opcional, memoização do erro de import, reuso do motor único, diretório corrente restaurado (inclusive após falha) e escolha da pasta ASCII |

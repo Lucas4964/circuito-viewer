@@ -8,6 +8,11 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from .branch_analysis import BranchAnalysisResult, analyze_branches
 from .branch_json_export import export_branches_json
+from .branch_power_flow import measure_branch_powers
+from .branch_power_source import (
+    DEFAULT_BRANCH_POWER_SOURCE,
+    BranchPowerSource,
+)
 from .branch_table_export import export_branches_csv
 from .allocation import TransformerAllocationModel
 from .allocation_measurements import (
@@ -55,6 +60,7 @@ from .opendss_mapping_store import OpenDssLibraryMappings
 from .opendss_simplified_export import build_simplified_export
 from .opendss_powerflow import run_power_flow
 from .opendss_settings import OpenDssLoadSettings
+from .opendss_solution import DEFAULT_MAX_POWER_FLOW_ITER
 from .phase_config import PhaseConfiguration
 from .regulator_import import load_regulators_csv
 from .segment_import import load_segments_csv
@@ -621,6 +627,7 @@ class OpenDssExportWorker(QObject):
         regulators: RegulatorModel | None = None,
         capacitors: CapacitorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
+        max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
         line_parameter_mode: OpenDssLineParameterMode = (
             OpenDssLineParameterMode.ORIGINAL
         ),
@@ -638,6 +645,7 @@ class OpenDssExportWorker(QObject):
         self.regulators = regulators
         self.capacitors = capacitors
         self.load_settings = load_settings
+        self.max_power_flow_iterations = int(max_power_flow_iterations)
         self.line_parameter_mode = line_parameter_mode
         self.library_catalog = library_catalog
         self.library_mappings = library_mappings
@@ -660,6 +668,7 @@ class OpenDssExportWorker(QObject):
                 regulators=self.regulators,
                 capacitors=self.capacitors,
                 load_settings=self.load_settings,
+                max_power_flow_iterations=self.max_power_flow_iterations,
                 line_parameter_mode=self.line_parameter_mode,
                 library_catalog=self.library_catalog,
                 library_mappings=self.library_mappings,
@@ -696,6 +705,7 @@ class OpenDssAllocationExportWorker(QObject):
         *,
         regulators: RegulatorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
+        max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
         line_parameter_mode: OpenDssLineParameterMode = (
             OpenDssLineParameterMode.ORIGINAL
         ),
@@ -714,6 +724,7 @@ class OpenDssAllocationExportWorker(QObject):
         self.settings = settings
         self.regulators = regulators
         self.load_settings = load_settings
+        self.max_power_flow_iterations = int(max_power_flow_iterations)
         self.line_parameter_mode = line_parameter_mode
         self.library_catalog = library_catalog
         self.library_mappings = library_mappings
@@ -737,6 +748,7 @@ class OpenDssAllocationExportWorker(QObject):
                 self.settings,
                 regulators=self.regulators,
                 load_settings=self.load_settings,
+                max_power_flow_iterations=self.max_power_flow_iterations,
                 line_parameter_mode=self.line_parameter_mode,
                 library_catalog=self.library_catalog,
                 library_mappings=self.library_mappings,
@@ -773,6 +785,7 @@ class SimplifiedOpenDssExportWorker(QObject):
         regulators: RegulatorModel | None = None,
         capacitors: CapacitorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
+        max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     ) -> None:
         super().__init__()
         self.catalog = catalog
@@ -786,6 +799,7 @@ class SimplifiedOpenDssExportWorker(QObject):
         self.regulators = regulators
         self.capacitors = capacitors
         self.load_settings = load_settings
+        self.max_power_flow_iterations = int(max_power_flow_iterations)
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -806,6 +820,7 @@ class SimplifiedOpenDssExportWorker(QObject):
                 regulators=self.regulators,
                 capacitors=self.capacitors,
                 load_settings=self.load_settings,
+                max_power_flow_iterations=self.max_power_flow_iterations,
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
             )
@@ -934,6 +949,7 @@ class PowerFlowWorker(QObject):
         regulators: RegulatorModel | None = None,
         capacitors: CapacitorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
+        max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
         line_parameter_mode: OpenDssLineParameterMode = (
             OpenDssLineParameterMode.ORIGINAL
         ),
@@ -951,6 +967,7 @@ class PowerFlowWorker(QObject):
         self.regulators = regulators
         self.capacitors = capacitors
         self.load_settings = load_settings
+        self.max_power_flow_iterations = int(max_power_flow_iterations)
         self.line_parameter_mode = line_parameter_mode
         self.library_catalog = library_catalog
         self.library_mappings = library_mappings
@@ -978,6 +995,7 @@ class PowerFlowWorker(QObject):
                     regulators=self.regulators,
                     capacitors=self.capacitors,
                     load_settings=self.load_settings,
+                    max_power_flow_iterations=self.max_power_flow_iterations,
                     line_parameter_mode=self.line_parameter_mode,
                     library_catalog=self.library_catalog,
                     library_mappings=self.library_mappings,
@@ -1045,12 +1063,17 @@ class EquivalentNetworkWorker(QObject):
         loads: LoadModel | None,
         patterns: LoadPatternModel | None,
         generator_updates: GeneratorUpdateModel | None = None,
+        *,
+        power_source: BranchPowerSource = DEFAULT_BRANCH_POWER_SOURCE,
+        power_flow: object | None = None,
     ) -> None:
         super().__init__()
         self.branches = branches
         self.loads = loads
         self.patterns = patterns
         self.generator_updates = generator_updates
+        self.power_source = BranchPowerSource(power_source)
+        self.power_flow = power_flow
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -1059,11 +1082,38 @@ class EquivalentNetworkWorker(QObject):
     @pyqtSlot()
     def run(self) -> None:
         try:
+            measured: dict[int, tuple] = {}
+            measurement_issues: dict[int, str] = {}
+            if self.power_source is BranchPowerSource.POWER_FLOW:
+                if self.power_flow is None:
+                    raise ValueError(
+                        "O cálculo das potências dos ramais por fluxo de "
+                        "potência exige um resultado de fluxo vigente."
+                    )
+                # A medição é a primeira metade do trabalho e usa a mesma barra
+                # de progresso: os dois laços percorrem os mesmos ramais.
+                measured, measurement_issues = measure_branch_powers(
+                    self.branches,
+                    self.power_flow,
+                    cancel_check=self._cancel_event.is_set,
+                    progress=lambda current, total: self.progress.emit(
+                        current,
+                        total,
+                    ),
+                )
             result = build_equivalent_network(
                 self.branches,
                 self.loads,
                 self.patterns,
                 self.generator_updates,
+                power_source=self.power_source,
+                measured_patterns=measured,
+                measurement_issues=measurement_issues,
+                source_power_flow=(
+                    self.power_flow
+                    if self.power_source is BranchPowerSource.POWER_FLOW
+                    else None
+                ),
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
             )
