@@ -154,7 +154,11 @@ class MainWindowSelectionTests(unittest.TestCase):
         ]
         self.assertEqual(window.import_action.text(), "Importar CSV…")
         self.assertEqual(len(import_actions), 0)
-        self.assertIn(window.import_action, window.file_menu.actions())
+        # A importação por CSV está suspensa: a ação existe e continua ligada,
+        # mas não entra no menu nem responde ao Ctrl+O.
+        self.assertNotIn(window.import_action, window.file_menu.actions())
+        self.assertTrue(window.import_action.shortcut().isEmpty())
+        self.assertIn(window.mdb_import_action, window.file_menu.actions())
         self.assertFalse(window.show_bars_action.isChecked())
         self.assertFalse(window.show_bars_action.isEnabled())
         self.assertNotIn(window.show_bars_action, toolbar.actions())
@@ -533,6 +537,12 @@ class MainWindowSelectionTests(unittest.TestCase):
         self.assertEqual(window.switch_detail_labels["corn"].text(), "N")
         self.assertEqual(window.switch_detail_labels["elo"].text(), "—")
         self.assertEqual(window.switch_detail_labels["elo_type"].text(), "FUSIVEL")
+        # Sem tipo resolvido — o modelo veio de um construtor direto —, o painel
+        # mostra traço em vez de afirmar um 0 ou 1 que ninguém declarou.
+        self.assertEqual(
+            window.switch_companion_labels["switch_type_id"].text(), "—"
+        )
+        self.assertEqual(window.switch_detail_labels["switchable"].text(), "—")
 
         window._set_selection(FeatureSelection("segment", 1))
         self.assertFalse(window.switch_details_section.isVisible())
@@ -542,6 +552,105 @@ class MainWindowSelectionTests(unittest.TestCase):
         window._set_switch_model(replacement)
         self.assertEqual(window._selected_feature, selection)
         self.assertEqual(window.switch_detail_labels["code"].text(), "NOVO")
+
+    def test_the_switch_panel_shows_the_type_and_whether_it_can_be_operated(
+        self,
+    ) -> None:
+        window, _, network = self._make_window()
+        self.addCleanup(window.close)
+        switches = SwitchModel(
+            network,
+            ["CH1"],
+            ["5"],
+            ["CIR-1"],
+            [0],
+            ["CH-COD"],
+            ["A"],
+            ["F"],
+            ["N"],
+            [""],
+            ["FUSIVEL"],
+            type_names=["Chave Fusível"],
+            switchable_values=["0"],
+        )
+        window._on_switch_import_finished(
+            SwitchLoadResult(switches, "utf-8-sig", 1, 1, 0, (), 0)
+        )
+        window._set_selection(FeatureSelection("segment", 0))
+
+        # O nome do tipo mora ao lado do id que o referencia, como o do cabo
+        # mora ao lado de CABOF_ID na tabela do trecho.
+        self.assertEqual(
+            window.switch_companion_labels["switch_type_id"].text(),
+            "Chave Fusível",
+        )
+        self.assertNotIn("type_name", window.switch_detail_labels)
+        # MANOBRAVEL segue linha própria: não é valor vinculado do banco.
+        self.assertEqual(window.switch_detail_labels["switchable"].text(), "0")
+        self.assertTrue(
+            window.switch_companion_labels["switch_type_id"].isVisible()
+        )
+
+    def test_the_switch_companion_resolves_the_circuit_and_the_segment(self) -> None:
+        # São os outros dois campos da chave que referenciam outro cadastro.
+        window, _, network = self._make_window()
+        self.addCleanup(window.close)
+        window._on_switch_import_finished(
+            SwitchLoadResult(
+                self._make_switches(network), "utf-8-sig", 1, 1, 0, (), 0
+            )
+        )
+        catalog = CircuitCatalogModel.build(
+            network,
+            window._switch_model,
+            [CircuitDefinition("CIR-1", "B1", "032011", "13.8")],
+        )
+        window._set_circuit_catalog(catalog)
+        window._set_selection(FeatureSelection("segment", 0))
+
+        companions = window.switch_companion_labels
+        self.assertEqual(companions["circuit_id"].text(), "032011")
+        self.assertEqual(
+            companions["segment_id"].text(), network.codes[0] or "—"
+        )
+        # Campo que não aponta para lugar nenhum fica com traço, como o
+        # ARRANJO_ID na tabela do trecho.
+        self.assertEqual(companions["corn"].text(), "—")
+
+    def test_a_segment_without_a_switch_clears_the_companion(self) -> None:
+        # Sem isto o tipo da chave anterior ficaria na tela.
+        window, _, network = self._make_window()
+        self.addCleanup(window.close)
+        switches = SwitchModel(
+            network,
+            ["CH1"],
+            ["5"],
+            ["CIR-1"],
+            [0],
+            ["CH-COD"],
+            ["A"],
+            ["F"],
+            ["N"],
+            [""],
+            ["FUSIVEL"],
+            type_names=["Chave Fusível"],
+            switchable_values=["0"],
+        )
+        window._on_switch_import_finished(
+            SwitchLoadResult(switches, "utf-8-sig", 1, 1, 0, (), 0)
+        )
+        window._set_selection(FeatureSelection("segment", 0))
+        self.assertEqual(
+            window.switch_companion_labels["switch_type_id"].text(),
+            "Chave Fusível",
+        )
+
+        window._set_selection(FeatureSelection("segment", 1))
+
+        self.assertFalse(window.switch_details_section.isVisible())
+        self.assertEqual(
+            window.switch_companion_labels["switch_type_id"].text(), "—"
+        )
 
     def test_replacing_segments_removes_switch_model_and_red_layer(self) -> None:
         from circuit_viewer.graphics import SwitchNetworkItem

@@ -34,7 +34,11 @@ from .allocation import (
 )
 from .cable_import import CableCsvResult, parse_cable_rows
 from .capacitor_import import CapacitorCsvResult, parse_capacitor_rows
-from .circuit_import import CircuitLoadResult, parse_circuit_rows
+from .circuit_import import (
+    CircuitLoadResult,
+    SubstationLink,
+    parse_circuit_rows,
+)
 from .circuit_level_import import CircuitLevelCsvResult, parse_circuit_level_rows
 from .csv_import import (
     DEFAULT_SCALE_SAMPLE_SIZE,
@@ -62,7 +66,12 @@ from .model import UtmCrs
 from .phase_config import PhaseConfiguration
 from .regulator_import import RegulatorLoadResult, parse_regulator_rows
 from .segment_import import SegmentLoadResult, parse_segment_rows
-from .switch_import import SwitchLoadResult, parse_switch_rows
+from .switch_import import (
+    SwitchLoadResult,
+    SwitchTypeInfo,
+    parse_switch_rows,
+)
+from .switch_types import SwitchTypeConfiguration
 
 
 # Os ``*LoadResult`` carregam a codificação do arquivo de origem; num banco não
@@ -305,6 +314,7 @@ def load_database(
     cancel_event: threading.Event | None = None,
     progress: ProgressCallback | None = None,
     phase_configuration: PhaseConfiguration | None = None,
+    switch_types: SwitchTypeConfiguration | None = None,
 ) -> MdbImportResult:
     """Importa as dez entidades lógicas de um banco, na ordem de dependência.
 
@@ -404,6 +414,7 @@ def load_database(
                 consumer_target=consumer_target,
                 source_path=source_path,
                 scale=scale,
+                switch_types=switch_types,
                 cancel_event=cancel_event,
                 progress=generator_emit if entity == "geradores" else emit,
                 consumer_progress=(
@@ -488,6 +499,176 @@ _ALLOCATION_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
 _ALLOCATION_DIAGNOSTIC_COLUMNS: dict[str, tuple[str, ...]] = {
     "BT_CONS": BT_CONSUMER_DIAGNOSTIC_HEADER,
 }
+
+
+# Tabelas da subestacao, com as colunas de que cada uma precisa. Nao entram no
+# mdb_tabelas.json de proposito: REQUIRED_COLUMNS["circuitos"] e o
+# EXPECTED_CIRCUIT_HEADER, entao declarar SE_ID ali tornaria a entidade inteira
+# irresoluvel num banco que nao o tenha — perder o catalogo de circuitos por
+# causa de uma coluna informativa.
+#
+# O transformador vem de SE_TRAFO, nao de TRAFO. As duas existem, tem esquema
+# parecido, e TRAFO e a de transformadores de distribuicao MT/BT — no banco
+# medido ela esta vazia. Quem for pelo nome obvio nao acha nada.
+_SUBSTATION_TABLE = ("SE", ("SE_ID", "CODIGO", "NOME"))
+_SUBSTATION_TRANSFORMER_TABLE = ("SE_TRAFO", ("TRAFO_ID", "CODIGO", "SNOM"))
+_CIRCUIT_LINK_COLUMNS = ("SE_ID", "TRAFO_ID")
+
+
+def _index_by_first_column(
+    database: AccessDatabase,
+    table: str,
+    columns: Sequence[str],
+) -> dict[str, tuple[str, ...]]:
+    """``{valor da 1a coluna: demais colunas}`` de uma tabela de consulta."""
+
+    index: dict[str, tuple[str, ...]] = {}
+    for row in database.iter_rows(table, columns):
+        key = row[0].strip()
+        if key and key not in index:
+            index[key] = tuple(value.strip() for value in row[1:])
+    return index
+
+
+def _resolve_columns(
+    database: AccessDatabase,
+    table: str,
+    wanted: Sequence[str],
+) -> tuple[str, ...] | None:
+    """Nomes reais de ``wanted`` em ``table``, ou ``None`` se faltar alguma."""
+
+    by_name = {column.casefold(): column for column in database.columns(table)}
+    resolved = tuple(by_name.get(name.casefold()) for name in wanted)
+    if any(name is None for name in resolved):
+        return None
+    return tuple(name for name in resolved if name is not None)
+
+
+# O catalogo de tipos de chave. O nome exibido sai daqui; o MANOBRAVEL sai do
+# tipos_chave.json, casado por CODIGO. Duas fontes de proposito: o tipo e fato
+# do cadastro, e manobrar ou nao e politica de quem opera a rede.
+_SWITCH_TYPE_TABLE = ("TIPOCHAVE", ("ID", "TIPO", "CODIGO"))
+
+
+def _load_switch_types(
+    database: AccessDatabase,
+    configuration: SwitchTypeConfiguration | None,
+) -> dict[str, SwitchTypeInfo]:
+    """``{TIPOCHV_ID: SwitchTypeInfo}`` para as chaves do banco.
+
+    Tolerante como as demais leituras auxiliares: sem a tabela ``TIPOCHAVE``,
+    sem as colunas, ou sem configuracao carregada, devolve vazio — as chaves
+    entram com os dois campos em branco e a rede continua desenhavel.
+
+    Um ``CODIGO`` que o arquivo nao declare mantem o **nome** do tipo e deixa o
+    ``MANOBRAVEL`` vazio: o banco sabe o que a chave e, e so a politica esta
+    faltando. Afirmar 0 ali seria inventar uma resposta.
+    """
+
+    table_by_name = {name.casefold(): name for name in database.tables()}
+    canonical, wanted = _SWITCH_TYPE_TABLE
+    table = table_by_name.get(canonical.casefold())
+    if table is None:
+        return {}
+    columns = _resolve_columns(database, table, wanted)
+    if columns is None:
+        return {}
+
+    types: dict[str, SwitchTypeInfo] = {}
+    for row in database.iter_rows(table, columns):
+        type_id, description, code = (value.strip() for value in row)
+        if not type_id:
+            continue
+        types[type_id] = SwitchTypeInfo(
+            description=description,
+            switchable=(
+                "" if configuration is None else configuration.switchable_text(code)
+            ),
+        )
+    return types
+
+
+def _load_substation_links(
+    database: AccessDatabase,
+    circuits_target: ResolvedEntity,
+) -> dict[str, SubstationLink]:
+    """De onde cada circuito sai: ``{CIRC_ID: SubstationLink}``.
+
+    Segue o molde de :func:`_load_transformer_allocations` — ler tabela auxiliar
+    direto do banco, tolerando a ausencia. Um banco sem ``SE``, sem ``SE_TRAFO``
+    ou sem as colunas de ligacao devolve vazio, a importacao segue e as colunas
+    de origem ficam em branco. Elas sao informativas; nenhuma delas pode custar
+    o catalogo de circuitos.
+
+    A tabela de circuitos e a **resolvida pelo mapeamento**, nunca o literal
+    ``CIRCUITO``: e o ``mdb_tabelas.json`` que decide de onde os circuitos vem.
+    """
+
+    table_by_name = {name.casefold(): name for name in database.tables()}
+    link_columns = _resolve_columns(
+        database, circuits_target.table, _CIRCUIT_LINK_COLUMNS
+    )
+    if link_columns is None:
+        return {}
+    # O CIRC_ID pode ter sido renomeado pelo mapeamento; os demais nao passam
+    # por ele, entao sao procurados pelo nome canonico.
+    circuit_id_column = circuits_target.columns[
+        circuits_target.header.index("CIRC_ID")
+    ]
+
+    lookups: dict[str, dict[str, tuple[str, ...]]] = {}
+    for canonical, wanted in (
+        _SUBSTATION_TABLE,
+        _SUBSTATION_TRANSFORMER_TABLE,
+    ):
+        table = table_by_name.get(canonical.casefold())
+        if table is None:
+            return {}
+        columns = _resolve_columns(database, table, wanted)
+        if columns is None:
+            return {}
+        lookups[canonical] = _index_by_first_column(database, table, columns)
+
+    substations = lookups[_SUBSTATION_TABLE[0]]
+    transformers = lookups[_SUBSTATION_TRANSFORMER_TABLE[0]]
+
+    links: dict[str, SubstationLink] = {}
+    for row in database.iter_rows(
+        circuits_target.table, (circuit_id_column, *link_columns)
+    ):
+        circuit_id, substation_id, transformer_id = (
+            value.strip() for value in row
+        )
+        if not circuit_id:
+            continue
+        reasons: list[str] = []
+        substation = substations.get(substation_id) if substation_id else None
+        if not substation_id:
+            reasons.append("circuito sem SE_ID; a subestação ficou em branco")
+        elif substation is None:
+            reasons.append(
+                f"SE_ID '{substation_id}' sem correspondência em "
+                f"{_SUBSTATION_TABLE[0]}"
+            )
+        transformer = transformers.get(transformer_id) if transformer_id else None
+        if not transformer_id:
+            reasons.append("circuito sem TRAFO_ID; o transformador ficou em branco")
+        elif transformer is None:
+            reasons.append(
+                f"TRAFO_ID '{transformer_id}' sem correspondência em "
+                f"{_SUBSTATION_TRANSFORMER_TABLE[0]}"
+            )
+        links[circuit_id] = SubstationLink(
+            substation_code="" if substation is None else substation[0],
+            substation_name="" if substation is None else substation[1],
+            # O id cru sobrevive mesmo sem correspondência: ele é o que o
+            # cadastro afirma, e vê-lo é o que permite achar o erro.
+            transformer_id=transformer_id,
+            transformer_code="" if transformer is None else transformer[0],
+            transformer_power="" if transformer is None else transformer[1],
+            reason="; ".join(reasons) or None,
+        )
+    return links
 
 
 def _load_transformer_allocations(
@@ -594,6 +775,7 @@ def _import_entity(
     consumer_target: ResolvedEntity | None,
     source_path: str,
     scale: float,
+    switch_types: SwitchTypeConfiguration | None,
     cancel_event: threading.Event | None,
     progress: Callable[[int], None] | None,
     consumer_progress: Callable[[int], None] | None,
@@ -654,7 +836,13 @@ def _import_entity(
     if entity == "patamares":
         return parse_load_pattern_rows(header, rows, results["cargas"].model, **common)
     if entity == "chaves":
-        return parse_switch_rows(header, rows, results["trechos"].model, **common)
+        return parse_switch_rows(
+            header,
+            rows,
+            results["trechos"].model,
+            switch_types=_load_switch_types(database, switch_types),
+            **common,
+        )
     if entity == "reguladores":
         return parse_regulator_rows(header, rows, results["trechos"].model, **common)
     if entity == "circuitos":
@@ -664,6 +852,7 @@ def _import_entity(
             rows,
             results["trechos"].model,
             None if switches is None else switches.model,
+            substation_links=_load_substation_links(database, target),
             **common,
         )
     if entity == "patamares_circuitos":

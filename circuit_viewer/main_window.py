@@ -209,6 +209,11 @@ from .opendss_settings_dialog import (
 from .overlap_report import CircuitOverlapReportWindow, OverlapReportTableModel
 from .patamares_window import PatamaresWindow
 from .power_flow_table import PowerFlowTableModel
+from .switch_types import (
+    SwitchTypeConfiguration,
+    SwitchTypeConfigurationError,
+    load_switch_types,
+)
 from .phase_config import (
     PHASE_COLORS,
     PhaseClassification,
@@ -772,6 +777,15 @@ class MainWindow(QMainWindow):
             )
         except PhaseConfigurationError as exc:
             self._phase_configuration_error = str(exc)
+        # Mesma disciplina do fases2.json: arquivo ruim desabilita só o que
+        # depende dele — aqui, as colunas TIPO e MANOBRAVEL da chave —, nunca a
+        # abertura do programa.
+        self._switch_types: SwitchTypeConfiguration | None = None
+        self._switch_types_error: str | None = None
+        try:
+            self._switch_types = load_switch_types()
+        except SwitchTypeConfigurationError as exc:
+            self._switch_types_error = str(exc)
         # Como o fases2.json, um mapeamento inválido desabilita apenas o recurso
         # que depende dele — aqui, a importação por banco.
         self._mdb_table_mapping = None
@@ -1021,6 +1035,8 @@ class MainWindow(QMainWindow):
         self._sync_power_flow_availability()
         if self._phase_configuration_error is not None:
             QTimer.singleShot(0, self._show_phase_configuration_error)
+        if self._switch_types_error is not None:
+            QTimer.singleShot(0, self._show_switch_types_warning)
         if self._curves_load.issue is not None:
             QTimer.singleShot(0, self._show_curves_load_warning)
         if self._calculation_levels_load.issue is not None:
@@ -1052,8 +1068,15 @@ class MainWindow(QMainWindow):
         return source is None or source is expected
 
     def _create_actions(self) -> None:
+        # A importação por CSV está **suspensa**, não removida: a ação existe,
+        # continua ligada e testada, mas não entra no menu nem responde ao
+        # Ctrl+O (ver _create_menus_and_toolbar). Para reativá-la basta devolver
+        # o addAction e o setShortcut.
+        #
+        # O objeto permanece porque oito pontos o alternam com setEnabled ao
+        # longo das importações; descartá-lo obrigaria a mexer em todos eles
+        # para desfazer algo declarado temporário.
         self.import_action = QAction("Importar CSV…", self)
-        self.import_action.setShortcut(QKeySequence.StandardKey.Open)
         self.import_action.setToolTip(
             "Importar barras, trechos, cargas, geradores, chaves ou circuitos de arquivos CSV"
         )
@@ -1345,7 +1368,7 @@ class MainWindow(QMainWindow):
 
     def _create_menus_and_toolbar(self) -> None:
         self.file_menu = self.menuBar().addMenu("Arquivo")
-        self.file_menu.addAction(self.import_action)
+        # self.file_menu.addAction(self.import_action)  # CSV suspenso
         self.file_menu.addAction(self.mdb_import_action)
         self.file_menu.addSeparator()
         self.file_menu.addAction(self.exit_action)
@@ -1948,7 +1971,12 @@ class MainWindow(QMainWindow):
 
         switch_fields = (
             ("switch_id", "CHAVE_ID:"),
+            # O nome do tipo mora na coluna companheira de TIPOCHV_ID, como
+            # o do cabo mora na de CABOF_ID. MANOBRAVEL segue linha própria:
+            # não é valor vinculado do banco e sim de tipos_chave.json, então
+            # não há id ao lado de quem morar.
             ("switch_type_id", "TIPOCHV_ID:"),
+            ("switchable", "MANOBRAVEL:"),
             ("circuit_id", "CIRC_ID:"),
             ("segment_id", "TRECHO_ID:"),
             ("code", "CODIGO:"),
@@ -1968,8 +1996,12 @@ class MainWindow(QMainWindow):
             self.switch_detail_labels,
             self.switch_caption_labels,
             self.switch_details_grid,
-            _,
-        ) = create_table(switch_fields, self.switch_details_section)
+            self.switch_companion_labels,
+        ) = create_table(
+            switch_fields,
+            self.switch_details_section,
+            with_companion=True,
+        )
         switch_layout.addWidget(self.switch_details_table)
         self.switch_details_section.setVisible(False)
         segment_layout.addWidget(self.switch_details_section)
@@ -2500,6 +2532,7 @@ class MainWindow(QMainWindow):
             overrides=selection.overrides,
             scale=selection.scale,
             phase_configuration=self._phase_configuration,
+            switch_types=self._switch_types,
         )
         worker.moveToThread(thread)
 
@@ -4003,6 +4036,24 @@ class MainWindow(QMainWindow):
         self._sync_generator_update_availability()
         self._sync_export_availability()
         self.statusBar().showMessage(f"{count:n} curva(s) salva(s).", 6_000)
+
+    def _show_switch_types_warning(self) -> None:
+        """Avisa que TIPO e MANOBRAVEL não sairão, e por quê.
+
+        O aviso é o único sinal: sem ele o usuário veria duas colunas em branco
+        e concluiria que o banco não traz o tipo, quando o problema está no
+        arquivo que ele mesmo edita.
+        """
+
+        if self._switch_types_error is None:
+            return
+        QMessageBox.warning(
+            self,
+            "Tipos de chave",
+            f"{self._switch_types_error}\n\n"
+            "As colunas TIPO e MANOBRAVEL da chave ficarão em branco até "
+            "o arquivo ser corrigido.",
+        )
 
     def _show_curves_load_warning(self) -> None:
         issue = self._curves_load.issue
@@ -7984,6 +8035,11 @@ class MainWindow(QMainWindow):
         if switch_record is None:
             for label in self.switch_detail_labels.values():
                 label.setText("—")
+            # As companheiras também: sem isto, o tipo da chave anterior fica
+            # na tela quando o trecho selecionado não tem chave nenhuma.
+            for label in self.switch_companion_labels.values():
+                label.setText("—")
+                label.setToolTip("")
             self.switch_details_section.setVisible(False)
         else:
             switch_values = {
@@ -7997,9 +8053,11 @@ class MainWindow(QMainWindow):
                 "corn": switch_record.corn,
                 "elo": switch_record.elo,
                 "elo_type": switch_record.elo_type,
+                "switchable": switch_record.switchable,
             }
             for key, value in switch_values.items():
                 self.switch_detail_labels[key].setText(value or "—")
+            self._sync_switch_companion_columns(switch_record, selection.index)
             self.switch_details_section.setVisible(True)
 
         regulator_record = (
@@ -8107,6 +8165,41 @@ class MainWindow(QMainWindow):
                 label.setText("—" if cable is None else cable_summary(cable))
                 label.setToolTip("" if cable is None else cable_tooltip(cable))
             label.setVisible(visible)
+
+    def _sync_switch_companion_columns(self, record, segment_index: int) -> None:  # noqa: ANN001
+        """Preenche a coluna à direita de TIPOCHV_ID, CIRC_ID e TRECHO_ID.
+
+        São os três campos da chave que referenciam outro cadastro — o mesmo
+        critério da tabela do trecho, onde FASES2, as barras e os cabos têm
+        companheira e o ``ARRANJO_ID``, que não aponta para lugar nenhum, fica
+        com traço.
+
+        O nome do tipo já vem resolvido no registro: quem o buscou na
+        ``TIPOCHAVE`` foi o importador. Aqui só se escolhe onde exibi-lo.
+
+        Sempre visível, como no painel de cargas: havendo chave selecionada há
+        trecho, e o código dele existe. Catálogo de circuitos ausente ou
+        ``CIRC_ID`` sem correspondência deixam traço, nunca erro.
+        """
+
+        catalog = self._circuit_catalog
+        circuit_code = ""
+        if catalog is not None and record.circuit_id:
+            circuit_index = catalog.index_for_id(record.circuit_id)
+            if circuit_index is not None:
+                circuit_code = catalog.definition(circuit_index).code
+        segment_code = ""
+        if self._line_model is not None and 0 <= segment_index < len(self._line_model):
+            segment_code = self._line_model.codes[segment_index]
+        linked = {
+            "switch_type_id": record.type_name,
+            "circuit_id": circuit_code,
+            "segment_id": segment_code,
+        }
+        for key, label in self.switch_companion_labels.items():
+            label.setText(linked.get(key, "") or "—")
+            label.setToolTip("")
+            label.setVisible(True)
 
     def _sync_load_companion_columns(self, load_index: int, record) -> None:  # noqa: ANN001
         """Preenche a coluna à direita de BARRA_ID e de FASES2.

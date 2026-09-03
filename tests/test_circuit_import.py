@@ -7,7 +7,11 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
-from circuit_viewer.circuit_import import load_circuits_csv
+from circuit_viewer.circuit_import import (
+    SubstationLink,
+    load_circuits_csv,
+    parse_circuit_rows,
+)
 from circuit_viewer.csv_import import CsvImportCancelled, CsvImportError
 from circuit_viewer.model import (
     CircuitCatalogModel,
@@ -275,6 +279,74 @@ class CircuitVisibilityTests(unittest.TestCase):
                 500_005.0, 8_000_000.0, 1.0, line_mask
             )
         )
+
+
+class SubstationLinkTests(unittest.TestCase):
+    """A origem do circuito chega pronta; o parser só a repassa."""
+
+    HEADER = ("CIRC_ID", "BARRA_ID", "CODIGO", "VNOM")
+
+    def setUp(self) -> None:
+        self.bars = make_bars(3)
+        self.network = make_network(self.bars, [0, 1], [1, 2])
+
+    def _parse(self, links=None):  # noqa: ANN001, ANN202
+        return parse_circuit_rows(
+            self.HEADER,
+            [("C1", "B0", "Circuito 1", "13.8")],
+            self.network,
+            None,
+            source_label="teste",
+            encoding="utf-8",
+            substation_links=links,
+        )
+
+    def test_without_links_the_fields_stay_empty(self) -> None:
+        # É o caso de qualquer fonte que não seja o banco Access.
+        definition = self._parse().model.definition(0)
+
+        self.assertEqual(definition.substation_code, "")
+        self.assertEqual(definition.substation_name, "")
+        self.assertEqual(definition.transformer_id, "")
+        self.assertEqual(definition.transformer_code, "")
+        self.assertEqual(definition.transformer_power, "")
+
+    def test_a_link_reaches_the_definition(self) -> None:
+        result = self._parse(
+            {
+                "C1": SubstationLink(
+                    substation_code="032",
+                    substation_name="SE AGUA BOA",
+                    transformer_id="3",
+                    transformer_code="53244TRAFO_032",
+                    transformer_power="25",
+                )
+            }
+        )
+
+        definition = result.model.definition(0)
+        self.assertEqual(definition.substation_code, "032")
+        self.assertEqual(definition.substation_name, "SE AGUA BOA")
+        self.assertEqual(definition.transformer_id, "3")
+        self.assertEqual(definition.transformer_code, "53244TRAFO_032")
+        self.assertEqual(definition.transformer_power, "25")
+        self.assertEqual(result.issues, ())
+
+    def test_a_reason_is_reported_without_rejecting_the_circuit(self) -> None:
+        # Contar como linha inválida mentiria no relatório: o circuito entrou
+        # no catálogo, só não trouxe a referência.
+        result = self._parse({"C1": SubstationLink(reason="SE_ID '9' sem par")})
+
+        self.assertEqual(len(result.model), 1)
+        self.assertEqual(result.invalid_rows, 0)
+        self.assertEqual(result.valid_rows, 1)
+        self.assertEqual([issue.reason for issue in result.issues], ["SE_ID '9' sem par"])
+
+    def test_a_circuit_absent_from_the_links_is_left_alone(self) -> None:
+        result = self._parse({"OUTRO": SubstationLink(substation_code="999")})
+
+        self.assertEqual(result.model.definition(0).substation_code, "")
+        self.assertEqual(result.issues, ())
 
 
 if __name__ == "__main__":

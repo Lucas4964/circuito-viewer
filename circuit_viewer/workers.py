@@ -62,6 +62,7 @@ from .opendss_powerflow import run_power_flow
 from .opendss_settings import OpenDssLoadSettings
 from .opendss_solution import DEFAULT_MAX_POWER_FLOW_ITER
 from .phase_config import PhaseConfiguration
+from .switch_types import SwitchTypeConfiguration
 from .regulator_import import load_regulators_csv
 from .segment_import import load_segments_csv
 from .switch_import import load_switches_csv
@@ -521,6 +522,7 @@ class MdbImportWorker(QObject):
         overrides: dict[str, str] | None = None,
         scale: float = 1.0,
         phase_configuration: PhaseConfiguration | None = None,
+        switch_types: SwitchTypeConfiguration | None = None,
     ) -> None:
         super().__init__()
         self.path = path
@@ -531,6 +533,7 @@ class MdbImportWorker(QObject):
         self.overrides = dict(overrides or {})
         self.scale = float(scale)
         self.phase_configuration = phase_configuration
+        self.switch_types = switch_types
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -552,6 +555,7 @@ class MdbImportWorker(QObject):
                         rows, current, total
                     ),
                     phase_configuration=self.phase_configuration,
+                    switch_types=self.switch_types,
                 )
         except CsvImportCancelled:
             self.cancelled.emit()

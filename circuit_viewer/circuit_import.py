@@ -7,7 +7,7 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from .csv_import import (
     PROGRESS_ROW_INTERVAL,
@@ -35,6 +35,26 @@ ProgressCallback = Callable[[int, int, int], None]
 class CircuitIssue:
     line_number: int
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class SubstationLink:
+    """De onde um circuito sai: a subestação e o transformador que o alimentam.
+
+    Chega pronto de quem leu o banco. Este módulo não sabe que ``SE`` e
+    ``SE_TRAFO`` existem — ele valida linhas de circuito, e a origem é apenas
+    mais um punhado de texto a repassar ao :class:`CircuitDefinition`.
+
+    ``reason`` é preenchido quando a chave estrangeira não resolveu: campo vazio
+    e um motivo a relatar, em vez de um circuito recusado.
+    """
+
+    substation_code: str = ""
+    substation_name: str = ""
+    transformer_id: str = ""
+    transformer_code: str = ""
+    transformer_power: str = ""
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +109,7 @@ def parse_circuit_rows(
     source_label: str,
     encoding: str,
     first_line_number: int = 2,
+    substation_links: Mapping[str, SubstationLink] | None = None,
     cancel_event: threading.Event | None = None,
     progress: RowProgress | None = None,
 ) -> CircuitLoadResult:
@@ -97,6 +118,12 @@ def parse_circuit_rows(
     Toda a validação vive aqui, independente da fonte: o CSV e o banco Access
     apenas entregam cabeçalho e linhas de texto. O custo dominante não é o
     parsing e sim a busca topológica de ``CircuitCatalogModel.build``.
+
+    ``substation_links`` mapeia ``CIRC_ID`` na origem do circuito, resolvida por
+    quem leu o banco. Ausente — o caso de qualquer fonte que não seja o Access —
+    os campos de origem ficam vazios e nada mais muda. Um vínculo que traga
+    ``reason`` vira ocorrência **sem** contar como linha inválida: o circuito
+    entrou no catálogo, e inflar a contagem de recusados mentiria no relatório.
     """
 
     definitions: list[CircuitDefinition] = []
@@ -144,12 +171,24 @@ def parse_circuit_rows(
             continue
 
         seen_ids.add(circuit_id)
+        link = (
+            None if substation_links is None else substation_links.get(circuit_id)
+        )
+        if link is not None and link.reason is not None:
+            # Fora de add_issue de propósito: o circuito foi aceito.
+            if len(issues) < MAX_REPORTED_ISSUES:
+                issues.append(CircuitIssue(line_number, link.reason))
         definitions.append(
             CircuitDefinition(
                 circuit_id=circuit_id,
                 root_bar_id=root_bar_id,
                 code=values["CODIGO"],
                 nominal_voltage=values["VNOM"],
+                substation_code="" if link is None else link.substation_code,
+                substation_name="" if link is None else link.substation_name,
+                transformer_id="" if link is None else link.transformer_id,
+                transformer_code="" if link is None else link.transformer_code,
+                transformer_power="" if link is None else link.transformer_power,
             )
         )
 

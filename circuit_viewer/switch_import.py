@@ -7,7 +7,7 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from .csv_import import (
     PROGRESS_ROW_INTERVAL,
@@ -35,6 +35,20 @@ EXPECTED_SWITCH_HEADER = (
 )
 MAX_REPORTED_ISSUES = 200
 ProgressCallback = Callable[[int, int, int], None]
+
+
+@dataclass(frozen=True, slots=True)
+class SwitchTypeInfo:
+    """O tipo de uma chave, já resolvido por quem conhece a fonte.
+
+    ``description`` vem do cadastro (``TIPOCHAVE.TIPO``) e ``switchable`` do
+    ``tipos_chave.json`` — banco e política, cada um da sua fonte. Ambos em
+    texto, como todo campo de chave no modelo, e vazios quando não há resposta:
+    a interface mostra traço, em vez de afirmar um 0 que ninguém declarou.
+    """
+
+    description: str = ""
+    switchable: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +104,7 @@ def parse_switch_rows(
     source_label: str,
     encoding: str,
     first_line_number: int = 2,
+    switch_types: Mapping[str, SwitchTypeInfo] | None = None,
     cancel_event: threading.Event | None = None,
     progress: RowProgress | None = None,
 ) -> SwitchLoadResult:
@@ -97,6 +112,11 @@ def parse_switch_rows(
 
     Toda a validação vive aqui, independente da fonte: o CSV e o banco Access
     apenas entregam cabeçalho e linhas de texto.
+
+    ``switch_types`` mapeia ``TIPOCHV_ID`` no tipo já resolvido — o nome vindo do
+    banco e o ``MANOBRAVEL`` vindo de ``tipos_chave.json``. Ausente, os dois
+    campos ficam vazios e nada mais muda: este módulo não sabe que ``TIPOCHAVE``
+    existe, nem que há um arquivo de configuração.
     """
 
     switch_ids: list[str] = []
@@ -178,6 +198,14 @@ def parse_switch_rows(
     if progress is not None:
         progress(total_rows)
 
+    resolved = tuple(
+        (
+            SwitchTypeInfo()
+            if switch_types is None
+            else switch_types.get(type_id, SwitchTypeInfo())
+        )
+        for type_id in switch_type_ids
+    )
     model = SwitchModel(
         segments,
         switch_ids,
@@ -190,6 +218,8 @@ def parse_switch_rows(
         corn_values,
         elo_values,
         elo_types,
+        type_names=[info.description for info in resolved],
+        switchable_values=[info.switchable for info in resolved],
         source_path=source_label,
     )
     return SwitchLoadResult(

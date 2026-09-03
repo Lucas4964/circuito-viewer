@@ -16,6 +16,7 @@ from circuit_viewer.mdb_import import (
 from circuit_viewer.mdb_mapping import ENTITY_ORDER, resolve_mapping
 from circuit_viewer.model import UtmCrs
 from circuit_viewer.phase_config import load_phase_configuration
+from circuit_viewer.switch_types import load_switch_types
 
 
 CRS = UtmCrs(zone=21, northern=False)
@@ -204,6 +205,174 @@ class LoadDatabaseTests(unittest.TestCase):
             by_table["BT_CONS"],
             ("ET_ID", "FASES2", "CONSUMO", "ID", "CODIGO"),
         )
+
+    SUBSTATION_TABLES = {
+        "CIRCUITO": (
+            ["CIRC_ID", "SE_ID", "TRAFO_ID", "BARRA_ID", "CODIGO", "VNOM", "NOME"],
+            [(2, 2, 3, 7, "004001", 13.800000190734863, "")],
+        ),
+        "SE": (
+            ["SE_ID", "CODIGO", "NOME", "VALTA"],
+            [(2, "032", "SE AGUA BOA", 69)],
+        ),
+        "SE_TRAFO": (
+            ["TRAFO_ID", "SE_ID", "CODIGO", "SNOM", "VMEDIA"],
+            [
+                (2, 2, "TRAFO_13KV", 50.0, 13.8),
+                (3, 2, "53244TRAFO_032", 25.0, 34.5),
+            ],
+        ),
+    }
+
+    def test_the_circuit_carries_its_substation_and_transformer(self) -> None:
+        # SE_ID e TRAFO_ID sao chaves de CIRCUITO; sem resolve-las a janela nao
+        # sabe dizer de onde o alimentador sai.
+        result = run(network_database(**self.SUBSTATION_TABLES))
+
+        definition = result.circuits.model.definition(0)
+        self.assertEqual(definition.substation_code, "032")
+        self.assertEqual(definition.substation_name, "SE AGUA BOA")
+        self.assertEqual(definition.transformer_id, "3")
+        self.assertEqual(definition.transformer_code, "53244TRAFO_032")
+        self.assertEqual(definition.transformer_power, "25")
+        self.assertEqual(result.circuits.issues, ())
+        self.assertEqual(result.circuits.invalid_rows, 0)
+
+    def test_a_key_that_does_not_resolve_empties_without_rejecting(self) -> None:
+        # Uma coluna informativa nao pode custar o alimentador: o circuito entra
+        # no catalogo, as celulas ficam vazias e o relatorio diz o motivo.
+        tables = dict(self.SUBSTATION_TABLES)
+        tables["CIRCUITO"] = (
+            tables["CIRCUITO"][0],
+            [(2, 99, 98, 7, "004001", 13.800000190734863, "")],
+        )
+        result = run(network_database(**tables))
+
+        definition = result.circuits.model.definition(0)
+        self.assertEqual(definition.substation_code, "")
+        self.assertEqual(definition.substation_name, "")
+        self.assertEqual(definition.transformer_code, "")
+        self.assertEqual(definition.transformer_power, "")
+        # O id cru sobrevive: e ele que permite achar o erro no cadastro.
+        self.assertEqual(definition.transformer_id, "98")
+        # Relatado, mas nao contado como linha invalida.
+        self.assertEqual(len(result.circuits.issues), 1)
+        reason = result.circuits.issues[0].reason
+        self.assertIn("SE_ID '99'", reason)
+        self.assertIn("TRAFO_ID '98'", reason)
+        self.assertEqual(result.circuits.invalid_rows, 0)
+        self.assertEqual(len(result.circuits.model), 1)
+
+    def test_an_empty_key_is_reported_too(self) -> None:
+        tables = dict(self.SUBSTATION_TABLES)
+        tables["CIRCUITO"] = (
+            tables["CIRCUITO"][0],
+            [(2, None, 3, 7, "004001", 13.800000190734863, "")],
+        )
+        result = run(network_database(**tables))
+
+        definition = result.circuits.model.definition(0)
+        self.assertEqual(definition.substation_code, "")
+        self.assertEqual(definition.transformer_code, "53244TRAFO_032")
+        self.assertIn("sem SE_ID", result.circuits.issues[0].reason)
+
+    def test_a_database_without_the_substation_tables_still_imports(self) -> None:
+        # O banco padrao do fixture nao tem SE nem SE_TRAFO nem TRAFO_ID: a
+        # importacao segue e as colunas de origem ficam em branco.
+        result = run(network_database())
+
+        definition = result.circuits.model.definition(0)
+        self.assertEqual(definition.substation_code, "")
+        self.assertEqual(definition.transformer_id, "")
+        self.assertEqual(result.circuits.issues, ())
+        self.assertEqual(result.failures, ())
+
+    def test_the_circuit_table_comes_from_the_mapping_not_a_literal(self) -> None:
+        # Quem decide de onde os circuitos vem e o mdb_tabelas.json. Com a
+        # entidade forcada para outra tabela, a leitura auxiliar tem de seguir
+        # junto — fixar "CIRCUITO" no codigo passaria neste cenario lendo a
+        # tabela errada.
+        tables = dict(self.SUBSTATION_TABLES)
+        columns, rows = tables.pop("CIRCUITO")
+        database = network_database(OUTRO_CIRCUITO=(columns, rows), **tables)
+
+        result = run(database, overrides={"circuitos": "OUTRO_CIRCUITO"})
+
+        self.assertEqual(
+            result.circuits.model.definition(0).transformer_code,
+            "53244TRAFO_032",
+        )
+        self.assertIn(
+            ("OUTRO_CIRCUITO", ("CIRC_ID", "SE_ID", "TRAFO_ID")),
+            database.statements,
+        )
+
+    SWITCH_TYPE_TABLES = {
+        "TIPOCHAVE": (
+            ["ID", "TIPO", "CODIGO", "ELO", "OPERACAO"],
+            [
+                (2, "Disjuntor", "DJ", 0, 0),
+                (4, "Chave Faca", "CF", 0, 0),
+                (5, "Chave Fusível", "CHFUSIVEL", 1, 0),
+                (99, "Tipo Novo", "INEDITO", 0, 0),
+            ],
+        ),
+    }
+
+    def _switch_database(self, type_id: int):  # noqa: ANN202
+        tables = dict(self.SWITCH_TYPE_TABLES)
+        tables["CHAVE"] = (
+            [
+                "CHAVE_ID", "TIPOCHV_ID", "CIRC_ID", "TRECHO_ID", "CODIGO",
+                "ESTADO", "ESTADO_NORMAL", "CORN", "ELO", "ELO_TIPO",
+            ],
+            [(4, type_id, 2, 3, "CHV-1", 1, 1, 400.0, 0.0, None)],
+        )
+        return network_database(**tables)
+
+    def test_the_switch_carries_its_type_and_whether_it_can_be_operated(self) -> None:
+        result = run(
+            self._switch_database(4), switch_types=load_switch_types()
+        )
+
+        record = result.switches.model.record(0)
+        self.assertEqual(record.type_name, "Chave Faca")
+        self.assertEqual(record.switchable, "1")
+
+    def test_a_fuse_is_not_switchable(self) -> None:
+        result = run(
+            self._switch_database(5), switch_types=load_switch_types()
+        )
+
+        record = result.switches.model.record(0)
+        self.assertEqual(record.type_name, "Chave Fusível")
+        self.assertEqual(record.switchable, "0")
+
+    def test_a_type_absent_from_the_file_keeps_its_name(self) -> None:
+        # O banco sabe o que a chave é; só a política está faltando. Afirmar 0
+        # ali seria inventar uma resposta que ninguém declarou.
+        result = run(
+            self._switch_database(99), switch_types=load_switch_types()
+        )
+
+        record = result.switches.model.record(0)
+        self.assertEqual(record.type_name, "Tipo Novo")
+        self.assertEqual(record.switchable, "")
+
+    def test_without_the_configuration_only_the_name_survives(self) -> None:
+        result = run(self._switch_database(4))
+
+        record = result.switches.model.record(0)
+        self.assertEqual(record.type_name, "Chave Faca")
+        self.assertEqual(record.switchable, "")
+
+    def test_a_database_without_tipochave_still_imports(self) -> None:
+        result = run(network_database(), switch_types=load_switch_types())
+
+        record = result.switches.model.record(0)
+        self.assertEqual(record.type_name, "")
+        self.assertEqual(record.switchable, "")
+        self.assertEqual(result.failures, ())
 
     def test_imports_every_entity(self) -> None:
         result = run(network_database())

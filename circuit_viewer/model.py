@@ -100,7 +100,14 @@ class SegmentRecord:
 
 @dataclass(frozen=True, slots=True)
 class SwitchRecord:
-    """Atributos de uma chave associada a um trecho da rede."""
+    """Atributos de uma chave associada a um trecho da rede.
+
+    ``type_name`` é o ``TIPOCHAVE.TIPO`` do banco — "Chave Faca", "Disjuntor" —
+    e ``switchable`` é o ``"1"``/``"0"`` que ``tipos_chave.json`` declara para
+    aquele tipo. Os dois saem vazios quando a fonte não os fornece, e a
+    interface troca vazio por traço: um fusível sem relação no arquivo não vira
+    manobrável por omissão.
+    """
 
     switch_id: str
     switch_type_id: str
@@ -112,6 +119,8 @@ class SwitchRecord:
     corn: str
     elo: str
     elo_type: str
+    type_name: str = ""
+    switchable: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,12 +249,30 @@ class LoadPatternRecord:
 
 @dataclass(frozen=True, slots=True)
 class CircuitDefinition:
-    """Metadados de um circuito e sua barra de partida."""
+    """Metadados de um circuito, sua barra de partida e sua origem.
+
+    Os cinco campos de origem descrevem **de onde** o alimentador sai: a
+    subestação e o transformador que o alimentam. Eles nascem do
+    ``SE_ID``/``TRAFO_ID`` da tabela de circuitos, resolvidos contra ``SE`` e
+    ``SE_TRAFO`` por quem conhece o banco — o parser de linhas os recebe
+    prontos.
+
+    Todos têm padrão vazio de propósito. São informativos: um circuito cuja
+    chave não resolva, ou que venha de uma fonte que não as tenha, continua
+    sendo um circuito, e o catálogo continua desenhável. Perder o alimentador
+    por causa de uma coluna de referência seria trocar o essencial pelo
+    acessório.
+    """
 
     circuit_id: str
     root_bar_id: str
     code: str
     nominal_voltage: str
+    substation_code: str = ""
+    substation_name: str = ""
+    transformer_id: str = ""
+    transformer_code: str = ""
+    transformer_power: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1465,6 +1492,8 @@ class SwitchModel:
         "_corn_values",
         "_elo_values",
         "_elo_types",
+        "_type_names",
+        "_switchable_values",
         "_by_id",
         "_record_by_segment",
         "source_path",
@@ -1484,9 +1513,15 @@ class SwitchModel:
         elo_values: Iterable[str],
         elo_types: Iterable[str],
         *,
+        type_names: Iterable[str] | None = None,
+        switchable_values: Iterable[str] | None = None,
         source_path: str | None = None,
     ) -> None:
         ids = tuple(str(value) for value in switch_ids)
+        # Keyword-only com padrão vazio: vinte e cinco pontos constroem este
+        # modelo posicionalmente, e o tipo resolvido é informativo — exigi-lo
+        # quebraria todos eles para acrescentar duas colunas de leitura.
+        blank = ("",) * len(ids)
         text_columns = tuple(
             tuple(str(value) for value in values)
             for values in (
@@ -1498,6 +1533,8 @@ class SwitchModel:
                 corn_values,
                 elo_values,
                 elo_types,
+                blank if type_names is None else type_names,
+                blank if switchable_values is None else switchable_values,
             )
         )
         associated_segments = np.ascontiguousarray(segment_indices, dtype=np.intp)
@@ -1541,6 +1578,8 @@ class SwitchModel:
             self._corn_values,
             self._elo_values,
             self._elo_types,
+            self._type_names,
+            self._switchable_values,
         ) = text_columns
         self._segment_indices = associated_segments
         self._by_id = by_id
@@ -1594,6 +1633,8 @@ class SwitchModel:
             corn=self._corn_values[index],
             elo=self._elo_values[index],
             elo_type=self._elo_types[index],
+            type_name=self._type_names[index],
+            switchable=self._switchable_values[index],
         )
 
     def record_for_segment(self, segment_index: int) -> SwitchRecord | None:

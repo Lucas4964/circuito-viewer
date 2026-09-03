@@ -1,0 +1,21 @@
+[
+  {"CODIGO": "CH",        "TIPO": "Chave (em geral)",                "MANOBRAVEL": 1},
+  {"CODIGO": "AT",        "TIPO": "Chave de Aterramento",            "MANOBRAVEL": 1},
+  {"CODIGO": "CF",        "TIPO": "Chave Faca",                      "MANOBRAVEL": 1},
+  {"CODIGO": "CL",        "TIPO": "Chave Lâmina",                    "MANOBRAVEL": 1},
+  {"CODIGO": "CT",        "TIPO": "Chave Tripolar",                  "MANOBRAVEL": 1},
+  {"CODIGO": "CHTAS",     "TIPO": "Chave Tripolar Abertura a Seco",  "MANOBRAVEL": 1},
+  {"CODIGO": "CHUNIP",    "TIPO": "Chave Unipolar",                  "MANOBRAVEL": 1},
+  {"CODIGO": "CHOLEO",    "TIPO": "Chave Óleo/Vácuo/Hexafluoreto",   "MANOBRAVEL": 1},
+  {"CODIGO": "TD",        "TIPO": "Chave Tandem",                    "MANOBRAVEL": 1},
+  {"CODIGO": "DJ",        "TIPO": "Disjuntor",                       "MANOBRAVEL": 1},
+  {"CODIGO": "RELIG",     "TIPO": "Religadora",                      "MANOBRAVEL": 1},
+  {"CODIGO": "SECC",      "TIPO": "Seccionalizadora",                "MANOBRAVEL": 1},
+
+  {"CODIGO": "CHFUSIVEL", "TIPO": "Chave Fusível",                   "MANOBRAVEL": 0},
+  {"CODIGO": "CFT",       "TIPO": "Chave Fusível de Transformador",  "MANOBRAVEL": 0},
+  {"CODIGO": "CFUSIVEL",  "TIPO": "Chave Fusível Religadora",        "MANOBRAVEL": 0},
+
+  {"CODIGO": "JUMPER",    "TIPO": "Jumper",                          "MANOBRAVEL": 0},
+  {"CODIGO": "FLYTAP",    "TIPO": "Fly Tap",                         "MANOBRAVEL": 0}
+]

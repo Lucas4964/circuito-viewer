@@ -22,7 +22,23 @@ class CircuitTableModel(QAbstractTableModel):
 
     visibilityChanged = pyqtSignal(int, bool)
     colorChanged = pyqtSignal(int, str)
-    HEADERS = ("Visível", "Cor", "CIRC_ID", "BARRA_ID", "CODIGO", "VNOM")
+    # Em blocos por entidade: o circuito, a subestação que o alimenta e o
+    # transformador de onde ele sai. O bloco do transformador tem a mesma forma
+    # do bloco do circuito — id, código, atributo —, que é a razão de o S_NOM
+    # fechar a fila em vez de se meter entre a SE e o trafo.
+    HEADERS = (
+        "Visível",
+        "Cor",
+        "CIRC_ID",
+        "BARRA_ID",
+        "CODIGO",
+        "VNOM",
+        "CODIGO_SE",
+        "NOME_SE",
+        "TRAFO_ID",
+        "CODIGO_TRAFO",
+        "S_NOM",
+    )
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
@@ -108,6 +124,11 @@ class CircuitTableModel(QAbstractTableModel):
             definition.root_bar_id,
             definition.code or "—",
             definition.nominal_voltage or "—",
+            definition.substation_code or "—",
+            definition.substation_name or "—",
+            definition.transformer_id or "—",
+            definition.transformer_code or "—",
+            definition.transformer_power or "—",
         )
         return values[column - 2]
 

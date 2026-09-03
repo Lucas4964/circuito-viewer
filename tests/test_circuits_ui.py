@@ -113,6 +113,84 @@ class CircuitsWindowTests(unittest.TestCase):
         self.app.processEvents()
         return window, catalog
 
+    # ------------------------------------------- colunas de origem do circuito
+
+    def test_the_table_shows_where_the_circuit_comes_from(self) -> None:
+        # Em blocos: o circuito, a subestação que o alimenta e o transformador
+        # de onde ele sai.
+        window, _ = self.make_two_circuit_window()
+        model = window.circuit_table_model
+
+        self.assertEqual(
+            model.HEADERS,
+            (
+                "Visível",
+                "Cor",
+                "CIRC_ID",
+                "BARRA_ID",
+                "CODIGO",
+                "VNOM",
+                "CODIGO_SE",
+                "NOME_SE",
+                "TRAFO_ID",
+                "CODIGO_TRAFO",
+                "S_NOM",
+            ),
+        )
+
+    def test_the_origin_columns_show_their_values(self) -> None:
+        window, _ = self.make_two_circuit_window()
+        catalog = CircuitCatalogModel.build(
+            window._line_model,
+            None,
+            [
+                CircuitDefinition(
+                    "C1",
+                    "B0",
+                    "ALIM-1",
+                    "13.8",
+                    substation_code="032",
+                    substation_name="SE AGUA BOA",
+                    transformer_id="3",
+                    transformer_code="53244TRAFO_032",
+                    transformer_power="25",
+                ),
+            ],
+        )
+        window._set_circuit_catalog(catalog)
+        self.app.processEvents()
+        model = window.circuit_table_model
+
+        row = [
+            model.data(model.index(0, column))
+            for column in range(2, len(model.HEADERS))
+        ]
+        self.assertEqual(
+            row,
+            [
+                "C1",
+                "B0",
+                "ALIM-1",
+                "13.8",
+                "032",
+                "SE AGUA BOA",
+                "3",
+                "53244TRAFO_032",
+                "25",
+            ],
+        )
+
+    def test_an_unresolved_origin_shows_a_dash(self) -> None:
+        # Mesmo tratamento que CODIGO e VNOM vazios já recebem.
+        window, _ = self.make_two_circuit_window()
+        model = window.circuit_table_model
+
+        origin = [
+            model.data(model.index(0, column))
+            for column in range(model.HEADERS.index("CODIGO_SE"), len(model.HEADERS))
+        ]
+        self.assertEqual(origin, ["—"] * 5)
+
     # --------------------------------------- duplo clique na barra inicial
 
     def test_double_click_on_the_root_bar_frames_it_on_the_map(self) -> None:
@@ -291,7 +369,7 @@ class CircuitsWindowTests(unittest.TestCase):
         self.assertFalse(window.circuits_window.isModal())
         table_model = window.circuit_table_model
         self.assertEqual(table_model.rowCount(), 1)
-        self.assertEqual(table_model.columnCount(), 6)
+        self.assertEqual(table_model.columnCount(), 11)
         self.assertEqual(
             table_model.data(table_model.index(0, 0), Qt.ItemDataRole.CheckStateRole),
             Qt.CheckState.Checked,
