@@ -49,6 +49,8 @@ from .branch_table_export import (
     BranchCsvExportResult,
     suggested_branch_csv_filename,
 )
+from .block_analysis import BlockRecord, analyze_blocks
+from .blocks_window import BlocksWindow, BlockTableModel
 from .branch_window import BranchesWindow, BranchTableModel
 from .calculation_levels import CalculationLevelSchedule
 from .calculation_levels_store import load_calculation_levels
@@ -752,6 +754,7 @@ class MainWindow(QMainWindow):
         self._branch_analysis_result: BranchAnalysisResult | None = None
         self._equivalent_network_result: EquivalentNetworkResult | None = None
         self._selected_branch: BranchRecord | None = None
+        self._selected_block: BlockRecord | None = None
         self._selected_feature: FeatureSelection | None = None
         self._effective_bar_mask = None
         self._effective_segment_mask = None
@@ -907,6 +910,11 @@ class MainWindow(QMainWindow):
         self.scene.addItem(self.segment_selection_overlay)
         self.branch_highlight_overlay = BranchHighlightOverlayItem()
         self.scene.addItem(self.branch_highlight_overlay)
+        # Instancia propria, e nao a mesma do ramal: os dois pintam em
+        # SELECTED_COLOR e disputariam o objeto. Separados, a exclusao mutua
+        # fica explicita em _select_block/_select_branch.
+        self.block_highlight_overlay = BranchHighlightOverlayItem()
+        self.scene.addItem(self.block_highlight_overlay)
         self.search_index = GlobalSearchIndex()
         self.search_palette = SearchPalette(
             self.search_index,
@@ -930,6 +938,8 @@ class MainWindow(QMainWindow):
         )
         self.branch_table_model = BranchTableModel(self)
         self.branches_window = BranchesWindow(self.branch_table_model, self)
+        self.block_table_model = BlockTableModel(self)
+        self.blocks_window = BlocksWindow(self.block_table_model, self)
         self.cable_table_model = CableTableModel(self)
         self.cables_window = CablesWindow(self.cable_table_model, self)
         # WireData/CNData e LineSpacing são bibliotecas globais. As montagens
@@ -1342,6 +1352,14 @@ class MainWindow(QMainWindow):
             self.branches_action.setToolTip(self._phase_configuration_error)
         self.branches_action.triggered.connect(self._show_or_analyze_branches)
 
+        self.blocks_action = QAction("Blocos…", self)
+        self.blocks_action.setEnabled(False)
+        self.blocks_action.setToolTip(
+            "Identificar as regiões delimitadas por chaves manobráveis, para "
+            "estudo de manobra"
+        )
+        self.blocks_action.triggered.connect(self._show_blocks)
+
         self.select_action = QAction("Selecionar", self)
         self.select_action.setCheckable(True)
         self.select_action.setChecked(True)
@@ -1409,6 +1427,7 @@ class MainWindow(QMainWindow):
 
         self.tools_menu = self.menuBar().addMenu("Ferramentas")
         self.tools_menu.addAction(self.branches_action)
+        self.tools_menu.addAction(self.blocks_action)
         self.tools_menu.addSeparator()
         self.tools_menu.addAction(self.update_generators_action)
         self.tools_menu.addAction(self.power_flow_action)
@@ -2181,6 +2200,10 @@ class MainWindow(QMainWindow):
         )
         self.search_palette.resultActivated.connect(self._activate_search_result)
         self.search_palette.closed.connect(self.view.setFocus)
+        self.blocks_window.blockSelected.connect(self._select_block)
+        self.blocks_window.blockActivated.connect(self._activate_block)
+        self.blocks_window.selectionCleared.connect(self._clear_block_highlight)
+        self.blocks_window.closed.connect(self._clear_block_highlight)
         self.branches_window.branchSelected.connect(self._select_branch)
         self.branches_window.branchActivated.connect(self._activate_branch)
         self.branches_window.selectionCleared.connect(
@@ -4168,6 +4191,14 @@ class MainWindow(QMainWindow):
         )
         self.branches_action.setEnabled(available)
         self.simplified_network_action.setEnabled(available)
+        # Os blocos nao dependem da configuracao de fases nem dos ramais: basta
+        # rede com chaves, que sao quem os delimita.
+        self.blocks_action.setEnabled(
+            self._circuit_catalog is not None
+            and self._line_model is not None
+            and self._switch_model is not None
+            and not self._busy()
+        )
 
     def _sync_export_availability(self) -> None:
         """Habilita cada exportação com os insumos exigidos por seu modo."""
@@ -6769,6 +6800,91 @@ class MainWindow(QMainWindow):
             self._close_after_branch_json_export = False
             self.close()
 
+    def _show_blocks(self) -> None:
+        """Calcula os blocos e abre a janela.
+
+        Sincrono, ao contrario da analise de ramais: e uma unica passada de
+        componentes conexas sobre a adjacencia ja montada — 119 ms medidos num
+        alimentador de 23.857 barras, abaixo do que se percebe como espera.
+        """
+
+        catalog = self._circuit_catalog
+        if catalog is None or self._line_model is None or self._busy():
+            return
+        try:
+            result = analyze_blocks(
+                catalog,
+                self._switch_model,
+                self._load_model,
+            )
+        except ValueError as exc:
+            QMessageBox.critical(self, "Blocos", str(exc))
+            return
+        self._clear_block_highlight()
+        self.blocks_window.set_result(result)
+        self.blocks_window.show()
+        self.blocks_window.raise_()
+        self.blocks_window.activateWindow()
+
+    def _invalidate_blocks(self) -> None:
+        """Descarta os blocos quando a rede que os originou deixa de valer."""
+
+        self._clear_block_highlight()
+        self.block_table_model.set_result(None)
+        self.blocks_window.set_result(None)
+
+    def _clear_block_highlight(self, *, clear_table: bool = False) -> None:
+        self._selected_block = None
+        self.block_highlight_overlay.clear()
+        if clear_table:
+            self.blocks_window.clear_selection()
+        self.view.viewport().update()
+
+    def _select_block(self, record: BlockRecord) -> None:
+        """Pinta o bloco no mapa, em exclusao mutua com o realce de ramal.
+
+        Um bloco sem trecho — dois manobraveis adjacentes na mesma barra — nao
+        tem o que pintar; o realce sai e a linha continua selecionavel.
+        """
+
+        if self._line_model is None:
+            return
+        self._clear_branch_highlight(clear_table=True)
+        self._selected_block = record
+        if record.segment_count == 0:
+            self.block_highlight_overlay.clear()
+            self.statusBar().showMessage(
+                f"Bloco {record.block_id:n} não possui trecho para destacar.",
+                4_000,
+            )
+        else:
+            try:
+                self.block_highlight_overlay.bind(
+                    self._line_model,
+                    record.segment_indices,
+                )
+            except (IndexError, ValueError):
+                self._invalidate_blocks()
+                self.statusBar().showMessage(
+                    "Os blocos não valem mais após a substituição dos dados.",
+                    5_000,
+                )
+                return
+        self.view.viewport().update()
+
+    def _activate_block(self, record: BlockRecord) -> None:
+        self._select_block(record)
+        if self._selected_block is not record or record.segment_count == 0:
+            return
+        try:
+            self.view.focus_segments(record.segment_indices)
+        except (IndexError, ValueError):
+            self._invalidate_blocks()
+            return
+        self.virtualizer.refresh(force=True)
+        self.load_virtualizer.refresh(force=True)
+        self.view.setFocus(Qt.FocusReason.OtherFocusReason)
+
     def _clear_branch_highlight(self, *, clear_table: bool = False) -> None:
         self._selected_branch = None
         self.branch_highlight_overlay.clear()
@@ -6802,6 +6918,7 @@ class MainWindow(QMainWindow):
             )
             self._circuit_visibility_timer.stop()
             self._apply_circuit_visibility()
+        self._clear_block_highlight(clear_table=True)
         self._selected_branch = record
         self.branch_highlight_overlay.bind(
             self._line_model,

@@ -1,0 +1,310 @@
+from __future__ import annotations
+
+import os
+import unittest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+try:
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QGuiApplication
+    from PyQt6.QtWidgets import QApplication
+
+    from circuit_viewer.blocks_window import BlocksWindow, BlockTableModel
+    from circuit_viewer.main_window import MainWindow
+
+    PYQT_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - ambiente sem PyQt
+    PYQT_AVAILABLE = False
+
+from circuit_viewer.block_analysis import analyze_blocks
+from circuit_viewer.block_table import BLOCK_TABLE_HEADERS
+
+from test_block_analysis import (  # noqa: E402
+    make_bars,
+    make_catalog,
+    make_loads,
+    make_network,
+    make_switches,
+)
+
+
+def sample_result():  # noqa: ANN201
+    """B0 —T0— B1 —T1(manobrável)— B2 —T2— B3, com carga em B1 e B3."""
+
+    bars = make_bars(4)
+    network = make_network(bars, [0, 1, 2], [1, 2, 3], lengths=[30.0, 5.0, 70.0])
+    switches = make_switches(network, [(1, "1", "1")])
+    loads = make_loads(bars, [1, 3], ["10", "25,5"])
+    return (
+        analyze_blocks(make_catalog(network, switches), switches, loads),
+        network,
+        switches,
+    )
+
+
+def many_boundaries_result():  # noqa: ANN201
+    """Um bloco central com três fronteiras, para exercitar a abreviação."""
+
+    #        B1                B3
+    #         |T1(m)            |T3(m)
+    # B0 —T0(m)— B2 —T2(m)— B4
+    bars = make_bars(5)
+    network = make_network(bars, [0, 1, 2, 3], [2, 2, 4, 2])
+    switches = make_switches(
+        network, [(0, "1", "1"), (1, "1", "1"), (2, "1", "1"), (3, "1", "1")]
+    )
+    return analyze_blocks(make_catalog(network, switches), switches)
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class BlockTableModelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.result, self.network, self.switches = sample_result()
+        self.model = BlockTableModel()
+        self.model.set_result(self.result)
+
+    def _column(self, name: str) -> int:
+        return BLOCK_TABLE_HEADERS.index(name)
+
+    def _display(self, row: int, name: str):  # noqa: ANN202
+        return self.model.data(
+            self.model.index(row, self._column(name)),
+            Qt.ItemDataRole.DisplayRole,
+        )
+
+    def test_the_table_has_the_agreed_columns_in_order(self) -> None:
+        self.assertEqual(
+            self.model.HEADERS,
+            (
+                "BLOCO_ID",
+                "NUM_BARRAS",
+                "NUM_TRECHOS",
+                "NUM_CARGAS",
+                "SNOM",
+                "COMPR",
+                "NUM_CHAVES",
+                "CHAVES",
+                "FONTE",
+            ),
+        )
+        self.assertEqual(self.model.rowCount(), 2)
+
+    def test_the_counts_reach_the_cells(self) -> None:
+        self.assertEqual(self._display(0, "BLOCO_ID"), "1")
+        self.assertEqual(self._display(0, "NUM_BARRAS"), "2")
+        self.assertEqual(self._display(0, "NUM_TRECHOS"), "1")
+        self.assertEqual(self._display(0, "NUM_CARGAS"), "1")
+        self.assertEqual(self._display(0, "NUM_CHAVES"), "1")
+
+    def test_the_source_block_is_marked(self) -> None:
+        marks = {self._display(row, "FONTE") for row in range(2)}
+        self.assertEqual(marks, {"0", "1"})
+
+    def test_a_block_without_a_value_shows_a_dash(self) -> None:
+        result = many_boundaries_result()
+        model = BlockTableModel()
+        model.set_result(result)
+        row = next(
+            index
+            for index in range(model.rowCount())
+            if model.record(index).segment_count == 0
+        )
+
+        self.assertEqual(
+            model.data(
+                model.index(row, self._column("COMPR")),
+                Qt.ItemDataRole.DisplayRole,
+            ),
+            "—",
+        )
+
+    # ------------------------------------------------- a coluna CHAVES ------
+
+    def test_a_single_boundary_is_shown_whole(self) -> None:
+        # Uma chave só: não há o que reticenciar.
+        self.assertEqual(self._display(0, "CHAVES"), "COD-CH0")
+
+    def test_several_boundaries_are_abbreviated(self) -> None:
+        result = many_boundaries_result()
+        model = BlockTableModel()
+        model.set_result(result)
+        row = next(
+            index
+            for index in range(model.rowCount())
+            if model.record(index).boundary_count > 1
+        )
+        column = self._column("CHAVES")
+
+        display = model.data(model.index(row, column), Qt.ItemDataRole.DisplayRole)
+        tooltip = model.data(model.index(row, column), Qt.ItemDataRole.ToolTipRole)
+        copiable = model.data(model.index(row, column), Qt.ItemDataRole.EditRole)
+
+        self.assertTrue(display.endswith("…"), display)
+        # O tooltip e o Ctrl+C trazem a lista inteira; a tela, só a dica.
+        self.assertNotIn("…", tooltip)
+        self.assertEqual(copiable, tooltip)
+        self.assertGreater(len(tooltip), len(display))
+        for code in model.record(row).boundary_switch_codes:
+            self.assertIn(code, tooltip)
+
+    def test_only_the_switches_column_differs_between_shown_and_copied(self) -> None:
+        # Nas demais o EditRole é nulo, e a cópia cai para o DisplayRole.
+        for name in BLOCK_TABLE_HEADERS:
+            if name == "CHAVES":
+                continue
+            with self.subTest(column=name):
+                index = self.model.index(0, self._column(name))
+                self.assertIsNone(
+                    self.model.data(index, Qt.ItemDataRole.EditRole)
+                )
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class BlocksWindowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window(self):  # noqa: ANN202
+        result, _, _ = sample_result()
+        model = BlockTableModel()
+        window = BlocksWindow(model)
+        self.addCleanup(window.close)
+        window.set_result(result)
+        return window, model, result
+
+    def test_the_summary_counts_blocks_boundaries_and_dead_ends(self) -> None:
+        window, _, result = self._window()
+
+        text = window.summary_label.text()
+        self.assertIn("2 bloco(s)", text)
+        self.assertIn("1 chave(s) manobrável(is)", text)
+        self.assertIn("2 bloco(s) com fronteira única", text)
+
+    def test_selecting_a_row_emits_the_record(self) -> None:
+        window, model, _ = self._window()
+        window.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        received: list[object] = []
+        window.blockSelected.connect(received.append)
+
+        window.table.setCurrentIndex(window.proxy_model.index(0, 0))
+        self.app.processEvents()
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].block_id, 1)
+        self.assertEqual(model.highlight_row, 0)
+
+    def test_the_highlight_follows_the_source_row_not_the_visible_one(self) -> None:
+        # A tabela ordena, então a linha visível não é a do modelo fonte.
+        # Realçar a visível pintaria a linha errada.
+        window, model, _ = self._window()
+        window.table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+        received: list[object] = []
+        window.blockSelected.connect(received.append)
+
+        window.table.setCurrentIndex(window.proxy_model.index(0, 0))
+        self.app.processEvents()
+
+        self.assertEqual(received[-1].block_id, 2)
+        self.assertEqual(model.highlight_row, 1)
+
+    def test_clearing_the_selection_drops_the_highlight(self) -> None:
+        window, model, _ = self._window()
+        window.table.setCurrentIndex(window.proxy_model.index(0, 0))
+        self.app.processEvents()
+
+        window.clear_selection()
+
+        self.assertEqual(model.highlight_row, -1)
+
+    def test_copying_the_switches_cell_yields_the_whole_list(self) -> None:
+        # É o escape para o valor que a tela abrevia.
+        result = many_boundaries_result()
+        model = BlockTableModel()
+        window = BlocksWindow(model)
+        self.addCleanup(window.close)
+        window.set_result(result)
+        row = next(
+            index
+            for index in range(model.rowCount())
+            if model.record(index).boundary_count > 1
+        )
+        column = BLOCK_TABLE_HEADERS.index("CHAVES")
+        window.table.setCurrentIndex(window.proxy_model.index(row, column))
+        window.table.selectionModel().select(
+            window.proxy_model.index(row, column),
+            window.table.selectionModel().SelectionFlag.Select,
+        )
+
+        window.table.copy_selection()
+        self.app.processEvents()
+
+        pasted = QGuiApplication.clipboard().text()
+        self.assertNotIn("…", pasted)
+        for code in model.record(row).boundary_switch_codes:
+            self.assertIn(code, pasted)
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class BlocksIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_the_action_lives_in_the_tools_menu_and_needs_a_network(self) -> None:
+        window = MainWindow()
+        self.addCleanup(window.close)
+
+        tools = next(
+            entry.menu()
+            for entry in window.menuBar().actions()
+            if entry.text() == "Ferramentas"
+        )
+        self.assertIn(window.blocks_action, tools.actions())
+        self.assertFalse(window.blocks_action.isEnabled())
+
+    def test_selecting_a_block_highlights_it_and_drops_the_branch(self) -> None:
+        # Os dois realces pintam na mesma cor; deixá-los conviver confundiria.
+        window = MainWindow()
+        self.addCleanup(window.close)
+        result, network, switches = sample_result()
+        window._line_model = network
+        window.block_table_model.set_result(result)
+        record = result.records[0]
+
+        window._select_block(record)
+
+        self.assertTrue(window.block_highlight_overlay.isVisible())
+        self.assertEqual(
+            window.block_highlight_overlay.segment_indices,
+            tuple(record.segment_indices.tolist()),
+        )
+        self.assertFalse(window.branch_highlight_overlay.isVisible())
+
+        window._clear_block_highlight()
+        self.assertFalse(window.block_highlight_overlay.isVisible())
+
+    def test_a_block_without_segments_says_so_instead_of_failing(self) -> None:
+        window = MainWindow()
+        self.addCleanup(window.close)
+        result = many_boundaries_result()
+        bars = make_bars(5)
+        network = make_network(bars, [0, 1, 2, 3], [2, 2, 4, 2])
+        window._line_model = network
+        empty = next(
+            record for record in result.records if record.segment_count == 0
+        )
+
+        window._select_block(empty)
+
+        self.assertFalse(window.block_highlight_overlay.isVisible())
+        self.assertIn("não possui trecho", window.statusBar().currentMessage())
+
+
+if __name__ == "__main__":
+    unittest.main()
