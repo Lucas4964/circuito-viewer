@@ -928,6 +928,21 @@ class GraphicsTests(unittest.TestCase):
         view._select_nearest(anchor + QPoint(0, 10))
         self.assertIsNone(selected[-1])
 
+    def test_the_hit_test_answers_the_same_thing_it_emits(self) -> None:
+        # O clique esquerdo e o menu de contexto usam a mesma deteccao; se ela
+        # divergisse, o menu falaria de um elemento e o painel de outro.
+        bars, _, _, view, _, _ = self._make_load_canvas(["L1"])
+        self.addCleanup(view.close)
+        selected: list[FeatureSelection | None] = []
+        view.selectionRequested.connect(selected.append)
+        anchor = view.mapFromScene(QPointF(float(bars.x[0]), -float(bars.y[0])))
+
+        for position in (anchor, anchor + QPoint(0, 10), anchor + QPoint(900, 900)):
+            with self.subTest(position=(position.x(), position.y())):
+                answered = view.feature_at(position)
+                view._select_nearest(position)
+                self.assertEqual(answered, selected[-1])
+
     def test_overview_load_border_is_selectable_while_center_selects_bar(self) -> None:
         bars, _, _, view, _, _ = self._make_load_canvas(["L1", "L2"], cap=1)
         self.addCleanup(view.close)

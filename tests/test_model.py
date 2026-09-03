@@ -5,6 +5,8 @@ import unittest
 import numpy as np
 
 from circuit_viewer.model import (
+    CLOSED_SWITCH_STATE,
+    OPEN_SWITCH_STATE,
     Bounds,
     CircuitModel,
     FeatureSelection,
@@ -14,6 +16,7 @@ from circuit_viewer.model import (
     StaticSegmentIndex,
     SwitchModel,
     UtmCrs,
+    switch_state_label,
 )
 
 
@@ -254,6 +257,44 @@ class CircuitModelTests(unittest.TestCase):
                 ["", ""],
                 ["", ""],
             )
+
+
+class SwitchStateLabelTests(unittest.TestCase):
+    """0 e 1 por extenso: o painel mostra a palavra, não o código."""
+
+    def test_the_two_known_states(self) -> None:
+        self.assertEqual(switch_state_label(CLOSED_SWITCH_STATE), "FECHADA")
+        self.assertEqual(switch_state_label(OPEN_SWITCH_STATE), "ABERTA")
+
+    def test_surrounding_spaces_do_not_lose_the_answer(self) -> None:
+        # O cadastro chega como texto; o resto do código já faz .strip().
+        self.assertEqual(switch_state_label(" 1 "), "FECHADA")
+        self.assertEqual(switch_state_label("\t0\n"), "ABERTA")
+
+    def test_an_empty_state_has_no_label(self) -> None:
+        # Vazio devolve vazio, e a interface converte em travessão.
+        self.assertEqual(switch_state_label(""), "")
+        self.assertEqual(switch_state_label("   "), "")
+
+    def test_an_unrecognised_value_says_what_the_program_does(self) -> None:
+        # O programa trata o valor inválido como aberta — o exportador registra
+        # "exportada como aberta" e a travessia bloqueia. Dizer só ABERTA
+        # esconderia o defeito de cadastro; dizer só travessão esconderia o
+        # comportamento.
+        for value in ("2", "x", "1.0"):
+            with self.subTest(value=value):
+                label = switch_state_label(value)
+                self.assertTrue(label.startswith("ABERTA"), label)
+                self.assertIn("não reconhecido", label)
+
+    def test_the_exporter_shares_the_constant_instead_of_copying_it(self) -> None:
+        # Um rótulo errado não quebra teste de comportamento: só mente na tela.
+        # Enquanto os dois forem o mesmo objeto, não há como divergirem.
+        from circuit_viewer.opendss_export import (
+            CLOSED_SWITCH_STATE as exported,
+        )
+
+        self.assertIs(exported, CLOSED_SWITCH_STATE)
 
 
 if __name__ == "__main__":

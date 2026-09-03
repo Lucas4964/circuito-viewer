@@ -324,6 +324,34 @@ class BlocksWindow(QDialog):
         self.issues_text.setPlainText("\n".join(issue_lines))
         self.issues_text.setVisible(bool(issue_lines))
 
+    def select_block(self, block_id: int) -> bool:
+        """Põe a linha do bloco em foco, seguindo a ordenação corrente.
+
+        A tradução fonte → proxy é obrigatória pelo mesmo motivo do realce: a
+        tabela ordena, e a linha do modelo não é a que está na tela.
+        """
+
+        source = self.proxy_model.sourceModel()
+        if not isinstance(source, BlockTableModel) or source.result is None:
+            return False
+        row = next(
+            (
+                index
+                for index, record in enumerate(source.result.records)
+                if record.block_id == int(block_id)
+            ),
+            None,
+        )
+        if row is None:
+            return False
+        proxy_index = self.proxy_model.mapFromSource(source.index(row, 0))
+        if not proxy_index.isValid():
+            return False
+        self.table.setCurrentIndex(proxy_index)
+        self.table.selectRow(proxy_index.row())
+        self.table.scrollTo(proxy_index)
+        return True
+
     def clear_selection(self) -> None:
         self.table.clearSelection()
         self.table.setCurrentIndex(QModelIndex())

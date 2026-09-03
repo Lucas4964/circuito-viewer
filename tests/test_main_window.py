@@ -553,6 +553,41 @@ class MainWindowSelectionTests(unittest.TestCase):
         self.assertEqual(window._selected_feature, selection)
         self.assertEqual(window.switch_detail_labels["code"].text(), "NOVO")
 
+    def test_the_switch_panel_spells_out_the_state(self) -> None:
+        # 0 e 1 não dizem nada a quem lê; a companheira traduz o código cru.
+        window, _, network = self._make_window()
+        self.addCleanup(window.close)
+        switches = SwitchModel(
+            network,
+            ["CH1", "CH2"],
+            ["4", "4"],
+            ["CIR-1", "CIR-1"],
+            [0, 1],
+            ["FECHADA-COD", "ABERTA-COD"],
+            ["1", "0"],
+            ["1", "0"],
+            ["N", "N"],
+            ["", ""],
+            ["", ""],
+        )
+        window._on_switch_import_finished(
+            SwitchLoadResult(switches, "utf-8-sig", 2, 2, 0, (), 0)
+        )
+
+        window._set_selection(FeatureSelection("segment", 0))
+        self.assertEqual(window.switch_detail_labels["state"].text(), "1")
+        self.assertEqual(window.switch_companion_labels["state"].text(), "FECHADA")
+        self.assertEqual(
+            window.switch_companion_labels["normal_state"].text(), "FECHADA"
+        )
+
+        window._set_selection(FeatureSelection("segment", 1))
+        self.assertEqual(window.switch_detail_labels["state"].text(), "0")
+        self.assertEqual(window.switch_companion_labels["state"].text(), "ABERTA")
+        self.assertEqual(
+            window.switch_companion_labels["normal_state"].text(), "ABERTA"
+        )
+
     def test_the_switch_panel_shows_the_type_and_whether_it_can_be_operated(
         self,
     ) -> None:

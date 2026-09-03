@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
@@ -142,6 +143,7 @@ from .model import (
     RegulatorModel,
     SwitchModel,
     UtmCrs,
+    switch_state_label,
 )
 from .opendss_export import (
     ARRANGEMENTS_FILENAME,
@@ -2200,6 +2202,7 @@ class MainWindow(QMainWindow):
         )
         self.search_palette.resultActivated.connect(self._activate_search_result)
         self.search_palette.closed.connect(self.view.setFocus)
+        self.view.contextMenuRequested.connect(self._show_map_context_menu)
         self.blocks_window.blockSelected.connect(self._select_block)
         self.blocks_window.blockActivated.connect(self._activate_block)
         self.blocks_window.selectionCleared.connect(self._clear_block_highlight)
@@ -6800,6 +6803,99 @@ class MainWindow(QMainWindow):
             self._close_after_branch_json_export = False
             self.close()
 
+    def _show_map_context_menu(self, feature, global_position) -> None:  # noqa: ANN001
+        """Monta o menu do mapa conforme o que está sob o cursor.
+
+        A view não sabe quais ferramentas existem; ela só diz o que foi clicado.
+        Quem decide o que oferecer é aqui, onde as ferramentas moram.
+
+        Sem nada aplicável o menu não abre: um menu vazio, ou com tudo cinza,
+        gasta um clique do usuário para não dizer nada.
+        """
+
+        menu = QMenu(self)
+        if feature is not None and feature.kind == "segment":
+            self._add_block_actions(menu, int(feature.index))
+        if menu.isEmpty():
+            return
+        menu.exec(global_position)
+
+    def _add_block_actions(self, menu, segment_index: int) -> None:  # noqa: ANN001
+        """Acrescenta o atalho para o bloco do trecho, ou os dois de uma chave.
+
+        Uma chave manobrável não pertence a bloco algum — ela é a fronteira —, e
+        a pergunta que se faz clicando nela é "o que isto separa?". Por isso ali
+        aparecem **dois** atalhos, um por bloco vizinho, nomeados: escolher qual
+        ver é do usuário, e adivinhar seria escolher por ele.
+        """
+
+        if self._circuit_catalog is None or self._switch_model is None:
+            return
+        result = self.block_table_model.result
+        if result is None:
+            action = menu.addAction("Ver bloco")
+            action.triggered.connect(
+                lambda _checked=False, index=segment_index: self._view_block(index)
+            )
+            return
+        blocks = result.blocks_for_segment(segment_index)
+        if not blocks:
+            return
+        if len(blocks) == 1:
+            action = menu.addAction(f"Ver bloco {blocks[0].block_id:n}")
+            action.triggered.connect(
+                lambda _checked=False, index=segment_index: self._view_block(index)
+            )
+            return
+        for record in blocks:
+            action = menu.addAction(
+                f"Ver bloco {record.block_id:n} "
+                f"({record.segment_count:n} trecho(s), "
+                f"{record.load_count:n} carga(s))"
+            )
+            action.triggered.connect(
+                lambda _checked=False, block_id=record.block_id: self._view_block(
+                    None, block_id
+                )
+            )
+
+    def _view_block(self, segment_index: int | None, block_id: int | None = None) -> None:
+        """Abre a tabela de blocos com o bloco pedido já selecionado.
+
+        Calcula a análise se ela ainda não existe: o atalho tem de funcionar sem
+        o usuário passar antes pelo menu Ferramentas, senão não é atalho.
+        """
+
+        if self.block_table_model.result is None:
+            self._show_blocks()
+        result = self.block_table_model.result
+        if result is None:
+            return
+        if block_id is None:
+            if segment_index is None:
+                return
+            blocks = result.blocks_for_segment(int(segment_index))
+            if not blocks:
+                self.statusBar().showMessage(
+                    "Este trecho não pertence a nenhum bloco identificado.",
+                    5_000,
+                )
+                return
+            if len(blocks) > 1:
+                # Recalculada agora: o menu foi montado antes de a análise
+                # existir, então não pôde oferecer um atalho por bloco.
+                self.statusBar().showMessage(
+                    f"Chave de fronteira entre os blocos "
+                    f"{', '.join(f'{record.block_id:n}' for record in blocks)}; "
+                    "o primeiro foi selecionado.",
+                    6_000,
+                )
+            block_id = blocks[0].block_id
+        self.blocks_window.show()
+        self.blocks_window.raise_()
+        self.blocks_window.activateWindow()
+        self.blocks_window.select_block(int(block_id))
+
     def _show_blocks(self) -> None:
         """Calcula os blocos e abre a janela.
 
@@ -8312,6 +8408,10 @@ class MainWindow(QMainWindow):
             "switch_type_id": record.type_name,
             "circuit_id": circuit_code,
             "segment_id": segment_code,
+            # 0 e 1 não dizem nada a quem lê; a companheira é o lugar de
+            # traduzir o código cru, como faz com o tipo e com a fase.
+            "state": switch_state_label(record.state),
+            "normal_state": switch_state_label(record.normal_state),
         }
         for key, label in self.switch_companion_labels.items():
             label.setText(linked.get(key, "") or "—")

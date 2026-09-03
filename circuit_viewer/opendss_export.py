@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
 from .model import (
+    CLOSED_SWITCH_STATE,
     CableModel,
     CapacitorModel,
     CircuitCatalogModel,
@@ -91,7 +92,6 @@ MASTER_FILENAME_SUFFIX = "_Master.dss"
 BUSCOORDS_FILENAME_SUFFIX = "_Buscoords.csv"
 # Barra infinita: o estudo de alimentador não modela a montante da subestação.
 SOURCE_SHORT_CIRCUIT_MVA = "999999"
-CLOSED_SWITCH_STATE = "1"
 MAX_REPORTED_ISSUES = 200
 LOAD_SHAPE_PREFIX = "PERFIL-"
 # NPAT 0..3: o LoadShape diário tem exatamente quatro pontos.

@@ -163,6 +163,41 @@ class BlockAnalysisResult:
     def is_empty(self) -> bool:
         return not self.records
 
+    def blocks_for_segment(self, segment_index: int) -> tuple[BlockRecord, ...]:
+        """Os blocos que um trecho identifica, do ponto de vista da manobra.
+
+        Um trecho comum pertence a **um** bloco. Um trecho de chave manobrável
+        não pertence a nenhum — ele é a fronteira —, e a resposta útil são os
+        **dois** blocos que ele separa: a pergunta que se faz clicando numa
+        chave é justamente "o que esta aqui divide?".
+
+        Devolve vazio quando o trecho não é reconhecido, o que acontece se o
+        resultado for de uma rede que já foi substituída.
+        """
+
+        target = int(segment_index)
+        inside = tuple(
+            record
+            for record in self.records
+            if target in set(record.segment_indices.tolist())
+        )
+        if inside:
+            return inside
+        switches = self.source_switches
+        by_segment = None if switches is None else switches.record_indices_by_segment
+        # Fora da faixa é trecho de outra rede, não erro: o resultado pode ser
+        # de antes de uma reimportação, e a resposta certa é "não reconheço".
+        if by_segment is None or not 0 <= target < len(by_segment):
+            return ()
+        switch_index = int(by_segment[target])
+        if switch_index < 0:
+            return ()
+        return tuple(
+            record
+            for record in self.records
+            if switch_index in set(record.boundary_switch_indices.tolist())
+        )
+
 
 class _IssueLog:
     """Acumula ocorrências respeitando o teto de detalhamento."""

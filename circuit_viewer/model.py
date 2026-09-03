@@ -98,6 +98,41 @@ class SegmentRecord:
     length: float | None
 
 
+# O que o ESTADO de uma chave significa. O literal "1" ja e testado em quatro
+# pontos — o exportador, a travessia da topologia, a validacao do catalogo e a
+# analise de ramais —, e nomea-lo aqui e o que impede uma quinta copia de
+# divergir: um rotulo errado nao quebra teste de comportamento, so mente na tela.
+CLOSED_SWITCH_STATE = "1"
+OPEN_SWITCH_STATE = "0"
+
+_SWITCH_STATE_LABELS = {
+    CLOSED_SWITCH_STATE: "FECHADA",
+    OPEN_SWITCH_STATE: "ABERTA",
+}
+
+
+def switch_state_label(value: str) -> str:
+    """O ESTADO de uma chave por extenso, no feminino de *chave*.
+
+    Vazio devolve vazio, para a interface mostrar o travessao que ja usa em
+    campo sem valor.
+
+    Um valor fora de ``{"0", "1"}`` nao vira travessao nem ``ABERTA`` seca: o
+    programa **trata** esse caso como aberta — o exportador registra "a chave foi
+    exportada como aberta" e a travessia bloqueia —, mas o cadastro esta errado.
+    Dizer so ``ABERTA`` esconderia o defeito; dizer so ``—`` esconderia o
+    comportamento. O rotulo diz as duas coisas.
+    """
+
+    text = str(value).strip()
+    if not text:
+        return ""
+    label = _SWITCH_STATE_LABELS.get(text)
+    if label is not None:
+        return label
+    return f"{_SWITCH_STATE_LABELS[OPEN_SWITCH_STATE]} (valor não reconhecido)"
+
+
 @dataclass(frozen=True, slots=True)
 class SwitchRecord:
     """Atributos de uma chave associada a um trecho da rede.

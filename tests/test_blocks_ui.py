@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PyQt6.QtCore import Qt
     from PyQt6.QtGui import QGuiApplication
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtWidgets import QApplication, QMenu
 
     from circuit_viewer.blocks_window import BlocksWindow, BlockTableModel
     from circuit_viewer.main_window import MainWindow
@@ -304,6 +304,134 @@ class BlocksIntegrationTests(unittest.TestCase):
 
         self.assertFalse(window.block_highlight_overlay.isVisible())
         self.assertIn("não possui trecho", window.statusBar().currentMessage())
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class SelectBlockTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_the_row_is_found_through_the_current_sort(self) -> None:
+        # A tabela ordena; procurar pela linha do modelo fonte selecionaria a
+        # linha errada na tela.
+        result, _, _ = sample_result()
+        model = BlockTableModel()
+        window = BlocksWindow(model)
+        self.addCleanup(window.close)
+        window.set_result(result)
+        window.table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+
+        self.assertTrue(window.select_block(1))
+
+        current = window.table.currentIndex()
+        source_row = window.proxy_model.mapToSource(current).row()
+        self.assertEqual(model.record(source_row).block_id, 1)
+
+    def test_an_unknown_block_is_refused_without_moving_the_selection(self) -> None:
+        result, _, _ = sample_result()
+        model = BlockTableModel()
+        window = BlocksWindow(model)
+        self.addCleanup(window.close)
+        window.set_result(result)
+
+        self.assertFalse(window.select_block(99))
+
+    def test_selecting_without_a_result_is_refused(self) -> None:
+        window = BlocksWindow(BlockTableModel())
+        self.addCleanup(window.close)
+
+        self.assertFalse(window.select_block(1))
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class MapContextMenuTests(unittest.TestCase):
+    """O atalho do mapa: clicar num trecho e chegar ao bloco dele."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window(self):  # noqa: ANN202
+        bars = make_bars(4)
+        network = make_network(bars, [0, 1, 2], [1, 2, 3])
+        # T1 manobrável (fronteira), T2 fusível (interno).
+        switches = make_switches(network, [(1, "1", "1"), (2, "0", "1")])
+        window = MainWindow()
+        self.addCleanup(window.close)
+        window._model = bars
+        window._line_model = network
+        window._switch_model = switches
+        window._set_circuit_catalog(None)
+        window._circuit_catalog = make_catalog(network, switches)
+        return window, network, switches
+
+    def _texts(self, window, segment_index: int) -> list[str]:  # noqa: ANN001
+        menu = QMenu()
+        window._add_block_actions(menu, segment_index)
+        return [action.text() for action in menu.actions()]
+
+    def test_a_common_segment_offers_one_shortcut(self) -> None:
+        window, _, _ = self._window()
+        window._show_blocks()
+
+        texts = self._texts(window, 0)
+
+        self.assertEqual(len(texts), 1)
+        self.assertTrue(texts[0].startswith("Ver bloco "))
+
+    def test_a_boundary_switch_offers_one_shortcut_per_side(self) -> None:
+        # Ela separa dois blocos; escolher qual ver é do usuário.
+        window, _, _ = self._window()
+        window._show_blocks()
+
+        texts = self._texts(window, 1)
+
+        self.assertEqual(len(texts), 2)
+        for text in texts:
+            self.assertIn("trecho(s)", text)
+        self.assertNotEqual(texts[0], texts[1])
+
+    def test_a_fuse_offers_the_block_it_sits_inside(self) -> None:
+        window, _, _ = self._window()
+        window._show_blocks()
+
+        self.assertEqual(len(self._texts(window, 2)), 1)
+
+    def test_before_the_analysis_the_shortcut_is_still_offered(self) -> None:
+        # Sem isso o atalho exigiria passar antes pelo menu Ferramentas, e
+        # deixaria de ser atalho.
+        window, _, _ = self._window()
+
+        self.assertEqual(self._texts(window, 0), ["Ver bloco"])
+
+    def test_the_shortcut_computes_the_analysis_and_selects_the_block(self) -> None:
+        window, _, _ = self._window()
+        self.assertIsNone(window.block_table_model.result)
+
+        window._view_block(0)
+        self.app.processEvents()
+
+        self.assertIsNotNone(window.block_table_model.result)
+        self.assertTrue(window.blocks_window.isVisible())
+        current = window.blocks_window.table.currentIndex()
+        self.assertTrue(current.isValid())
+        source_row = window.blocks_window.proxy_model.mapToSource(current).row()
+        expected = window.block_table_model.result.blocks_for_segment(0)[0]
+        self.assertEqual(
+            window.block_table_model.record(source_row).block_id,
+            expected.block_id,
+        )
+
+    def test_the_menu_stays_closed_when_nothing_applies(self) -> None:
+        # Menu vazio, ou com tudo cinza, gasta um clique para não dizer nada.
+        window, _, _ = self._window()
+        window._circuit_catalog = None
+
+        menu = QMenu()
+        window._add_block_actions(menu, 0)
+
+        self.assertTrue(menu.isEmpty())
 
 
 if __name__ == "__main__":

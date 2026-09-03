@@ -236,6 +236,44 @@ class BlockContentTests(unittest.TestCase):
         )
 
 
+class SegmentLookupTests(unittest.TestCase):
+    """De um trecho para o bloco: o que o atalho do mapa pergunta."""
+
+    def setUp(self) -> None:
+        # B0 —T0— B1 —T1(manobrável)— B2 —T2(fusível)— B3
+        self.bars = make_bars(4)
+        self.network = make_network(self.bars, [0, 1, 2], [1, 2, 3])
+        self.switches = make_switches(
+            self.network, [(1, "1", "1"), (2, "0", "1")]
+        )
+        self.result = analyze_blocks(
+            make_catalog(self.network, self.switches), self.switches
+        )
+
+    def test_a_common_segment_belongs_to_one_block(self) -> None:
+        blocks = self.result.blocks_for_segment(0)
+
+        self.assertEqual(len(blocks), 1)
+        self.assertIn(0, set(blocks[0].segment_indices.tolist()))
+
+    def test_a_boundary_switch_answers_with_both_blocks(self) -> None:
+        # Ela não pertence a bloco algum — é a fronteira —, e a pergunta que se
+        # faz clicando nela é "o que isto separa?".
+        blocks = self.result.blocks_for_segment(1)
+
+        self.assertEqual(len(blocks), 2)
+        self.assertNotEqual(blocks[0].block_id, blocks[1].block_id)
+
+    def test_a_fuse_answers_with_the_block_it_sits_inside(self) -> None:
+        blocks = self.result.blocks_for_segment(2)
+
+        self.assertEqual(len(blocks), 1)
+        self.assertIn(2, set(blocks[0].segment_indices.tolist()))
+
+    def test_an_unknown_segment_answers_nothing(self) -> None:
+        self.assertEqual(self.result.blocks_for_segment(99), ())
+
+
 class DegenerateBlockTests(unittest.TestCase):
     def test_a_block_between_two_switches_has_no_segment(self) -> None:
         # B0 —T0(manobrável)— B1 —T1(manobrável)— B2: B1 fica sozinha, num bloco

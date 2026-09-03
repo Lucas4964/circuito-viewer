@@ -1430,6 +1430,7 @@ class DiagramView(QGraphicsView):
     viewportChanged = pyqtSignal()
     zoomLimitReached = pyqtSignal()
     selectionRequested = pyqtSignal(object)
+    contextMenuRequested = pyqtSignal(object, object)
     mouseCoordinateChanged = pyqtSignal(float, float)
     satelliteUnavailable = pyqtSignal(str)
 
@@ -1990,9 +1991,19 @@ class DiagramView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def _select_nearest(self, position: QPoint) -> None:
+        self.selectionRequested.emit(self.feature_at(position))
+
+    def feature_at(self, position: QPoint) -> FeatureSelection | None:
+        """O que está sob o cursor, na mesma ordem de prioridade do clique.
+
+        Devolve em vez de emitir porque dois caminhos precisam da resposta: o
+        clique esquerdo, que seleciona, e o menu de contexto, que pergunta sobre
+        o que está embaixo. Duplicar a detecção faria os dois divergirem no
+        primeiro ajuste de tolerância.
+        """
+
         if self._model is None:
-            self.selectionRequested.emit(None)
-            return
+            return None
         x, y = self.model_point_at(position)
         scale = abs(self.transform().m11())
         tolerance = CLICK_TOLERANCE_PX / max(scale, 1e-12)
@@ -2011,8 +2022,7 @@ class DiagramView(QGraphicsView):
                 continue
             load_index = layer.hit_test(position, overview=False)
             if load_index is not None:
-                self.selectionRequested.emit(FeatureSelection(kind, load_index))
-                return
+                return FeatureSelection(kind, load_index)
         overview_candidates: list[tuple[float, int, str, int, LoadRenderModel]] = []
         for priority, (kind, layer, model) in enumerate(load_layers):
             if layer is None or model is None:
@@ -2046,26 +2056,35 @@ class DiagramView(QGraphicsView):
                     dy = position.y() - anchor.y()
                     center_radius = POINT_DIAMETER_PX / 2.0
                     if dx * dx + dy * dy > center_radius * center_radius:
-                        self.selectionRequested.emit(
-                            FeatureSelection(load_kind, overview_load_index)
-                        )
-                        return
-                self.selectionRequested.emit(FeatureSelection("bar", bar_index))
-                return
+                        return FeatureSelection(load_kind, overview_load_index)
+                return FeatureSelection("bar", bar_index)
         if overview_candidate is not None:
             _, _, load_kind, overview_load_index, _ = overview_candidate
-            self.selectionRequested.emit(
-                FeatureSelection(load_kind, overview_load_index)
-            )
-            return
+            return FeatureSelection(load_kind, overview_load_index)
         if self._line_model is not None:
             segment_index = self._line_model.spatial_index.nearest(
                 x, y, tolerance, self._segment_visibility_mask
             )
             if segment_index is not None:
-                self.selectionRequested.emit(FeatureSelection("segment", segment_index))
-                return
-        self.selectionRequested.emit(None)
+                return FeatureSelection("segment", segment_index)
+        return None
+
+    def contextMenuEvent(self, event) -> None:  # noqa: ANN001, N802
+        """Seleciona o que está sob o cursor e pede o menu a quem o monta.
+
+        Selecionar antes de abrir é o que a maioria dos programas faz e o que
+        evita a dúvida de sobre qual elemento o menu age: o painel da direita
+        passa a mostrar exatamente aquele.
+
+        A view não monta o menu: ela não conhece as ferramentas do programa.
+        Emite o alvo e a posição, e a janela principal decide o que oferecer.
+        """
+
+        position = event.pos()
+        feature = self.feature_at(position)
+        self.selectionRequested.emit(feature)
+        self.contextMenuRequested.emit(feature, event.globalPos())
+        event.accept()
 
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
         super().drawBackground(painter, rect)
