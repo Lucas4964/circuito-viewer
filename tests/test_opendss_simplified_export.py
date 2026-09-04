@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 
 from circuit_viewer.branch_analysis import analyze_branches
@@ -25,6 +26,7 @@ from circuit_viewer.model import (
     UtmCrs,
 )
 from circuit_viewer.opendss_powerflow import PowerFlowResult, SegmentPowers
+from circuit_viewer.branch_json_export import build_branch_json_payload
 from circuit_viewer.opendss_simplified_export import (
     SINGLE_PHASE_BRANCHES_FILENAME,
     TWO_PHASE_BRANCHES_FILENAME,
@@ -351,6 +353,67 @@ class SimplifiedOpenDssExportTests(unittest.TestCase):
                 patterns=patterns,
                 generator_updates=updates,
             )
+
+
+
+class JsonMatchesLoadShapeTests(unittest.TestCase):
+    """O P0..Q3 do JSON e o LoadShape do ramal têm de dizer a mesma coisa.
+
+    São duas saídas do mesmo dado, e um consumidor que compare as duas tem de
+    encontrar os mesmos números. Elas só coincidem porque ambas leem a coluna da
+    fase do ramal, pelo mesmo ``PHASE_COLUMNS`` — somar as três colunas numa
+    delas quebraria a igualdade sem quebrar teste nenhum, se este não existisse.
+    """
+
+    def test_the_json_powers_are_the_shape_multipliers(self) -> None:
+        catalog, loads, patterns, updates, equivalent = make_system()
+        branches = equivalent.model.branches
+
+        payload = build_branch_json_payload(
+            branches,
+            equivalent,
+            tuple(range(len(branches.records))),
+        )
+        bundle = build_simplified_export(
+            catalog,
+            make_cables(),
+            PHASES,
+            (0,),
+            equivalent=equivalent,
+            loads=loads,
+            patterns=patterns,
+            generator_updates=updates,
+        )
+        text = "\n".join(content for _, content in bundle.files)
+
+        checked = 0
+        for record in branches.records:
+            entry = payload[f"RAMAL-{record.branch_id}"]
+            if entry["P0"] is None:
+                continue
+            shapes = re.findall(
+                rf"New LoadShape\.PERFIL-RAMAL-{record.branch_id}-\dF-\w+ "
+                r"npts=\d+ interval=\d+ mult=\[([^\]]+)\] qmult=\[([^\]]+)\]",
+                text,
+            )
+            if not shapes:
+                continue
+            self.assertEqual(
+                len(shapes),
+                1,
+                "um ramal com potência no JSON é monofásico e tem um LoadShape",
+            )
+            mult, qmult = shapes[0]
+            self.assertEqual(
+                [float(value) for value in mult.split()],
+                [entry[f"P{npat}"] for npat in range(4)],
+            )
+            self.assertEqual(
+                [float(value) for value in qmult.split()],
+                [entry[f"Q{npat}"] for npat in range(4)],
+            )
+            checked += 1
+        self.assertGreater(checked, 0, "nenhum ramal com LoadShape para comparar")
 
 
 if __name__ == "__main__":

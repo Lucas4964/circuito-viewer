@@ -9,8 +9,8 @@ import os
 from pathlib import Path
 import tempfile
 
-from .branch_analysis import BranchAnalysisResult, BranchRecord
-from .equivalent_network import EquivalentNetworkResult
+from .branch_analysis import BranchAnalysisResult, BranchRecord, BranchType
+from .equivalent_network import PHASE_COLUMNS, EquivalentNetworkResult
 from .opendss_export import sanitize_dss_name
 
 
@@ -66,6 +66,61 @@ def _checked_codes(
             )
         result.append(code)
     return result
+
+
+# Um campo por patamar, para P e para Q. Sempre os oito, em qualquer caso: a
+# estrutura do arquivo nao pode depender do metodo escolhido nem do estado do
+# cadastro, senao quem consome precisa testar a presenca de cada chave.
+BRANCH_POWER_FIELDS = tuple(
+    f"{letter}{npat}" for letter in ("P", "Q") for npat in range(4)
+)
+
+
+def _branch_powers(
+    equivalent: EquivalentNetworkResult,
+    equivalent_index: int,
+    branch: BranchRecord,
+) -> dict[str, float | None]:
+    """Potencia por patamar do ramal, na origem que o usuario escolheu.
+
+    Nao ha condicional de metodo aqui, e e de proposito: o
+    ``EquivalentNetworkResult`` ja chega montado com a origem vigente — quem
+    decide entre agregar as cargas e medir o fluxo na cabeceira e o
+    ``build_equivalent_network``, pelo ``power_source``. Ler daqui e o que faz o
+    arquivo ter a mesma forma nos dois modos.
+
+    **Bifasico sai vazio.** Um numero unico misturaria as duas fases sem dizer
+    qual e qual, e um valor ambiguo e pior que a ausencia dele. No monofasico ha
+    uma fase so, o campo ``fase`` da propria entrada diz qual e, e o valor lido
+    e o **da coluna daquela fase** — e por isso que os oito campos bastam onde os
+    patamares guardam vinte e quatro numeros.
+
+    Escolher a coluna, em vez de somar as tres, e o que torna verdadeira a
+    leitura "P0 e a potencia ativa deste ramal na sua fase". A agregacao soma as
+    seis colunas das cargas sem filtrar por fase — o filtro de
+    ``aggregate_patterns`` so vale para geradores —, entao um cadastro que ponha
+    potencia numa fase que nao e a do ramal faria a soma dizer outra coisa.
+
+    Vazio tambem quando faltam os quatro patamares — medicao que nao cobriu a
+    cabeceira, ou agregacao incompleta. ``None``, e nao zero: nao ter resposta
+    nao e ter potencia nula.
+    """
+
+    empty: dict[str, float | None] = {name: None for name in BRANCH_POWER_FIELDS}
+    if branch.branch_type is not BranchType.MONOPHASIC:
+        return empty
+    columns = PHASE_COLUMNS.get(str(branch.phase).strip().upper())
+    if columns is None:
+        return empty
+    patterns = equivalent.model.records_for_load(equivalent_index)
+    if not patterns:
+        return empty
+    active_column, reactive_column = columns
+    powers = dict(empty)
+    for record in patterns:
+        powers[f"P{record.npat}"] = float(getattr(record, active_column))
+        powers[f"Q{record.npat}"] = float(getattr(record, reactive_column))
+    return powers
 
 
 def build_branch_json_payload(
@@ -215,6 +270,7 @@ def build_branch_json_payload(
             "chave_ini": str(branch.first_switch_code),
             "fase": branch.phase,
             "remanejavel": bool(branch.removable),
+            **_branch_powers(equivalent, equivalent_index, branch),
         }
         if progress is not None:
             progress(position, total)

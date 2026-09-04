@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
 from .branch_analysis import BranchType
-from .equivalent_network import EquivalentNetworkResult
+from .equivalent_network import PHASE_COLUMNS, EquivalentNetworkResult
 from .model import (
     CableModel,
     CapacitorModel,
@@ -81,11 +81,9 @@ _GENERATOR_FILES = {
     2: TWO_PHASE_GENERATORS_FILENAME,
     3: THREE_PHASE_GENERATORS_FILENAME,
 }
-_FIELD_BY_PHASE = {
-    "D": ("pd", "qd"),
-    "E": ("pe", "qe"),
-    "F": ("pf", "qf"),
-}
+# Reexportado do equivalent_network: o mapeamento e o mesmo que a agregacao usa,
+# e o LoadShape daqui tem de sair da mesma coluna que ela preencheu.
+_FIELD_BY_PHASE = PHASE_COLUMNS
 
 
 class SimplifiedOpenDssExportError(ValueError):

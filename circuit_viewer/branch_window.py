@@ -636,6 +636,24 @@ class BranchesWindow(QDialog):
         self.clear_selection()
         self._sync_export_availability()
 
+    def keyPressEvent(self, event) -> None:  # noqa: ANN001, N802
+        """Esc desfaz um nível por vez, como no mapa.
+
+        Havendo linha selecionada, o Esc a desmarca — e o destaque some pelo
+        caminho que já existe. Não havendo, o evento segue para o ``QDialog``,
+        que fecha a janela como sempre fez. O fechar-com-Esc não se perde; ele
+        só passa a ser o segundo passo.
+        """
+
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self.table.currentIndex().isValid()
+        ):
+            self.clear_selection()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def _record_for_index(self, index: QModelIndex) -> BranchRecord | None:
         if not index.isValid():
             return None

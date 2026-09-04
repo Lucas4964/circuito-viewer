@@ -7,11 +7,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PyQt6.QtCore import Qt
-    from PyQt6.QtGui import QGuiApplication
+    from PyQt6.QtGui import QGuiApplication, QKeyEvent
     from PyQt6.QtWidgets import QApplication, QMenu
 
     from circuit_viewer.blocks_window import BlocksWindow, BlockTableModel
     from circuit_viewer.main_window import MainWindow
+    from circuit_viewer.model import FeatureSelection
 
     PYQT_AVAILABLE = True
 except ModuleNotFoundError:  # pragma: no cover - ambiente sem PyQt
@@ -432,6 +433,143 @@ class MapContextMenuTests(unittest.TestCase):
         window._add_block_actions(menu, 0)
 
         self.assertTrue(menu.isEmpty())
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class DismissHighlightTests(unittest.TestCase):
+    """Como o usuário desfaz um destaque, que antes ficava de pé para sempre."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window(self):  # noqa: ANN202
+        result, network, switches = sample_result()
+        window = MainWindow()
+        self.addCleanup(window.close)
+        window._model = network.bars
+        window._line_model = network
+        window._switch_model = switches
+        window._circuit_catalog = make_catalog(network, switches)
+        window.block_table_model.set_result(result)
+        # O bloco de B0: contém o trecho 0 e as barras 0 e 1.
+        record = next(
+            item
+            for item in result.records
+            if 0 in set(item.bar_indices.tolist())
+        )
+        window._select_block(record)
+        return window, record, network
+
+    def test_clicking_inside_the_highlight_keeps_it(self) -> None:
+        # Inspecionar um trecho da própria região não deveria custar o lugar.
+        window, record, _ = self._window()
+        inside = int(record.segment_indices[0])
+
+        window._set_selection(FeatureSelection("segment", inside))
+
+        self.assertTrue(window.block_highlight_overlay.isVisible())
+        self.assertIsNotNone(window._selected_block)
+
+    def test_clicking_a_bar_inside_the_highlight_keeps_it(self) -> None:
+        window, record, _ = self._window()
+        inside = int(record.bar_indices[0])
+
+        window._set_selection(FeatureSelection("bar", inside))
+
+        self.assertTrue(window.block_highlight_overlay.isVisible())
+
+    def test_clicking_outside_clears_it(self) -> None:
+        window, record, network = self._window()
+        owned = set(record.segment_indices.tolist())
+        outside = next(
+            index for index in range(len(network)) if index not in owned
+        )
+
+        window._set_selection(FeatureSelection("segment", outside))
+
+        self.assertFalse(window.block_highlight_overlay.isVisible())
+        self.assertIsNone(window._selected_block)
+
+    def test_clicking_empty_space_clears_it(self) -> None:
+        window, _, _ = self._window()
+
+        window._set_selection(None)
+
+        self.assertFalse(window.block_highlight_overlay.isVisible())
+
+    def test_escape_removes_the_highlight_before_the_selection(self) -> None:
+        # Um nível por vez: dá para tirar o destaque e seguir examinando.
+        window, record, _ = self._window()
+        inside = int(record.segment_indices[0])
+        window._set_selection(FeatureSelection("segment", inside))
+        self.assertTrue(window.block_highlight_overlay.isVisible())
+
+        window._escape_pressed()
+
+        self.assertFalse(window.block_highlight_overlay.isVisible())
+        self.assertIsNotNone(window._selected_feature)
+
+        window._escape_pressed()
+
+        self.assertIsNone(window._selected_feature)
+
+    def test_the_power_flow_arriving_does_not_erase_the_highlight(self) -> None:
+        # É o que preserve_highlight protege, e é fácil de quebrar sem notar.
+        window, record, _ = self._window()
+        window._set_selection(
+            FeatureSelection("segment", int(record.segment_indices[0]))
+        )
+
+        window._set_selection(window._selected_feature, preserve_highlight=True)
+
+        self.assertTrue(window.block_highlight_overlay.isVisible())
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class BlocksWindowEscapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window(self):  # noqa: ANN202
+        result, _, _ = sample_result()
+        model = BlockTableModel()
+        window = BlocksWindow(model)
+        self.addCleanup(window.close)
+        window.set_result(result)
+        window.show()
+        return window
+
+    def _escape(self, window) -> None:  # noqa: ANN001
+        window.keyPressEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyPress,
+                Qt.Key.Key_Escape,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        self.app.processEvents()
+
+    def test_escape_unselects_the_row_without_closing(self) -> None:
+        window = self._window()
+        window.table.setCurrentIndex(window.proxy_model.index(0, 0))
+        self.app.processEvents()
+
+        self._escape(window)
+
+        self.assertFalse(window.table.currentIndex().isValid())
+        self.assertTrue(window.isVisible())
+
+    def test_escape_without_a_row_closes_the_window(self) -> None:
+        # O fechar-com-Esc do QDialog não se perde; vira o segundo passo.
+        window = self._window()
+        window.clear_selection()
+        self.app.processEvents()
+
+        self._escape(window)
+
+        self.assertFalse(window.isVisible())
 
 
 if __name__ == "__main__":

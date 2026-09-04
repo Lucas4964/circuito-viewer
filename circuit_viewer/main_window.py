@@ -6,7 +6,13 @@ from pathlib import Path
 from typing import Sequence
 
 from PyQt6.QtCore import QSettings, QSignalBlocker, QThread, QTimer, Qt
-from PyQt6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
+from PyQt6.QtGui import (
+    QAction,
+    QActionGroup,
+    QCloseEvent,
+    QKeySequence,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -2202,6 +2208,22 @@ class MainWindow(QMainWindow):
         )
         self.search_palette.resultActivated.connect(self._activate_search_result)
         self.search_palette.closed.connect(self.view.setFocus)
+        # Preso ao mapa, e não à janela. Com contexto de janela o atalho
+        # engolia o Esc antes de qualquer diálogo filho: a paleta de busca, que
+        # tem o seu próprio tratamento da tecla, deixava de fechar. E com o
+        # cursor num campo editável do painel lateral, Esc deve cancelar a
+        # edição, não apagar o destaque do mapa.
+        #
+        # A cobertura do gesto não diminui: as janelas de Blocos e de Ramais
+        # tratam Esc por conta própria.
+        self._escape_shortcut = QShortcut(
+            QKeySequence(Qt.Key.Key_Escape),
+            self.view,
+        )
+        self._escape_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self._escape_shortcut.activated.connect(self._escape_pressed)
         self.view.contextMenuRequested.connect(self._show_map_context_menu)
         self.blocks_window.blockSelected.connect(self._select_block)
         self.blocks_window.blockActivated.connect(self._activate_block)
@@ -5705,7 +5727,7 @@ class MainWindow(QMainWindow):
             self._set_selection(
                 self._selected_feature,
                 reveal_hidden=self._search_focus_active,
-                preserve_branch=True,
+                preserve_highlight=True,
             )
         self._show_power_flow_report(result)
 
@@ -6929,6 +6951,70 @@ class MainWindow(QMainWindow):
         self.block_table_model.set_result(None)
         self.blocks_window.set_result(None)
 
+    def _highlighted_record(self):  # noqa: ANN202
+        """O bloco ou o ramal em destaque, ou ``None``.
+
+        Um de cada vez: a exclusão mútua entre os dois já garante isso, e é o
+        que permite uma regra só para os dois.
+        """
+
+        return self._selected_block or self._selected_branch
+
+    def _selection_inside_highlight(self, selection) -> bool:  # noqa: ANN001
+        """A seleção cai dentro do conjunto em destaque?
+
+        Barra e carga contam tanto quanto o trecho: uma carga dentro do bloco é
+        tão de dentro quanto o alimentador que a serve, e perder o destaque ao
+        clicar nela seria arbitrário. Os dois tipos de registro já expõem os
+        vetores de trecho e de barra; nada é recalculado aqui.
+        """
+
+        record = self._highlighted_record()
+        if record is None or selection is None:
+            return False
+        if selection.kind == "segment":
+            return int(selection.index) in set(record.segment_indices.tolist())
+        bar_index = None
+        if selection.kind == "bar":
+            bar_index = int(selection.index)
+        elif selection.kind == "load" and self._load_model is not None:
+            if 0 <= int(selection.index) < len(self._load_model):
+                bar_index = int(self._load_model.bar_indices[int(selection.index)])
+        if bar_index is None:
+            return False
+        return bar_index in set(record.bar_indices.tolist())
+
+    def _clear_highlights(self, *, clear_table: bool = False) -> bool:
+        """Apaga os dois destaques. Devolve se havia algum a apagar.
+
+        A resposta é o que o Esc usa para saber se já fez alguma coisa neste
+        nível, antes de descer para o seguinte.
+        """
+
+        had = self._highlighted_record() is not None
+        self._clear_block_highlight(clear_table=clear_table)
+        self._clear_branch_highlight(clear_table=clear_table)
+        return had
+
+    def _escape_pressed(self) -> None:
+        """Desfaz um nível por vez: primeiro o destaque, depois a seleção.
+
+        Cada Esc volta um passo, em vez de devolver tudo ao estado neutro de uma
+        vez — assim dá para tirar o destaque e continuar examinando o elemento.
+        """
+
+        # Com a paleta de busca aberta, o Esc pertence a ela — fechá-la é o
+        # gesto mais imediato que o usuário espera. O atalho daqui está preso ao
+        # mapa, mas a paleta devolve o foco à view ao ser fechada, então sem
+        # esta precedência explícita ele engoliria o Esc de uma paleta reaberta.
+        if self.search_palette.isVisible():
+            self.search_palette.close_palette()
+            return
+        if self._clear_highlights(clear_table=True):
+            return
+        if self._selected_feature is not None:
+            self._set_selection(None)
+
     def _clear_block_highlight(self, *, clear_table: bool = False) -> None:
         self._selected_block = None
         self.block_highlight_overlay.clear()
@@ -6999,7 +7085,7 @@ class MainWindow(QMainWindow):
             )
         ):
             return
-        self._set_selection(None, preserve_branch=True)
+        self._set_selection(None, preserve_highlight=True)
         if self.search_palette.isVisible():
             self.search_palette.close_palette()
         reactivated = False
@@ -7906,10 +7992,15 @@ class MainWindow(QMainWindow):
         selection: FeatureSelection | None,
         *,
         reveal_hidden: bool = False,
-        preserve_branch: bool = False,
+        preserve_highlight: bool = False,
     ) -> None:
-        if not preserve_branch:
-            self._clear_branch_highlight(clear_table=True)
+        # O destaque sobrevive ao clique que cai **dentro** dele: inspecionar um
+        # trecho, uma barra ou uma carga da própria região não deveria custar o
+        # lugar onde se estava. Qualquer outro elemento, ou o vazio, limpa.
+        if not preserve_highlight and not self._selection_inside_highlight(
+            selection
+        ):
+            self._clear_highlights(clear_table=True)
         self._search_focus_active = selection is not None and bool(reveal_hidden)
         if selection is None or selection.kind != "load":
             self.load_pattern_table_model.set_records(())

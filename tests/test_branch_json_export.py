@@ -10,11 +10,14 @@ from unittest.mock import patch
 from circuit_viewer import (
     BranchJsonValidationError,
     build_branch_json_payload,
+    EquivalentLoadPatternRecord,
     build_equivalent_network,
     export_branches_json,
     suggested_branch_json_filename,
 )
 from circuit_viewer.branch_analysis import analyze_branches
+from circuit_viewer.branch_json_export import BRANCH_POWER_FIELDS
+from circuit_viewer.branch_power_source import BranchPowerSource
 from circuit_viewer.calculation_levels import default_calculation_levels
 from circuit_viewer.curvas import Curve
 from circuit_viewer.generator_update import (
@@ -251,6 +254,14 @@ class BranchJsonExportTests(unittest.TestCase):
                     "chave_ini": "CHAVE-Á",
                     "fase": "D",
                     "remanejavel": True,
+                    "P0": 10.0,
+                    "P1": 21.0,
+                    "P2": 32.0,
+                    "P3": 43.0,
+                    "Q0": 19998.0,
+                    "Q1": 19998.0,
+                    "Q2": 19998.0,
+                    "Q3": 19998.0,
                 }
             },
         )
@@ -264,6 +275,95 @@ class BranchJsonExportTests(unittest.TestCase):
             equivalent.model.record(0).maximum_active_demand,
             Decimal("43"),
         )
+
+    def test_every_branch_carries_the_eight_power_fields(self) -> None:
+        # A estrutura não pode depender do método nem do estado do cadastro:
+        # quem consome não deveria testar a presença de cada chave.
+        branches, equivalent = make_snapshot()
+
+        payload = build_branch_json_payload(branches, equivalent, (0,))
+
+        for name in BRANCH_POWER_FIELDS:
+            with self.subTest(field=name):
+                self.assertIn(name, payload["RAMAL-1"])
+
+    def test_the_power_comes_from_the_selected_method(self) -> None:
+        """A exigência central: mesmas chaves, valores da origem escolhida."""
+
+        branches, aggregated = make_snapshot()
+        branch_id = branches.records[0].branch_id
+        # A mesma análise, agora com a potência medida na cabeceira em vez de
+        # agregada das cargas. Só a origem muda.
+        measured = build_equivalent_network(
+            branches,
+            branches.source_loads,
+            power_source=BranchPowerSource.POWER_FLOW,
+            measured_patterns={
+                branch_id: tuple(
+                    EquivalentLoadPatternRecord(
+                        f"RAMAL-{branch_id}",
+                        npat,
+                        Decimal(f"{100 + npat}"),
+                        Decimal(0),
+                        Decimal(0),
+                        Decimal(f"{10 + npat}"),
+                        Decimal(0),
+                        Decimal(0),
+                    )
+                    for npat in range(4)
+                )
+            },
+        )
+
+        from_table = build_branch_json_payload(branches, aggregated, (0,))
+        from_flow = build_branch_json_payload(branches, measured, (0,))
+
+        self.assertEqual(
+            set(from_table["RAMAL-1"]), set(from_flow["RAMAL-1"])
+        )
+        # A medição preenche a coluna D, que é a fase deste ramal.
+        self.assertEqual(from_flow["RAMAL-1"]["fase"], "D")
+        self.assertEqual(from_flow["RAMAL-1"]["P0"], 100.0)
+        self.assertEqual(from_flow["RAMAL-1"]["P3"], 103.0)
+        self.assertEqual(from_flow["RAMAL-1"]["Q0"], 10.0)
+        self.assertNotEqual(
+            from_table["RAMAL-1"]["P0"], from_flow["RAMAL-1"]["P0"]
+        )
+
+    def test_only_the_column_of_the_branch_phase_is_read(self) -> None:
+        # A agregação soma as seis colunas das cargas sem filtrar por fase, então
+        # um cadastro pode pôr potência numa fase que não é a do ramal. Somar as
+        # três faria "P0 é a potência deste ramal na sua fase" deixar de valer.
+        branches, equivalent = make_snapshot()
+        record = equivalent.model.records_for_load(0)[0]
+        self.assertEqual(branches.records[0].phase, "D")
+        # O fixture tem reativo nas três colunas, então a soma difere da coluna
+        # da fase — é exatamente o caso que distingue as duas leituras.
+        self.assertNotEqual(record.qe, 0)
+
+        payload = build_branch_json_payload(branches, equivalent, (0,))
+
+        self.assertEqual(payload["RAMAL-1"]["Q0"], float(record.qd))
+        self.assertNotEqual(
+            payload["RAMAL-1"]["Q0"], float(record.qd + record.qe + record.qf)
+        )
+
+    def test_a_branch_without_the_four_patamares_reports_no_power(self) -> None:
+        # None, e não zero: não ter resposta não é ter potência nula.
+        branches, _ = make_snapshot()
+        # Sem tabela de patamares a agregação não produz os quatro NPAT.
+        incomplete = build_equivalent_network(branches, branches.source_loads)
+        self.assertEqual(
+            incomplete.model.records_for_load(0),
+            (),
+            "o fixture precisa de um ramal sem patamares para este caso",
+        )
+
+        payload = build_branch_json_payload(branches, incomplete, (0,))
+
+        for name in BRANCH_POWER_FIELDS:
+            with self.subTest(field=name):
+                self.assertIsNone(payload["RAMAL-1"][name])
 
     def test_chave_ini_ignores_removable_gate(self) -> None:
         """``chave_ini`` é sempre a primeira chave, mesmo em ramal não remanejável."""

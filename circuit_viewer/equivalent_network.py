@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from decimal import Decimal, InvalidOperation, localcontext
 import re
 from typing import Literal
@@ -33,13 +34,23 @@ _DECIMAL_PATTERN = re.compile(
     r"^[+-]?(?:(?:\d+(?:[.,]\d*)?)|(?:[.,]\d+))(?:[eE][+-]?\d+)?$"
 )
 _PATTERN_FIELDS = ("pd", "pe", "pf", "qd", "qe", "qf")
+
+# Qual par de colunas do patamar pertence a cada fase. Publico e definido aqui,
+# junto de EquivalentLoadPatternRecord, porque tres lugares precisam da mesma
+# resposta: a agregacao, o LoadShape da exportacao simplificada e os campos de
+# potencia do JSON dos ramais. Tres copias divergiriam em silencio, e a
+# consequencia seria um numero atribuido a fase errada.
+PHASE_COLUMNS: Mapping[str, tuple[str, str]] = MappingProxyType(
+    {
+        "D": ("pd", "qd"),
+        "E": ("pe", "qe"),
+        "F": ("pf", "qf"),
+    }
+)
 _FIELD_PHASE = {
-    "pd": "D",
-    "pe": "E",
-    "pf": "F",
-    "qd": "D",
-    "qe": "E",
-    "qf": "F",
+    field: phase
+    for phase, fields in PHASE_COLUMNS.items()
+    for field in fields
 }
 ZERO_POWER_TOLERANCE = Decimal("1e-9")
 # Marcador do diagnóstico informativo: a carga não tem tabela e foi contada como

@@ -16,6 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PyQt6.QtCore import QItemSelection, QItemSelectionModel, QPoint, Qt
+    from PyQt6.QtGui import QKeyEvent
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication, QAbstractItemView, QMessageBox
 
@@ -668,6 +669,79 @@ class BranchesUiTests(unittest.TestCase):
         self.assertFalse(window.branches_window.table.selectionModel().hasSelection())
         self.assertEqual(window._selected_feature, FeatureSelection("segment", 0))
         self.assertIs(window._line_model, segments)
+
+    def _highlighted_window(self):  # noqa: ANN202
+        """Janela com um ramal em destaque, pronta para os gestos de desfazer."""
+
+        window, _, _, _ = self.make_window()
+        window._show_or_analyze_branches()
+        self.wait_for_analysis(window)
+        self.wait_for_equivalent(window)
+        record = window._branch_analysis_result.records[0]
+        window._select_branch(record)
+        self.app.processEvents()
+        self.assertTrue(window.branch_highlight_overlay.isVisible())
+        return window, record
+
+    def test_clicking_inside_the_branch_keeps_the_highlight(self) -> None:
+        # Antes, qualquer clique no mapa apagava o destaque do ramal — inclusive
+        # o clique num trecho de dentro dele, para ver o cabo.
+        window, record = self._highlighted_window()
+
+        window._set_selection(
+            FeatureSelection("segment", int(record.segment_indices[0]))
+        )
+
+        self.assertTrue(window.branch_highlight_overlay.isVisible())
+        self.assertIsNotNone(window._selected_branch)
+
+    def test_clicking_outside_the_branch_clears_the_highlight(self) -> None:
+        window, record = self._highlighted_window()
+        owned = set(record.segment_indices.tolist())
+        outside = next(
+            index
+            for index in range(len(window._line_model))
+            if index not in owned
+        )
+
+        window._set_selection(FeatureSelection("segment", outside))
+
+        self.assertFalse(window.branch_highlight_overlay.isVisible())
+        self.assertIsNone(window._selected_branch)
+
+    def test_escape_clears_the_branch_highlight(self) -> None:
+        window, _ = self._highlighted_window()
+
+        window._escape_pressed()
+
+        self.assertFalse(window.branch_highlight_overlay.isVisible())
+        self.assertIsNone(window._selected_branch)
+
+    def test_escape_in_the_window_unselects_before_closing(self) -> None:
+        # Pela tabela, que é o caminho real: a linha selecionada é o que dispara
+        # o destaque, e é ela que o Esc precisa desfazer primeiro.
+        window, _, _, _ = self.make_window()
+        window._show_or_analyze_branches()
+        self.wait_for_analysis(window)
+        self.wait_for_equivalent(window)
+        branches = window.branches_window
+        branches.table.setCurrentIndex(branches.proxy_model.index(0, 1))
+        self.app.processEvents()
+        self.assertTrue(branches.table.currentIndex().isValid())
+        self.assertTrue(window.branch_highlight_overlay.isVisible())
+
+        branches.keyPressEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyPress,
+                Qt.Key.Key_Escape,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        self.app.processEvents()
+
+        self.assertFalse(branches.table.currentIndex().isValid())
+        self.assertTrue(branches.isVisible())
+        self.assertFalse(window.branch_highlight_overlay.isVisible())
 
     def test_phase_mode_survives_branch_selection_and_data_change_invalidates(self) -> None:
         window, _, _, catalog = self.make_window()
