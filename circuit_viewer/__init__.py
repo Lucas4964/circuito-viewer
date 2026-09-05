@@ -2,6 +2,7 @@
 
 from .circuit_colors import (
     contrast_ratio_with_white,
+    contrasting_text_color,
     generate_circuit_palette,
     normalize_hex_color,
 )
@@ -461,6 +462,7 @@ __all__ = [
     "CircuitModel",
     "CircuitVisibilityController",
     "contrast_ratio_with_white",
+    "contrasting_text_color",
     "COORDINATE_UNITS",
     "CsvLoadResult",
     "Curve",

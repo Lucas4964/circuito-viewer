@@ -56,7 +56,13 @@ from .branch_table_export import (
     BranchCsvExportResult,
     suggested_branch_csv_filename,
 )
-from .block_analysis import BlockRecord, analyze_blocks
+from .block_analysis import BlockAnalysisResult, BlockRecord, analyze_blocks
+from .block_graph import resolve_block_circuit_indices
+from .block_graph_window import (
+    BlockGraphWindow,
+    load_scale_nodes_by_power,
+    save_scale_nodes_by_power,
+)
 from .blocks_window import BlocksWindow, BlockTableModel
 from .branch_window import BranchesWindow, BranchTableModel
 from .calculation_levels import CalculationLevelSchedule
@@ -731,6 +737,9 @@ class MainWindow(QMainWindow):
         self._max_power_flow_iterations = load_max_power_flow_iterations(
             self._settings
         )
+        self._scale_block_graph_nodes_by_power = load_scale_nodes_by_power(
+            self._settings
+        )
 
         self._model: CircuitModel | None = None
         self._line_model: LineNetworkModel | None = None
@@ -761,6 +770,9 @@ class MainWindow(QMainWindow):
         self._circuit_visibility: CircuitVisibilityController | None = None
         self._branch_analysis_result: BranchAnalysisResult | None = None
         self._equivalent_network_result: EquivalentNetworkResult | None = None
+        self._block_graph_style_result: BlockAnalysisResult | None = None
+        self._block_graph_style_catalog: CircuitCatalogModel | None = None
+        self._block_graph_circuit_indices: dict[int, int | None] = {}
         self._selected_branch: BranchRecord | None = None
         self._selected_block: BlockRecord | None = None
         self._selected_feature: FeatureSelection | None = None
@@ -948,6 +960,10 @@ class MainWindow(QMainWindow):
         self.branches_window = BranchesWindow(self.branch_table_model, self)
         self.block_table_model = BlockTableModel(self)
         self.blocks_window = BlocksWindow(self.block_table_model, self)
+        self.block_graph_window = BlockGraphWindow(
+            scale_nodes_by_power=self._scale_block_graph_nodes_by_power,
+            parent=self,
+        )
         self.cable_table_model = CableTableModel(self)
         self.cables_window = CablesWindow(self.cable_table_model, self)
         # WireData/CNData e LineSpacing são bibliotecas globais. As montagens
@@ -1368,6 +1384,13 @@ class MainWindow(QMainWindow):
         )
         self.blocks_action.triggered.connect(self._show_blocks)
 
+        self.block_graph_action = QAction("Grafo de blocos…", self)
+        self.block_graph_action.setEnabled(False)
+        self.block_graph_action.setToolTip(
+            "Visualizar as relações topológicas entre blocos e suas chaves"
+        )
+        self.block_graph_action.triggered.connect(self._show_block_graph)
+
         self.select_action = QAction("Selecionar", self)
         self.select_action.setCheckable(True)
         self.select_action.setChecked(True)
@@ -1436,6 +1459,7 @@ class MainWindow(QMainWindow):
         self.tools_menu = self.menuBar().addMenu("Ferramentas")
         self.tools_menu.addAction(self.branches_action)
         self.tools_menu.addAction(self.blocks_action)
+        self.tools_menu.addAction(self.block_graph_action)
         self.tools_menu.addSeparator()
         self.tools_menu.addAction(self.update_generators_action)
         self.tools_menu.addAction(self.power_flow_action)
@@ -2203,6 +2227,9 @@ class MainWindow(QMainWindow):
         self.circuit_table_model.colorChanged.connect(
             self._schedule_circuit_visibility_update
         )
+        self.circuit_table_model.colorChanged.connect(
+            self._sync_block_graph_styles
+        )
         self.circuits_window.rootBarActivated.connect(
             self._focus_circuit_root_bar
         )
@@ -2226,9 +2253,23 @@ class MainWindow(QMainWindow):
         self._escape_shortcut.activated.connect(self._escape_pressed)
         self.view.contextMenuRequested.connect(self._show_map_context_menu)
         self.blocks_window.blockSelected.connect(self._select_block)
+        self.blocks_window.blockSelected.connect(self.block_graph_window.select_block)
         self.blocks_window.blockActivated.connect(self._activate_block)
         self.blocks_window.selectionCleared.connect(self._clear_block_highlight)
+        self.blocks_window.selectionCleared.connect(
+            self.block_graph_window.clear_selection
+        )
         self.blocks_window.closed.connect(self._clear_block_highlight)
+        self.blocks_window.graphRequested.connect(self._show_block_graph)
+        self.block_graph_window.blockRequested.connect(
+            self._select_block_from_graph
+        )
+        self.block_graph_window.selectionCleared.connect(
+            self.blocks_window.clear_selection
+        )
+        self.block_graph_window.scaleNodesByPowerChanged.connect(
+            self._set_scale_block_graph_nodes_by_power
+        )
         self.branches_window.branchSelected.connect(self._select_branch)
         self.branches_window.branchActivated.connect(self._activate_branch)
         self.branches_window.selectionCleared.connect(
@@ -3932,6 +3973,7 @@ class MainWindow(QMainWindow):
             generator_mask = masks.source_generator_mask
             equivalent_mask = masks.equivalent_load_mask
         colors = () if controller is None else controller.colors
+        self._sync_block_graph_styles()
         phase_mode = (
             self.phase_coloring_action.isChecked()
             and self._phase_classification is not None
@@ -4224,6 +4266,7 @@ class MainWindow(QMainWindow):
             and self._switch_model is not None
             and not self._busy()
         )
+        self.block_graph_action.setEnabled(self.blocks_action.isEnabled())
 
     def _sync_export_availability(self) -> None:
         """Habilita cada exportação com os insumos exigidos por seu modo."""
@@ -6888,9 +6931,7 @@ class MainWindow(QMainWindow):
         o usuário passar antes pelo menu Ferramentas, senão não é atalho.
         """
 
-        if self.block_table_model.result is None:
-            self._show_blocks()
-        result = self.block_table_model.result
+        result = self._ensure_blocks_result()
         if result is None:
             return
         if block_id is None:
@@ -6918,17 +6959,24 @@ class MainWindow(QMainWindow):
         self.blocks_window.activateWindow()
         self.blocks_window.select_block(int(block_id))
 
-    def _show_blocks(self) -> None:
-        """Calcula os blocos e abre a janela.
+    def _ensure_blocks_result(self) -> BlockAnalysisResult | None:
+        """Calcula uma vez e compartilha o mesmo resultado entre as duas janelas.
 
         Sincrono, ao contrario da analise de ramais: e uma unica passada de
         componentes conexas sobre a adjacencia ja montada — 119 ms medidos num
         alimentador de 23.857 barras, abaixo do que se percebe como espera.
         """
 
+        current = self.block_table_model.result
+        if current is not None:
+            if self.block_graph_window.result is not current:
+                self.block_graph_window.set_result(current)
+                self._sync_block_graph_styles()
+            return current
+
         catalog = self._circuit_catalog
         if catalog is None or self._line_model is None or self._busy():
-            return
+            return None
         try:
             result = analyze_blocks(
                 catalog,
@@ -6937,12 +6985,91 @@ class MainWindow(QMainWindow):
             )
         except ValueError as exc:
             QMessageBox.critical(self, "Blocos", str(exc))
-            return
+            return None
         self._clear_block_highlight()
         self.blocks_window.set_result(result)
+        self.block_graph_window.set_result(result)
+        self._sync_block_graph_styles()
+        return result
+
+    def _show_blocks(self) -> None:
+        """Garante a análise vigente e abre a tabela de blocos."""
+
+        if self._ensure_blocks_result() is None:
+            return
         self.blocks_window.show()
         self.blocks_window.raise_()
         self.blocks_window.activateWindow()
+
+    def _show_block_graph(self) -> None:
+        """Garante a análise vigente e abre sua representação topológica."""
+
+        if self._ensure_blocks_result() is None:
+            return
+        self.block_graph_window.show()
+        self.block_graph_window.raise_()
+        self.block_graph_window.activateWindow()
+
+    def _select_block_from_graph(self, block_id: int) -> None:
+        """Passa o clique do grafo pela seleção já consolidada da tabela."""
+
+        if not self.blocks_window.select_block(int(block_id)):
+            return
+        selected = self._selected_block
+        if selected is not None and selected.block_id == int(block_id):
+            return
+        result = self.block_table_model.result
+        if result is None:
+            return
+        record = next(
+            (item for item in result.records if item.block_id == int(block_id)),
+            None,
+        )
+        if record is not None:
+            # Selecionar novamente a linha corrente não emite currentRowChanged.
+            # Este caminho mantém o clique idempotente depois de um realce ser
+            # removido por outro gesto da janela principal.
+            self._select_block(record)
+
+    def _set_scale_block_graph_nodes_by_power(self, enabled: bool) -> None:
+        self._scale_block_graph_nodes_by_power = bool(enabled)
+        save_scale_nodes_by_power(
+            self._settings,
+            self._scale_block_graph_nodes_by_power,
+        )
+        self.block_graph_window.set_scale_nodes_by_power(
+            self._scale_block_graph_nodes_by_power
+        )
+
+    def _sync_block_graph_styles(self, *args) -> None:  # noqa: ANN002
+        del args
+        result = self.block_graph_window.result
+        catalog = self._circuit_catalog
+        controller = self._circuit_visibility
+        if result is None or catalog is None or controller is None:
+            self._block_graph_style_result = None
+            self._block_graph_style_catalog = None
+            self._block_graph_circuit_indices = {}
+            self.block_graph_window.set_circuit_styles({}, (), ())
+            return
+        if (
+            result is not self._block_graph_style_result
+            or catalog is not self._block_graph_style_catalog
+        ):
+            self._block_graph_circuit_indices = resolve_block_circuit_indices(
+                result,
+                catalog,
+            )
+            self._block_graph_style_result = result
+            self._block_graph_style_catalog = catalog
+        circuit_labels = tuple(
+            definition.circuit_id for definition in catalog.definitions
+        )
+        self.block_graph_window.set_circuit_styles(
+            self._block_graph_circuit_indices,
+            controller.colors,
+            circuit_labels,
+        )
 
     def _invalidate_blocks(self) -> None:
         """Descarta os blocos quando a rede que os originou deixa de valer."""
@@ -6950,6 +7077,8 @@ class MainWindow(QMainWindow):
         self._clear_block_highlight()
         self.block_table_model.set_result(None)
         self.blocks_window.set_result(None)
+        self.block_graph_window.set_result(None)
+        self.block_graph_window.set_circuit_styles({}, (), ())
 
     def _highlighted_record(self):  # noqa: ANN202
         """O bloco ou o ramal em destaque, ou ``None``.

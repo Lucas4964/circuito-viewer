@@ -27,7 +27,7 @@ NumPy 2.x, pyproj 3.5+.
 9. [Seleção, interação e navegação](#9-seleção-interação-e-navegação)
 10. [Estruturas de dados e finalidades](#10-estruturas-de-dados-e-finalidades)
 11. [Concorrência e ciclo de vida das threads](#11-concorrência-e-ciclo-de-vida-das-threads)
-12. [Subsistemas analíticos](#12-subsistemas-analíticos) (ramais · rede simplificada · exportação OpenDSS · fluxo de potência · leitura de bancos Access)
+12. [Subsistemas analíticos](#12-subsistemas-analíticos) (ramais · blocos · rede simplificada · exportação OpenDSS · fluxo de potência · leitura de bancos Access)
 13. [Camada de satélite](#13-camada-de-satélite)
 14. [Busca global](#14-busca-global)
 15. [Dependências](#15-dependências)
@@ -43,8 +43,8 @@ Aplicação desktop PyQt6 para importar, visualizar e analisar redes elétricas 
 distribuição georreferenciadas em coordenadas UTM. O usuário importa até seis
 arquivos CSV encadeados (barras → trechos → chaves/cargas → patamares →
 circuitos), navega em um canvas com fundo de satélite opcional, inspeciona
-atributos, filtra por circuito, executa análises topológicas (ramais e rede
-simplificada por cargas equivalentes) e resolve o fluxo de potência dos
+atributos, filtra por circuito, executa análises topológicas (ramais, blocos e
+rede simplificada por cargas equivalentes) e resolve o fluxo de potência dos
 circuitos visíveis sem sair da aplicação.
 
 O projeto foi dimensionado para escala industrial: os benchmarks cobrem
@@ -101,6 +101,8 @@ CIRCUITO_VIEWER/
 │   ├── opendss_engine.py      # único acesso ao py_dss_interface (opcional)
 │   ├── opendss_powerflow.py   # execução do fluxo e associação dos resultados
 │   ├── branch_analysis.py     # análise topológica de ramais
+│   ├── block_analysis.py      # regiões delimitadas por chaves manobráveis
+│   ├── block_graph.py         # multigrafo e layout hierárquico sem Qt
 │   ├── equivalent_network.py  # projeção simplificada / cargas equivalentes
 │   ├── branch_power_source.py # método de obtenção da potência dos ramais
 │   ├── branch_power_flow.py   # potência do ramal medida no fluxo de potência
@@ -114,6 +116,8 @@ CIRCUITO_VIEWER/
 │   ├── main_window.py         # orquestração da UI e do estado da aplicação
 │   ├── circuits_window.py     # tabela de circuitos (visibilidade + cor)
 │   ├── branch_window.py       # tabela de ramais (filtro, ordenação, avisos)
+│   ├── blocks_window.py       # tabela e seleção sincronizada dos blocos
+│   ├── block_graph_window.py  # grafo QGraphicsView dos blocos e chaves
 │   ├── cables_window.py       # tabela do catálogo de cabos
 │   ├── opendss_export_dialog.py  # seleção dos circuitos a exportar
 │   ├── opendss_settings_dialog.py # Configurações → OpenDSS… + QSettings
@@ -133,7 +137,7 @@ CIRCUITO_VIEWER/
 │   ├── phase_legend.py        # legenda flutuante do modo por fases
 │   └── theme.py               # tema claro/escuro escolhido manualmente
 │
-├── tests/                     # 53 arquivos de teste (unittest + pytest-qt)
+├── tests/                     # 78 arquivos de teste (unittest + pytest-qt)
 ├── benchmarks/                # 8 benchmarks com modo --enforce
 ├── README.md                  # documentação de uso
 ├── ARQUITETURA.md             # este documento
@@ -2258,6 +2262,51 @@ linha lógica `geradores`. Assim, detecção e override continuam independentes
 por tabela, mas dependência, instalação, progresso e relatório permanecem uma
 única operação. A leitura contabiliza primeiro `MT_CONS` e depois
 `MT_GERADOR_CONS`, sem regressão na barra global.
+
+### 12.6 Blocos e grafo topológico (`block_analysis.py`, `block_graph.py`)
+
+`analyze_blocks()` remove logicamente os trechos associados a chaves
+manobráveis e calcula as componentes conexas restantes. Cada componente vira um
+`BlockRecord`; a chave removida pertence às fronteiras dos blocos tocados pelas
+suas duas barras. O estado aberto/fechado não muda a partição, pois o bloco
+representa o que uma operação pode isolar. `total_power` soma o `SNOM` numérico
+das cargas do bloco e `contains_source` marca componentes que contêm a barra
+inicial de algum circuito.
+
+`build_block_graph()` transforma o resultado em multigrafo sem Qt. As pontas de
+cada `BlockGraphEdge` são recuperadas pelo trecho da chave, em vez de inferidas
+apenas pela lista de fronteiras. Assim, chaves paralelas continuam sendo arestas
+distintas e uma chave contornada por outro caminho aparece como autoenlace, não
+é descartada.
+
+`layout_block_graph()` separa componentes e executa BFS simultânea a partir de
+todos os blocos-fonte. Componentes sem fonte usam o menor `block_id`. As arestas
+que descobrem nós formam a floresta de posicionamento; pais ficam centralizados
+sobre os filhos e a coordenada Y é a profundidade. Arestas restantes continuam
+no resultado e a interface as desenha curvas, preservando ciclos e paralelismo.
+
+`BlockGraphWindow` desenha o modelo em uma cena própria. Nós são
+`QGraphicsObject` clicáveis e arestas são `QGraphicsPathItem`; o canvas branco
+oferece zoom sob o cursor, pan no fundo e reenquadramento. `MainWindow` resolve o
+único circuito de cada bloco pelas barras alcançadas e, como fallback, pelo
+`CIRC_ID` inequívoco das chaves de fronteira. A paleta vigente colore os nós e a
+luminância relativa escolhe texto preto ou branco; associação ausente ou
+contraditória usa cinza. Arestas cujas pontas têm circuitos distintos recebem
+linha e rótulo `#FF00FF` com 4 px. O clique em nó emite apenas o `block_id`:
+`MainWindow` o envia a `BlocksWindow.select_block()`, portanto a tradução
+fonte/proxy e o sinal `blockSelected` existentes continuam sendo o único caminho
+para selecionar a linha e pintar o bloco no mapa. No sentido inverso, os sinais
+da tabela atualizam a seleção gráfica sem reemissão.
+
+A preferência `block_graph/scale_nodes_by_power` fica no `QSettings` e seu
+controle fica no cabeçalho do próprio grafo. Desligada, o diâmetro é 56 px;
+ligada, varia de 36 a 72 px pela fórmula
+`sqrt(36² + (potência/máxima) × (72²−36²))`, tornando a área proporcional.
+Valores ausentes, negativos ou nulos usam o mínimo. O layout usa passos de 200
+px na horizontal, 170 px na vertical e 260 px entre componentes; as legendas de
+arestas procuram uma posição central que não intercepte os nós. A análise é
+calculada uma vez, compartilhada pelas duas janelas e invalidada junto com suas
+fontes.
 
 ---
 

@@ -20,8 +20,10 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QHeaderView,
+    QHBoxLayout,
     QLabel,
     QPlainTextEdit,
+    QPushButton,
     QTableView,
     QVBoxLayout,
 )
@@ -233,6 +235,7 @@ class BlocksWindow(QDialog):
     blockSelected = pyqtSignal(object)
     blockActivated = pyqtSignal(object)
     selectionCleared = pyqtSignal()
+    graphRequested = pyqtSignal()
     closed = pyqtSignal()
 
     def __init__(self, table_model: BlockTableModel, parent=None) -> None:  # noqa: ANN001
@@ -243,11 +246,21 @@ class BlocksWindow(QDialog):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
         layout = QVBoxLayout(self)
+        summary_row = QHBoxLayout()
         self.summary_label = QLabel(
             "Importe uma rede com chaves para identificar os blocos."
         )
         self.summary_label.setWordWrap(True)
-        layout.addWidget(self.summary_label)
+        summary_row.addWidget(self.summary_label, 1)
+        self.graph_button = QPushButton("Visualizar grafo…", self)
+        self.graph_button.setObjectName("block_graph_button")
+        self.graph_button.setEnabled(False)
+        self.graph_button.setToolTip(
+            "Abrir uma representação simplificada das relações entre blocos"
+        )
+        self.graph_button.clicked.connect(self.graphRequested)
+        summary_row.addWidget(self.graph_button)
+        layout.addLayout(summary_row)
 
         self.proxy_model = BlockSortProxyModel(self)
         self.proxy_model.setSourceModel(table_model)
@@ -300,7 +313,10 @@ class BlocksWindow(QDialog):
             self.issues_label.setText("")
             self.issues_text.setPlainText("")
             self.issues_text.setVisible(False)
+            self.graph_button.setEnabled(False)
             return
+
+        self.graph_button.setEnabled(not result.is_empty)
 
         dead_ends = sum(1 for record in result.records if record.is_dead_end)
         self.summary_label.setText(

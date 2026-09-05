@@ -7,6 +7,7 @@ import unittest
 
 from circuit_viewer.circuit_colors import (
     contrast_ratio_with_white,
+    contrasting_text_color,
     generate_circuit_palette,
     normalize_hex_color,
 )
@@ -44,6 +45,11 @@ class CircuitPaletteTests(unittest.TestCase):
             normalize_hex_color("red")
         with self.assertRaises(ValueError):
             normalize_hex_color("#1234")
+
+    def test_text_color_chooses_the_stronger_black_or_white_contrast(self) -> None:
+        self.assertEqual(contrasting_text_color("#000000"), "#FFFFFF")
+        self.assertEqual(contrasting_text_color("#FFFFFF"), "#000000")
+        self.assertEqual(contrasting_text_color("#FF00FF"), "#000000")
 
 
 if __name__ == "__main__":

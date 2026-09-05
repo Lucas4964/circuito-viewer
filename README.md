@@ -1664,6 +1664,40 @@ elemento original permanece visível enquanto for necessário por outro circuito
 visível. **Mostrar cargas** controla conjuntamente cargas originais preservadas e
 cargas equivalentes, e **Enquadrar tudo** usa os limites da projeção ativa.
 
+## Blocos e grafo topológico
+
+**Ferramentas → Blocos…** identifica as regiões delimitadas por chaves
+manobráveis e as apresenta na tabela existente. O botão **Visualizar grafo…**
+dessa janela e **Ferramentas → Grafo de blocos…** abrem uma segunda janela não
+modal com a mesma análise: cada círculo é um bloco e cada linha é uma chave de
+fronteira. O código da chave aparece sobre a linha; detalhes do bloco e da chave
+ficam disponíveis nas dicas de ferramenta.
+
+Os blocos-fonte ocupam o topo e os demais são distribuídos em níveis pela menor
+quantidade de chaves até uma fonte. Redes desconectadas aparecem lado a lado.
+Ciclos, chaves paralelas e chaves cujas pontas pertencem ao mesmo bloco não são
+omitidos: aparecem como curvas ou autoenlaces além da floresta principal.
+
+Clique em um nó para selecionar a linha correspondente na tabela de blocos e
+destacar a região na visualização principal. A sincronização também funciona no
+sentido inverso; limpar a seleção em uma janela limpa a outra. Use a roda para
+zoom, arraste o fundo para mover e dê duplo clique — ou use **Enquadrar** — para
+ver novamente o grafo inteiro.
+
+Na própria janela do grafo, **Dimensionar nós dos blocos por potência instalada**
+faz a área dos círculos representar a soma de `SNOM` das cargas de cada bloco. A
+opção começa desligada e é lembrada entre sessões. Ligada, usa diâmetros de 36 a
+72 px, com área proporcional à potência relativa ao maior bloco; potência
+ausente, negativa ou zero usa o tamanho mínimo. Desligada, todos os nós têm 56
+px. O limite menor, o espaçamento ampliado e o reposicionamento das legendas
+evitam que nós grandes cubram outros nós ou códigos de chaves.
+
+O conteúdo da janela usa fundo branco mesmo com o tema escuro. Cada nó recebe a
+cor cadastrada para seu circuito, com texto preto ou branco escolhido pelo maior
+contraste. Uma chave que liga blocos de circuitos diferentes aparece com linha
+e rótulo magenta mais espessos; blocos cuja associação seja ausente ou
+contraditória ficam em cinza neutro.
+
 ## Testes e benchmark
 
 Os testes do núcleo usam apenas a biblioteca padrão e NumPy. Os testes gráficos
@@ -1721,6 +1755,9 @@ atualizado junto com mudanças relevantes de arquitetura.
 - `circuit_viewer/circuits_window.py`: tabela de visibilidade e cores dos circuitos.
 - `circuit_viewer/overlap_report.py`: relatório tabular das sobreposições.
 - `circuit_viewer/branch_analysis.py`: análise topológica dos ramais.
+- `circuit_viewer/block_analysis.py`: identificação e grandezas dos blocos.
+- `circuit_viewer/block_graph.py`: multigrafo e layout hierárquico dos blocos.
+- `circuit_viewer/block_graph_window.py`: canvas interativo e persistência visual.
 - `circuit_viewer/equivalent_network.py`: projeção e agregação das cargas equivalentes.
 - `circuit_viewer/branch_window.py`: tabela, filtro e avisos dos ramais.
 - `circuit_viewer/opendss_export.py`: geração dos arquivos `.dss` e do master.

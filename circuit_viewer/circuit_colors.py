@@ -66,6 +66,20 @@ def contrast_ratio_with_white(color: str) -> float:
     return 1.05 / (_relative_luminance(rgb) + 0.05)
 
 
+def contrasting_text_color(background: str) -> str:
+    """Escolhe preto ou branco com o maior contraste WCAG sobre ``background``."""
+
+    normalized = normalize_hex_color(background)
+    rgb = tuple(
+        int(normalized[index : index + 2], 16) / 255.0
+        for index in (1, 3, 5)
+    )
+    luminance = _relative_luminance(rgb)
+    white_contrast = 1.05 / (luminance + 0.05)
+    black_contrast = (luminance + 0.05) / 0.05
+    return "#FFFFFF" if white_contrast >= black_contrast else "#000000"
+
+
 def _oklch_candidate(
     lightness: float,
     chroma: float,
