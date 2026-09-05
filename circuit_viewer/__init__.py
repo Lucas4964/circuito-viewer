@@ -6,6 +6,13 @@ from .circuit_colors import (
     generate_circuit_palette,
     normalize_hex_color,
 )
+from .display_identity import (
+    BlockDisplayIdentity,
+    UNRESOLVED_BLOCK_PREFIX,
+    UNRESOLVED_CIRCUIT_LABEL,
+    build_block_display_identities,
+    circuit_display_labels,
+)
 from .branch_analysis import (
     BranchAnalysisResult,
     BranchIssue,

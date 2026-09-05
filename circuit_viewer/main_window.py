@@ -57,7 +57,6 @@ from .branch_table_export import (
     suggested_branch_csv_filename,
 )
 from .block_analysis import BlockAnalysisResult, BlockRecord, analyze_blocks
-from .block_graph import resolve_block_circuit_indices
 from .block_graph_window import (
     BlockGraphWindow,
     load_scale_nodes_by_power,
@@ -65,6 +64,11 @@ from .block_graph_window import (
 )
 from .blocks_window import BlocksWindow, BlockTableModel
 from .branch_window import BranchesWindow, BranchTableModel
+from .display_identity import (
+    BlockDisplayIdentity,
+    build_block_display_identities,
+    circuit_display_labels,
+)
 from .calculation_levels import CalculationLevelSchedule
 from .calculation_levels_store import load_calculation_levels
 from .circuit_calculation_levels import (
@@ -771,6 +775,7 @@ class MainWindow(QMainWindow):
         self._block_graph_style_result: BlockAnalysisResult | None = None
         self._block_graph_style_catalog: CircuitCatalogModel | None = None
         self._block_graph_circuit_indices: dict[int, int | None] = {}
+        self._block_display_identities: dict[int, BlockDisplayIdentity] = {}
         self._selected_branch: BranchRecord | None = None
         self._selected_block: BlockRecord | None = None
         self._selected_feature: FeatureSelection | None = None
@@ -6568,7 +6573,7 @@ class MainWindow(QMainWindow):
         if not branch_indices:
             return
         suggested = suggested_branch_csv_filename(
-            self.branches_window.selected_circuit_id()
+            self.branches_window.selected_circuit_label()
         )
         path, _ = QFileDialog.getSaveFileName(
             self.branches_window,
@@ -6720,7 +6725,7 @@ class MainWindow(QMainWindow):
             )
         )
         suggested = suggested_branch_json_filename(
-            self.branches_window.selected_circuit_id()
+            self.branches_window.selected_circuit_label()
         )
         path, _ = QFileDialog.getSaveFileName(
             self.branches_window,
@@ -6909,14 +6914,16 @@ class MainWindow(QMainWindow):
         if not blocks:
             return
         if len(blocks) == 1:
-            action = menu.addAction(f"Ver bloco {blocks[0].block_id:n}")
+            action = menu.addAction(
+                f"Ver bloco {self._block_display_label(blocks[0])}"
+            )
             action.triggered.connect(
                 lambda _checked=False, index=segment_index: self._view_block(index)
             )
             return
         for record in blocks:
             action = menu.addAction(
-                f"Ver bloco {record.block_id:n} "
+                f"Ver bloco {self._block_display_label(record)} "
                 f"({record.segment_count:n} trecho(s), "
                 f"{record.load_count:n} carga(s))"
             )
@@ -6925,6 +6932,10 @@ class MainWindow(QMainWindow):
                     None, block_id
                 )
             )
+
+    def _block_display_label(self, record: BlockRecord) -> str:
+        identity = self._block_display_identities.get(record.block_id)
+        return f"{record.block_id:n}" if identity is None else identity.graph_label
 
     def _view_block(self, segment_index: int | None, block_id: int | None = None) -> None:
         """Abre a tabela de blocos com o bloco pedido já selecionado.
@@ -6951,7 +6962,7 @@ class MainWindow(QMainWindow):
                 # existir, então não pôde oferecer um atalho por bloco.
                 self.statusBar().showMessage(
                     f"Chave de fronteira entre os blocos "
-                    f"{', '.join(f'{record.block_id:n}' for record in blocks)}; "
+                    f"{', '.join(self._block_display_label(record) for record in blocks)}; "
                     "o primeiro foi selecionado.",
                     6_000,
                 )
@@ -6989,9 +7000,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Blocos", str(exc))
             return None
         self._clear_block_highlight()
-        self.blocks_window.set_result(result)
         self.block_graph_window.set_result(result)
         self._sync_block_graph_styles()
+        self.blocks_window.set_result(result, self._block_display_identities)
         return result
 
     def _show_blocks(self) -> None:
@@ -7136,25 +7147,34 @@ class MainWindow(QMainWindow):
             self._block_graph_style_result = None
             self._block_graph_style_catalog = None
             self._block_graph_circuit_indices = {}
-            self.block_graph_window.set_circuit_styles({}, (), ())
+            self._block_display_identities = {}
+            self.block_graph_window.set_circuit_styles({}, (), (), {})
             return
         if (
             result is not self._block_graph_style_result
             or catalog is not self._block_graph_style_catalog
         ):
-            self._block_graph_circuit_indices = resolve_block_circuit_indices(
+            self._block_display_identities = build_block_display_identities(
                 result,
                 catalog,
             )
+            self._block_graph_circuit_indices = {
+                block_id: identity.circuit_index
+                for block_id, identity in self._block_display_identities.items()
+            }
             self._block_graph_style_result = result
             self._block_graph_style_catalog = catalog
-        circuit_labels = tuple(
-            definition.circuit_id for definition in catalog.definitions
-        )
+            if self.block_table_model.result is result:
+                self.blocks_window.set_result(
+                    result,
+                    self._block_display_identities,
+                )
+        circuit_labels = circuit_display_labels(catalog)
         self.block_graph_window.set_circuit_styles(
             self._block_graph_circuit_indices,
             controller.colors,
             circuit_labels,
+            self._block_display_identities,
         )
 
     def _invalidate_blocks(self) -> None:
@@ -7164,7 +7184,8 @@ class MainWindow(QMainWindow):
         self.block_table_model.set_result(None)
         self.blocks_window.set_result(None)
         self.block_graph_window.set_result(None)
-        self.block_graph_window.set_circuit_styles({}, (), ())
+        self.block_graph_window.set_circuit_styles({}, (), (), {})
+        self._block_display_identities = {}
 
     def _highlighted_record(self):  # noqa: ANN202
         """O bloco ou o ramal em destaque, ou ``None``.
@@ -7251,7 +7272,8 @@ class MainWindow(QMainWindow):
         if record.segment_count == 0:
             self.block_highlight_overlay.clear()
             self.statusBar().showMessage(
-                f"Bloco {record.block_id:n} não possui trecho para destacar.",
+                f"Bloco {self._block_display_label(record)} não possui trecho "
+                "para destacar.",
                 4_000,
             )
         else:

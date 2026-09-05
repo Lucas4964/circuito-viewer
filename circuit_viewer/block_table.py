@@ -9,10 +9,12 @@ verdade sobre o que a tabela mostra.
 from __future__ import annotations
 
 from .block_analysis import BlockRecord
+from .display_identity import BlockDisplayIdentity
 
 
 BLOCK_TABLE_HEADERS = (
-    "BLOCO_ID",
+    "CIRCUITO",
+    "BLOCO",
     "NUM_BARRAS",
     "NUM_TRECHOS",
     "NUM_CARGAS",
@@ -25,7 +27,7 @@ BLOCK_TABLE_HEADERS = (
 BLOCK_NUMERIC_COLUMNS = frozenset(
     BLOCK_TABLE_HEADERS.index(name)
     for name in (
-        "BLOCO_ID",
+        "BLOCO",
         "NUM_BARRAS",
         "NUM_TRECHOS",
         "NUM_CARGAS",
@@ -35,6 +37,8 @@ BLOCK_NUMERIC_COLUMNS = frozenset(
         "FONTE",
     )
 )
+BLOCK_CIRCUIT_COLUMN = BLOCK_TABLE_HEADERS.index("CIRCUITO")
+BLOCK_NUMBER_COLUMN = BLOCK_TABLE_HEADERS.index("BLOCO")
 BLOCK_POWER_COLUMN = BLOCK_TABLE_HEADERS.index("SNOM")
 BLOCK_LENGTH_COLUMN = BLOCK_TABLE_HEADERS.index("COMPR")
 BLOCK_SWITCHES_COLUMN = BLOCK_TABLE_HEADERS.index("CHAVES")
@@ -47,7 +51,10 @@ SWITCH_SEPARATOR = ", "
 TRUNCATION_SUFFIX = "…"
 
 
-def block_table_values(record: BlockRecord) -> tuple[object | None, ...]:
+def block_table_values(
+    record: BlockRecord,
+    identity: BlockDisplayIdentity,
+) -> tuple[object | None, ...]:
     """Os valores brutos de uma linha, na ordem de :data:`BLOCK_TABLE_HEADERS`.
 
     Brutos de propósito: número continua número, para a ordenação da tabela
@@ -55,7 +62,8 @@ def block_table_values(record: BlockRecord) -> tuple[object | None, ...]:
     """
 
     return (
-        record.block_id,
+        identity.circuit_label,
+        identity.local_number,
         record.bar_count,
         record.segment_count,
         record.load_count,
@@ -92,8 +100,10 @@ def switch_list_summary(record: BlockRecord) -> str:
 
 
 __all__ = [
+    "BLOCK_CIRCUIT_COLUMN",
     "BLOCK_LENGTH_COLUMN",
     "BLOCK_NUMERIC_COLUMNS",
+    "BLOCK_NUMBER_COLUMN",
     "BLOCK_POWER_COLUMN",
     "BLOCK_SOURCE_COLUMN",
     "BLOCK_SWITCHES_COLUMN",

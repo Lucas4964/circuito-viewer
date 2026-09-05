@@ -81,29 +81,60 @@ def filter_block_graph(
     *,
     include_unresolved: bool = False,
 ) -> BlockGraph:
-    """Devolve o subgrafo induzido pelos circuitos escolhidos.
+    """Devolve o recorte dos circuitos escolhidos.
 
     A ordem dos nós e das arestas é preservada. Em particular,
     ``BlockGraphEdge.switch_index`` continua apontando para o registro original
     da chave, o que permite à interface navegar até o trecho correspondente.
+
+    Com exatamente um circuito selecionado, acrescenta os blocos válidos dos
+    outros circuitos diretamente ligados a ele e somente as arestas dessa
+    ligação. O circuito vizinho não é expandido e seus demais enlaces não
+    aparecem. Com zero ou vários circuitos, o recorte continua sendo induzido.
     """
 
     selected = frozenset(int(value) for value in selected_circuit_indices)
-    visible_ids: set[int] = set()
+    base_visible_ids: set[int] = set()
     for record in graph.nodes:
         circuit_index = block_circuit_indices.get(record.block_id)
         if circuit_index is None:
             if include_unresolved:
-                visible_ids.add(record.block_id)
+                base_visible_ids.add(record.block_id)
         elif circuit_index in selected:
-            visible_ids.add(record.block_id)
+            base_visible_ids.add(record.block_id)
+
+    visible_ids = set(base_visible_ids)
+    direct_edge_indices: set[int] = set()
+    if len(selected) == 1:
+        selected_circuit = next(iter(selected))
+        for edge_index, edge in enumerate(graph.edges):
+            start_circuit = block_circuit_indices.get(edge.start_block_id)
+            end_circuit = block_circuit_indices.get(edge.end_block_id)
+            if (
+                start_circuit == selected_circuit
+                and end_circuit is not None
+                and end_circuit != selected_circuit
+            ):
+                visible_ids.add(edge.end_block_id)
+                direct_edge_indices.add(edge_index)
+            elif (
+                end_circuit == selected_circuit
+                and start_circuit is not None
+                and start_circuit != selected_circuit
+            ):
+                visible_ids.add(edge.start_block_id)
+                direct_edge_indices.add(edge_index)
     nodes = tuple(
         record for record in graph.nodes if record.block_id in visible_ids
     )
     edges = tuple(
         edge
-        for edge in graph.edges
-        if edge.start_block_id in visible_ids and edge.end_block_id in visible_ids
+        for edge_index, edge in enumerate(graph.edges)
+        if (
+            edge.start_block_id in base_visible_ids
+            and edge.end_block_id in base_visible_ids
+        )
+        or edge_index in direct_edge_indices
     )
     return BlockGraph(nodes, edges)
 

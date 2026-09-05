@@ -1528,6 +1528,13 @@ somente para valores configurados com `NUMERO_FASES=2` e incorporam integralment
 suas subárvores monofásicas a jusante, mesmo quando elas usam diferentes valores
 `FASES2`.
 
+O filtro **Circuito**, a coluna visual **CIRCUITO**, os diagnósticos e a cópia
+da tabela identificam o alimentador pelo `CODIGO`, preservando inclusive zeros
+à esquerda. Código vazio ou repetido recebe o `CIRC_ID` entre parênteses apenas
+para desambiguar. Essa troca é visual: o CSV continua exportando sua coluna
+`CIRC_ID` original e o contrato do JSON não muda. O nome sugerido para o arquivo
+usa o código que aparece no filtro.
+
 Uma componente monofásica ligada a mais de um núcleo bifásico, ou ligada
 simultaneamente ao tronco e a um núcleo bifásico por caminhos distintos, é
 excluída de todos os ramais envolvidos e registrada nos diagnósticos. Isso evita
@@ -1674,6 +1681,14 @@ modal com a mesma análise: cada círculo é um bloco e cada linha é uma chave 
 fronteira. O código da chave aparece sobre a linha; detalhes do bloco e da chave
 ficam disponíveis nas dicas de ferramenta.
 
+A tabela começa por **CIRCUITO** e **BLOCO**. O primeiro usa o código do
+circuito e o segundo é numerado novamente a partir de 1 em cada circuito; o
+filtro **Circuito** permite ver todos, somente um alimentador ou **Sem circuito
+definido**. O identificador técnico global continua existindo apenas para
+sincronização interna. No grafo, a identidade visível combina os dois campos,
+por exemplo `001001-1`; blocos neutros usam `SEM-CIRCUITO-1`. Ordenação, filtro
+e modo de posicionamento não renumeram os blocos.
+
 Em **Posicionamento: Árvore**, modo padrão de cada execução, os blocos-fonte
 ocupam o topo e os demais são distribuídos em níveis pela menor quantidade de
 chaves até uma fonte. Redes desconectadas aparecem lado a lado. A opção
@@ -1694,6 +1709,14 @@ com apenas um circuito começa com ele selecionado; com dois ou mais, começa
 vazia. Blocos sem associação inequívoca podem ser incluídos separadamente por
 **Sem circuito definido**. A escolha dura enquanto a rede atual estiver
 carregada e não altera a visibilidade dos circuitos no mapa principal.
+
+Quando exatamente um circuito é marcado, o grafo acrescenta automaticamente
+cada bloco de outro circuito ligado diretamente por uma chave magenta. Somente
+o bloco externo e as chaves que cruzam essa fronteira aparecem: o restante do
+circuito vizinho e seus outros enlaces ficam ocultos. Isso expõe pontos de
+manobra sem poluir o desenho. Com vários circuitos, permanece o subgrafo
+induzido normal; **Incluir vizinhos diretos** continua selecionando por inteiro
+os circuitos adjacentes de um único salto.
 
 Clique em um nó para selecionar a linha correspondente na tabela de blocos e
 destacar a região na visualização principal. Clique em uma aresta ou em seu

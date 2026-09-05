@@ -1241,6 +1241,13 @@ múltiplas conexões, a ordenação dos candidatos escolhe a primária mais pró
 `(circuit_id, first_segment_id)` e `branch_id` reatribuído como sequência global
 1..N, `issues` (deduplicados, teto de 500) e as fontes usadas.
 
+Na camada Qt, `BranchRecord.circuit_id` continua sendo a chave técnica e os
+serializadores CSV/JSON continuam consumindo esse valor. `BranchTableModel`
+resolve `record.circuit_index` contra os rótulos compartilhados de circuito e
+apresenta `CODIGO` no filtro, na coluna **CIRCUITO**, na cópia e nos
+diagnósticos. O nome sugerido da exportação usa o mesmo rótulo, mas o conteúdo
+do arquivo conserva o contrato anterior.
+
 ### 12.2 Rede simplificada (`equivalent_network.py`)
 
 **Objetivo:** substituir cada ramal por uma carga equivalente na sua conexão com
@@ -2273,6 +2280,15 @@ representa o que uma operação pode isolar. `total_power` soma o `SNOM` numéri
 das cargas do bloco e `contains_source` marca componentes que contêm a barra
 inicial de algum circuito.
 
+`display_identity.py` separa identidade técnica e identidade visível.
+`BlockRecord.block_id` permanece global, contíguo e é a chave de sinais,
+seleções, nós e arestas. `build_block_display_identities()` reaproveita a
+resolução inequívoca de circuito e atribui, na ordem do `block_id`, contadores
+independentes por circuito. O resultado contém o `circuit_index`, o rótulo por
+`CODIGO`, o número local e `<CODIGO>-<N>`; blocos neutros formam a sequência
+`SEM-CIRCUITO-N`. `circuit_display_labels()` preserva zeros à esquerda e usa o
+`CIRC_ID` apenas quando o código está vazio ou repetido.
+
 `build_block_graph()` transforma o resultado em multigrafo sem Qt. As pontas de
 cada `BlockGraphEdge` são recuperadas pelo trecho da chave, em vez de inferidas
 apenas pela lista de fronteiras. Assim, chaves paralelas continuam sendo arestas
@@ -2301,7 +2317,11 @@ oferece zoom sob o cursor, pan no fundo e reenquadramento. O cabeçalho abre um
 `CircuitSelectionPopup` com uma lista marcável sem reservar espaço permanente.
 `filter_block_graph()` produz o subgrafo induzido pelos circuitos escolhidos e
 `direct_circuit_neighbors()` expande somente um salto pelas arestas
-intercircuito. Um circuito é marcado automaticamente; catálogos com dois ou
+intercircuito. Quando há exatamente um circuito escolhido, o filtro acrescenta
+os blocos externos diretamente ligados e somente as arestas que cruzam essa
+fronteira; não inclui outros enlaces desses blocos nem prossegue pelo
+alimentador vizinho. Com várias escolhas o recorte permanece induzido. Um
+circuito é marcado automaticamente; catálogos com dois ou
 mais começam vazios, e a associação neutra é uma opção separada. O grafo
 completo permanece imutável na janela e cada mudança de filtro recalcula apenas
 o subgrafo visível; o modo Árvore recalcula seus níveis e o modo espacial
@@ -2330,6 +2350,12 @@ detalhes da chave; duplo clique reutiliza `focus_segment()`. Duplo clique em nó
 reutiliza `focus_segments()`, e no vazio limpa o estado e chama `_fit_all()`.
 Linha e rótulo compartilham uma área de hit-test ampliada. No sentido inverso,
 os sinais da tabela atualizam a seleção gráfica sem reemissão.
+
+`BlocksWindow` recebe o mesmo mapa de identidades usado pelo grafo. Sua tabela
+mostra **CIRCUITO** e **BLOCO**, e o proxy filtra pelo `circuit_index`, nunca
+pelo texto visível; assim códigos repetidos continuam seguros. Seleções vindas
+do grafo ajustam o combo quando necessário para revelar o bloco externo sem
+alterar o filtro do grafo ou a visibilidade do mapa.
 
 O zoom do grafo limita a escala absoluta entre `1e-6` e `8.0`, não a quantidade
 de passos após `fitInView()`. Assim, grafos extensos que começam muito reduzidos

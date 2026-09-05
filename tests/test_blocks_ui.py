@@ -11,6 +11,7 @@ try:
     from PyQt6.QtWidgets import QApplication, QMenu
 
     from circuit_viewer.blocks_window import BlocksWindow, BlockTableModel
+    from circuit_viewer.display_identity import BlockDisplayIdentity
     from circuit_viewer.main_window import MainWindow
     from circuit_viewer.model import FeatureSelection
 
@@ -82,7 +83,8 @@ class BlockTableModelTests(unittest.TestCase):
         self.assertEqual(
             self.model.HEADERS,
             (
-                "BLOCO_ID",
+                "CIRCUITO",
+                "BLOCO",
                 "NUM_BARRAS",
                 "NUM_TRECHOS",
                 "NUM_CARGAS",
@@ -96,7 +98,8 @@ class BlockTableModelTests(unittest.TestCase):
         self.assertEqual(self.model.rowCount(), 2)
 
     def test_the_counts_reach_the_cells(self) -> None:
-        self.assertEqual(self._display(0, "BLOCO_ID"), "1")
+        self.assertEqual(self._display(0, "CIRCUITO"), "Sem circuito definido")
+        self.assertEqual(self._display(0, "BLOCO"), "1")
         self.assertEqual(self._display(0, "NUM_BARRAS"), "2")
         self.assertEqual(self._display(0, "NUM_TRECHOS"), "1")
         self.assertEqual(self._display(0, "NUM_CARGAS"), "1")
@@ -187,6 +190,43 @@ class BlocksWindowTests(unittest.TestCase):
         self.assertIn("1 chave(s) manobrável(is)", text)
         self.assertIn("2 bloco(s) com fronteira única", text)
 
+    def test_filter_uses_circuit_codes_and_reveals_a_programmatic_selection(self) -> None:
+        result, _, _ = sample_result()
+        identities = {
+            result.records[0].block_id: BlockDisplayIdentity(
+                0, "001001", 1, "001001-1"
+            ),
+            result.records[1].block_id: BlockDisplayIdentity(
+                1, "001002", 1, "001002-1"
+            ),
+        }
+        model = BlockTableModel()
+        window = BlocksWindow(model)
+        self.addCleanup(window.close)
+        window.set_result(result, identities)
+
+        self.assertEqual(
+            [window.circuit_filter.itemText(index) for index in range(3)],
+            ["Todos os circuitos", "001001", "001002"],
+        )
+        self.assertEqual(
+            model.data(model.index(0, BLOCK_TABLE_HEADERS.index("CIRCUITO"))),
+            "001001",
+        )
+        self.assertEqual(
+            model.data(model.index(1, BLOCK_TABLE_HEADERS.index("BLOCO"))),
+            "1",
+        )
+
+        window.circuit_filter.setCurrentIndex(
+            window.circuit_filter.findData(0)
+        )
+        self.assertEqual(window.proxy_model.rowCount(), 1)
+
+        self.assertTrue(window.select_block(result.records[1].block_id))
+        self.assertEqual(window.circuit_filter.currentText(), "001002")
+        self.assertEqual(window.proxy_model.rowCount(), 1)
+
     def test_selecting_a_row_emits_the_record(self) -> None:
         window, model, _ = self._window()
         window.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
@@ -204,7 +244,10 @@ class BlocksWindowTests(unittest.TestCase):
         # A tabela ordena, então a linha visível não é a do modelo fonte.
         # Realçar a visível pintaria a linha errada.
         window, model, _ = self._window()
-        window.table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+        window.table.sortByColumn(
+            BLOCK_TABLE_HEADERS.index("BLOCO"),
+            Qt.SortOrder.DescendingOrder,
+        )
         received: list[object] = []
         window.blockSelected.connect(received.append)
 

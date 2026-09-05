@@ -313,6 +313,49 @@ class BlockGraphFilterTests(unittest.TestCase):
             (0, 1, 4),
         )
 
+    def test_single_circuit_adds_only_direct_external_blocks_and_edges(self) -> None:
+        filtered = filter_block_graph(
+            self.graph,
+            self.circuits,
+            frozenset({0}),
+        )
+
+        self.assertEqual(filtered.node_ids, (1, 2, 3))
+        self.assertEqual(
+            tuple(edge.switch_index for edge in filtered.edges),
+            (0, 1, 4),
+        )
+        self.assertNotIn(4, filtered.node_ids)
+        self.assertNotIn(5, filtered.node_ids)
+
+    def test_single_circuit_preserves_parallel_boundary_switches(self) -> None:
+        circuits = {1: 0, 2: 1, 3: 1, 4: 2, 5: None}
+
+        filtered = filter_block_graph(
+            self.graph,
+            circuits,
+            frozenset({0}),
+        )
+
+        self.assertEqual(filtered.node_ids, (1, 2))
+        self.assertEqual(
+            tuple(edge.switch_index for edge in filtered.edges),
+            (0, 4),
+        )
+
+    def test_single_circuit_does_not_add_an_unresolved_external_block(self) -> None:
+        filtered = filter_block_graph(
+            self.graph,
+            self.circuits,
+            frozenset({2}),
+        )
+
+        self.assertEqual(filtered.node_ids, (3, 4))
+        self.assertEqual(
+            tuple(edge.switch_index for edge in filtered.edges),
+            (2, 3),
+        )
+
     def test_unresolved_blocks_are_an_explicit_independent_choice(self) -> None:
         hidden = filter_block_graph(self.graph, self.circuits, frozenset())
         shown = filter_block_graph(

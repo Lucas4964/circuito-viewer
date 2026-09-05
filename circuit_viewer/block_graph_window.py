@@ -65,6 +65,7 @@ from .block_graph import (
     layout_block_graph_by_coordinates,
 )
 from .circuit_colors import contrasting_text_color, normalize_hex_color
+from .display_identity import BlockDisplayIdentity
 from .model import CLOSED_SWITCH_STATE, OPEN_SWITCH_STATE, switch_state_label
 
 
@@ -319,26 +320,39 @@ class BlockNodeItem(QGraphicsObject):
         record: BlockRecord,
         diameter: float,
         fill_color: str = DEFAULT_NODE_COLOR,
+        display_label: str | None = None,
     ) -> None:
         super().__init__()
         self.record = record
         self.diameter = float(diameter)
         self.fill_color = QColor(normalize_hex_color(fill_color))
+        self.display_label = str(display_label or f"B{record.block_id:n}")
         self._selected = False
         self.setAcceptHoverEvents(True)
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setZValue(2.0)
-        switches = ", ".join(record.boundary_switch_codes) or "—"
+        self._update_tooltip()
+
+    def _update_tooltip(self) -> None:
+        switches = ", ".join(self.record.boundary_switch_codes) or "—"
         self.setToolTip(
-            f"Bloco {record.block_id:n}\n"
-            f"Potência instalada: {_power_text(record)}\n"
-            f"Barras: {record.bar_count:n}\n"
-            f"Trechos: {record.segment_count:n}\n"
-            f"Cargas: {record.load_count:n}\n"
+            f"Bloco {self.display_label}\n"
+            f"Potência instalada: {_power_text(self.record)}\n"
+            f"Barras: {self.record.bar_count:n}\n"
+            f"Trechos: {self.record.segment_count:n}\n"
+            f"Cargas: {self.record.load_count:n}\n"
             f"Chaves de fronteira: {switches}\n"
-            f"Bloco-fonte: {'sim' if record.contains_source else 'não'}"
+            f"Bloco-fonte: {'sim' if self.record.contains_source else 'não'}"
         )
+
+    def set_display_label(self, label: str) -> None:
+        normalized = str(label)
+        if normalized == self.display_label:
+            return
+        self.display_label = normalized
+        self._update_tooltip()
+        self.update()
 
     @property
     def selected(self) -> bool:
@@ -397,12 +411,19 @@ class BlockNodeItem(QGraphicsObject):
 
         font = painter.font()
         font.setBold(True)
+        available_width = max(8.0, self.diameter - 6.0)
+        while (
+            font.pointSizeF() > 5.0
+            and QFontMetricsF(font).horizontalAdvance(self.display_label)
+            > available_width
+        ):
+            font.setPointSizeF(max(5.0, font.pointSizeF() - 0.5))
         painter.setFont(font)
         painter.setPen(text_color)
         painter.drawText(
             circle,
             Qt.AlignmentFlag.AlignCenter,
-            f"B{self.record.block_id:n}",
+            self.display_label,
         )
 
         caption = QRectF(
@@ -503,12 +524,20 @@ class BlockEdgeItem(QGraphicsPathItem):
         intercircuit: bool = False,
         start_circuit: str = "",
         end_circuit: str = "",
+        start_block_label: str | None = None,
+        end_block_label: str | None = None,
     ) -> None:
         super().__init__(path)
         self.edge = edge
         self.intercircuit = bool(intercircuit)
         self._start_circuit = start_circuit
         self._end_circuit = end_circuit
+        self._start_block_label = str(
+            start_block_label or f"B{edge.start_block_id:n}"
+        )
+        self._end_block_label = str(
+            end_block_label or f"B{edge.end_block_id:n}"
+        )
         self._selected = False
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setAcceptHoverEvents(True)
@@ -557,7 +586,7 @@ class BlockEdgeItem(QGraphicsPathItem):
             f"Chave: {self.edge.label}\n"
             f"ID: {self.edge.switch_id or '—'}\n"
             f"Estado: {state}\n"
-            f"Blocos: B{self.edge.start_block_id:n} ↔ B{self.edge.end_block_id:n}"
+            f"Blocos: {self._start_block_label} ↔ {self._end_block_label}"
             f"{circuit_text}"
         )
         self.label_item.setToolTip(self.toolTip())
@@ -592,6 +621,18 @@ class BlockEdgeItem(QGraphicsPathItem):
         self.label_item.set_highlighted(normalized)
         self._update_tooltip()
         self.update()
+
+    def set_block_labels(self, start_label: str, end_label: str) -> None:
+        normalized_start = str(start_label)
+        normalized_end = str(end_label)
+        if (
+            normalized_start == self._start_block_label
+            and normalized_end == self._end_block_label
+        ):
+            return
+        self._start_block_label = normalized_start
+        self._end_block_label = normalized_end
+        self._update_tooltip()
 
     def position_label_away_from(self, node_rects: tuple[QRectF, ...]) -> None:
         """Escolhe um ponto central da aresta cuja legenda não cubra nós."""
@@ -686,6 +727,7 @@ class BlockGraphView(QGraphicsView):
         self._coordinate_positions: dict[int, tuple[float, float]] = {}
         self.scale_by_power = False
         self._block_circuit_indices: dict[int, int | None] = {}
+        self._block_identities: dict[int, BlockDisplayIdentity] = {}
         self._circuit_colors: tuple[str, ...] = ()
         self._circuit_labels: tuple[str, ...] = ()
         self.node_items: dict[int, BlockNodeItem] = {}
@@ -771,6 +813,14 @@ class BlockGraphView(QGraphicsView):
         if 0 <= circuit_index < len(self._circuit_labels):
             return self._circuit_labels[circuit_index]
         return str(circuit_index)
+
+    def _block_label(self, block_id: int) -> str:
+        identity = self._block_identities.get(int(block_id))
+        return (
+            f"B{int(block_id):n}"
+            if identity is None
+            else identity.graph_label
+        )
 
     def _edge_style(self, edge: BlockGraphEdge) -> tuple[bool, str, str]:
         _, start_index = self._style_for_block(edge.start_block_id)
@@ -878,6 +928,8 @@ class BlockGraphView(QGraphicsView):
                 intercircuit=intercircuit,
                 start_circuit=start_circuit,
                 end_circuit=end_circuit,
+                start_block_label=self._block_label(edge.start_block_id),
+                end_block_label=self._block_label(edge.end_block_id),
             )
             item.position_label_away_from(node_rects)
             self._scene.addItem(item)
@@ -889,6 +941,7 @@ class BlockGraphView(QGraphicsView):
                 record,
                 diameters[record.block_id],
                 fill_color,
+                self._block_label(record.block_id),
             )
             item.setPos(points[record.block_id])
             item.clicked.connect(self._node_clicked)
@@ -939,6 +992,7 @@ class BlockGraphView(QGraphicsView):
         block_circuit_indices: dict[int, int | None],
         circuit_colors: tuple[str, ...],
         circuit_labels: tuple[str, ...],
+        block_identities: dict[int, BlockDisplayIdentity] | None = None,
     ) -> None:
         normalized_colors = tuple(
             normalize_hex_color(color) for color in circuit_colors
@@ -948,21 +1002,32 @@ class BlockGraphView(QGraphicsView):
             for block_id, index in block_circuit_indices.items()
         }
         normalized_labels = tuple(str(label) for label in circuit_labels)
+        normalized_identities = {
+            int(block_id): identity
+            for block_id, identity in (block_identities or {}).items()
+        }
         if (
             normalized_indices == self._block_circuit_indices
             and normalized_colors == self._circuit_colors
             and normalized_labels == self._circuit_labels
+            and normalized_identities == self._block_identities
         ):
             return
         self._block_circuit_indices = normalized_indices
         self._circuit_colors = normalized_colors
         self._circuit_labels = normalized_labels
+        self._block_identities = normalized_identities
         for block_id, item in self.node_items.items():
             fill_color, _ = self._style_for_block(block_id)
             item.set_fill_color(fill_color)
+            item.set_display_label(self._block_label(block_id))
         for item in self.edge_items:
             intercircuit, start_circuit, end_circuit = self._edge_style(item.edge)
             item.set_intercircuit(intercircuit, start_circuit, end_circuit)
+            item.set_block_labels(
+                self._block_label(item.edge.start_block_id),
+                self._block_label(item.edge.end_block_id),
+            )
         self.viewport().update()
 
     def select_block(self, block_id: int) -> bool:
@@ -1240,6 +1305,7 @@ class BlockGraphWindow(QDialog):
         self.result: BlockAnalysisResult | None = None
         self._full_graph = BlockGraph((), ())
         self._block_circuit_indices: dict[int, int | None] = {}
+        self._block_identities: dict[int, BlockDisplayIdentity] = {}
         self._circuit_colors: tuple[str, ...] = ()
         self._circuit_labels: tuple[str, ...] = ()
         self._selected_circuit_indices: frozenset[int] = frozenset()
@@ -1343,6 +1409,7 @@ class BlockGraphWindow(QDialog):
         if result is self.result:
             return
         self.result = result
+        self._block_identities = {}
         self._full_graph = (
             BlockGraph((), ()) if result is None else build_block_graph(result)
         )
@@ -1360,6 +1427,12 @@ class BlockGraphWindow(QDialog):
             self._circuit_colors = ()
             self._circuit_labels = ()
             self._selection_needs_initialization = False
+        self.view.set_circuit_styles(
+            self._block_circuit_indices,
+            self._circuit_colors,
+            self._circuit_labels,
+            self._block_identities,
+        )
         self._initialize_circuit_selection()
         self._sync_circuit_selector()
         self._refresh_filtered_graph()
@@ -1454,6 +1527,7 @@ class BlockGraphWindow(QDialog):
         block_circuit_indices: dict[int, int | None],
         circuit_colors: tuple[str, ...],
         circuit_labels: tuple[str, ...],
+        block_identities: dict[int, BlockDisplayIdentity] | None = None,
     ) -> None:
         normalized_indices = {
             int(block_id): None if index is None else int(index)
@@ -1463,6 +1537,10 @@ class BlockGraphWindow(QDialog):
             normalize_hex_color(color) for color in circuit_colors
         )
         normalized_labels = tuple(str(label) for label in circuit_labels)
+        normalized_identities = {
+            int(block_id): identity
+            for block_id, identity in (block_identities or {}).items()
+        }
         filter_context_changed = (
             normalized_indices != self._block_circuit_indices
             or normalized_labels != self._circuit_labels
@@ -1470,6 +1548,7 @@ class BlockGraphWindow(QDialog):
         self._block_circuit_indices = normalized_indices
         self._circuit_colors = normalized_colors
         self._circuit_labels = normalized_labels
+        self._block_identities = normalized_identities
         valid_indices = frozenset(range(len(normalized_labels)))
         self._selected_circuit_indices &= valid_indices
         self._initialize_circuit_selection()
@@ -1477,6 +1556,7 @@ class BlockGraphWindow(QDialog):
             normalized_indices,
             normalized_colors,
             normalized_labels,
+            normalized_identities,
         )
         self._sync_circuit_selector()
         if filter_context_changed:

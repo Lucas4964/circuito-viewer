@@ -43,6 +43,7 @@ from .branch_table_export import (
     branch_table_values,
 )
 from .equivalent_network import EquivalentNetworkResult
+from .display_identity import circuit_display_labels
 
 
 BRANCH_INTEREST_COLUMN = 0
@@ -51,6 +52,9 @@ BRANCH_DATA_COLUMN_OFFSET = 1
 # e "a primeira delas" nao e o que se quer ordenar por padrao — o identificador e.
 BRANCH_DEFAULT_SORT_COLUMN = (
     BRANCH_TABLE_HEADERS.index("RAMAL_ID") + BRANCH_DATA_COLUMN_OFFSET
+)
+BRANCH_CIRCUIT_COLUMN = (
+    BRANCH_TABLE_HEADERS.index("CIRC_ID") + BRANCH_DATA_COLUMN_OFFSET
 )
 # Alfa da faixa da linha corrente: forte o bastante para guiar o olho ao
 # rolar as colunas, fraco o bastante para não competir com a célula
@@ -86,10 +90,16 @@ class BranchTableModel(QAbstractTableModel):
         self._current_is_measured = False
         self._interest_branch_ids: set[int] = set()
         self._highlight_row = -1
+        self._circuit_labels: tuple[str, ...] = ()
 
     def set_result(self, result: BranchAnalysisResult | None) -> None:
         self.beginResetModel()
         self.result = result
+        self._circuit_labels = (
+            ()
+            if result is None or result.source_catalog is None
+            else circuit_display_labels(result.source_catalog)
+        )
         self._totals_by_branch = {}
         self._current_is_measured = False
         self._interest_branch_ids.clear()
@@ -152,7 +162,11 @@ class BranchTableModel(QAbstractTableModel):
             and 0 <= int(section) < len(self.HEADERS)
         ):
             if role == Qt.ItemDataRole.DisplayRole:
-                return self.HEADERS[int(section)]
+                return (
+                    "CIRCUITO"
+                    if int(section) == BRANCH_CIRCUIT_COLUMN
+                    else self.HEADERS[int(section)]
+                )
             if (
                 role == Qt.ItemDataRole.ToolTipRole
                 and int(section) == BRANCH_INTEREST_COLUMN
@@ -200,6 +214,13 @@ class BranchTableModel(QAbstractTableModel):
         if self.result is None or not 0 <= int(row) < len(self.result.records):
             raise IndexError(row)
         return self.result.records[int(row)]
+
+    def circuit_label(self, record: BranchRecord) -> str:
+        result = self.result
+        catalog = None if result is None else result.source_catalog
+        if catalog is None or not 0 <= record.circuit_index < len(catalog):
+            return record.circuit_id
+        return self._circuit_labels[record.circuit_index]
 
     def _raw_values(self, record: BranchRecord) -> tuple[object, ...]:
         demand, current = self._totals_by_branch.get(
@@ -270,6 +291,8 @@ class BranchTableModel(QAbstractTableModel):
         value = self._raw_values(record)[
             index.column() - BRANCH_DATA_COLUMN_OFFSET
         ]
+        if index.column() == BRANCH_CIRCUIT_COLUMN:
+            value = self.circuit_label(record)
         if role == Qt.ItemDataRole.UserRole:
             if value is None:
                 return float("inf") if index.column() in self.NUMERIC_COLUMNS else ""
@@ -517,12 +540,15 @@ class BranchesWindow(QDialog):
         self.circuit_filter.clear()
         self.circuit_filter.addItem("Todos os circuitos", None)
         if result is not None:
-            circuit_ids = sorted(
-                {record.circuit_id for record in result.records},
-                key=str.casefold,
+            circuits = sorted(
+                {
+                    (record.circuit_id, source.circuit_label(record))
+                    for record in result.records
+                },
+                key=lambda item: item[1].casefold(),
             )
-            for circuit_id in circuit_ids:
-                self.circuit_filter.addItem(circuit_id, circuit_id)
+            for circuit_id, label in circuits:
+                self.circuit_filter.addItem(label, circuit_id)
         self.circuit_filter.blockSignals(False)
         self.proxy_model.set_circuit_id(None)
 
@@ -607,6 +633,11 @@ class BranchesWindow(QDialog):
         value = self.circuit_filter.currentData()
         return None if value is None else str(value)
 
+    def selected_circuit_label(self) -> str | None:
+        if self.circuit_filter.currentData() is None:
+            return None
+        return self.circuit_filter.currentText()
+
     def _sync_export_availability(self) -> None:
         has_rows = self.proxy_model.rowCount() > 0
         export_pending = self._json_export_pending or self._csv_export_pending
@@ -654,8 +685,21 @@ class BranchesWindow(QDialog):
         issue_count = 0
         if branch_result is not None:
             issue_count += len(branch_result.issues) + branch_result.omitted_issue_count
+            catalog = branch_result.source_catalog
+            labels_by_id = (
+                {}
+                if catalog is None
+                else {
+                    definition.circuit_id: label
+                    for definition, label in zip(
+                        catalog.definitions,
+                        circuit_display_labels(catalog),
+                        strict=True,
+                    )
+                }
+            )
             issue_lines.extend(
-                f"[{issue.circuit_id}] {issue.message}"
+                f"[{labels_by_id.get(issue.circuit_id, issue.circuit_id)}] {issue.message}"
                 + (f" ({issue.segment_id})" if issue.segment_id else "")
                 for issue in branch_result.issues
             )

@@ -124,9 +124,9 @@ class BranchesUiTests(unittest.TestCase):
                 [""],
                 [""],
             )
-        definitions = [CircuitDefinition("C1", "B0", "", "")]
+        definitions = [CircuitDefinition("C1", "B0", "001001", "")]
         if two_circuits:
-            definitions.append(CircuitDefinition("C2", "B0", "", ""))
+            definitions.append(CircuitDefinition("C2", "B0", "001002", ""))
         catalog = CircuitCatalogModel.build(segments, switches, definitions)
         window = MainWindow(self.config_path)
         self.addCleanup(window.close)
@@ -214,7 +214,7 @@ class BranchesUiTests(unittest.TestCase):
         expected = {
             "RAMAL_ID": "1",
             "TIPO_RAMAL": "MONOFASICO",
-            "CIRC_ID": "C1",
+            "CIRC_ID": "001001",
             "BARRA_ID": "B1",
             "NIVEL_TOPOLOGICO": "1",
             "TRECHO_ID": "T2",
@@ -230,7 +230,7 @@ class BranchesUiTests(unittest.TestCase):
                 column = model_column(name)
                 self.assertEqual(
                     model.headerData(column, Qt.Orientation.Horizontal),
-                    name,
+                    "CIRCUITO" if name == "CIRC_ID" else name,
                 )
                 self.assertEqual(model.data(model.index(0, column)), value)
 
@@ -573,7 +573,8 @@ class BranchesUiTests(unittest.TestCase):
 
         self.assertEqual(
             QApplication.clipboard().text(),
-            "1\t—\t—\t0\tMONOFASICO\tC1\n2\t—\t—\t0\tMONOFASICO\tC2",
+            "1\t—\t—\t0\tMONOFASICO\t001001\n"
+            "2\t—\t—\t0\tMONOFASICO\t001002",
         )
 
     def _window_with_two_branches(self):  # noqa: ANN202
@@ -838,9 +839,35 @@ class BranchesUiTests(unittest.TestCase):
         window._show_branches_window()
 
         self.assertEqual(window.branches_window.circuit_filter.count(), 3)
+        self.assertEqual(
+            [
+                window.branches_window.circuit_filter.itemText(index)
+                for index in range(3)
+            ],
+            ["Todos os circuitos", "001001", "001002"],
+        )
+        circuit_column = model_column("CIRC_ID")
+        self.assertEqual(
+            window.branch_table_model.headerData(
+                circuit_column,
+                Qt.Orientation.Horizontal,
+            ),
+            "CIRCUITO",
+        )
+        self.assertEqual(
+            window.branch_table_model.data(
+                window.branch_table_model.index(0, circuit_column)
+            ),
+            "001001",
+        )
         window.branches_window.circuit_filter.setCurrentIndex(1)
         self.app.processEvents()
         self.assertEqual(window.branches_window.proxy_model.rowCount(), 1)
+        self.assertEqual(window.branches_window.selected_circuit_id(), "C1")
+        self.assertEqual(
+            window.branches_window.selected_circuit_label(),
+            "001001",
+        )
 
         first_record = result.records[0]
         circuit_check = window.circuit_table_model.index(

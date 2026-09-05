@@ -33,6 +33,7 @@ try:
         save_scale_nodes_by_power,
     )
     from circuit_viewer.blocks_window import BlockTableModel, BlocksWindow
+    from circuit_viewer.display_identity import BlockDisplayIdentity
     from circuit_viewer.main_window import MainWindow
     from circuit_viewer.model import CircuitVisibilityController, FeatureSelection
     from circuit_viewer.theme import AppTheme, build_palette
@@ -80,8 +81,34 @@ class BlockGraphWindowTests(unittest.TestCase):
         self.assertEqual(window.view.edge_items[0].edge.label, "COD-CH0")
         for record in result.records:
             item = window.view.node_items[record.block_id]
-            self.assertIn(f"Bloco {record.block_id}", item.toolTip())
+            self.assertIn(f"Bloco B{record.block_id}", item.toolTip())
             self.assertIn("kVA", item.toolTip())
+
+    def test_nodes_and_edge_tooltips_use_the_composite_block_identity(self) -> None:
+        window, result = self._window()
+        identities = {
+            record.block_id: BlockDisplayIdentity(
+                0,
+                "001001",
+                position,
+                f"001001-{position}",
+            )
+            for position, record in enumerate(result.records, start=1)
+        }
+
+        window.set_circuit_styles(
+            {record.block_id: 0 for record in result.records},
+            ("#2878B5",),
+            ("001001",),
+            identities,
+        )
+
+        self.assertEqual(window.view.node_items[1].display_label, "001001-1")
+        self.assertIn("Bloco 001001-2", window.view.node_items[2].toolTip())
+        self.assertIn(
+            "Blocos: 001001-1 ↔ 001001-2",
+            window.view.edge_items[0].toolTip(),
+        )
 
     def test_layout_selector_defaults_to_tree_and_coordinates_follow_the_map(self) -> None:
         window, _ = self._window()
@@ -179,7 +206,7 @@ class BlockGraphWindowTests(unittest.TestCase):
             "Circuitos exibidos: 1/1",
         )
 
-    def test_two_circuits_start_empty_and_checking_updates_the_graph(self) -> None:
+    def test_two_circuits_start_empty_and_single_selection_adds_boundary_neighbor(self) -> None:
         result, _, _ = sample_result()
         window = BlockGraphWindow()
         self.addCleanup(window.close)
@@ -203,7 +230,8 @@ class BlockGraphWindowTests(unittest.TestCase):
         self.app.processEvents()
 
         self.assertEqual(window.selected_circuit_indices, frozenset({0}))
-        self.assertEqual(set(window.view.node_items), {1})
+        self.assertEqual(set(window.view.node_items), {1, 2})
+        self.assertEqual(len(window.view.edge_items), 1)
 
     def test_selector_is_a_popup_and_closes_with_escape(self) -> None:
         window, _ = self._window()
@@ -294,7 +322,7 @@ class BlockGraphWindowTests(unittest.TestCase):
         )
 
         self.assertEqual(window.selected_circuit_indices, frozenset({1}))
-        self.assertEqual(set(window.view.node_items), {2})
+        self.assertEqual(set(window.view.node_items), {1, 2})
         self.assertEqual(
             window.view.node_items[2].fill_color.name().upper(),
             "#ABCDEF",
@@ -722,6 +750,28 @@ class BlockGraphIntegrationTests(unittest.TestCase):
         self.app.processEvents()
 
         self.assertTrue(window.block_graph_window.isVisible())
+
+    def test_main_window_shares_code_based_block_identities(self) -> None:
+        window, _ = self._window()
+
+        self.assertEqual(
+            window.block_graph_window.view.node_items[1].display_label,
+            "ALIM-1-1",
+        )
+        circuit_column = window.block_table_model.HEADERS.index("CIRCUITO")
+        block_column = window.block_table_model.HEADERS.index("BLOCO")
+        self.assertEqual(
+            window.block_table_model.data(
+                window.block_table_model.index(0, circuit_column)
+            ),
+            "ALIM-1",
+        )
+        self.assertEqual(
+            window.block_table_model.data(
+                window.block_table_model.index(1, block_column)
+            ),
+            "2",
+        )
 
     def test_graph_click_selects_the_sorted_table_and_highlights_the_map(self) -> None:
         window, result = self._window()

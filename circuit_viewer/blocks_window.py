@@ -18,6 +18,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QDialog,
     QHeaderView,
     QHBoxLayout,
@@ -39,11 +40,17 @@ from .block_table import (
     switch_list_summary,
     switch_list_text,
 )
+from .display_identity import (
+    BlockDisplayIdentity,
+    UNRESOLVED_CIRCUIT_LABEL,
+    fallback_block_display_identities,
+)
 
 
 # Mesmo alfa da tabela de ramais: forte o bastante para guiar o olho ao rolar
 # as colunas, fraco o bastante para não competir com a célula selecionada.
 BLOCK_HIGHLIGHT_ALPHA = 50
+UNRESOLVED_CIRCUIT_FILTER = -1
 
 
 class BlockTableModel(QAbstractTableModel):
@@ -53,11 +60,25 @@ class BlockTableModel(QAbstractTableModel):
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
         self.result: BlockAnalysisResult | None = None
+        self._identities: dict[int, BlockDisplayIdentity] = {}
         self._highlight_row = -1
 
-    def set_result(self, result: BlockAnalysisResult | None) -> None:
+    def set_result(
+        self,
+        result: BlockAnalysisResult | None,
+        identities: dict[int, BlockDisplayIdentity] | None = None,
+    ) -> None:
         self.beginResetModel()
         self.result = result
+        if result is None:
+            self._identities = {}
+        else:
+            fallback = fallback_block_display_identities(result)
+            supplied = identities or {}
+            self._identities = {
+                record.block_id: supplied.get(record.block_id, fallback[record.block_id])
+                for record in result.records
+            }
         self._highlight_row = -1
         self.endResetModel()
 
@@ -65,6 +86,10 @@ class BlockTableModel(QAbstractTableModel):
         if self.result is None:
             raise IndexError(row)
         return self.result.records[row]
+
+    def identity(self, row: int) -> BlockDisplayIdentity:
+        record = self.record(row)
+        return self._identities[record.block_id]
 
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: ANN001, N802
         if parent.isValid() or self.result is None:
@@ -119,7 +144,7 @@ class BlockTableModel(QAbstractTableModel):
             return self._highlight_brush()
         record = self.record(index.row())
         column = index.column()
-        value = block_table_values(record)[column]
+        value = block_table_values(record, self.identity(index.row()))[column]
 
         # UserRole é a chave de ordenação: valor cru, para o proxy comparar
         # grandeza e não texto formatado.
@@ -167,8 +192,28 @@ class BlockTableModel(QAbstractTableModel):
 class BlockSortProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
+        self._circuit_index: int | None = None
         self.setSortRole(Qt.ItemDataRole.UserRole)
         self.setDynamicSortFilter(True)
+
+    def set_circuit_index(self, circuit_index: int | None) -> None:
+        normalized = None if circuit_index is None else int(circuit_index)
+        if normalized == self._circuit_index:
+            return
+        self._circuit_index = normalized
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # noqa: N802
+        del source_parent
+        if self._circuit_index is None:
+            return True
+        source = self.sourceModel()
+        if not isinstance(source, BlockTableModel):
+            return False
+        owner = source.identity(source_row).circuit_index
+        if self._circuit_index == UNRESOLVED_CIRCUIT_FILTER:
+            return owner is None
+        return owner == self._circuit_index
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # noqa: N802
         source = self.sourceModel()
@@ -262,6 +307,15 @@ class BlocksWindow(QDialog):
         summary_row.addWidget(self.graph_button)
         layout.addLayout(summary_row)
 
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("Circuito:"))
+        self.circuit_filter = QComboBox(self)
+        self.circuit_filter.setObjectName("blocks_circuit_filter")
+        self.circuit_filter.setMinimumWidth(180)
+        filters.addWidget(self.circuit_filter)
+        filters.addStretch(1)
+        layout.addLayout(filters)
+
         self.proxy_model = BlockSortProxyModel(self)
         self.proxy_model.setSourceModel(table_model)
         self.table = BlockTableView(self)
@@ -298,13 +352,46 @@ class BlocksWindow(QDialog):
         selection_model = self.table.selectionModel()
         selection_model.currentRowChanged.connect(self._current_row_changed)
         self.table.activated.connect(self._activate_index)
+        self.circuit_filter.currentIndexChanged.connect(self._apply_filter)
 
-    def set_result(self, result: BlockAnalysisResult | None) -> None:
+    def set_result(
+        self,
+        result: BlockAnalysisResult | None,
+        identities: dict[int, BlockDisplayIdentity] | None = None,
+    ) -> None:
         source = self.proxy_model.sourceModel()
         assert isinstance(source, BlockTableModel)
         self.table.clearSelection()
         self.table.setCurrentIndex(QModelIndex())
-        source.set_result(result)
+        source.set_result(result, identities)
+        self.circuit_filter.blockSignals(True)
+        self.circuit_filter.clear()
+        self.circuit_filter.addItem("Todos os circuitos", None)
+        if result is not None:
+            available: dict[int, str] = {}
+            has_unresolved = False
+            for row in range(source.rowCount()):
+                identity = source.identity(row)
+                if identity.circuit_index is None:
+                    has_unresolved = True
+                else:
+                    available.setdefault(
+                        identity.circuit_index,
+                        identity.circuit_label,
+                    )
+            for circuit_index, label in sorted(
+                available.items(),
+                key=lambda item: item[1].casefold(),
+            ):
+                self.circuit_filter.addItem(label, circuit_index)
+            if has_unresolved:
+                self.circuit_filter.addItem(
+                    UNRESOLVED_CIRCUIT_LABEL,
+                    UNRESOLVED_CIRCUIT_FILTER,
+                )
+        self.circuit_filter.setCurrentIndex(0)
+        self.circuit_filter.blockSignals(False)
+        self.proxy_model.set_circuit_index(None)
 
         if result is None:
             self.summary_label.setText(
@@ -360,7 +447,22 @@ class BlocksWindow(QDialog):
         )
         if row is None:
             return False
-        proxy_index = self.proxy_model.mapFromSource(source.index(row, 0))
+        source_index = source.index(row, 0)
+        proxy_index = self.proxy_model.mapFromSource(source_index)
+        if not proxy_index.isValid():
+            identity = source.identity(row)
+            target = (
+                UNRESOLVED_CIRCUIT_FILTER
+                if identity.circuit_index is None
+                else identity.circuit_index
+            )
+            filter_index = self.circuit_filter.findData(target)
+            if filter_index >= 0:
+                blocked = self.circuit_filter.blockSignals(True)
+                self.circuit_filter.setCurrentIndex(filter_index)
+                self.circuit_filter.blockSignals(blocked)
+                self.proxy_model.set_circuit_index(target)
+                proxy_index = self.proxy_model.mapFromSource(source_index)
         if not proxy_index.isValid():
             return False
         self.table.setCurrentIndex(proxy_index)
@@ -373,6 +475,14 @@ class BlocksWindow(QDialog):
         self.table.setCurrentIndex(QModelIndex())
         self._highlight_source_row(QModelIndex())
         self.selectionCleared.emit()
+
+    def selected_circuit_index(self) -> int | None:
+        value = self.circuit_filter.currentData()
+        return None if value is None else int(value)
+
+    def _apply_filter(self) -> None:
+        self.proxy_model.set_circuit_index(self.circuit_filter.currentData())
+        self.clear_selection()
 
     def keyPressEvent(self, event) -> None:  # noqa: ANN001, N802
         """Esc desfaz um nível por vez, como no mapa.
