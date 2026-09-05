@@ -1264,6 +1264,20 @@ Para cada ramal gera um `EquivalentLoadRecord`:
   `PF`, considerando somente as fases reais do ramal e os quatro NPAT. É
   calculado uma vez durante a agregação, ignora Q, preserva negativos e vale
   `None` quando os patamares estão incompletos;
+- `maximum_current`: maior corrente de fase, em ampères, sobre o mesmo conjunto
+  de fases e NPAT, com a **procedência colada em `power_source`**. Na agregação
+  por tabelas é estimada aqui: `√(P²+Q²)` da fase dividido por
+  `phase_voltage_kv(VNOM)`, a mesma tensão que a exportação simplificada usa ao
+  escrever a fase como carga monofásica em `wye`. No fluxo de potência é a
+  medida que `measure_branch_powers()` devolve à parte, lida no elemento de
+  conexão sob a tensão real do ponto — estimar ali pela nominal daria um número
+  menor na proporção da queda, e o erro cresce exatamente onde a corrente
+  interessa. Um ramal medido sem leitura de corrente fica `None` em vez de cair
+  na estimativa: a coluna não mistura origens. Diferente da demanda, carrega a
+  reativa, então seu patamar de máximo pode ser outro. Vale `None` também nas
+  condições que anulam a demanda e, no modo tabela, quando o circuito não
+  informa `VNOM` numérica positiva — em silêncio, sem diagnóstico: a grandeza é
+  informativa e uma ocorrência por ramal encheria a lista;
 - proveniência: `source_load_indices` e `source_generator_indices`, mais o
   estado `valid`, `incomplete` ou `zero` da agregação elétrica.
 
@@ -1987,13 +2001,17 @@ cancelamento, validação ou falha anterior à substituição preservam o destin
 
 #### Exportação CSV da tabela (`branch_table_export.py`)
 
-`BRANCH_TABLE_HEADERS` e `branch_table_values()` são a definição única das 23
-colunas de dados consumidas pelo modelo Qt e pelo exportador. A interface
+`BRANCH_TABLE_HEADERS` e `branch_table_values()` são a definição única das 24
+colunas de dados consumidas pelo modelo Qt e pelo exportador. São duas tuplas
+posicionais escritas à mão: reordenar uma sem a outra não quebra nada visível,
+apenas põe cada valor sob o cabeçalho errado, e por isso o pareamento tem teste
+próprio. A interface
 acrescenta antes delas uma coluna estreita e exclusiva para o checkbox de
 interesse, que não entra no CSV. A interface captura os
 índices na ordem atual do `QSortFilterProxyModel`; o núcleo não reordena nem
-refaz a análise. O equivalente é opcional e sua ausência produz apenas uma
-célula vazia em `DEMANDA_MAXIMA`.
+refaz a análise. O equivalente é opcional e sua ausência produz apenas
+células vazias em `DEMANDA_MAXIMA` e `CORRENTE_MAXIMA`, as duas grandezas que
+`branch_equivalent_totals()` extrai dele em par.
 
 O serializador usa `csv.writer` com `;`, vírgula decimal, sem agrupamento de
 milhares, precisão interna completa, `UTF-8-SIG` e `CRLF`. O conteúdo inteiro é

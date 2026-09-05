@@ -12,7 +12,11 @@ from circuit_viewer.model import (
     LoadModel,
     UtmCrs,
 )
-from circuit_viewer.opendss_powerflow import PowerFlowResult, SegmentPowers
+from circuit_viewer.opendss_powerflow import (
+    PowerFlowResult,
+    SegmentCurrents,
+    SegmentPowers,
+)
 from circuit_viewer.phase_config import PhaseConfiguration, PhaseMappingEntry
 
 
@@ -100,7 +104,20 @@ def powers(nodes, active, reactive) -> SegmentPowers:
     )
 
 
-def make_power_flow(catalog, loads, segment_powers) -> PowerFlowResult:
+def currents(nodes, magnitudes, angles=()) -> SegmentCurrents:
+    return SegmentCurrents(
+        nodes=tuple(nodes),
+        magnitudes=tuple(tuple(row) for row in magnitudes),
+        angles=tuple(tuple(row) for row in angles),
+    )
+
+
+def make_power_flow(
+    catalog,
+    loads,
+    segment_powers,
+    segment_currents=None,
+) -> PowerFlowResult:
     return PowerFlowResult(
         catalog=catalog,
         cables=None,
@@ -109,8 +126,142 @@ def make_power_flow(catalog, loads, segment_powers) -> PowerFlowResult:
         patterns=None,
         step_count=4,
         segment_powers=segment_powers,
+        segment_currents={} if segment_currents is None else segment_currents,
         solved_circuits=("C1",),
     )
+
+
+class MeasureBranchCurrentsTests(unittest.TestCase):
+    """A corrente do ramal vem medida, não derivada da potência.
+
+    Derivá-la exigiria a tensão da barra; com a nominal o número sairia menor
+    na proporção da queda, justamente onde a queda importa.
+    """
+
+    def _branch_and_powers(self):  # noqa: ANN202
+        _, _, catalog, loads = make_sources()
+        branches = analyze_branches(catalog, PHASES, loads)
+        branch = branches.records[0]
+        return (
+            catalog,
+            loads,
+            branches,
+            branch,
+            {
+                branch.first_segment_index: powers(
+                    (1,),
+                    ((10.0,), (20.0,), (30.0,), (40.0,)),
+                    ((1.0,), (2.0,), (3.0,), (4.0,)),
+                )
+            },
+        )
+
+    def test_the_largest_magnitude_among_the_four_patamares(self) -> None:
+        catalog, loads, branches, branch, segment_powers = self._branch_and_powers()
+        flow = make_power_flow(
+            catalog,
+            loads,
+            segment_powers,
+            {
+                branch.first_segment_index: currents(
+                    (1,),
+                    ((3.5,), (9.25,), (2.0,), (7.0,)),
+                )
+            },
+        )
+
+        _, failures, measured = measure_branch_powers(branches, flow)
+
+        self.assertEqual(failures, {})
+        self.assertEqual(measured[branch.branch_id], Decimal("9.25"))
+
+    def test_a_branch_without_read_current_keeps_its_power(self) -> None:
+        # Corrente ausente não é medição ausente: a equivalência precisa da
+        # potência, e ela veio.
+        catalog, loads, branches, branch, segment_powers = self._branch_and_powers()
+        flow = make_power_flow(catalog, loads, segment_powers)
+
+        patterns, failures, measured = measure_branch_powers(branches, flow)
+
+        self.assertEqual(failures, {})
+        self.assertIn(branch.branch_id, patterns)
+        self.assertEqual(measured, {})
+
+    def test_two_connections_add_as_phasors_not_as_magnitudes(self) -> None:
+        # Duas entradas em oposição de fase se cancelam; somar módulos daria 4 A
+        # onde a rede vê zero.
+        _, _, catalog, loads = make_sources(extra_segment=("d", 1, 4))
+        branches = analyze_branches(catalog, PHASES, loads)
+        branch = branches.records[0]
+        self.assertEqual(branch.trunk_connection_count, 2)
+        connection_ids = ("T2", "T4")
+        indices = [
+            index
+            for index, segment_id in enumerate(catalog.segments.segment_ids)
+            if segment_id in connection_ids
+        ]
+        flow = make_power_flow(
+            catalog,
+            loads,
+            {
+                index: powers(
+                    (1,),
+                    ((1.0,), (1.0,), (1.0,), (1.0,)),
+                    ((0.0,), (0.0,), (0.0,), (0.0,)),
+                )
+                for index in indices
+            },
+            {
+                indices[0]: currents(
+                    (1,),
+                    ((2.0,), (2.0,), (2.0,), (2.0,)),
+                    ((0.0,), (0.0,), (0.0,), (0.0,)),
+                ),
+                indices[1]: currents(
+                    (1,),
+                    ((2.0,), (2.0,), (2.0,), (2.0,)),
+                    ((180.0,), (180.0,), (180.0,), (180.0,)),
+                ),
+            },
+        )
+
+        _, failures, measured = measure_branch_powers(branches, flow)
+
+        self.assertEqual(failures, {})
+        self.assertLess(float(measured[branch.branch_id]), 1e-9)
+
+    def test_two_connections_without_angles_give_up_on_the_current(self) -> None:
+        # Sem ângulo não há soma fasorial, e somar módulos inventaria um valor.
+        _, _, catalog, loads = make_sources(extra_segment=("d", 1, 4))
+        branches = analyze_branches(catalog, PHASES, loads)
+        branch = branches.records[0]
+        indices = [
+            index
+            for index, segment_id in enumerate(catalog.segments.segment_ids)
+            if segment_id in ("T2", "T4")
+        ]
+        flow = make_power_flow(
+            catalog,
+            loads,
+            {
+                index: powers(
+                    (1,),
+                    ((1.0,), (1.0,), (1.0,), (1.0,)),
+                    ((0.0,), (0.0,), (0.0,), (0.0,)),
+                )
+                for index in indices
+            },
+            {
+                index: currents((1,), ((2.0,), (2.0,), (2.0,), (2.0,)))
+                for index in indices
+            },
+        )
+
+        patterns, failures, measured = measure_branch_powers(branches, flow)
+
+        self.assertEqual(failures, {})
+        self.assertIn(branch.branch_id, patterns)
+        self.assertEqual(measured, {})
 
 
 class MeasureBranchPowersTests(unittest.TestCase):
@@ -131,7 +282,7 @@ class MeasureBranchPowersTests(unittest.TestCase):
             },
         )
 
-        measured, failures = measure_branch_powers(branches, flow)
+        measured, failures, currents = measure_branch_powers(branches, flow)
 
         self.assertEqual(failures, {})
         group = measured[branch.branch_id]
@@ -170,7 +321,7 @@ class MeasureBranchPowersTests(unittest.TestCase):
             },
         )
 
-        measured, failures = measure_branch_powers(branches, flow)
+        measured, failures, currents = measure_branch_powers(branches, flow)
 
         self.assertEqual(failures, {})
         group = measured[branch.branch_id]
@@ -199,7 +350,7 @@ class MeasureBranchPowersTests(unittest.TestCase):
             },
         )
 
-        measured, failures = measure_branch_powers(branches, flow)
+        measured, failures, currents = measure_branch_powers(branches, flow)
 
         self.assertEqual(failures, {})
         group = measured[branch.branch_id]
@@ -230,7 +381,7 @@ class MeasureBranchPowersTests(unittest.TestCase):
             },
         )
 
-        measured, failures = measure_branch_powers(branches, flow)
+        measured, failures, currents = measure_branch_powers(branches, flow)
 
         self.assertEqual(failures, {})
         group = measured[branch.branch_id]
@@ -243,7 +394,7 @@ class MeasureBranchPowersTests(unittest.TestCase):
         branch = branches.records[0]
         flow = make_power_flow(catalog, loads, {})
 
-        measured, failures = measure_branch_powers(branches, flow)
+        measured, failures, currents = measure_branch_powers(branches, flow)
 
         self.assertEqual(measured, {})
         self.assertIn("T2", failures[branch.branch_id])
@@ -267,7 +418,7 @@ class MeasureBranchPowersTests(unittest.TestCase):
             solved_circuits=(),
         )
 
-        measured, failures = measure_branch_powers(branches, flow)
+        measured, failures, currents = measure_branch_powers(branches, flow)
 
         self.assertEqual(measured, {})
         self.assertIn("não foi resolvido", failures[branch.branch_id])
@@ -292,7 +443,7 @@ class MeasureBranchPowersTests(unittest.TestCase):
             unconverged=(("C1", 2),),
         )
 
-        measured, failures = measure_branch_powers(branches, flow)
+        measured, failures, currents = measure_branch_powers(branches, flow)
 
         self.assertEqual(measured, {})
         self.assertIn("não convergiu", failures[branch.branch_id])
@@ -311,7 +462,7 @@ class MeasureBranchPowersTests(unittest.TestCase):
             },
         )
 
-        measured, failures = measure_branch_powers(branches, flow)
+        measured, failures, currents = measure_branch_powers(branches, flow)
 
         self.assertEqual(measured, {})
         self.assertIn("quatro patamares", failures[branch.branch_id])
@@ -330,7 +481,7 @@ class MeasureBranchPowersTests(unittest.TestCase):
             },
         )
 
-        measured, failures = measure_branch_powers(branches, flow)
+        measured, failures, currents = measure_branch_powers(branches, flow)
 
         self.assertEqual(measured, {})
         self.assertIn("fases2.json", failures[branch.branch_id])

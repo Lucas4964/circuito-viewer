@@ -1545,6 +1545,24 @@ quatro NPAT; mantém o sinal, ignora integralmente potência reativa e aparece
 como `—` quando a equivalência estiver indisponível ou incompleta. Ela reflete o
 método escolhido em [Potências dos ramais](#potências-dos-ramais): a agregação
 das tabelas das cargas ou a medição no primeiro elemento do ramal.
+`CORRENTE_MAXIMA` é a maior corrente de fase entre as mesmas fases e os mesmos
+quatro NPAT, em ampères, e **acompanha o método escolhido**, como a potência:
+
+- **Agregação pelas tabelas**: é estimada, `√(P²+Q²)` da fase dividido pela
+  tensão de fase do circuito, `VNOM/√3` — a mesma tensão sob a qual a rede
+  simplificada exporta cada fase do ramal como carga monofásica em `wye`. Fica
+  `—` quando o circuito não informa uma `VNOM` numérica positiva, caso em que
+  não há tensão com que calcular.
+- **Fluxo de potência**: é a corrente que o motor mediu no elemento de conexão
+  do ramal, sob a tensão real daquele ponto. Não é a mesma conta: estimar pela
+  nominal daria um valor menor na proporção da queda de tensão, justamente onde
+  a queda importa. Um ramal medido em potência mas sem leitura de corrente fica
+  `—` em vez de cair na estimativa, para não misturar procedências na coluna.
+  Entrando o ramal por mais de um vão, as correntes somam como fasores.
+
+A dica de ferramenta traz o valor íntegro e diz qual das duas origens produziu
+aquele número. Por levar a reativa junto, o patamar de máximo da corrente pode
+não ser o de `DEMANDA_MAXIMA`.
 `NIVEL_TOPOLOGICO` conta os trechos trifásicos energizados no menor caminho
 entre a barra fonte do circuito e a conexão do ramal: a própria fonte é nível
 zero. Em troncos bifurcados, o nível expressa proximidade relativa da fonte;
@@ -1557,7 +1575,13 @@ vazio, o total é exibido como `—`.
 
 A tabela pode ser ordenada e filtrada por circuito. A primeira coluna contém um
 checkbox para marcar ramais de interesse; as marcações sobrevivem a filtros e
-ordenação, mas são limpas por uma nova análise. Células podem ser selecionadas
+ordenação, mas são limpas por uma nova análise. `DEMANDA_MAXIMA`,
+`CORRENTE_MAXIMA` e `NUM_CARGAS` vêm logo depois de `RAMAL_ID`, junto do
+checkbox, porque são os valores que decidem a marcação; o CSV segue a mesma
+ordem. Um texto discreto no canto
+inferior esquerdo informa quantos ramais estão marcados entre as linhas visíveis
+— exatamente o que a exportação JSON gravaria em `ramais_interesse` — e
+acrescenta `(+N fora do filtro)` quando o filtro de circuito esconde marcações. Células podem ser selecionadas
 em intervalos e copiadas com `Ctrl+C` como texto tabulado para o Excel, sem
 permitir edição ou colagem. Selecionar um ramal reativa seu circuito caso ele
 esteja oculto, sem alterar o modo de coloração por fases.

@@ -17,6 +17,7 @@ from .branch_power_source import (
     BranchPowerSource,
 )
 from .generator_update import GeneratorUpdateModel
+from .opendss_export import parse_number, phase_voltage_kv
 from .model import (
     BoolArray,
     CircuitCatalogModel,
@@ -129,6 +130,20 @@ class EquivalentLoadPatternRecord:
         return (self.pd, self.pe, self.pf, self.qd, self.qe, self.qf)
 
 
+def apparent_power(pattern: EquivalentLoadPatternRecord, letter: str) -> Decimal:
+    """Potência aparente de uma fase do patamar, em kVA.
+
+    Lê o par de colunas da fase por ``PHASE_COLUMNS``, a mesma tabela que a
+    agregação e o LoadShape usam, para que as três leituras não possam divergir
+    sobre qual coluna pertence a qual fase.
+    """
+
+    active_field, reactive_field = PHASE_COLUMNS[letter.upper()]
+    active: Decimal = getattr(pattern, active_field)
+    reactive: Decimal = getattr(pattern, reactive_field)
+    return (active * active + reactive * reactive).sqrt()
+
+
 @dataclass(frozen=True, slots=True)
 class EquivalentLoadRecord:
     """Carga derivada de um ramal, com proveniência explícita."""
@@ -149,6 +164,7 @@ class EquivalentLoadRecord:
     source_generator_indices: IndexArray
     aggregation_state: Literal["valid", "incomplete", "zero"]
     maximum_active_demand: Decimal | None
+    maximum_current: Decimal | None
     snom: Decimal | None
     sadm: Decimal | None
 
@@ -172,7 +188,12 @@ class EquivalentLoadRecord:
                 raise ValueError("Os índices de proveniência devem ser imutáveis.")
         if self.aggregation_state not in {"valid", "incomplete", "zero"}:
             raise ValueError("O estado da agregação equivalente é inválido.")
-        for value in (self.maximum_active_demand, self.snom, self.sadm):
+        for value in (
+            self.maximum_active_demand,
+            self.maximum_current,
+            self.snom,
+            self.sadm,
+        ):
             if value is not None and not value.is_finite():
                 raise ValueError("Os totais equivalentes devem ser finitos.")
 
@@ -534,6 +555,7 @@ def build_equivalent_network(
         Mapping[int, Sequence[EquivalentLoadPatternRecord]] | None
     ) = None,
     measurement_issues: Mapping[int, str] | None = None,
+    measured_currents: Mapping[int, Decimal] | None = None,
     source_power_flow: object | None = None,
     cancel_check: CancelCheck | None = None,
     progress: ProgressCallback | None = None,
@@ -634,6 +656,39 @@ def build_equivalent_network(
                     )
                     return None
             return total
+
+    def branch_maximum_current(
+        branch: BranchRecord,
+        pattern_group: Sequence[EquivalentLoadPatternRecord],
+        phase_letters: Sequence[str],
+    ) -> Decimal | None:
+        """Maior corrente de fase do ramal entre os quatro patamares.
+
+        Cada fase de cada patamar tem sua corrente ``S/V``: a potência aparente
+        da fase sobre a tensão de fase do circuito. É a leitura por fase que
+        ``maximum_active_demand`` também faz, e é a mesma da rede simplificada,
+        onde cada fase do ramal vira uma carga monofásica em ``wye`` sob
+        ``VNOM/√3`` — o que garante que a corrente anunciada aqui seja a que o
+        modelo exportado veria.
+
+        Sem ``VNOM`` numérica positiva não há tensão, logo não há corrente a
+        afirmar: devolve ``None``, e a célula fica ``—``. Silencioso de
+        propósito, como a demanda incompleta: a corrente é informativa, e um
+        diagnóstico por ramal encheria a lista de ocorrências com uma linha por
+        ramal do circuito.
+        """
+
+        nominal = parse_number(
+            catalog.definition(branch.circuit_index).nominal_voltage
+        )
+        if nominal is None or nominal <= 0.0:
+            return None
+        voltage = Decimal(repr(phase_voltage_kv(nominal)))
+        return max(
+            apparent_power(pattern, letter) / voltage
+            for pattern in pattern_group
+            for letter in phase_letters
+        )
 
     generators_by_branch: list[list[int]] = [[] for _ in branches.records]
     ambiguous_branches: set[int] = set()
@@ -887,15 +942,35 @@ def build_equivalent_network(
             if branches.phase_configuration is None
             else branches.phase_configuration.phase_letters_for_value(branch.phases2)
         )
+        usable = bool(complete and pattern_group is not None and phase_letters)
         maximum_active_demand = (
             None
-            if not complete or pattern_group is None or not phase_letters
+            if not usable
             else max(
                 getattr(pattern, f"p{letter.lower()}")
                 for pattern in pattern_group
                 for letter in phase_letters
             )
         )
+        # A corrente segue a origem escolhida, como a potência. No fluxo ela é
+        # medida pelo motor sob a tensão real do ponto; estimá-la aqui a partir
+        # da tensão nominal daria um número menor, e menor justamente onde a
+        # queda de tensão importa. Sem medição da corrente naquele ramal fica
+        # ``None``: melhor vazio do que um valor de outra procedência.
+        if not usable:
+            maximum_current = None
+        elif power_source is BranchPowerSource.POWER_FLOW:
+            maximum_current = (
+                None
+                if measured_currents is None
+                else measured_currents.get(branch.branch_id)
+            )
+        else:
+            maximum_current = branch_maximum_current(
+                branch,
+                pattern_group,
+                phase_letters,
+            )
         is_zero = bool(
             complete
             and pattern_group is not None
@@ -927,6 +1002,7 @@ def build_equivalent_network(
                     "incomplete" if not complete else "zero" if is_zero else "valid"
                 ),
                 maximum_active_demand=maximum_active_demand,
+                maximum_current=maximum_current,
                 snom=aggregate_load_field(branch, "SNOM"),
                 sadm=aggregate_load_field(branch, "SADM"),
             )

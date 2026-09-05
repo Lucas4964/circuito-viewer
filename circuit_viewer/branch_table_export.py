@@ -20,8 +20,15 @@ from .opendss_export import sanitize_dss_name
 CancelCheck = Callable[[], bool]
 ProgressCallback = Callable[[int, int], None]
 
+# A ordem vale para os tres consumidores: a tabela da janela, o Ctrl+C dela e o
+# CSV. DEMANDA_MAXIMA e NUM_CARGAS vem logo apos o identificador porque sao o que
+# se olha para decidir marcar um ramal, e a caixa de marcacao e a primeira coluna
+# da tabela: no fim da linha, decidir custava rolar ate o fim e voltar.
 BRANCH_TABLE_HEADERS = (
     "RAMAL_ID",
+    "DEMANDA_MAXIMA",
+    "CORRENTE_MAXIMA",
+    "NUM_CARGAS",
     "TIPO_RAMAL",
     "CIRC_ID",
     "BARRA_ID",
@@ -33,8 +40,6 @@ BRANCH_TABLE_HEADERS = (
     "CHAVE_CODIGO",
     "NUM_TRECHOS",
     "COMPR",
-    "NUM_CARGAS",
-    "DEMANDA_MAXIMA",
     "FASES2",
     "FASE",
     "REMANEJAVEL",
@@ -54,6 +59,7 @@ BRANCH_NUMERIC_COLUMNS = frozenset(
         "COMPR",
         "NUM_CARGAS",
         "DEMANDA_MAXIMA",
+        "CORRENTE_MAXIMA",
         "REMANEJAVEL",
         "NUM_BARRAS",
         "NUM_CHAVES",
@@ -64,6 +70,7 @@ BRANCH_NUMERIC_COLUMNS = frozenset(
 )
 BRANCH_LENGTH_COLUMN = BRANCH_TABLE_HEADERS.index("COMPR")
 BRANCH_MAXIMUM_DEMAND_COLUMN = BRANCH_TABLE_HEADERS.index("DEMANDA_MAXIMA")
+BRANCH_MAXIMUM_CURRENT_COLUMN = BRANCH_TABLE_HEADERS.index("CORRENTE_MAXIMA")
 BRANCH_REMOVABLE_COLUMN = BRANCH_TABLE_HEADERS.index("REMANEJAVEL")
 
 
@@ -84,11 +91,22 @@ def suggested_branch_csv_filename(circuit_id: str | None) -> str:
 def branch_table_values(
     record: BranchRecord,
     maximum_active_demand: Decimal | None,
+    maximum_current: Decimal | None,
 ) -> tuple[object, ...]:
-    """Devolve a linha canônica usada tanto pelo Qt quanto pelo CSV."""
+    """Devolve a linha canônica usada tanto pelo Qt quanto pelo CSV.
+
+    A ordem tem de ser a de ``BRANCH_TABLE_HEADERS``, posição por posição. As
+    duas tuplas são presas uma à outra por
+    ``BranchTableValueTests.test_every_header_names_the_value_below_it``, porque
+    o sintoma de reordenar só uma delas seria um número sob o cabeçalho errado —
+    silencioso na tela e no CSV.
+    """
 
     return (
         record.branch_id,
+        maximum_active_demand,
+        maximum_current,
+        record.load_count,
         record.branch_type.value,
         record.circuit_id,
         record.connection_bar_id,
@@ -100,8 +118,6 @@ def branch_table_values(
         record.first_switch_code if record.removable else "",
         record.segment_count,
         record.total_length,
-        record.load_count,
-        maximum_active_demand,
         record.phases2,
         record.phase,
         int(record.removable),
@@ -114,16 +130,23 @@ def branch_table_values(
     )
 
 
-def _maximum_demands(
+def branch_equivalent_totals(
     branches: BranchAnalysisResult,
     equivalent: EquivalentNetworkResult | None,
-) -> dict[int, Decimal | None]:
+) -> dict[int, tuple[Decimal | None, Decimal | None]]:
+    """Demanda e corrente máximas de cada ramal, na ordem em que a linha as usa.
+
+    Um par por ramal em vez de dois dicionários paralelos: as duas grandezas
+    vêm do mesmo registro e são consumidas juntas, e separá-las só criaria a
+    chance de uma ficar para trás.
+    """
+
     if equivalent is None:
         return {}
     if equivalent.model.branches is not branches:
         raise ValueError("A rede equivalente não corresponde aos ramais exportados.")
     return {
-        record.branch_id: record.maximum_active_demand
+        record.branch_id: (record.maximum_active_demand, record.maximum_current)
         for record in equivalent.model.records
     }
 
@@ -160,7 +183,7 @@ def build_branches_csv_bytes(
     if any(index < 0 or index >= len(branches.records) for index in selected):
         raise IndexError("A seleção contém um ramal inexistente.")
     cancelled = cancel_check or (lambda: False)
-    demands = _maximum_demands(branches, equivalent)
+    totals = branch_equivalent_totals(branches, equivalent)
     stream = io.StringIO(newline="")
     writer = csv.writer(
         stream,
@@ -175,12 +198,10 @@ def build_branches_csv_bytes(
         if cancelled():
             raise InterruptedError("Exportação CSV dos ramais cancelada.")
         record = branches.records[branch_index]
+        demand, current = totals.get(record.branch_id, (None, None))
         writer.writerow(
             _format_pt_br(value)
-            for value in branch_table_values(
-                record,
-                demands.get(record.branch_id),
-            )
+            for value in branch_table_values(record, demand, current)
         )
         if progress is not None:
             progress(position, total)

@@ -189,7 +189,7 @@ def build_measured_system_export(active: float, **kwargs):
         },
         solved_circuits=("C1",),
     )
-    measured, failures = measure_branch_powers(branches, flow)
+    measured, failures, currents = measure_branch_powers(branches, flow)
     equivalent = build_equivalent_network(
         branches,
         loads,

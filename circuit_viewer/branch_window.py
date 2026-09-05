@@ -32,8 +32,10 @@ from PyQt6.QtWidgets import (
 )
 
 from .branch_analysis import BranchAnalysisResult, BranchRecord
+from .branch_power_source import BranchPowerSource
 from .branch_table_export import (
     BRANCH_LENGTH_COLUMN,
+    BRANCH_MAXIMUM_CURRENT_COLUMN,
     BRANCH_MAXIMUM_DEMAND_COLUMN,
     BRANCH_NUMERIC_COLUMNS,
     BRANCH_REMOVABLE_COLUMN,
@@ -45,6 +47,11 @@ from .equivalent_network import EquivalentNetworkResult
 
 BRANCH_INTEREST_COLUMN = 0
 BRANCH_DATA_COLUMN_OFFSET = 1
+# Pelo nome, e nao pela posicao: as colunas de dados ja mudaram de ordem uma vez,
+# e "a primeira delas" nao e o que se quer ordenar por padrao — o identificador e.
+BRANCH_DEFAULT_SORT_COLUMN = (
+    BRANCH_TABLE_HEADERS.index("RAMAL_ID") + BRANCH_DATA_COLUMN_OFFSET
+)
 # Alfa da faixa da linha corrente: forte o bastante para guiar o olho ao
 # rolar as colunas, fraco o bastante para não competir com a célula
 # selecionada, que o Qt pinta com Highlight opaco.
@@ -52,6 +59,11 @@ BRANCH_HIGHLIGHT_ALPHA = 50
 
 
 class BranchTableModel(QAbstractTableModel):
+    # Sinal proprio em vez de dataChanged: este ultimo tambem dispara a cada
+    # troca de linha destacada e a cada chegada da rede equivalente, e quem
+    # escuta a marcacao varre as linhas visiveis para se atualizar.
+    interestChanged = pyqtSignal()
+
     HEADERS = ("", *BRANCH_TABLE_HEADERS)
     NUMERIC_COLUMNS = frozenset(
         column + BRANCH_DATA_COLUMN_OFFSET for column in BRANCH_NUMERIC_COLUMNS
@@ -60,22 +72,30 @@ class BranchTableModel(QAbstractTableModel):
     MAXIMUM_DEMAND_COLUMN = (
         BRANCH_MAXIMUM_DEMAND_COLUMN + BRANCH_DATA_COLUMN_OFFSET
     )
+    MAXIMUM_CURRENT_COLUMN = (
+        BRANCH_MAXIMUM_CURRENT_COLUMN + BRANCH_DATA_COLUMN_OFFSET
+    )
     REMOVABLE_COLUMN = BRANCH_REMOVABLE_COLUMN + BRANCH_DATA_COLUMN_OFFSET
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
         self.result: BranchAnalysisResult | None = None
-        self._maximum_demand_by_branch: dict[int, Decimal | None] = {}
+        self._totals_by_branch: dict[
+            int, tuple[Decimal | None, Decimal | None]
+        ] = {}
+        self._current_is_measured = False
         self._interest_branch_ids: set[int] = set()
         self._highlight_row = -1
 
     def set_result(self, result: BranchAnalysisResult | None) -> None:
         self.beginResetModel()
         self.result = result
-        self._maximum_demand_by_branch = {}
+        self._totals_by_branch = {}
+        self._current_is_measured = False
         self._interest_branch_ids.clear()
         self._highlight_row = -1
         self.endResetModel()
+        self.interestChanged.emit()
 
     def set_equivalent_result(
         self,
@@ -83,21 +103,29 @@ class BranchTableModel(QAbstractTableModel):
     ) -> None:
         if result is not None and result.model.branches is not self.result:
             raise ValueError("A rede equivalente deve pertencer aos ramais exibidos.")
-        self._maximum_demand_by_branch = (
+        self._current_is_measured = (
+            result is not None
+            and result.model.power_source is BranchPowerSource.POWER_FLOW
+        )
+        self._totals_by_branch = (
             {}
             if result is None
             else {
-                record.branch_id: record.maximum_active_demand
+                record.branch_id: (
+                    record.maximum_active_demand,
+                    record.maximum_current,
+                )
                 for record in result.model.records
             }
         )
         if self.rowCount() > 0:
+            # As duas colunas chegam juntas e podem nem ser vizinhas: o
+            # intervalo vai da menor à maior, sem supor a ordem entre elas.
+            first = min(self.MAXIMUM_DEMAND_COLUMN, self.MAXIMUM_CURRENT_COLUMN)
+            last = max(self.MAXIMUM_DEMAND_COLUMN, self.MAXIMUM_CURRENT_COLUMN)
             self.dataChanged.emit(
-                self.index(0, self.MAXIMUM_DEMAND_COLUMN),
-                self.index(
-                    self.rowCount() - 1,
-                    self.MAXIMUM_DEMAND_COLUMN,
-                ),
+                self.index(0, first),
+                self.index(self.rowCount() - 1, last),
                 (
                     Qt.ItemDataRole.DisplayRole,
                     Qt.ItemDataRole.ToolTipRole,
@@ -174,10 +202,10 @@ class BranchTableModel(QAbstractTableModel):
         return self.result.records[int(row)]
 
     def _raw_values(self, record: BranchRecord) -> tuple[object, ...]:
-        return branch_table_values(
-            record,
-            self._maximum_demand_by_branch.get(record.branch_id),
+        demand, current = self._totals_by_branch.get(
+            record.branch_id, (None, None)
         )
+        return branch_table_values(record, demand, current)
 
     def interest_branch_ids(self) -> tuple[int, ...]:
         return tuple(sorted(self._interest_branch_ids))
@@ -214,6 +242,7 @@ class BranchTableModel(QAbstractTableModel):
             index,
             (Qt.ItemDataRole.CheckStateRole, Qt.ItemDataRole.UserRole),
         )
+        self.interestChanged.emit()
         return True
 
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):  # noqa: ANN201
@@ -266,6 +295,21 @@ class BranchTableModel(QAbstractTableModel):
                 if role == Qt.ItemDataRole.ToolTipRole
                 else f"{value:.4f}"
             )
+        elif index.column() == self.MAXIMUM_CURRENT_COLUMN:
+            # Duas casas na célula, valor inteiro na dica: um ampère não se lê
+            # com dez casas, mas o número exato continua a um passe de mouse.
+            # A dica diz também a procedência, porque as duas existem e não dão
+            # o mesmo número: a medida sai da tensão real do ponto, a estimada
+            # da nominal, e é impossível distingui-las olhando a célula.
+            if role == Qt.ItemDataRole.ToolTipRole:
+                origin = (
+                    "medida no fluxo de potência"
+                    if self._current_is_measured
+                    else "estimada de S ÷ (VNOM/√3)"
+                )
+                display = f"{value} A · {origin}"
+            else:
+                display = f"{value:.2f}"
         elif isinstance(value, int):
             display = f"{value:n}"
         else:
@@ -437,12 +481,30 @@ class BranchesWindow(QDialog):
         layout.addWidget(self.issues_label)
         layout.addWidget(self.issues_text)
 
+        status_row = QHBoxLayout()
+        self.interest_status_label = QLabel(self)
+        self.interest_status_label.setObjectName("branches_interest_status")
+        # Discreto de proposito: cor de texto secundario e um ponto a menos na
+        # fonte. A cor vem do papel da paleta, e nao de um valor fixo, para
+        # acompanhar a troca de tema em runtime.
+        self.interest_status_label.setForegroundRole(
+            QPalette.ColorRole.PlaceholderText
+        )
+        status_font = self.interest_status_label.font()
+        status_font.setPointSizeF(max(status_font.pointSizeF() - 1.0, 7.0))
+        self.interest_status_label.setFont(status_font)
+        status_row.addWidget(self.interest_status_label)
+        status_row.addStretch(1)
+        layout.addLayout(status_row)
+
+        table_model.interestChanged.connect(self._refresh_interest_status)
         self.circuit_filter.currentIndexChanged.connect(self._apply_filter)
         self.export_csv_button.clicked.connect(self.exportCsvRequested)
         self.export_json_button.clicked.connect(self.exportJsonRequested)
         selection_model = self.table.selectionModel()
         selection_model.currentRowChanged.connect(self._current_row_changed)
         self.table.activated.connect(self._activate_index)
+        self._refresh_interest_status()
 
     def set_result(self, result: BranchAnalysisResult | None) -> None:
         self._equivalent_result = None
@@ -476,8 +538,9 @@ class BranchesWindow(QDialog):
             )
         self._refresh_issues()
         self._sync_export_availability()
+        self._refresh_interest_status()
         self.table.sortByColumn(
-            BRANCH_DATA_COLUMN_OFFSET,
+            BRANCH_DEFAULT_SORT_COLUMN,
             Qt.SortOrder.AscendingOrder,
         )
 
@@ -625,6 +688,37 @@ class BranchesWindow(QDialog):
         self.issues_text.setPlainText("\n".join(issue_lines))
         self.issues_text.setVisible(issue_count > 0)
 
+    def _refresh_interest_status(self) -> None:
+        """Diz quantos ramais estao marcados, sem exigir uma exportacao.
+
+        Conta os marcados **entre as linhas visiveis**, pelas mesmas funcoes que
+        montam ``ramais_interesse`` na exportacao JSON, para que o numero na tela
+        seja o do arquivo e nao um segundo numero parecido. Os que o filtro de
+        circuito escondeu entram a parte: sem isso o usuario exportaria doze
+        achando que exporta quinze.
+        """
+
+        source = self.proxy_model.sourceModel()
+        if not isinstance(source, BranchTableModel):
+            self.interest_status_label.clear()
+            return
+        visible = len(
+            self.interest_branch_ids_for_source_rows(self.visible_source_rows())
+        )
+        hidden = len(source.interest_branch_ids()) - visible
+        if visible == 0 and hidden <= 0:
+            self.interest_status_label.clear()
+            return
+        if visible == 0:
+            text = "Nenhum ramal marcado"
+        elif visible == 1:
+            text = "1 ramal marcado"
+        else:
+            text = f"{visible:n} ramais marcados"
+        if hidden > 0:
+            text += f" (+{hidden:n} fora do filtro)"
+        self.interest_status_label.setText(text)
+
     def clear_selection(self) -> None:
         self.table.clearSelection()
         self.table.setCurrentIndex(QModelIndex())
@@ -635,6 +729,7 @@ class BranchesWindow(QDialog):
         self.proxy_model.set_circuit_id(self.circuit_filter.currentData())
         self.clear_selection()
         self._sync_export_availability()
+        self._refresh_interest_status()
 
     def keyPressEvent(self, event) -> None:  # noqa: ANN001, N802
         """Esc desfaz um nível por vez, como no mapa.

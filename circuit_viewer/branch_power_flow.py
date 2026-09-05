@@ -25,15 +25,22 @@ só — nula quando o primeiro elemento é uma chave, porque ``Switch=Yes`` zera
 parâmetros elétricos da linha — e em troca o valor do ramal é exatamente o que o
 painel de fluxo de potência já mostra para aquele trecho, sem uma segunda
 leitura que pudesse divergir dele.
+
+**Corrente.** Do mesmo elemento sai a corrente medida, em ampères, que o motor
+resolveu com a tensão real daquele ponto. Ela não é derivável das potências
+daqui: ``S/V`` exigiria a tensão da barra, e usar a nominal subestimaria a
+corrente na exata proporção da queda — justamente onde a queda importa. Por isso
+a medição a devolve à parte, em vez de deixar a rede equivalente estimá-la.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from decimal import Decimal, localcontext
+import math
 
 from .branch_analysis import BranchAnalysisResult
-from .equivalent_network import EquivalentLoadPatternRecord
+from .equivalent_network import PHASE_COLUMNS, EquivalentLoadPatternRecord
 from .opendss_export import LOAD_PATTERN_COUNT, phase_letters_by_node
 from .opendss_powerflow import PowerFlowResult
 
@@ -41,9 +48,46 @@ from .opendss_powerflow import PowerFlowResult
 CancelCheck = Callable[[], bool]
 ProgressCallback = Callable[[int, int], None]
 
-# Ordem dos campos de EquivalentLoadPatternRecord, por letra de fase.
-_ACTIVE_FIELD = {"D": "pd", "E": "pe", "F": "pf"}
-_REACTIVE_FIELD = {"D": "qd", "E": "qe", "F": "qf"}
+def _accumulate_currents(
+    readings,  # noqa: ANN001 - SegmentCurrents, sem importar o módulo do OpenDSS
+    letters_by_node: dict[int, str],
+    totals: list[dict[str, complex]],
+    *,
+    negate: bool,
+    phasor: bool,
+) -> bool:
+    """Soma a corrente de um vão de conexão. ``False`` quando não dá para ler.
+
+    ``phasor`` só é exigido quando há mais de um vão: com um único, o módulo
+    basta, e ele existe mesmo em leituras que não guardaram o ângulo. Devolver
+    ``False`` deixa o ramal sem corrente, não sem medição — a potência segue
+    válida.
+    """
+
+    if readings is None:
+        return False
+    if len(readings.magnitudes) != len(totals):
+        return False
+    if phasor and len(readings.angles) != len(totals):
+        return False
+    for npat, row in enumerate(readings.magnitudes):
+        if len(row) != len(readings.nodes):
+            return False
+        angles = readings.angles[npat] if phasor else None
+        for offset, node in enumerate(readings.nodes):
+            letter = letters_by_node.get(int(node))
+            if letter is None or letter not in totals[npat]:
+                continue
+            magnitude = float(row[offset])
+            if angles is None:
+                totals[npat][letter] += complex(magnitude, 0.0)
+                continue
+            angle = math.radians(float(angles[offset]) + (180.0 if negate else 0.0))
+            totals[npat][letter] += complex(
+                magnitude * math.cos(angle),
+                magnitude * math.sin(angle),
+            )
+    return True
 
 
 def measure_branch_powers(
@@ -55,12 +99,19 @@ def measure_branch_powers(
 ) -> tuple[
     dict[int, tuple[EquivalentLoadPatternRecord, ...]],
     dict[int, str],
+    dict[int, Decimal],
 ]:
-    """Devolve ``(patamares por RAMAL_ID, motivo da falha por RAMAL_ID)``.
+    """Devolve ``(patamares, motivo da falha, maior corrente)`` por ``RAMAL_ID``.
 
-    Um ramal aparece em exatamente um dos dois mapeamentos. O segundo alimenta
-    os diagnósticos da rede equivalente: um ramal sem medição fica com
-    equivalência incompleta, como já acontece com a agregação por tabelas.
+    Um ramal aparece em exatamente um dos dois primeiros mapeamentos. O de
+    falhas alimenta os diagnósticos da rede equivalente: um ramal sem medição
+    fica com equivalência incompleta, como já acontece com a agregação por
+    tabelas.
+
+    O terceiro é a maior corrente de fase entre os quatro patamares, em
+    ampères, e é **opcional**: um ramal medido cuja corrente não pôde ser lida
+    fica de fora dele sem virar falha, porque a potência — que é o que a
+    equivalência exige — continua válida.
     """
 
     catalog = branches.source_catalog
@@ -96,6 +147,7 @@ def measure_branch_powers(
 
     patterns: dict[int, tuple[EquivalentLoadPatternRecord, ...]] = {}
     failures: dict[int, str] = {}
+    currents: dict[int, Decimal] = {}
     total = len(branches.records)
 
     for position, branch in enumerate(branches.records, start=1):
@@ -142,9 +194,17 @@ def measure_branch_powers(
             with localcontext() as context:
                 context.prec = 50
                 totals = [
-                    {letter: [Decimal(0), Decimal(0)] for letter in _ACTIVE_FIELD}
+                    {letter: [Decimal(0), Decimal(0)] for letter in PHASE_COLUMNS}
                     for _ in range(LOAD_PATTERN_COUNT)
                 ]
+                # A corrente é somada como fasor, não como módulo: entrando o
+                # ramal por dois vãos, somar módulos daria um número que não
+                # existe. O ângulo vem de graça na mesma leitura do motor.
+                current_totals = [
+                    {letter: 0j for letter in PHASE_COLUMNS}
+                    for _ in range(LOAD_PATTERN_COUNT)
+                ]
+                current_known = True
                 for segment_index, negate in connections:
                     powers = power_flow.segment_powers.get(segment_index)
                     element_id = segments.segment_ids[segment_index]
@@ -178,6 +238,13 @@ def measure_branch_powers(
                             "a nenhuma fase de fases2.json."
                         )
                         break
+                    current_known = current_known and _accumulate_currents(
+                        power_flow.segment_currents.get(segment_index),
+                        letters_by_node,
+                        current_totals,
+                        negate=negate,
+                        phasor=len(connections) > 1,
+                    )
                     for npat in range(LOAD_PATTERN_COUNT):
                         active_row = powers.active[npat]
                         reactive_row = powers.reactive[npat]
@@ -207,16 +274,26 @@ def measure_branch_powers(
                             load_id,
                             npat,
                             **{
-                                _ACTIVE_FIELD[letter]: totals[npat][letter][0]
-                                for letter in _ACTIVE_FIELD
+                                PHASE_COLUMNS[letter][0]: totals[npat][letter][0]
+                                for letter in PHASE_COLUMNS
                             },
                             **{
-                                _REACTIVE_FIELD[letter]: totals[npat][letter][1]
-                                for letter in _REACTIVE_FIELD
+                                PHASE_COLUMNS[letter][1]: totals[npat][letter][1]
+                                for letter in PHASE_COLUMNS
                             },
                         )
                         for npat in range(LOAD_PATTERN_COUNT)
                     )
+                    if current_known:
+                        currents[branch.branch_id] = Decimal(
+                            repr(
+                                max(
+                                    abs(value)
+                                    for row in current_totals
+                                    for value in row.values()
+                                )
+                            )
+                        )
 
         if failure is not None:
             failures[branch.branch_id] = failure
@@ -225,7 +302,7 @@ def measure_branch_powers(
 
     if cancelled():
         raise InterruptedError("Medição das potências dos ramais cancelada.")
-    return patterns, failures
+    return patterns, failures, currents
 
 
 __all__ = ["measure_branch_powers"]

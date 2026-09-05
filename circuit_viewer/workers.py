@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 import threading
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
@@ -1088,6 +1089,7 @@ class EquivalentNetworkWorker(QObject):
         try:
             measured: dict[int, tuple] = {}
             measurement_issues: dict[int, str] = {}
+            measured_currents: dict[int, Decimal] = {}
             if self.power_source is BranchPowerSource.POWER_FLOW:
                 if self.power_flow is None:
                     raise ValueError(
@@ -1096,7 +1098,11 @@ class EquivalentNetworkWorker(QObject):
                     )
                 # A medição é a primeira metade do trabalho e usa a mesma barra
                 # de progresso: os dois laços percorrem os mesmos ramais.
-                measured, measurement_issues = measure_branch_powers(
+                (
+                    measured,
+                    measurement_issues,
+                    measured_currents,
+                ) = measure_branch_powers(
                     self.branches,
                     self.power_flow,
                     cancel_check=self._cancel_event.is_set,
@@ -1113,6 +1119,7 @@ class EquivalentNetworkWorker(QObject):
                 power_source=self.power_source,
                 measured_patterns=measured,
                 measurement_issues=measurement_issues,
+                measured_currents=measured_currents,
                 source_power_flow=(
                     self.power_flow
                     if self.power_source is BranchPowerSource.POWER_FLOW

@@ -22,7 +22,12 @@ try:
 
     from circuit_viewer.branch_analysis import analyze_branches
     from circuit_viewer.branch_power_source import BranchPowerSource
-    from circuit_viewer.equivalent_network import build_equivalent_network
+    from circuit_viewer.branch_table_export import BRANCH_TABLE_HEADERS
+    from circuit_viewer.branch_window import BRANCH_DATA_COLUMN_OFFSET
+    from circuit_viewer.equivalent_network import (
+        EquivalentLoadPatternRecord,
+        build_equivalent_network,
+    )
     from circuit_viewer.csv_import import CsvLoadResult
     from circuit_viewer.main_window import MainWindow
     from circuit_viewer.model import (
@@ -44,6 +49,16 @@ try:
     PYQT_AVAILABLE = True
 except ModuleNotFoundError:
     PYQT_AVAILABLE = False
+
+
+def model_column(name: str) -> int:
+    """Coluna do modelo Qt pelo nome, ja contando a caixa de marcacao.
+
+    As colunas de dados mudam de ordem conforme o uso pede; o teste nao deveria
+    mudar junto.
+    """
+
+    return BRANCH_TABLE_HEADERS.index(name) + BRANCH_DATA_COLUMN_OFFSET
 
 
 @unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
@@ -188,24 +203,36 @@ class BranchesUiTests(unittest.TestCase):
         self.assertTrue(window.branches_window.export_csv_button.isEnabled())
         model = window.branch_table_model
         self.assertEqual(model.rowCount(), 1)
-        self.assertEqual(model.columnCount(), 24)
+        self.assertEqual(model.columnCount(), 25)
         self.assertEqual(
-            model.headerData(6, Qt.Orientation.Horizontal),
+            model.headerData(
+                model_column("NIVEL_TOPOLOGICO"),
+                Qt.Orientation.Horizontal,
+            ),
             "NIVEL_TOPOLOGICO",
         )
-        self.assertEqual(model.headerData(14, Qt.Orientation.Horizontal), "DEMANDA_MAXIMA")
-        self.assertEqual(model.data(model.index(0, 1)), "1")
-        self.assertEqual(model.data(model.index(0, 2)), "MONOFASICO")
-        self.assertEqual(model.data(model.index(0, 3)), "C1")
-        self.assertEqual(model.data(model.index(0, 4)), "B1")
-        self.assertEqual(model.data(model.index(0, 6)), "1")
-        self.assertEqual(model.data(model.index(0, 7)), "T2")
-        self.assertEqual(model.data(model.index(0, 9)), "—")
-        self.assertEqual(model.data(model.index(0, 11)), "2")
-        self.assertEqual(model.data(model.index(0, 12)), "200.000")
-        self.assertEqual(model.data(model.index(0, 14)), "0.0000")
-        self.assertEqual(model.data(model.index(0, 15)), "D")
-        self.assertEqual(model.data(model.index(0, 16)), "D")
+        expected = {
+            "RAMAL_ID": "1",
+            "TIPO_RAMAL": "MONOFASICO",
+            "CIRC_ID": "C1",
+            "BARRA_ID": "B1",
+            "NIVEL_TOPOLOGICO": "1",
+            "TRECHO_ID": "T2",
+            "CHAVE_ID": "—",
+            "NUM_TRECHOS": "2",
+            "COMPR": "200.000",
+            "DEMANDA_MAXIMA": "0.0000",
+            "FASES2": "D",
+            "FASE": "D",
+        }
+        for name, value in expected.items():
+            with self.subTest(coluna=name):
+                column = model_column(name)
+                self.assertEqual(
+                    model.headerData(column, Qt.Orientation.Horizontal),
+                    name,
+                )
+                self.assertEqual(model.data(model.index(0, column)), value)
 
         cached = window._branch_analysis_result
         window._show_or_analyze_branches()
@@ -513,7 +540,10 @@ class BranchesUiTests(unittest.TestCase):
         )
         branch_window = window.branches_window
         branch_window.set_result(branches)
-        branch_window.proxy_model.sort(1, Qt.SortOrder.AscendingOrder)
+        branch_window.proxy_model.sort(
+            model_column("RAMAL_ID"),
+            Qt.SortOrder.AscendingOrder,
+        )
         self.app.processEvents()
 
         self.assertEqual(
@@ -528,9 +558,11 @@ class BranchesUiTests(unittest.TestCase):
             branch_window.table.editTriggers(),
             QAbstractItemView.EditTrigger.NoEditTriggers,
         )
+        # A selecao comeca na caixa de marcacao de proposito: e dela que o
+        # copiar tem de escapar.
         selection = QItemSelection(
             branch_window.proxy_model.index(0, 0),
-            branch_window.proxy_model.index(1, 3),
+            branch_window.proxy_model.index(1, model_column("CIRC_ID")),
         )
         branch_window.table.selectionModel().select(
             selection,
@@ -541,8 +573,123 @@ class BranchesUiTests(unittest.TestCase):
 
         self.assertEqual(
             QApplication.clipboard().text(),
-            "1\tMONOFASICO\tC1\n2\tMONOFASICO\tC2",
+            "1\t—\t—\t0\tMONOFASICO\tC1\n2\t—\t—\t0\tMONOFASICO\tC2",
         )
+
+    def _window_with_two_branches(self):  # noqa: ANN202
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        window._branch_analysis_result = branches
+        window.branches_window.set_result(branches)
+        model = window.branch_table_model
+        self.assertEqual(model.rowCount(), 2)
+        self.assertNotEqual(
+            model.record(0).circuit_id,
+            model.record(1).circuit_id,
+        )
+        return window, model
+
+    @staticmethod
+    def _mark(model, row: int, checked: bool = True) -> None:  # noqa: ANN001
+        model.setData(
+            model.index(row, 0),
+            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked,
+            Qt.ItemDataRole.CheckStateRole,
+        )
+
+    def _filter_to_circuit_of(self, window, model, row: int) -> None:  # noqa: ANN001
+        circuit_filter = window.branches_window.circuit_filter
+        circuit_filter.setCurrentIndex(
+            circuit_filter.findData(model.record(row).circuit_id)
+        )
+        self.app.processEvents()
+
+    def test_demand_and_load_count_sit_next_to_the_checkbox(self) -> None:
+        # O motivo da ordem: decidir marcar um ramal era rolar ate o fim da
+        # linha para ver a demanda e voltar ao inicio para clicar na caixa.
+        window, model = self._window_with_two_branches()
+
+        self.assertEqual(
+            [
+                model.headerData(column, Qt.Orientation.Horizontal)
+                for column in range(1, 5)
+            ],
+            ["RAMAL_ID", "DEMANDA_MAXIMA", "CORRENTE_MAXIMA", "NUM_CARGAS"],
+        )
+        header = window.branches_window.table.horizontalHeader()
+        self.assertEqual(header.sortIndicatorSection(), model_column("RAMAL_ID"))
+        self.assertEqual(header.sortIndicatorOrder(), Qt.SortOrder.AscendingOrder)
+
+    def test_interest_status_counts_the_marked_branches(self) -> None:
+        window, model = self._window_with_two_branches()
+        label = window.branches_window.interest_status_label
+        self.assertEqual(label.text(), "")
+
+        self._mark(model, 0)
+        self.assertEqual(label.text(), "1 ramal marcado")
+
+        self._mark(model, 1)
+        self.assertEqual(label.text(), "2 ramais marcados")
+
+        self._mark(model, 0, checked=False)
+        self._mark(model, 1, checked=False)
+        self.assertEqual(label.text(), "")
+
+    def test_interest_status_announces_marks_hidden_by_the_filter(self) -> None:
+        # Sem o acrescimo, o usuario exportaria um ramal achando que exporta dois.
+        window, model = self._window_with_two_branches()
+        self._mark(model, 0)
+        self._mark(model, 1)
+
+        self._filter_to_circuit_of(window, model, 0)
+
+        self.assertEqual(
+            window.branches_window.interest_status_label.text(),
+            "1 ramal marcado (+1 fora do filtro)",
+        )
+
+    def test_interest_status_when_the_filter_hides_every_mark(self) -> None:
+        window, model = self._window_with_two_branches()
+        self._mark(model, 1)
+
+        self._filter_to_circuit_of(window, model, 0)
+
+        self.assertEqual(
+            window.branches_window.interest_status_label.text(),
+            "Nenhum ramal marcado (+1 fora do filtro)",
+        )
+
+    def test_interest_status_shows_what_the_json_export_would_receive(self) -> None:
+        """O numero na tela e o do arquivo, nao um segundo numero parecido."""
+
+        window, model = self._window_with_two_branches()
+        branches_window = window.branches_window
+        self._mark(model, 0)
+        self._mark(model, 1)
+        self._filter_to_circuit_of(window, model, 0)
+
+        exported = branches_window.interest_branch_ids_for_source_rows(
+            branches_window.visible_source_rows()
+        )
+
+        self.assertEqual(len(model.interest_branch_ids()), 2)
+        self.assertEqual(len(exported), 1)
+        shown = int(branches_window.interest_status_label.text().split(" ", 1)[0])
+        self.assertEqual(shown, len(exported))
+
+    def test_a_new_analysis_clears_the_interest_counter(self) -> None:
+        window, model = self._window_with_two_branches()
+        self._mark(model, 0)
+        label = window.branches_window.interest_status_label
+        self.assertNotEqual(label.text(), "")
+
+        window.branches_window.set_result(model.result)
+
+        self.assertEqual(label.text(), "")
+        self.assertEqual(model.interest_branch_ids(), ())
 
     def test_csv_button_preserves_visual_filter_and_sort_order(self) -> None:
         window, _, _, catalog = self.make_window(two_circuits=True)
@@ -553,7 +700,7 @@ class BranchesUiTests(unittest.TestCase):
         window._branch_analysis_result = branches
         window.branches_window.set_result(branches)
         proxy = window.branches_window.proxy_model
-        proxy.sort(1, Qt.SortOrder.DescendingOrder)
+        proxy.sort(model_column("RAMAL_ID"), Qt.SortOrder.DescendingOrder)
         self.app.processEvents()
         target = Path(self.temp.name) / "todos.csv"
 
@@ -581,7 +728,10 @@ class BranchesUiTests(unittest.TestCase):
         with filtered_target.open(encoding="utf-8-sig", newline="") as stream:
             filtered_rows = list(csv.reader(stream, delimiter=";"))
         self.assertEqual(len(filtered_rows), 2)
-        self.assertEqual(filtered_rows[1][2], "C1")
+        self.assertEqual(
+            filtered_rows[1][BRANCH_TABLE_HEADERS.index("CIRC_ID")],
+            "C1",
+        )
 
     def test_maximum_demand_formats_tooltip_and_sorts_numerically(self) -> None:
         window, _, _, catalog = self.make_window(two_circuits=True)
@@ -591,19 +741,23 @@ class BranchesUiTests(unittest.TestCase):
         )
         window.branches_window.set_result(branches)
         model = window.branch_table_model
-        model._maximum_demand_by_branch = {  # índice derivado já calculado
-            1: Decimal("10.123456789"),
-            2: Decimal("2.5"),
+        model._totals_by_branch = {  # índice derivado já calculado
+            1: (Decimal("10.123456789"), None),
+            2: (Decimal("2.5"), None),
         }
-        model.dataChanged.emit(model.index(0, 14), model.index(1, 14))
+        demand_column = model_column("DEMANDA_MAXIMA")
+        model.dataChanged.emit(
+            model.index(0, demand_column),
+            model.index(1, demand_column),
+        )
 
-        self.assertEqual(model.data(model.index(0, 14)), "10.1235")
+        self.assertEqual(model.data(model.index(0, demand_column)), "10.1235")
         self.assertEqual(
-            model.data(model.index(0, 14), Qt.ItemDataRole.ToolTipRole),
+            model.data(model.index(0, demand_column), Qt.ItemDataRole.ToolTipRole),
             "10.123456789",
         )
         proxy = window.branches_window.proxy_model
-        proxy.sort(14, Qt.SortOrder.AscendingOrder)
+        proxy.sort(demand_column, Qt.SortOrder.AscendingOrder)
         self.app.processEvents()
 
         ordered_ids = tuple(
@@ -611,6 +765,69 @@ class BranchesUiTests(unittest.TestCase):
             for row in range(proxy.rowCount())
         )
         self.assertEqual(ordered_ids, (2, 1))
+
+    def test_maximum_current_rounds_in_the_cell_and_is_exact_in_the_tooltip(self) -> None:
+        window, _, _, catalog = self.make_window(two_circuits=True)
+        branches = analyze_branches(
+            catalog,
+            load_phase_configuration(self.config_path),
+        )
+        window.branches_window.set_result(branches)
+        model = window.branch_table_model
+        model._totals_by_branch = {  # índice derivado já calculado
+            1: (None, Decimal("12.345678")),
+            2: (None, None),
+        }
+        column = model_column("CORRENTE_MAXIMA")
+        model.dataChanged.emit(model.index(0, column), model.index(1, column))
+
+        self.assertEqual(model.data(model.index(0, column)), "12.35")
+        self.assertEqual(
+            model.data(model.index(0, column), Qt.ItemDataRole.ToolTipRole),
+            "12.345678 A · estimada de S ÷ (VNOM/√3)",
+        )
+        self.assertEqual(model.data(model.index(1, column)), "—")
+
+    def test_the_tooltip_says_the_current_came_from_the_power_flow(self) -> None:
+        # A pergunta que a célula não responde sozinha: medida ou estimada?
+        window, model = self._window_with_two_branches()
+        branches = model.result
+        measured_patterns = {
+            record.branch_id: tuple(
+                EquivalentLoadPatternRecord(
+                    f"RAMAL-{record.branch_id}",
+                    npat,
+                    Decimal("1"),
+                    Decimal(0),
+                    Decimal(0),
+                    Decimal(0),
+                    Decimal(0),
+                    Decimal(0),
+                )
+                for npat in range(4)
+            )
+            for record in branches.records
+        }
+        first = branches.records[0].branch_id
+        equivalent = build_equivalent_network(
+            branches,
+            None,
+            None,
+            power_source=BranchPowerSource.POWER_FLOW,
+            measured_patterns=measured_patterns,
+            measured_currents={first: Decimal("4.5")},
+        )
+        window.branches_window.set_equivalent_result(equivalent)
+        column = model_column("CORRENTE_MAXIMA")
+
+        self.assertEqual(model.data(model.index(0, column)), "4.50")
+        self.assertEqual(
+            model.data(model.index(0, column), Qt.ItemDataRole.ToolTipRole),
+            "4.5 A · medida no fluxo de potência",
+        )
+        # O segundo ramal foi medido em potência mas não em corrente: fica
+        # vazio, e não com a estimativa, que teria outra procedência.
+        self.assertEqual(model.data(model.index(1, column)), "—")
 
     def test_filter_selection_reactivates_circuit_and_highlights_whole_branch(self) -> None:
         window, _, segments, catalog = self.make_window(two_circuits=True)
@@ -916,20 +1133,21 @@ class BranchesUiTests(unittest.TestCase):
         self.assertEqual(branch.branch_type.value, "BIFASICO")
         self.assertEqual(set(branch.segment_indices), {2, 3})
         self.assertTrue(branch.removable)
+        table = window.branch_table_model
         self.assertEqual(
-            window.branch_table_model.data(window.branch_table_model.index(0, 2)),
+            table.data(table.index(0, model_column("TIPO_RAMAL"))),
             "BIFASICO",
         )
         self.assertEqual(
-            window.branch_table_model.data(window.branch_table_model.index(0, 7)),
+            table.data(table.index(0, model_column("TRECHO_ID"))),
             "T2",
         )
         self.assertEqual(
-            window.branch_table_model.data(window.branch_table_model.index(0, 9)),
+            table.data(table.index(0, model_column("CHAVE_ID"))),
             "CH1",
         )
         self.assertEqual(
-            window.branch_table_model.data(window.branch_table_model.index(0, 10)),
+            table.data(table.index(0, model_column("CHAVE_CODIGO"))),
             "CCH1",
         )
 

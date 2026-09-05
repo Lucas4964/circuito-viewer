@@ -120,10 +120,24 @@ def make_switch_first_snapshot():
     return analyze_branches(catalog, PHASES)
 
 
-def equivalent_with_demand(branches, value: Decimal):  # noqa: ANN001
-    record = SimpleNamespace(branch_id=1, maximum_active_demand=value)
+def equivalent_with_demand(
+    branches,  # noqa: ANN001
+    value: Decimal,
+    current: Decimal | None = None,
+):
+    record = SimpleNamespace(
+        branch_id=1,
+        maximum_active_demand=value,
+        maximum_current=current,
+    )
     model = SimpleNamespace(branches=branches, records=(record,))
     return SimpleNamespace(model=model)
+
+
+def column(name: str) -> int:
+    """Posicao da coluna pelo nome, para o teste sobreviver a reordenacoes."""
+
+    return BRANCH_TABLE_HEADERS.index(name)
 
 
 def parse_csv(content: bytes) -> list[list[str]]:
@@ -147,31 +161,58 @@ class BranchTableExportTests(unittest.TestCase):
         self.assertNotIn(b"\n", content.replace(b"\r\n", b""))
         rows = parse_csv(content)
         self.assertEqual(tuple(rows[0]), BRANCH_TABLE_HEADERS)
-        self.assertEqual(len(rows[1]), 23)
-        self.assertEqual(rows[1][2], "C;Á")
-        self.assertEqual(rows[1][5], "1")
-        self.assertEqual(rows[1][7], "TRECHO;Á")
-        self.assertEqual(rows[1][8], "")
-        self.assertEqual(rows[1][9], "")
+        self.assertEqual(len(rows[1]), len(BRANCH_TABLE_HEADERS))
+        self.assertEqual(rows[1][column("CIRC_ID")], "C;Á")
+        self.assertEqual(rows[1][column("NIVEL_TOPOLOGICO")], "1")
+        self.assertEqual(rows[1][column("TRECHO_CODIGO")], "TRECHO;Á")
+        self.assertEqual(rows[1][column("CHAVE_ID")], "")
+        self.assertEqual(rows[1][column("CHAVE_CODIGO")], "")
         self.assertEqual(
-            rows[1][11],
+            rows[1][column("COMPR")],
             repr(branches.records[0].total_length).replace(".", ","),
         )
-        self.assertEqual(rows[1][13], "40,905912345678901234")
+        self.assertEqual(
+            rows[1][column("DEMANDA_MAXIMA")],
+            "40,905912345678901234",
+        )
+        self.assertEqual(rows[1][column("CORRENTE_MAXIMA")], "")
+
+    def test_maximum_current_reaches_the_csv_with_full_precision(self) -> None:
+        branches = make_snapshot()
+        current = Decimal("1.234567890123456789")
+
+        rows = parse_csv(
+            build_branches_csv_bytes(
+                branches,
+                equivalent_with_demand(branches, Decimal("1"), current),
+                (0,),
+            )
+        )
+
+        self.assertEqual(
+            rows[1][column("CORRENTE_MAXIMA")],
+            "1,234567890123456789",
+        )
 
     def test_missing_maximum_demand_is_an_empty_cell(self) -> None:
         branches = make_snapshot()
 
         rows = parse_csv(build_branches_csv_bytes(branches, None, (0,)))
 
-        self.assertEqual(rows[1][13], "")
+        self.assertEqual(rows[1][column("DEMANDA_MAXIMA")], "")
 
     def test_csv_separates_first_common_segment_from_first_switch(self) -> None:
         branches = make_switch_first_snapshot()
 
         rows = parse_csv(build_branches_csv_bytes(branches, None, (0,)))
 
-        self.assertEqual(rows[1][6:10], ["T2", "TRECHO-COMUM", "CH1", "COD-CH1"])
+        self.assertEqual(
+            [
+                rows[1][column(name)]
+                for name in ("TRECHO_ID", "TRECHO_CODIGO", "CHAVE_ID", "CHAVE_CODIGO")
+            ],
+            ["T2", "TRECHO-COMUM", "CH1", "COD-CH1"],
+        )
 
     def test_non_removable_branch_hides_switch_columns(self) -> None:
         record = make_switch_first_snapshot().records[0]
@@ -181,10 +222,64 @@ class BranchTableExportTests(unittest.TestCase):
             first_switch_position=6,
         )
 
-        values = branch_table_values(record, None)
+        values = branch_table_values(record, None, None)
 
         self.assertEqual(values[BRANCH_TABLE_HEADERS.index("CHAVE_ID")], "")
         self.assertEqual(values[BRANCH_TABLE_HEADERS.index("CHAVE_CODIGO")], "")
+
+    def test_every_header_names_the_value_below_it(self) -> None:
+        """Prende as duas tuplas posicionais uma a outra.
+
+        ``BRANCH_TABLE_HEADERS`` e ``branch_table_values`` sao listas paralelas
+        escritas a mao. Reordenar so uma delas nao quebra nada que se veja: a
+        tabela e o CSV seguem saindo, com cada numero sob o cabecalho errado.
+        """
+
+        record = make_switch_first_snapshot().records[0]
+        demand = Decimal("12.5")
+
+        current = Decimal("3.25")
+
+        row = dict(
+            zip(
+                BRANCH_TABLE_HEADERS,
+                branch_table_values(record, demand, current),
+            )
+        )
+
+        self.assertEqual(len(row), len(BRANCH_TABLE_HEADERS))
+        self.assertEqual(row["RAMAL_ID"], record.branch_id)
+        self.assertEqual(row["DEMANDA_MAXIMA"], demand)
+        self.assertEqual(row["CORRENTE_MAXIMA"], current)
+        self.assertEqual(row["NUM_CARGAS"], record.load_count)
+        self.assertEqual(row["TIPO_RAMAL"], record.branch_type.value)
+        self.assertEqual(row["CIRC_ID"], record.circuit_id)
+        self.assertEqual(row["BARRA_ID"], record.connection_bar_id)
+        self.assertEqual(row["BARRA_CODIGO"], record.connection_bar_code)
+        self.assertEqual(row["NIVEL_TOPOLOGICO"], record.topological_level)
+        self.assertEqual(row["TRECHO_ID"], record.first_common_segment_id)
+        self.assertEqual(row["TRECHO_CODIGO"], record.first_common_segment_code)
+        self.assertEqual(row["CHAVE_ID"], record.first_switch_id)
+        self.assertEqual(row["CHAVE_CODIGO"], record.first_switch_code)
+        self.assertEqual(row["NUM_TRECHOS"], record.segment_count)
+        self.assertEqual(row["COMPR"], record.total_length)
+        self.assertEqual(row["FASES2"], record.phases2)
+        self.assertEqual(row["FASE"], record.phase)
+        self.assertEqual(row["REMANEJAVEL"], int(record.removable))
+        self.assertEqual(row["NUM_BARRAS"], record.bar_count)
+        self.assertEqual(row["NUM_CHAVES"], record.switch_count)
+        self.assertEqual(row["POS_PRIMEIRA_CHAVE"], record.first_switch_position)
+        self.assertEqual(row["NUM_CONEXOES_TRONCO"], record.trunk_connection_count)
+        self.assertEqual(row["NUM_COMPR_AUSENTE"], record.missing_length_count)
+        self.assertEqual(row["TOPOLOGIA"], record.topology)
+
+    def test_demand_and_load_count_lead_the_row(self) -> None:
+        # A ordem existe por um motivo de uso: sao as duas colunas que se olha
+        # para decidir marcar um ramal, e a caixa de marcacao abre a tabela.
+        self.assertEqual(
+            BRANCH_TABLE_HEADERS[:4],
+            ("RAMAL_ID", "DEMANDA_MAXIMA", "CORRENTE_MAXIMA", "NUM_CARGAS"),
+        )
 
     def test_received_order_is_preserved_exactly(self) -> None:
         branches = make_snapshot(two_branches=True)
@@ -192,7 +287,10 @@ class BranchTableExportTests(unittest.TestCase):
         rows = parse_csv(build_branches_csv_bytes(branches, None, (1, 0)))
 
         self.assertEqual([row[0] for row in rows[1:]], ["2", "1"])
-        self.assertEqual([row[5] for row in rows[1:]], ["2", "1"])
+        self.assertEqual(
+            [row[column("NIVEL_TOPOLOGICO")] for row in rows[1:]],
+            ["2", "1"],
+        )
 
     def test_atomic_round_trip_and_no_temporary_file(self) -> None:
         branches = make_snapshot()

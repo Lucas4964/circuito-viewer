@@ -49,6 +49,7 @@ def make_sources(
     *,
     snom: tuple[str, ...] = ("999", "1,5", "2.5e0"),
     sadm: tuple[str, ...] = ("999", "2", "3"),
+    nominal_voltage: str = "",
 ):
     bars = CircuitModel(
         ["B0", "B1", "B2", "B3", "B4"],
@@ -72,7 +73,7 @@ def make_sources(
     catalog = CircuitCatalogModel.build(
         segments,
         None,
-        [CircuitDefinition("C1", "B0", "", "")],
+        [CircuitDefinition("C1", "B0", "", nominal_voltage)],
     )
     loads = LoadModel(
         bars,
@@ -255,6 +256,81 @@ class EquivalentNetworkTests(unittest.TestCase):
         self.assertEqual(record.maximum_active_demand, Decimal("12"))
         self.assertEqual(result.model.index_for_id("RAMAL-1"), 0)
         self.assertEqual(result.model.index_for_branch_id(1), 0)
+        self.assertEqual(result.issues, ())
+
+    def test_maximum_current_is_the_apparent_power_over_the_phase_voltage(self) -> None:
+        """A corrente que o proprio modelo exportado veria.
+
+        A rede simplificada escreve cada fase do ramal como uma carga
+        monofasica em ``wye`` sob ``VNOM/raiz(3)``; a corrente anunciada aqui
+        sai da mesma conta, patamar a patamar.
+        """
+
+        _, _, catalog, loads = make_sources(nominal_voltage="13.8")
+        patterns = LoadPatternModel(
+            loads,
+            [pattern_group("L0", 9), pattern_group("L1", 1), pattern_group("L2", 2)],
+        )
+        branches = analyze_branches(catalog, PHASES, loads)
+
+        result = build_equivalent_network(branches, loads, patterns)
+
+        record = result.model.record(0)
+        # No patamar 3 o ramal tem PD=12 e QD=6, logo S=raiz(180) kVA sobre
+        # 13,8/raiz(3) kV. O maior dos quatro patamares, calculado a parte.
+        self.assertAlmostEqual(
+            float(record.maximum_current),
+            1.6839058026988767,
+            places=9,
+        )
+
+    def test_maximum_current_takes_the_worst_phase_and_patamar(self) -> None:
+        # O patamar da maior corrente nao precisa ser o da maior demanda: a
+        # corrente carrega a reativa junto, e a demanda maxima a ignora.
+        _, _, catalog, loads = make_sources(nominal_voltage="13.8")
+
+        def group(load_id: str, rows):  # noqa: ANN001, ANN202
+            return tuple(
+                LoadPatternRecord(load_id, npat, pd, "0", "0", qd, "0", "0")
+                for npat, (pd, qd) in enumerate(rows)
+            )
+
+        patterns = LoadPatternModel(
+            loads,
+            [
+                group("L0", (("0", "0"),) * 4),
+                group("L1", (("3", "40"), ("10", "0"), ("0", "0"), ("0", "0"))),
+                group("L2", (("0", "0"),) * 4),
+            ],
+        )
+        branches = analyze_branches(catalog, PHASES, loads)
+
+        result = build_equivalent_network(branches, loads, patterns)
+
+        record = result.model.record(0)
+        self.assertEqual(record.maximum_active_demand, Decimal("10"))
+        voltage = Decimal("13.8") / Decimal(3).sqrt()
+        self.assertAlmostEqual(
+            float(record.maximum_current),
+            float(Decimal(40 * 40 + 3 * 3).sqrt() / voltage),
+            places=9,
+        )
+
+    def test_maximum_current_is_absent_without_a_nominal_voltage(self) -> None:
+        # Sem tensao nao ha corrente a afirmar, e a celula fica vazia — em
+        # silencio, porque um diagnostico por ramal encheria a lista.
+        _, _, catalog, loads = make_sources()
+        patterns = LoadPatternModel(
+            loads,
+            [pattern_group("L0", 9), pattern_group("L1", 1), pattern_group("L2", 2)],
+        )
+        branches = analyze_branches(catalog, PHASES, loads)
+
+        result = build_equivalent_network(branches, loads, patterns)
+
+        record = result.model.record(0)
+        self.assertIsNotNone(record.maximum_active_demand)
+        self.assertIsNone(record.maximum_current)
         self.assertEqual(result.issues, ())
 
     def test_biphasic_equivalent_aggregates_attached_single_phase_loads(self) -> None:
@@ -567,6 +643,51 @@ class MeasuredEquivalentNetworkTests(unittest.TestCase):
             [Decimal("7"), Decimal("14"), Decimal("21"), Decimal("28")],
         )
         self.assertIs(measured.model.power_source, BranchPowerSource.POWER_FLOW)
+
+    def test_the_current_follows_the_chosen_method(self) -> None:
+        """No fluxo, a corrente é a medida — nunca a estimada pela nominal.
+
+        As duas respostas existem e diferem: a estimativa usa ``VNOM``, a
+        medição usa a tensão real do ponto. Misturá-las poria na tabela um
+        número de procedência diferente da potência ao lado.
+        """
+
+        _, _, catalog, loads = make_sources(nominal_voltage="13.8")
+        patterns = LoadPatternModel(loads, [pattern_group("L0", 9), (), ()])
+        branches = analyze_branches(catalog, PHASES, loads)
+        branch_id = branches.records[0].branch_id
+
+        measured = build_equivalent_network(
+            branches,
+            loads,
+            patterns,
+            power_source=BranchPowerSource.POWER_FLOW,
+            measured_patterns={branch_id: measured_group(f"RAMAL-{branch_id}", "7")},
+            measured_currents={branch_id: Decimal("3.5")},
+        )
+
+        self.assertEqual(measured.model.record(0).maximum_current, Decimal("3.5"))
+
+    def test_the_flow_mode_leaves_the_current_empty_when_it_was_not_measured(
+        self,
+    ) -> None:
+        _, _, catalog, loads = make_sources(nominal_voltage="13.8")
+        patterns = LoadPatternModel(loads, [pattern_group("L0", 9), (), ()])
+        branches = analyze_branches(catalog, PHASES, loads)
+        branch_id = branches.records[0].branch_id
+
+        measured = build_equivalent_network(
+            branches,
+            loads,
+            patterns,
+            power_source=BranchPowerSource.POWER_FLOW,
+            measured_patterns={branch_id: measured_group(f"RAMAL-{branch_id}", "7")},
+        )
+
+        record = measured.model.record(0)
+        self.assertEqual(record.aggregation_state, "valid")
+        self.assertIsNotNone(record.maximum_active_demand)
+        self.assertIsNone(record.maximum_current)
 
     def test_branch_without_measurement_reports_the_reason(self) -> None:
         _, _, catalog, loads = make_sources()
