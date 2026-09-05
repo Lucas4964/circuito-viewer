@@ -38,6 +38,7 @@ COORDINATE_UNITS: tuple[tuple[float, str], ...] = (
     (100.0, "Centímetros"),
     (1000.0, "Milímetros"),
 )
+DEFAULT_COORDINATE_SCALE = 10.0
 DEFAULT_SCALE_SAMPLE_SIZE = 5_000
 
 ProgressCallback = Callable[[int, int, int], None]

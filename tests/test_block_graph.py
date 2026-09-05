@@ -16,9 +16,13 @@ from circuit_viewer.block_graph import (
     VERTICAL_NODE_GAP,
     BlockGraph,
     BlockGraphEdge,
+    block_coordinate_anchors,
     block_node_diameters,
     build_block_graph,
+    direct_circuit_neighbors,
+    filter_block_graph,
     layout_block_graph,
+    layout_block_graph_by_coordinates,
     resolve_block_circuit_indices,
 )
 
@@ -174,6 +178,172 @@ class BlockGraphLayoutTests(unittest.TestCase):
         self.assertEqual(layout.depths[3], 0)
         self.assertEqual(layout.depths[4], 1)
         self.assertGreater(layout.positions[3][0], layout.positions[1][0])
+
+
+class BlockGraphCoordinateLayoutTests(unittest.TestCase):
+    def test_boundary_bar_at_each_switch_side_is_the_block_anchor(self) -> None:
+        bars = make_bars(4)
+        network = make_network(bars, [0, 1, 2], [1, 2, 3])
+        switches = make_switches(network, [(1, "1", "1")])
+        result = analyze_blocks(make_catalog(network, switches), switches)
+        graph = build_block_graph(result)
+
+        anchors = block_coordinate_anchors(result)
+
+        edge = graph.edges[0]
+        self.assertEqual(
+            anchors[edge.start_block_id],
+            (float(bars.x[1]), -float(bars.y[1])),
+        )
+        self.assertEqual(
+            anchors[edge.end_block_id],
+            (float(bars.x[2]), -float(bars.y[2])),
+        )
+
+    def test_block_without_a_boundary_uses_all_of_its_bars(self) -> None:
+        bars = make_bars(3)
+        network = make_network(bars, [0, 1], [1, 2])
+        result = analyze_blocks(make_catalog(network), None)
+
+        anchors = block_coordinate_anchors(result)
+
+        self.assertEqual(
+            anchors,
+            {1: (float(bars.x.mean()), -float(bars.y.mean()))},
+        )
+
+    def test_repeated_boundary_bar_has_only_one_vote_in_the_centroid(self) -> None:
+        bars = make_bars(5)
+        network = make_network(
+            bars,
+            [0, 0, 3, 0],
+            [3, 1, 2, 4],
+        )
+        switches = make_switches(
+            network,
+            [(1, "1", "1"), (2, "1", "1"), (3, "1", "1")],
+        )
+        result = analyze_blocks(make_catalog(network, switches), switches)
+        central = next(record for record in result.records if record.bar_count == 2)
+
+        anchors = block_coordinate_anchors(result)
+
+        self.assertEqual(
+            anchors[central.block_id],
+            (
+                (float(bars.x[0]) + float(bars.x[3])) / 2.0,
+                -(float(bars.y[0]) + float(bars.y[3])) / 2.0,
+            ),
+        )
+
+    def test_uniform_scale_preserves_shape_and_targets_typical_edge_length(self) -> None:
+        graph = BlockGraph(
+            (_record(1), _record(2), _record(3)),
+            (_edge(0, 1, 2), _edge(1, 2, 3)),
+        )
+        anchors = {1: (0.0, 0.0), 2: (10.0, 0.0), 3: (10.0, -10.0)}
+
+        layout = layout_block_graph_by_coordinates(graph, anchors)
+
+        first = layout.positions[1]
+        second = layout.positions[2]
+        third = layout.positions[3]
+        self.assertAlmostEqual(math.dist(first, second), 200.0)
+        self.assertAlmostEqual(math.dist(second, third), 200.0)
+        self.assertAlmostEqual(first[1], second[1])
+        self.assertLess(third[1], second[1])
+
+    def test_coincident_nodes_receive_only_a_deterministic_minimum_separation(self) -> None:
+        graph = BlockGraph(
+            (_record(1), _record(2)),
+            (_edge(0, 1, 2),),
+        )
+        anchors = {1: (5.0, 5.0), 2: (5.0, 5.0)}
+
+        first = layout_block_graph_by_coordinates(graph, anchors)
+        second = layout_block_graph_by_coordinates(graph, anchors)
+
+        self.assertEqual(first.positions, second.positions)
+        self.assertGreaterEqual(
+            math.dist(first.positions[1], first.positions[2]),
+            FIXED_NODE_DIAMETER + 24.0,
+        )
+
+    def test_missing_source_geometry_disables_coordinate_anchors(self) -> None:
+        result = SimpleNamespace(
+            records=(_record(1),),
+            source_segments=None,
+            source_switches=None,
+        )
+
+        self.assertEqual(block_coordinate_anchors(result), {})
+
+
+class BlockGraphFilterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.graph = BlockGraph(
+            (
+                _record(1, source=True),
+                _record(2),
+                _record(3),
+                _record(4),
+                _record(5),
+            ),
+            (
+                _edge(0, 1, 2),
+                _edge(1, 2, 3),
+                _edge(2, 3, 4),
+                _edge(3, 4, 4),
+                _edge(4, 1, 2),
+                _edge(5, 4, 5),
+            ),
+        )
+        self.circuits = {1: 0, 2: 0, 3: 1, 4: 2, 5: None}
+
+    def test_filter_is_induced_and_preserves_parallel_edges_and_indices(self) -> None:
+        filtered = filter_block_graph(
+            self.graph,
+            self.circuits,
+            frozenset({0, 1}),
+        )
+
+        self.assertEqual(filtered.node_ids, (1, 2, 3))
+        self.assertEqual(
+            tuple(edge.switch_index for edge in filtered.edges),
+            (0, 1, 4),
+        )
+
+    def test_unresolved_blocks_are_an_explicit_independent_choice(self) -> None:
+        hidden = filter_block_graph(self.graph, self.circuits, frozenset())
+        shown = filter_block_graph(
+            self.graph,
+            self.circuits,
+            frozenset(),
+            include_unresolved=True,
+        )
+
+        self.assertEqual(hidden.node_ids, ())
+        self.assertEqual(shown.node_ids, (5,))
+        self.assertEqual(shown.edges, ())
+
+    def test_neighbors_expand_exactly_one_intercircuit_step(self) -> None:
+        neighbors = direct_circuit_neighbors(
+            self.graph,
+            self.circuits,
+            frozenset({0}),
+        )
+
+        self.assertEqual(neighbors, frozenset({1}))
+        self.assertNotIn(2, neighbors)
+
+    def test_same_circuit_self_loop_and_unresolved_edge_are_not_neighbors(self) -> None:
+        neighbors = direct_circuit_neighbors(
+            self.graph,
+            self.circuits,
+            frozenset({2}),
+        )
+
+        self.assertEqual(neighbors, frozenset({1}))
 
 
 class BlockNodeDiameterTests(unittest.TestCase):

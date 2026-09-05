@@ -4,11 +4,12 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from dataclasses import replace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt6.QtCore import QPoint, QSettings, Qt
+    from PyQt6.QtCore import QPoint, QPointF, QSettings, Qt
     from PyQt6.QtGui import QPalette
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication
@@ -16,12 +17,16 @@ try:
     from circuit_viewer.block_graph import (
         FIXED_NODE_DIAMETER,
         MAX_NODE_DIAMETER,
+        BlockGraphLayoutMode,
     )
     from circuit_viewer.block_graph_window import (
         BLOCK_GRAPH_SCALE_SETTINGS_KEY,
         CANVAS_BACKGROUND,
         DEFAULT_NODE_COLOR,
         INTERCIRCUIT_COLOR,
+        SWITCH_CLOSED_COLOR,
+        SWITCH_OPEN_COLOR,
+        SWITCH_UNKNOWN_COLOR,
         BlockGraphWindow,
         load_scale_nodes_by_power,
         parse_scale_nodes_by_power,
@@ -29,7 +34,7 @@ try:
     )
     from circuit_viewer.blocks_window import BlockTableModel, BlocksWindow
     from circuit_viewer.main_window import MainWindow
-    from circuit_viewer.model import CircuitVisibilityController
+    from circuit_viewer.model import CircuitVisibilityController, FeatureSelection
     from circuit_viewer.theme import AppTheme, build_palette
 
     PYQT_AVAILABLE = True
@@ -37,7 +42,8 @@ except ImportError:  # pragma: no cover - ambiente mínimo sem extras de UI
     PYQT_AVAILABLE = False
 
 from test_blocks_ui import sample_result
-from test_block_analysis import make_catalog
+from test_block_analysis import make_bars, make_catalog, make_network, make_switches
+from circuit_viewer.block_analysis import analyze_blocks
 
 
 @unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
@@ -51,6 +57,11 @@ class BlockGraphWindowTests(unittest.TestCase):
         window = BlockGraphWindow(scale_nodes_by_power=scale)
         self.addCleanup(window.close)
         window.set_result(result)
+        window.set_circuit_styles(
+            {record.block_id: 0 for record in result.records},
+            ("#2878B5",),
+            ("C1",),
+        )
         return window, result
 
     def test_the_window_starts_with_a_blank_graph(self) -> None:
@@ -71,6 +82,250 @@ class BlockGraphWindowTests(unittest.TestCase):
             item = window.view.node_items[record.block_id]
             self.assertIn(f"Bloco {record.block_id}", item.toolTip())
             self.assertIn("kVA", item.toolTip())
+
+    def test_layout_selector_defaults_to_tree_and_coordinates_follow_the_map(self) -> None:
+        window, _ = self._window()
+
+        self.assertTrue(window.layout_mode_combo.isEnabled())
+        self.assertEqual(window.layout_mode, BlockGraphLayoutMode.TREE)
+        self.assertEqual(window.layout_mode_combo.currentText(), "Árvore")
+
+        window.layout_mode_combo.setCurrentIndex(
+            window.layout_mode_combo.findData(
+                BlockGraphLayoutMode.COORDINATES.value
+            )
+        )
+
+        first = window.view.node_items[1].scenePos()
+        second = window.view.node_items[2].scenePos()
+        self.assertEqual(window.layout_mode, BlockGraphLayoutMode.COORDINATES)
+        self.assertAlmostEqual(first.y(), second.y())
+        self.assertLess(first.x(), second.x())
+
+    def test_changing_layout_preserves_selection_and_reframes_geometry(self) -> None:
+        window, _ = self._window()
+        window.select_block(2)
+
+        window.set_layout_mode(BlockGraphLayoutMode.COORDINATES)
+
+        self.assertEqual(window.view.selected_block_id, 2)
+        self.assertTrue(window.view.node_items[2].selected)
+        self.assertTrue(window.view._fit_pending)
+
+    def test_coordinate_mode_is_disabled_without_source_geometry(self) -> None:
+        result, _, _ = sample_result()
+        window = BlockGraphWindow()
+        self.addCleanup(window.close)
+        window.set_result(replace(result, source_segments=None))
+
+        self.assertFalse(window.coordinate_layout_available)
+        self.assertFalse(window.layout_mode_combo.isEnabled())
+        window.set_layout_mode(BlockGraphLayoutMode.COORDINATES)
+        self.assertEqual(window.layout_mode, BlockGraphLayoutMode.TREE)
+
+    def test_coordinate_positions_stay_stable_while_filtering_circuits(self) -> None:
+        result, _, _ = sample_result()
+        window = BlockGraphWindow()
+        self.addCleanup(window.close)
+        window.set_result(result)
+        window.set_circuit_styles(
+            {1: 0, 2: 1},
+            ("#112233", "#DDEEFF"),
+            ("C1", "C2"),
+        )
+        window._circuit_selection_changed(frozenset({0, 1}), False)
+        window.set_layout_mode(BlockGraphLayoutMode.COORDINATES)
+        original = window.view.node_items[1].scenePos()
+
+        window._circuit_selection_changed(frozenset({0}), False)
+
+        filtered = window.view.node_items[1].scenePos()
+        self.assertAlmostEqual(filtered.x(), original.x())
+        self.assertAlmostEqual(filtered.y(), original.y())
+
+    def test_layout_choice_is_not_inherited_by_a_new_window(self) -> None:
+        window, _ = self._window()
+        window.set_layout_mode(BlockGraphLayoutMode.COORDINATES)
+        fresh = BlockGraphWindow()
+        self.addCleanup(fresh.close)
+
+        self.assertEqual(fresh.layout_mode, BlockGraphLayoutMode.TREE)
+        self.assertEqual(fresh.layout_mode_combo.currentText(), "Árvore")
+
+    def test_coordinate_choice_survives_a_new_network_in_the_same_session(self) -> None:
+        window, result = self._window()
+        window.set_layout_mode(BlockGraphLayoutMode.COORDINATES)
+
+        window.set_result(None)
+        window.set_result(result)
+        window.set_circuit_styles(
+            {record.block_id: 0 for record in result.records},
+            ("#2878B5",),
+            ("C1",),
+        )
+
+        self.assertEqual(window.layout_mode, BlockGraphLayoutMode.COORDINATES)
+        self.assertEqual(
+            window.view.layout_mode,
+            BlockGraphLayoutMode.COORDINATES,
+        )
+
+    def test_one_circuit_is_selected_automatically(self) -> None:
+        window, _ = self._window()
+
+        self.assertEqual(window.selected_circuit_indices, frozenset({0}))
+        self.assertEqual(
+            window.circuit_selector_button.text(),
+            "Circuitos exibidos: 1/1",
+        )
+
+    def test_two_circuits_start_empty_and_checking_updates_the_graph(self) -> None:
+        result, _, _ = sample_result()
+        window = BlockGraphWindow()
+        self.addCleanup(window.close)
+        window.set_result(result)
+        window.set_circuit_styles(
+            {1: 0, 2: 1},
+            ("#112233", "#DDEEFF"),
+            ("C1", "C2"),
+        )
+
+        self.assertEqual(window.selected_circuit_indices, frozenset())
+        self.assertEqual(window.view.node_items, {})
+        self.assertEqual(
+            window.circuit_selector_button.text(),
+            "Circuitos exibidos: 0/2",
+        )
+        self.assertIn("Selecione", window.view._empty_label.text())
+
+        first = window.circuit_selector_popup.circuit_list.item(0)
+        first.setCheckState(Qt.CheckState.Checked)
+        self.app.processEvents()
+
+        self.assertEqual(window.selected_circuit_indices, frozenset({0}))
+        self.assertEqual(set(window.view.node_items), {1})
+
+    def test_selector_is_a_popup_and_closes_with_escape(self) -> None:
+        window, _ = self._window()
+        window.show()
+        self.app.processEvents()
+
+        window.circuit_selector_button.click()
+        self.app.processEvents()
+
+        self.assertTrue(window.circuit_selector_popup.isVisible())
+        self.assertGreater(window.circuit_selector_popup.circuit_list.count(), 0)
+        first = window.circuit_selector_popup.circuit_list.item(0)
+        first.setCheckState(Qt.CheckState.Unchecked)
+        self.app.processEvents()
+        self.assertTrue(window.circuit_selector_popup.isVisible())
+
+        window.circuit_selector_button.click()
+        self.app.processEvents()
+        self.assertFalse(window.circuit_selector_popup.isVisible())
+
+        window.circuit_selector_button.click()
+        self.app.processEvents()
+        self.assertTrue(window.circuit_selector_popup.isVisible())
+
+        QTest.keyClick(
+            window.circuit_selector_popup,
+            Qt.Key.Key_Escape,
+        )
+        self.app.processEvents()
+
+        self.assertFalse(window.circuit_selector_popup.isVisible())
+
+    def test_select_all_and_clear_update_the_complete_selection(self) -> None:
+        result, _, _ = sample_result()
+        window = BlockGraphWindow()
+        self.addCleanup(window.close)
+        window.set_result(result)
+        window.set_circuit_styles(
+            {1: 0, 2: 1},
+            ("#112233", "#DDEEFF"),
+            ("C1", "C2"),
+        )
+
+        window.circuit_selector_popup.select_all_button.click()
+
+        self.assertEqual(window.selected_circuit_indices, frozenset({0, 1}))
+        self.assertEqual(set(window.view.node_items), {1, 2})
+
+        window.circuit_selector_popup.clear_button.click()
+
+        self.assertEqual(window.selected_circuit_indices, frozenset())
+        self.assertEqual(window.view.node_items, {})
+
+    def test_neighbor_action_adds_only_direct_intercircuit_neighbor(self) -> None:
+        result, _, _ = sample_result()
+        window = BlockGraphWindow()
+        self.addCleanup(window.close)
+        window.set_result(result)
+        window.set_circuit_styles(
+            {1: 0, 2: 1},
+            ("#112233", "#DDEEFF"),
+            ("C1", "C2"),
+        )
+        window._circuit_selection_changed(frozenset({0}), False)
+
+        window.circuit_selector_popup.include_neighbors_button.click()
+
+        self.assertEqual(window.selected_circuit_indices, frozenset({0, 1}))
+        self.assertEqual(set(window.view.node_items), {1, 2})
+        self.assertEqual(len(window.view.edge_items), 1)
+
+    def test_color_update_preserves_the_filtered_circuit_selection(self) -> None:
+        result, _, _ = sample_result()
+        window = BlockGraphWindow()
+        self.addCleanup(window.close)
+        window.set_result(result)
+        window.set_circuit_styles(
+            {1: 0, 2: 1},
+            ("#112233", "#DDEEFF"),
+            ("C1", "C2"),
+        )
+        window._circuit_selection_changed(frozenset({1}), False)
+
+        window.set_circuit_styles(
+            {1: 0, 2: 1},
+            ("#445566", "#ABCDEF"),
+            ("C1", "C2"),
+        )
+
+        self.assertEqual(window.selected_circuit_indices, frozenset({1}))
+        self.assertEqual(set(window.view.node_items), {2})
+        self.assertEqual(
+            window.view.node_items[2].fill_color.name().upper(),
+            "#ABCDEF",
+        )
+
+    def test_unresolved_blocks_have_an_explicit_selector_entry(self) -> None:
+        window, _ = self._window()
+
+        window.set_circuit_styles(
+            {1: 0, 2: None},
+            ("#112233",),
+            ("C1",),
+        )
+
+        labels = [
+            window.circuit_selector_popup.circuit_list.item(row).text()
+            for row in range(window.circuit_selector_popup.circuit_list.count())
+        ]
+        self.assertIn("Sem circuito definido", labels)
+        self.assertEqual(set(window.view.node_items), {1})
+
+        unresolved = next(
+            window.circuit_selector_popup.circuit_list.item(row)
+            for row in range(window.circuit_selector_popup.circuit_list.count())
+            if window.circuit_selector_popup.circuit_list.item(row).text()
+            == "Sem circuito definido"
+        )
+        unresolved.setCheckState(Qt.CheckState.Checked)
+
+        self.assertTrue(window.include_unresolved)
+        self.assertEqual(set(window.view.node_items), {1, 2})
 
     def test_window_content_and_canvas_are_always_white(self) -> None:
         window, _ = self._window()
@@ -97,6 +352,7 @@ class BlockGraphWindowTests(unittest.TestCase):
             ("#112233", "#F1EEDD"),
             ("C1", "C2"),
         )
+        window._circuit_selection_changed(frozenset({0, 1}), False)
 
         self.assertEqual(window.view.node_items[1].fill_color.name(), "#112233")
         self.assertEqual(window.view.node_items[1].text_color.name(), "#ffffff")
@@ -109,6 +365,10 @@ class BlockGraphWindowTests(unittest.TestCase):
         self.assertTrue(edge.label_item.highlighted)
         self.assertEqual(
             edge.label_item.background_color.name().upper(),
+            SWITCH_CLOSED_COLOR,
+        )
+        self.assertEqual(
+            edge.label_item.border_color.name().upper(),
             INTERCIRCUIT_COLOR,
         )
         self.assertEqual(edge.label_item.text_color.name(), "#000000")
@@ -122,11 +382,43 @@ class BlockGraphWindowTests(unittest.TestCase):
 
         self.assertFalse(edge.intercircuit)
         self.assertFalse(edge.label_item.highlighted)
+        self.assertEqual(edge.stroke_color.name().upper(), "#555555")
+        self.assertEqual(edge.label_item.background_color.name().upper(), SWITCH_CLOSED_COLOR)
+
+    def test_only_the_switch_label_uses_open_and_closed_state_colors(self) -> None:
+        bars = make_bars(4)
+        network = make_network(bars, [0, 1, 2], [1, 2, 3])
+        switches = make_switches(network, [(1, "1", "0")])
+        result = analyze_blocks(make_catalog(network, switches), switches)
+        window = BlockGraphWindow()
+        self.addCleanup(window.close)
+        window.set_result(result)
+        window.set_circuit_styles(
+            {record.block_id: 0 for record in result.records},
+            ("#2878B5",),
+            ("C1",),
+        )
+
+        edge = window.view.edge_items[0]
+        self.assertEqual(edge.label_item.background_color.name().upper(), SWITCH_OPEN_COLOR)
+        self.assertEqual(edge.label_item.text_color.name(), "#000000")
+        self.assertEqual(edge.stroke_color.name().upper(), "#555555")
+
+        edge.label_item.state = ""
+        self.assertEqual(
+            edge.label_item.background_color.name().upper(),
+            SWITCH_UNKNOWN_COLOR,
+        )
 
     def test_unresolved_block_uses_the_neutral_color(self) -> None:
         window, _ = self._window()
 
-        window.set_circuit_styles({1: None, 2: None}, (), ())
+        window.set_circuit_styles(
+            {1: None, 2: None},
+            ("#112233",),
+            ("C1",),
+        )
+        window._circuit_selection_changed(frozenset(), True)
 
         self.assertTrue(
             all(
@@ -220,6 +512,97 @@ class BlockGraphWindowTests(unittest.TestCase):
         self.assertAlmostEqual(after.x(), before.x(), places=6)
         self.assertAlmostEqual(after.y(), before.y(), places=6)
 
+    def test_zoom_limit_is_absolute_even_after_a_very_small_fit(self) -> None:
+        window, _ = self._window()
+        cursor = QPoint(300, 220)
+        window.view.resetTransform()
+        window.view.scale(1.0e-5, 1.0e-5)
+
+        window.view.zoom_by_steps(200.0, cursor)
+
+        self.assertAlmostEqual(
+            window.view.transform().m11(),
+            window.view.MAX_ZOOM_SCALE,
+            places=6,
+        )
+
+    def test_edge_line_and_label_are_clickable(self) -> None:
+        window, _ = self._window()
+        received: list[int] = []
+        window.switchRequested.connect(received.append)
+        window.show()
+        self.app.processEvents()
+        window.view.fit_to_content()
+        edge = window.view.edge_items[0]
+        line_position = window.view.mapFromScene(
+            edge.mapToScene(edge.path().pointAtPercent(0.20))
+        )
+        label_position = window.view.mapFromScene(
+            edge.label_item.mapToScene(QPointF())
+        )
+
+        QTest.mouseClick(
+            window.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=line_position,
+        )
+        QTest.mouseClick(
+            window.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=label_position,
+        )
+        self.app.processEvents()
+
+        self.assertEqual(
+            received,
+            [edge.edge.switch_index, edge.edge.switch_index],
+        )
+        self.assertEqual(
+            window.view.selected_switch_index,
+            edge.edge.switch_index,
+        )
+        self.assertTrue(edge.selected)
+
+    def test_double_click_activates_nodes_switches_and_resets_on_empty(self) -> None:
+        window, _ = self._window()
+        blocks: list[int] = []
+        switches: list[int] = []
+        resets: list[bool] = []
+        window.blockActivated.connect(blocks.append)
+        window.switchActivated.connect(switches.append)
+        window.resetRequested.connect(lambda: resets.append(True))
+        window.show()
+        self.app.processEvents()
+        window.view.fit_to_content()
+
+        node_position = window.view.mapFromScene(
+            window.view.node_items[1].scenePos()
+        )
+        QTest.mouseDClick(
+            window.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=node_position,
+        )
+        edge = window.view.edge_items[0]
+        edge_position = window.view.mapFromScene(
+            edge.label_item.mapToScene(QPointF())
+        )
+        QTest.mouseDClick(
+            window.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=edge_position,
+        )
+        QTest.mouseDClick(
+            window.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=QPoint(3, 3),
+        )
+        self.app.processEvents()
+
+        self.assertEqual(blocks, [1])
+        self.assertEqual(switches, [edge.edge.switch_index])
+        self.assertEqual(resets, [True])
+
     def test_power_scaling_preserves_zoom_and_view_center(self) -> None:
         window, _ = self._window()
         window.show()
@@ -282,6 +665,7 @@ class BlockGraphIntegrationTests(unittest.TestCase):
         result, network, switches = sample_result()
         window = MainWindow(settings=self.settings)
         self.addCleanup(window.close)
+        self.addCleanup(window._circuit_visibility_timer.stop)
         window._model = network.bars
         window._line_model = network
         window._switch_model = switches
@@ -351,6 +735,68 @@ class BlockGraphIntegrationTests(unittest.TestCase):
         self.assertEqual(window.block_table_model.record(source_index.row()).block_id, 1)
         self.assertEqual(window._selected_block, result.records[0])
         self.assertTrue(window.block_highlight_overlay.isVisible())
+
+    def test_graph_node_activation_focuses_the_block_on_the_main_map(self) -> None:
+        window, result = self._window()
+        focused: list[tuple[int, ...]] = []
+        window.view.focus_segments = lambda values: focused.append(
+            tuple(int(value) for value in values)
+        )
+
+        window.block_graph_window.blockActivated.emit(1)
+
+        self.assertEqual(focused, [tuple(result.records[0].segment_indices)])
+        self.assertEqual(window._selected_block, result.records[0])
+
+    def test_graph_switch_selection_opens_details_and_activation_focuses(self) -> None:
+        window, _ = self._window()
+        switch_index = 0
+        segment_index = int(window._switch_model.segment_indices[switch_index])
+        focused: list[int] = []
+        window.view.focus_segment = lambda value: focused.append(int(value))
+
+        window.block_graph_window.switchRequested.emit(switch_index)
+
+        self.assertEqual(
+            window._selected_feature,
+            FeatureSelection("segment", segment_index),
+        )
+        self.assertEqual(window.details_dock.windowTitle(), "Chave selecionada")
+        self.assertEqual(
+            window.block_graph_window.view.selected_switch_index,
+            switch_index,
+        )
+
+        window.block_graph_window.switchActivated.emit(switch_index)
+
+        self.assertEqual(focused, [segment_index])
+
+    def test_double_click_reset_clears_state_and_fits_the_main_map(self) -> None:
+        window, _ = self._window()
+        fitted: list[bool] = []
+        window._fit_all = lambda: fitted.append(True)
+        window.block_graph_window.switchRequested.emit(0)
+
+        window.block_graph_window.resetRequested.emit()
+
+        self.assertIsNone(window._selected_feature)
+        self.assertIsNone(window._selected_block)
+        self.assertIsNone(window.block_graph_window.view.selected_switch_index)
+        self.assertEqual(fitted, [True])
+
+    def test_filtering_out_the_selected_block_clears_the_map_highlight(self) -> None:
+        window, _ = self._window()
+        window.block_graph_window.view._node_clicked(1)
+        self.assertTrue(window.block_highlight_overlay.isVisible())
+
+        window.block_graph_window._circuit_selection_changed(
+            frozenset(),
+            False,
+        )
+
+        self.assertIsNone(window._selected_block)
+        self.assertFalse(window.block_highlight_overlay.isVisible())
+        self.assertIsNone(window.block_graph_window.view.selected_block_id)
 
     def test_table_selection_and_clear_are_reflected_in_the_graph(self) -> None:
         window, _ = self._window()

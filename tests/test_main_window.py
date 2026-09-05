@@ -782,11 +782,12 @@ class UtmImportDialogTests(unittest.TestCase):
             ["Arquivo:", "Zona UTM:", "Hemisfério:", "Unidade das coordenadas:"],
         )
 
-    def test_defaults_to_metres_without_a_suggestion(self) -> None:
+    def test_defaults_to_decimetres_without_a_suggestion(self) -> None:
         dialog = UtmImportDialog("barras.csv")
         self.addCleanup(dialog.deleteLater)
 
-        self.assertEqual(dialog.coordinate_scale(), 1.0)
+        self.assertEqual(dialog.coordinate_scale(), 10.0)
+        self.assertEqual(dialog.unit_input.currentText(), "Decímetros")
         self.assertEqual(dialog.crs(), UtmCrs(21, northern=False))
 
     def test_unknown_factor_falls_back_to_metres(self) -> None:

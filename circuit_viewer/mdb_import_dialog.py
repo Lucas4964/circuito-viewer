@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .csv_import import COORDINATE_UNITS
+from .csv_import import COORDINATE_UNITS, DEFAULT_COORDINATE_SCALE
 from .mdb_mapping import (
     ENTITY_LABELS,
     ENTITY_ORDER,
@@ -117,7 +117,7 @@ class MdbImportDialog(QDialog):
         table_names: tuple[str, ...],
         parent=None,  # noqa: ANN001
         *,
-        suggested_scale: float = 1.0,
+        suggested_scale: float = DEFAULT_COORDINATE_SCALE,
         row_counts: dict[str, int] | None = None,
     ) -> None:
         super().__init__(parent)

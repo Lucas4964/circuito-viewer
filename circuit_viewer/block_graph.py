@@ -1,15 +1,17 @@
 """Modelo e layout determinístico do grafo simplificado de blocos.
 
 Esta camada não importa Qt. Ela transforma o resultado da análise de blocos em
-um multigrafo e calcula uma floresta em níveis, deixando a interface responsável
-somente por desenhar e interagir com os itens.
+um multigrafo e oferece tanto a floresta em níveis quanto a projeção baseada nas
+coordenadas da rede, deixando a interface apenas desenhar e interagir.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from enum import StrEnum
 import math
+from statistics import median
 
 from .block_analysis import BlockAnalysisResult, BlockRecord
 from .model import CircuitCatalogModel
@@ -21,6 +23,15 @@ MAX_NODE_DIAMETER = 72.0
 HORIZONTAL_NODE_GAP = 200.0
 VERTICAL_NODE_GAP = 170.0
 COMPONENT_GAP = 260.0
+GEOGRAPHIC_TARGET_EDGE_LENGTH = 200.0
+GEOGRAPHIC_NODE_CLEARANCE = 24.0
+
+
+class BlockGraphLayoutMode(StrEnum):
+    """Formas disponíveis de organizar os blocos no canvas."""
+
+    TREE = "tree"
+    COORDINATES = "coordinates"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +72,61 @@ class BlockGraphLayout:
     depths: dict[int, int]
     root_ids: tuple[int, ...]
     tree_edge_indices: frozenset[int]
+
+
+def filter_block_graph(
+    graph: BlockGraph,
+    block_circuit_indices: dict[int, int | None],
+    selected_circuit_indices: frozenset[int] | set[int] | tuple[int, ...],
+    *,
+    include_unresolved: bool = False,
+) -> BlockGraph:
+    """Devolve o subgrafo induzido pelos circuitos escolhidos.
+
+    A ordem dos nós e das arestas é preservada. Em particular,
+    ``BlockGraphEdge.switch_index`` continua apontando para o registro original
+    da chave, o que permite à interface navegar até o trecho correspondente.
+    """
+
+    selected = frozenset(int(value) for value in selected_circuit_indices)
+    visible_ids: set[int] = set()
+    for record in graph.nodes:
+        circuit_index = block_circuit_indices.get(record.block_id)
+        if circuit_index is None:
+            if include_unresolved:
+                visible_ids.add(record.block_id)
+        elif circuit_index in selected:
+            visible_ids.add(record.block_id)
+    nodes = tuple(
+        record for record in graph.nodes if record.block_id in visible_ids
+    )
+    edges = tuple(
+        edge
+        for edge in graph.edges
+        if edge.start_block_id in visible_ids and edge.end_block_id in visible_ids
+    )
+    return BlockGraph(nodes, edges)
+
+
+def direct_circuit_neighbors(
+    graph: BlockGraph,
+    block_circuit_indices: dict[int, int | None],
+    circuit_indices: frozenset[int] | set[int] | tuple[int, ...],
+) -> frozenset[int]:
+    """Circuitos ligados diretamente aos informados por arestas intercircuito."""
+
+    selected = frozenset(int(value) for value in circuit_indices)
+    neighbors: set[int] = set()
+    for edge in graph.edges:
+        start = block_circuit_indices.get(edge.start_block_id)
+        end = block_circuit_indices.get(edge.end_block_id)
+        if start is None or end is None or start == end:
+            continue
+        if start in selected and end not in selected:
+            neighbors.add(end)
+        if end in selected and start not in selected:
+            neighbors.add(start)
+    return frozenset(neighbors)
 
 
 def build_block_graph(result: BlockAnalysisResult) -> BlockGraph:
@@ -238,6 +304,200 @@ def layout_block_graph(graph: BlockGraph) -> BlockGraphLayout:
     )
 
 
+def block_coordinate_anchors(
+    result: BlockAnalysisResult,
+) -> dict[int, tuple[float, float]]:
+    """Calcula uma âncora espacial para cada bloco a partir das suas fronteiras.
+
+    Cada barra na ponta de uma chave conta no máximo uma vez por bloco. Blocos
+    sem chave de fronteira usam o centroide de todas as suas barras. O eixo Y é
+    invertido aqui para seguir a mesma orientação norte-acima do mapa principal.
+    Um dicionário vazio indica que a geometria de origem não está disponível ou
+    é inconsistente e permite que a interface desabilite o modo espacial.
+    """
+
+    records = tuple(result.records)
+    if not records:
+        return {}
+    segments = result.source_segments
+    switches = result.source_switches
+    if segments is None:
+        return {}
+    bars = getattr(segments, "bars", None)
+    if bars is None:
+        return {}
+
+    block_by_bar: dict[int, int] = {}
+    boundary_bars: dict[int, set[int]] = {
+        record.block_id: set() for record in records
+    }
+    for record in records:
+        for raw_bar_index in record.bar_indices:
+            block_by_bar[int(raw_bar_index)] = record.block_id
+
+    try:
+        if switches is not None:
+            boundary_switches = {
+                int(raw_switch_index)
+                for record in records
+                for raw_switch_index in record.boundary_switch_indices
+            }
+            for switch_index in sorted(boundary_switches):
+                segment_index = int(switches.segment_indices[switch_index])
+                for raw_bar_index in (
+                    segments.start_indices[segment_index],
+                    segments.end_indices[segment_index],
+                ):
+                    bar_index = int(raw_bar_index)
+                    block_id = block_by_bar.get(bar_index)
+                    if block_id is not None:
+                        boundary_bars[block_id].add(bar_index)
+
+        anchors: dict[int, tuple[float, float]] = {}
+        for record in records:
+            indices = boundary_bars[record.block_id]
+            if not indices:
+                indices = {int(value) for value in record.bar_indices}
+            ordered = sorted(indices)
+            x = math.fsum(float(bars.x[index]) for index in ordered) / len(ordered)
+            y = -math.fsum(float(bars.y[index]) for index in ordered) / len(ordered)
+            if not math.isfinite(x) or not math.isfinite(y):
+                return {}
+            anchors[record.block_id] = (x, y)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return {}
+    return anchors
+
+
+def _coordinate_scale(
+    graph: BlockGraph,
+    anchors: dict[int, tuple[float, float]],
+) -> float:
+    lengths: list[float] = []
+    measured_pairs: set[tuple[int, int]] = set()
+    for edge in graph.edges:
+        if edge.start_block_id == edge.end_block_id:
+            continue
+        if edge.endpoint_key in measured_pairs:
+            continue
+        measured_pairs.add(edge.endpoint_key)
+        start = anchors[edge.start_block_id]
+        end = anchors[edge.end_block_id]
+        distance = math.hypot(end[0] - start[0], end[1] - start[1])
+        if distance > 1.0e-9 and math.isfinite(distance):
+            lengths.append(distance)
+    if not lengths:
+        ordered = sorted(anchors.values())
+        for start, end in zip(ordered, ordered[1:]):
+            distance = math.hypot(end[0] - start[0], end[1] - start[1])
+            if distance > 1.0e-9 and math.isfinite(distance):
+                lengths.append(distance)
+    return (
+        GEOGRAPHIC_TARGET_EDGE_LENGTH / median(lengths)
+        if lengths
+        else 1.0
+    )
+
+
+def _separate_coordinate_overlaps(
+    positions: dict[int, tuple[float, float]],
+    diameters: dict[int, float],
+) -> dict[int, tuple[float, float]]:
+    """Move deterministicamente apenas o nó cujo envelope colide ao inserir."""
+
+    placed: dict[int, tuple[float, float]] = {}
+    golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+    for block_id in sorted(positions):
+        anchor_x, anchor_y = positions[block_id]
+        diameter = max(0.0, float(diameters.get(block_id, FIXED_NODE_DIAMETER)))
+
+        def available(candidate_x: float, candidate_y: float) -> bool:
+            for other_id, (other_x, other_y) in placed.items():
+                other_diameter = max(
+                    0.0,
+                    float(diameters.get(other_id, FIXED_NODE_DIAMETER)),
+                )
+                minimum = (
+                    (diameter + other_diameter) / 2.0
+                    + GEOGRAPHIC_NODE_CLEARANCE
+                )
+                if math.hypot(candidate_x - other_x, candidate_y - other_y) < minimum:
+                    return False
+            return True
+
+        if available(anchor_x, anchor_y):
+            placed[block_id] = (anchor_x, anchor_y)
+            continue
+
+        step = max(diameter, MIN_NODE_DIAMETER) / 2.0 + GEOGRAPHIC_NODE_CLEARANCE
+        attempt = 1
+        while True:
+            radius = step * math.sqrt(attempt)
+            angle = attempt * golden_angle
+            candidate = (
+                anchor_x + radius * math.cos(angle),
+                anchor_y + radius * math.sin(angle),
+            )
+            if available(*candidate):
+                placed[block_id] = candidate
+                break
+            attempt += 1
+
+    center_x = math.fsum(value[0] for value in placed.values()) / len(placed)
+    center_y = math.fsum(value[1] for value in placed.values()) / len(placed)
+    return {
+        block_id: (x - center_x, y - center_y)
+        for block_id, (x, y) in placed.items()
+    }
+
+
+def layout_block_graph_by_coordinates(
+    graph: BlockGraph,
+    anchors: dict[int, tuple[float, float]],
+    diameters: dict[int, float] | None = None,
+) -> BlockGraphLayout:
+    """Preserva a forma espacial por uma transformação uniforme e sem rotação."""
+
+    node_ids = tuple(sorted(graph.node_ids))
+    if not node_ids:
+        return BlockGraphLayout({}, {}, (), frozenset())
+    if any(block_id not in anchors for block_id in node_ids):
+        raise ValueError("Todos os blocos precisam de uma âncora espacial.")
+    if any(
+        not math.isfinite(float(value))
+        for block_id in node_ids
+        for value in anchors[block_id]
+    ):
+        raise ValueError("As âncoras espaciais devem ser finitas.")
+
+    center_x = math.fsum(anchors[block_id][0] for block_id in node_ids) / len(node_ids)
+    center_y = math.fsum(anchors[block_id][1] for block_id in node_ids) / len(node_ids)
+    scale = _coordinate_scale(graph, anchors)
+    normalized = {
+        block_id: (
+            (anchors[block_id][0] - center_x) * scale,
+            (anchors[block_id][1] - center_y) * scale,
+        )
+        for block_id in node_ids
+    }
+    positions = _separate_coordinate_overlaps(
+        normalized,
+        diameters
+        or {block_id: FIXED_NODE_DIAMETER for block_id in node_ids},
+    )
+    roots = tuple(
+        record.block_id for record in graph.nodes if record.contains_source
+    )
+    return BlockGraphLayout(
+        positions=positions,
+        depths={},
+        root_ids=roots,
+        # No modo espacial, uma aresta simples não precisa da curvatura usada
+        # para denunciar as relações que ficaram fora da floresta geradora.
+        tree_edge_indices=frozenset(range(len(graph.edges))),
+    )
+
+
 def block_node_diameters(
     records: tuple[BlockRecord, ...],
     scale_by_power: bool,
@@ -318,14 +578,21 @@ __all__ = [
     "BlockGraph",
     "BlockGraphEdge",
     "BlockGraphLayout",
+    "BlockGraphLayoutMode",
     "COMPONENT_GAP",
     "FIXED_NODE_DIAMETER",
+    "GEOGRAPHIC_NODE_CLEARANCE",
+    "GEOGRAPHIC_TARGET_EDGE_LENGTH",
     "HORIZONTAL_NODE_GAP",
     "MAX_NODE_DIAMETER",
     "MIN_NODE_DIAMETER",
     "VERTICAL_NODE_GAP",
     "block_node_diameters",
+    "block_coordinate_anchors",
     "build_block_graph",
+    "direct_circuit_neighbors",
+    "filter_block_graph",
     "layout_block_graph",
+    "layout_block_graph_by_coordinates",
     "resolve_block_circuit_indices",
 ]

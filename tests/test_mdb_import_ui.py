@@ -202,6 +202,17 @@ class ImportDialogTests(unittest.TestCase):
     def test_the_suggested_unit_is_preselected(self) -> None:
         self.assertEqual(self.dialog.coordinate_scale(), 10.0)
 
+    def test_coordinate_unit_defaults_to_decimetres(self) -> None:
+        dialog = MdbImportDialog(
+            r"C:\dados\rede.mdb",
+            self.plan,
+            self.database.tables(),
+        )
+        self.addCleanup(dialog.close)
+
+        self.assertEqual(dialog.coordinate_scale(), 10.0)
+        self.assertEqual(dialog.unit_input.currentText(), "Decímetros")
+
     def test_an_undetected_entity_is_disabled_with_the_reason(self) -> None:
         database = network_database()
         del database._tables["REGULADOR"]

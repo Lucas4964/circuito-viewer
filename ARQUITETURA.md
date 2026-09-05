@@ -595,11 +595,11 @@ vêm do `UtmImportDialog`, não do arquivo.
 
 **Unidade canônica: metro.** `load_csv(..., scale=)` divide X e Y ainda no
 parsing, de modo que `CircuitModel` — e tudo que dele deriva — sempre guarda
-metros, a mesma unidade de `COMPR`. `detect_coordinate_scale()` lê uma amostra
-(5.000 linhas por padrão, para não pagar uma passada completa antes do diálogo)
-e **devolve o divisor** — o menor de `COORDINATE_UNITS` que coloca as duas faixas
-dentro do envelope UTM (`UTM_EASTING_RANGE`, `UTM_NORTHING_RANGE`), ou `1.0` se
-o arquivo não pôde ser amostrado ou nenhuma unidade encaixar.
+metros, a mesma unidade de `COMPR`. `UtmImportDialog` usa o divisor `10.0`
+(decímetros) por padrão e permite alterá-lo manualmente. O fluxo da aplicação
+não amostra mais o arquivo para tentar inferir a unidade. Os helpers públicos
+`detect_coordinate_scale()` e `scale_from_ranges()` permanecem disponíveis
+somente por compatibilidade e não participam da importação pela interface.
 
 `scale` é um **divisor de unidade aplicado uma única vez**, não um fator de
 renderização: a cena permanece em UTM cru (ver seção 8). É a diferença para o
@@ -690,9 +690,9 @@ Três decisões merecem registro:
   sem nenhum aviso. Há teste de regressão que importa `ESTADO` como inteiro e
   como `float` e confere que o circuito alcança as três barras.
 
-`detect_database_scale()` espelha `detect_coordinate_scale()` do CSV: amostra o
-início da tabela de barras e delega a `scale_from_ranges()`, que é a mesma
-decisão para as duas fontes.
+O diálogo MDB segue a mesma regra do CSV: começa em decímetros e não lê as
+coordenadas antecipadamente para inferir a unidade. `detect_database_scale()`
+permanece como helper público compatível, mas não é chamado pela interface.
 
 Na chegada, `_on_mdb_import_finished` instala os modelos pelos **setters
 existentes** (`_set_line_model`, `_set_switch_model`, `_set_circuit_catalog`…),
@@ -2285,18 +2285,55 @@ que descobrem nós formam a floresta de posicionamento; pais ficam centralizados
 sobre os filhos e a coordenada Y é a profundidade. Arestas restantes continuam
 no resultado e a interface as desenha curvas, preservando ciclos e paralelismo.
 
+`block_coordinate_anchors()` oferece o segundo modo sem acoplar o núcleo ao Qt:
+reúne, sem duplicação, as barras nas pontas das chaves pertencentes a cada bloco
+e usa seu centroide; sem fronteiras, usa todas as barras do bloco. O Y é
+invertido como no mapa. `layout_block_graph_by_coordinates()` centraliza essas
+âncoras e aplica uma transformação uniforme que leva a mediana das distâncias
+entre blocos conectados a 200 unidades lógicas. Uma passada determinística move
+somente os círculos que ainda colidiriam, mantendo 24 px de folga. O layout é
+calculado sobre o grafo completo e o filtro apenas seleciona posições, evitando
+que os nós saltem ao marcar circuitos.
+
 `BlockGraphWindow` desenha o modelo em uma cena própria. Nós são
 `QGraphicsObject` clicáveis e arestas são `QGraphicsPathItem`; o canvas branco
-oferece zoom sob o cursor, pan no fundo e reenquadramento. `MainWindow` resolve o
-único circuito de cada bloco pelas barras alcançadas e, como fallback, pelo
+oferece zoom sob o cursor, pan no fundo e reenquadramento. O cabeçalho abre um
+`CircuitSelectionPopup` com uma lista marcável sem reservar espaço permanente.
+`filter_block_graph()` produz o subgrafo induzido pelos circuitos escolhidos e
+`direct_circuit_neighbors()` expande somente um salto pelas arestas
+intercircuito. Um circuito é marcado automaticamente; catálogos com dois ou
+mais começam vazios, e a associação neutra é uma opção separada. O grafo
+completo permanece imutável na janela e cada mudança de filtro recalcula apenas
+o subgrafo visível; o modo Árvore recalcula seus níveis e o modo espacial
+reutiliza as posições estáveis calculadas para a rede completa.
+
+O cabeçalho oferece `Árvore` e `Coordenadas da rede`. A escolha não usa
+`QSettings`: cada processo começa em Árvore e mantém a opção apenas durante a
+sessão. Trocar o modo preserva a seleção e reenquadra a geometria. Sem
+coordenadas válidas para todos os blocos, a alternativa espacial fica
+indisponível e a janela permanece em Árvore.
+
+`MainWindow` resolve o único circuito de cada bloco pelas barras alcançadas e,
+como fallback, pelo
 `CIRC_ID` inequívoco das chaves de fronteira. A paleta vigente colore os nós e a
 luminância relativa escolhe texto preto ou branco; associação ausente ou
-contraditória usa cinza. Arestas cujas pontas têm circuitos distintos recebem
-linha e rótulo `#FF00FF` com 4 px. O clique em nó emite apenas o `block_id`:
+contraditória usa cinza. A etiqueta de cada chave recebe `#00FF00` para estado
+fechado e `#FF0000` para aberto, enquanto estado ausente ou inválido usa fundo
+neutro. Arestas cujas pontas têm circuitos distintos mantêm a linha `#FF00FF`
+com 4 px e acrescentam contorno magenta à etiqueta, sem substituir a cor do
+estado; as demais linhas permanecem cinza. O clique em nó emite apenas o `block_id`:
 `MainWindow` o envia a `BlocksWindow.select_block()`, portanto a tradução
 fonte/proxy e o sinal `blockSelected` existentes continuam sendo o único caminho
-para selecionar a linha e pintar o bloco no mapa. No sentido inverso, os sinais
-da tabela atualizam a seleção gráfica sem reemissão.
+para selecionar a linha e pintar o bloco no mapa. A aresta mantém o
+`switch_index` do modelo original: clique seleciona o trecho e mostra os
+detalhes da chave; duplo clique reutiliza `focus_segment()`. Duplo clique em nó
+reutiliza `focus_segments()`, e no vazio limpa o estado e chama `_fit_all()`.
+Linha e rótulo compartilham uma área de hit-test ampliada. No sentido inverso,
+os sinais da tabela atualizam a seleção gráfica sem reemissão.
+
+O zoom do grafo limita a escala absoluta entre `1e-6` e `8.0`, não a quantidade
+de passos após `fitInView()`. Assim, grafos extensos que começam muito reduzidos
+ainda podem atingir uma escala legível; o ponto sob o cursor permanece fixo.
 
 A preferência `block_graph/scale_nodes_by_power` fica no `QSettings` e seu
 controle fica no cabeçalho do próprio grafo. Desligada, o diâmetro é 56 px;

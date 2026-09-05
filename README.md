@@ -38,8 +38,9 @@ termina com ao menos uma barra válida.
 
 O mesmo diálogo pede a **unidade das coordenadas**. O modelo trabalha em metros
 — a mesma unidade de `COMPR` —, e muitas bases guardam X e Y em decímetros ou
-centímetros. A aplicação lê uma amostra do arquivo, deduz a unidade e já a
-apresenta selecionada; basta confirmar ou escolher outra na lista. Coordenadas
+centímetros. **Decímetros** é a seleção padrão, sem tentativa de dedução
+automática; escolha manualmente outra unidade na lista quando a origem usar uma
+escala diferente. Coordenadas
 que continuem fora da faixa UTM válida (easting entre 100.000 e 900.000;
 northing entre 0 e 10.000.000) são aceitas, mas o relatório avisa — nesse caso a
 imagem de satélite não consegue se posicionar corretamente.
@@ -236,8 +237,8 @@ substituída manualmente sem afetar a outra.
 catálogo nem qualquer outra entidade.
 
 O mesmo diálogo pede zona, hemisfério e **unidade das coordenadas**, como na
-importação de barras por CSV. A unidade é deduzida de uma amostra da tabela de
-barras e já vem selecionada.
+importação de barras por CSV. **Decímetros** já vem selecionado, sem leitura de
+amostra para inferir a unidade, e pode ser alterado manualmente.
 
 **Se o banco tiver senha**, a aplicação a pede antes de abrir e repergunta
 quando não confere, em vez de mostrar o erro do driver. A senha é usada apenas
@@ -1673,16 +1674,37 @@ modal com a mesma análise: cada círculo é um bloco e cada linha é uma chave 
 fronteira. O código da chave aparece sobre a linha; detalhes do bloco e da chave
 ficam disponíveis nas dicas de ferramenta.
 
-Os blocos-fonte ocupam o topo e os demais são distribuídos em níveis pela menor
-quantidade de chaves até uma fonte. Redes desconectadas aparecem lado a lado.
+Em **Posicionamento: Árvore**, modo padrão de cada execução, os blocos-fonte
+ocupam o topo e os demais são distribuídos em níveis pela menor quantidade de
+chaves até uma fonte. Redes desconectadas aparecem lado a lado. A opção
+**Coordenadas da rede**, no mesmo cabeçalho, aproxima a disposição do desenho
+original: cada bloco usa o centro das barras situadas nas pontas de suas chaves,
+com fallback para o centro de todas as barras do bloco. A orientação e as
+proporções são preservadas por uma escala uniforme; somente nós sobrepostos
+recebem uma pequena separação. A escolha dura durante a sessão, mas não é salva.
 Ciclos, chaves paralelas e chaves cujas pontas pertencem ao mesmo bloco não são
-omitidos: aparecem como curvas ou autoenlaces além da floresta principal.
+omitidos: aparecem como curvas ou autoenlaces.
+
+O botão **Circuitos exibidos: N/M**, no cabeçalho da janela, abre sob demanda
+uma lista com caixas de seleção e a cor de cada circuito. A lista não ocupa o
+canvas quando fechada e oferece **Selecionar todos**, **Limpar** e **Incluir
+vizinhos diretos**. Esta última ação acrescenta somente circuitos ligados aos
+já marcados por uma chave magenta, sem continuar pela cadeia inteira. Uma rede
+com apenas um circuito começa com ele selecionado; com dois ou mais, começa
+vazia. Blocos sem associação inequívoca podem ser incluídos separadamente por
+**Sem circuito definido**. A escolha dura enquanto a rede atual estiver
+carregada e não altera a visibilidade dos circuitos no mapa principal.
 
 Clique em um nó para selecionar a linha correspondente na tabela de blocos e
-destacar a região na visualização principal. A sincronização também funciona no
-sentido inverso; limpar a seleção em uma janela limpa a outra. Use a roda para
-zoom, arraste o fundo para mover e dê duplo clique — ou use **Enquadrar** — para
-ver novamente o grafo inteiro.
+destacar a região na visualização principal. Clique em uma aresta ou em seu
+rótulo para selecionar a chave e abrir seus detalhes. O duplo clique localiza e
+enquadra o bloco ou a chave no mapa principal; no fundo vazio, limpa seleções e
+destaques e reenquadra tanto o mapa quanto o subconjunto atual do grafo. A
+sincronização de blocos também funciona no sentido inverso. Use a roda para
+zoom, arraste o fundo para mover e use **Enquadrar** para ver todo o subconjunto.
+O zoom é limitado pela escala absoluta de `1e-6` a `8.0`, portanto um
+enquadramento inicial muito reduzido não impede a aproximação até uma escala
+legível.
 
 Na própria janela do grafo, **Dimensionar nós dos blocos por potência instalada**
 faz a área dos círculos representar a soma de `SNOM` das cargas de cada bloco. A
@@ -1694,9 +1716,12 @@ evitam que nós grandes cubram outros nós ou códigos de chaves.
 
 O conteúdo da janela usa fundo branco mesmo com o tema escuro. Cada nó recebe a
 cor cadastrada para seu circuito, com texto preto ou branco escolhido pelo maior
-contraste. Uma chave que liga blocos de circuitos diferentes aparece com linha
-e rótulo magenta mais espessos; blocos cuja associação seja ausente ou
-contraditória ficam em cinza neutro.
+contraste. A etiqueta com o código da chave usa verde puro (`#00FF00`) quando
+fechada e vermelho puro (`#FF0000`) quando aberta; estado ausente ou inválido
+fica neutro. A linha continua cinza nas ligações internas e magenta, com 4 px,
+entre circuitos diferentes; nesse caso a etiqueta ganha contorno magenta sem
+perder a cor do estado. Blocos cuja associação seja ausente ou contraditória
+ficam em cinza neutro.
 
 ## Testes e benchmark
 

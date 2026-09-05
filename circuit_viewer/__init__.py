@@ -162,6 +162,7 @@ from .phase_config import (
 )
 from .csv_import import (
     COORDINATE_UNITS,
+    DEFAULT_COORDINATE_SCALE,
     CsvLoadResult,
     detect_coordinate_scale,
     load_csv,
@@ -464,6 +465,7 @@ __all__ = [
     "contrast_ratio_with_white",
     "contrasting_text_color",
     "COORDINATE_UNITS",
+    "DEFAULT_COORDINATE_SCALE",
     "CsvLoadResult",
     "Curve",
     "CurveCatalog",

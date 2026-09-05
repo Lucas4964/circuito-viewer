@@ -86,8 +86,8 @@ from .circuit_level_import import CircuitLevelCsvResult
 from .circuits_window import CircuitTableModel, CircuitsWindow
 from .csv_import import (
     COORDINATE_UNITS,
+    DEFAULT_COORDINATE_SCALE,
     CsvLoadResult,
-    detect_coordinate_scale,
 )
 from .curvas import Curve, CurveCatalog
 from .curvas_store import load_curves
@@ -125,7 +125,7 @@ from .mdb_engine import (
     mdb_import_error,
     open_database,
 )
-from .mdb_import import MdbImportResult, detect_database_scale
+from .mdb_import import MdbImportResult
 from .mdb_import_dialog import MdbImportDialog, MdbPasswordDialog
 from .mdb_import_report import MdbImportReportWindow
 from .mdb_mapping import (
@@ -391,7 +391,7 @@ class UtmImportDialog(QDialog):
         file_name: str,
         parent=None,  # noqa: ANN001
         *,
-        suggested_scale: float = 1.0,
+        suggested_scale: float = DEFAULT_COORDINATE_SCALE,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Sistema de coordenadas UTM")
@@ -422,8 +422,6 @@ class UtmImportDialog(QDialog):
         )
         form.addRow("Unidade das coordenadas:", self.unit_input)
 
-        # A dedução só devolve fatores de COORDINATE_UNITS, então a entrada
-        # correspondente sempre existe no combo.
         position = self.unit_input.findData(suggested_scale)
         if position >= 0:
             self.unit_input.setCurrentIndex(position)
@@ -2264,8 +2262,20 @@ class MainWindow(QMainWindow):
         self.block_graph_window.blockRequested.connect(
             self._select_block_from_graph
         )
+        self.block_graph_window.blockActivated.connect(
+            self._activate_block_from_graph
+        )
+        self.block_graph_window.switchRequested.connect(
+            self._select_switch_from_graph
+        )
+        self.block_graph_window.switchActivated.connect(
+            self._activate_switch_from_graph
+        )
         self.block_graph_window.selectionCleared.connect(
-            self.blocks_window.clear_selection
+            self._clear_selection_from_block_graph
+        )
+        self.block_graph_window.resetRequested.connect(
+            self._reset_from_block_graph
         )
         self.block_graph_window.scaleNodesByPowerChanged.connect(
             self._set_scale_block_graph_nodes_by_power
@@ -2335,15 +2345,9 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        try:
-            suggested_scale = detect_coordinate_scale(path)
-        except Exception:
-            # A dedução é uma conveniência: se falhar, o diálogo abre em metros.
-            suggested_scale = 1.0
         crs_dialog = UtmImportDialog(
             Path(path).name,
             self,
-            suggested_scale=suggested_scale,
         )
         if crs_dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2575,7 +2579,6 @@ class MainWindow(QMainWindow):
                     row_counts[entity.table] = database.row_count(entity.table)
                 except Exception:  # noqa: BLE001 — a contagem é informativa
                     continue
-            suggested_scale = detect_database_scale(database, plan)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Falha ao ler o banco", str(exc))
             return
@@ -2599,7 +2602,6 @@ class MainWindow(QMainWindow):
             plan,
             table_names,
             self,
-            suggested_scale=suggested_scale,
             row_counts=row_counts,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -7030,6 +7032,90 @@ class MainWindow(QMainWindow):
             # Este caminho mantém o clique idempotente depois de um realce ser
             # removido por outro gesto da janela principal.
             self._select_block(record)
+
+    def _activate_block_from_graph(self, block_id: int) -> None:
+        self._select_block_from_graph(int(block_id))
+        record = self._selected_block
+        if record is not None and record.block_id == int(block_id):
+            self._activate_block(record)
+
+    def _switch_segment_index_from_graph(
+        self,
+        switch_index: int,
+    ) -> int | None:
+        result = self.block_graph_window.result
+        switches = self._switch_model
+        normalized = int(switch_index)
+        if (
+            result is None
+            or switches is None
+            or result.source_switches is not switches
+            or not 0 <= normalized < len(switches)
+        ):
+            self.statusBar().showMessage(
+                "A chave do grafo não está mais disponível após a "
+                "substituição dos dados.",
+                5_000,
+            )
+            return None
+        return int(switches.segment_indices[normalized])
+
+    def _select_switch_from_graph(self, switch_index: int) -> None:
+        segment_index = self._switch_segment_index_from_graph(switch_index)
+        if segment_index is None:
+            return
+        self._set_selection(
+            FeatureSelection("segment", segment_index),
+            reveal_hidden=True,
+        )
+        # Limpar o destaque anterior passa pela tabela de blocos e, por
+        # consequência, limpa a seleção gráfica. Reaplicar aqui mantém a chave
+        # como o item corrente do grafo.
+        self.block_graph_window.select_switch(int(switch_index))
+        self.virtualizer.refresh(force=True)
+        self.load_virtualizer.refresh(force=True)
+        self.equivalent_load_virtualizer.refresh(force=True)
+        self.details_dock.show()
+        self.details_dock.setWindowTitle("Chave selecionada")
+        QTimer.singleShot(
+            0,
+            lambda: self.segment_details_page.ensureWidgetVisible(
+                self.switch_details_section
+            ),
+        )
+
+    def _activate_switch_from_graph(self, switch_index: int) -> None:
+        self._select_switch_from_graph(int(switch_index))
+        segment_index = self._switch_segment_index_from_graph(switch_index)
+        if (
+            segment_index is None
+            or self._selected_feature
+            != FeatureSelection("segment", segment_index)
+        ):
+            return
+        try:
+            self.view.focus_segment(segment_index)
+        except IndexError:
+            self.statusBar().showMessage(
+                "O trecho da chave não está mais disponível após a "
+                "substituição dos dados.",
+                5_000,
+            )
+            return
+        self.virtualizer.refresh(force=True)
+        self.load_virtualizer.refresh(force=True)
+        self.equivalent_load_virtualizer.refresh(force=True)
+        self.view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _clear_selection_from_block_graph(self) -> None:
+        self.blocks_window.clear_selection()
+        self.block_graph_window.clear_selection()
+        if self._selected_feature is not None:
+            self._set_selection(None)
+
+    def _reset_from_block_graph(self) -> None:
+        self._clear_selection_from_block_graph()
+        self._fit_all()
 
     def _set_scale_block_graph_nodes_by_power(self, enabled: bool) -> None:
         self._scale_block_graph_nodes_by_power = bool(enabled)
