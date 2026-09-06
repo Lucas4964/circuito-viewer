@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import math
+from pathlib import Path
+import threading
 
 from PyQt6.QtCore import (
     QEvent,
+    QObject,
     QPoint,
     QPointF,
     QRectF,
     QSettings,
+    QThread,
     QTimer,
     Qt,
     pyqtSignal,
@@ -17,6 +22,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QBrush,
     QColor,
+    QCloseEvent,
     QFontMetricsF,
     QIcon,
     QKeyEvent,
@@ -54,10 +60,13 @@ from .block_analysis import BlockAnalysisResult, BlockRecord
 from .block_graph import (
     BlockGraph,
     BlockGraphEdge,
+    BlockGraphEdgeRoute,
     BlockGraphLayout,
     BlockGraphLayoutMode,
+    BlockNodeEnvelope,
     block_coordinate_anchors,
     block_node_diameters,
+    block_node_envelopes,
     build_block_graph,
     direct_circuit_neighbors,
     filter_block_graph,
@@ -66,6 +75,17 @@ from .block_graph import (
 )
 from .circuit_colors import contrasting_text_color, normalize_hex_color
 from .display_identity import BlockDisplayIdentity
+from .graphviz_layout import (
+    GRAPHVIZ_CACHE_SIZE,
+    GraphvizDotInput,
+    GraphvizLayoutCancelled,
+    GraphvizLayoutError,
+    GraphvizRuntimeStatus,
+    calculate_graphviz_layout,
+    graphviz_layout_cache_key,
+    probe_graphviz_runtime,
+    serialize_graphviz_dot,
+)
 from .model import CLOSED_SWITCH_STATE, OPEN_SWITCH_STATE, switch_state_label
 
 
@@ -79,6 +99,21 @@ SWITCH_CLOSED_COLOR = "#00FF00"
 SWITCH_OPEN_COLOR = "#FF0000"
 SWITCH_UNKNOWN_COLOR = "#FFFFFF"
 UNRESOLVED_CIRCUIT_INDEX = -1
+NODE_TEXT_MIN_PROJECTED_DIAMETER = 18.0
+NODE_POWER_MIN_PROJECTED_DIAMETER = 36.0
+SWITCH_LABEL_TEXT_MIN_PROJECTED_HEIGHT = 12.0
+
+
+def _projected_length(painter: QPainter, length: float) -> float:
+    """Converte uma medida do item para o maior comprimento projetado."""
+
+    transform = painter.worldTransform()
+    horizontal_scale = math.hypot(transform.m11(), transform.m12())
+    vertical_scale = math.hypot(transform.m21(), transform.m22())
+    scale = max(horizontal_scale, vertical_scale)
+    if not math.isfinite(scale):
+        return abs(float(length))
+    return abs(float(length)) * scale
 
 
 def parse_scale_nodes_by_power(value: object) -> bool:
@@ -328,6 +363,7 @@ class BlockNodeItem(QGraphicsObject):
         self.fill_color = QColor(normalize_hex_color(fill_color))
         self.display_label = str(display_label or f"B{record.block_id:n}")
         self._selected = False
+        self._hovered = False
         self.setAcceptHoverEvents(True)
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -363,6 +399,31 @@ class BlockNodeItem(QGraphicsObject):
         if normalized == self._selected:
             return
         self._selected = normalized
+        self.update()
+
+    @property
+    def details_forced(self) -> bool:
+        return self._selected or self._hovered
+
+    def detail_level_for_projected_diameter(
+        self,
+        projected_diameter: float,
+    ) -> int:
+        """Retorna 0 (sem texto), 1 (identidade) ou 2 (detalhes)."""
+
+        if self.details_forced:
+            return 2
+        if projected_diameter < NODE_TEXT_MIN_PROJECTED_DIAMETER:
+            return 0
+        if projected_diameter < NODE_POWER_MIN_PROJECTED_DIAMETER:
+            return 1
+        return 2
+
+    def _set_hovered(self, hovered: bool) -> None:
+        normalized = bool(hovered)
+        if normalized == self._hovered:
+            return
+        self._hovered = normalized
         self.update()
 
     def set_fill_color(self, color: str) -> None:
@@ -409,6 +470,12 @@ class BlockNodeItem(QGraphicsObject):
         painter.setPen(QPen(border, border_width))
         painter.drawEllipse(circle)
 
+        detail_level = self.detail_level_for_projected_diameter(
+            _projected_length(painter, self.diameter)
+        )
+        if detail_level == 0:
+            return
+
         font = painter.font()
         font.setBold(True)
         available_width = max(8.0, self.diameter - 6.0)
@@ -426,6 +493,9 @@ class BlockNodeItem(QGraphicsObject):
             self.display_label,
         )
 
+        if detail_level < 2:
+            return
+
         caption = QRectF(
             -self.CAPTION_WIDTH / 2.0,
             radius + 4.0,
@@ -442,6 +512,14 @@ class BlockNodeItem(QGraphicsObject):
             _power_text(self.record),
         )
 
+    def hoverEnterEvent(self, event) -> None:  # noqa: ANN001, N802
+        self._set_hovered(True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event) -> None:  # noqa: ANN001, N802
+        self._set_hovered(False)
+        super().hoverLeaveEvent(event)
+
     def mousePressEvent(self, event) -> None:  # noqa: ANN001, N802
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self.record.block_id)
@@ -451,6 +529,9 @@ class BlockNodeItem(QGraphicsObject):
 
 
 class _EdgeLabelItem(QGraphicsObject):
+    MARKER_WIDTH = 18.0
+    MARKER_HEIGHT = 8.0
+
     def __init__(
         self,
         text: str,
@@ -463,6 +544,8 @@ class _EdgeLabelItem(QGraphicsObject):
         self.text = text
         self.state = str(state).strip()
         self.highlighted = bool(highlighted)
+        self._details_forced = False
+        self._hovered = False
         metrics = QFontMetricsF(QApplication.font())
         bounds = metrics.boundingRect(text)
         self._bounds = QRectF(
@@ -472,6 +555,7 @@ class _EdgeLabelItem(QGraphicsObject):
             bounds.height() + 4.0,
         )
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setAcceptHoverEvents(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_highlighted(self, highlighted: bool) -> None:
@@ -480,6 +564,36 @@ class _EdgeLabelItem(QGraphicsObject):
             return
         self.highlighted = normalized
         self.update()
+
+    @property
+    def details_forced(self) -> bool:
+        return self._details_forced or self._hovered
+
+    def set_details_forced(self, forced: bool) -> None:
+        normalized = bool(forced)
+        if normalized == self._details_forced:
+            return
+        self._details_forced = normalized
+        self.update()
+
+    def _set_hovered(self, hovered: bool) -> None:
+        normalized = bool(hovered)
+        if normalized == self._hovered:
+            return
+        self._hovered = normalized
+        self.update()
+
+    def shows_text_for_projected_height(self, projected_height: float) -> bool:
+        return (
+            self.details_forced
+            or projected_height >= SWITCH_LABEL_TEXT_MIN_PROJECTED_HEIGHT
+        )
+
+    @property
+    def marker_rect(self) -> QRectF:
+        width = min(self.MARKER_WIDTH, self._bounds.width())
+        height = min(self.MARKER_HEIGHT, self._bounds.height())
+        return QRectF(-width / 2.0, -height / 2.0, width, height)
 
     @property
     def background_color(self) -> QColor:
@@ -503,6 +617,10 @@ class _EdgeLabelItem(QGraphicsObject):
     def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
         del option, widget
         background = self.background_color
+        show_text = self.shows_text_for_projected_height(
+            _projected_length(painter, self._bounds.height())
+        )
+        painted_bounds = self._bounds if show_text else self.marker_rect
         painter.setPen(
             QPen(
                 self.border_color,
@@ -510,9 +628,19 @@ class _EdgeLabelItem(QGraphicsObject):
             )
         )
         painter.setBrush(QBrush(background))
-        painter.drawRoundedRect(self._bounds, 3.0, 3.0)
+        painter.drawRoundedRect(painted_bounds, 3.0, 3.0)
+        if not show_text:
+            return
         painter.setPen(self.text_color)
         painter.drawText(self._bounds, Qt.AlignmentFlag.AlignCenter, self.text)
+
+    def hoverEnterEvent(self, event) -> None:  # noqa: ANN001, N802
+        self._set_hovered(True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event) -> None:  # noqa: ANN001, N802
+        self._set_hovered(False)
+        super().hoverLeaveEvent(event)
 
 
 class BlockEdgeItem(QGraphicsPathItem):
@@ -526,6 +654,7 @@ class BlockEdgeItem(QGraphicsPathItem):
         end_circuit: str = "",
         start_block_label: str | None = None,
         end_block_label: str | None = None,
+        label_leader: tuple[QPointF, QPointF] | None = None,
     ) -> None:
         super().__init__(path)
         self.edge = edge
@@ -539,6 +668,11 @@ class BlockEdgeItem(QGraphicsPathItem):
             end_block_label or f"B{edge.end_block_id:n}"
         )
         self._selected = False
+        self._hovered = False
+        self._label_leader_path = QPainterPath()
+        if label_leader is not None:
+            self._label_leader_path.moveTo(label_leader[0])
+            self._label_leader_path.lineTo(label_leader[1])
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setAcceptHoverEvents(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -561,19 +695,36 @@ class BlockEdgeItem(QGraphicsPathItem):
         if normalized == self._selected:
             return
         self._selected = normalized
+        self.label_item.set_details_forced(
+            self._selected or self._hovered
+        )
         self.update()
+
+    def _set_hovered(self, hovered: bool) -> None:
+        normalized = bool(hovered)
+        if normalized == self._hovered:
+            return
+        self._hovered = normalized
+        self.label_item.set_details_forced(
+            self._selected or self._hovered
+        )
 
     def shape(self) -> QPainterPath:
         stroker = QPainterPathStroker()
         stroker.setWidth(max(12.0, self.stroke_width + 6.0))
         clickable = stroker.createStroke(self.path())
+        if not self._label_leader_path.isEmpty():
+            clickable.addPath(stroker.createStroke(self._label_leader_path))
         clickable.addRect(
             self.label_item.mapRectToParent(self.label_item.boundingRect())
         )
         return clickable
 
     def boundingRect(self) -> QRectF:  # noqa: N802
-        return super().boundingRect().adjusted(-8.0, -8.0, 8.0, 8.0)
+        bounds = super().boundingRect()
+        if not self._label_leader_path.isEmpty():
+            bounds = bounds.united(self._label_leader_path.boundingRect())
+        return bounds.adjusted(-8.0, -8.0, 8.0, 8.0)
 
     def _update_tooltip(self) -> None:
         state = switch_state_label(self.edge.state) or "—"
@@ -655,6 +806,12 @@ class BlockEdgeItem(QGraphicsPathItem):
     def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
         del option, widget
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if not self._label_leader_path.isEmpty():
+            leader_pen = QPen(self.stroke_color, 1.2)
+            leader_pen.setStyle(Qt.PenStyle.DotLine)
+            painter.setPen(leader_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(self._label_leader_path)
         if self._selected:
             selection_pen = QPen(
                 QColor("#111111"),
@@ -669,6 +826,14 @@ class BlockEdgeItem(QGraphicsPathItem):
         )
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(self.path())
+
+    def hoverEnterEvent(self, event) -> None:  # noqa: ANN001, N802
+        self._set_hovered(True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event) -> None:  # noqa: ANN001, N802
+        self._set_hovered(False)
+        super().hoverLeaveEvent(event)
 
 
 def _edge_path(
@@ -704,6 +869,71 @@ def _edge_path(
     return path
 
 
+def _edge_route_path(route: BlockGraphEdgeRoute) -> QPainterPath:
+    """Converte a rota independente de Qt no caminho efetivamente pintado."""
+
+    if not route.points:
+        return QPainterPath()
+    path = QPainterPath(QPointF(*route.points[0]))
+    if route.cubic and len(route.points) >= 4 and (len(route.points) - 1) % 3 == 0:
+        for index in range(1, len(route.points), 3):
+            path.cubicTo(
+                QPointF(*route.points[index]),
+                QPointF(*route.points[index + 1]),
+                QPointF(*route.points[index + 2]),
+            )
+        return path
+    if route.curved and len(route.points) == 3:
+        path.quadTo(QPointF(*route.points[1]), QPointF(*route.points[2]))
+        return path
+    for point in route.points[1:]:
+        path.lineTo(QPointF(*point))
+    return path
+
+
+class _GraphvizLayoutWorker(QObject):
+    """Executa um cálculo ``dot`` fora da thread da interface."""
+
+    finished = pyqtSignal(int, object, object)
+
+    def __init__(
+        self,
+        generation: int,
+        executable: Path,
+        dot_input: GraphvizDotInput,
+        graph: BlockGraph,
+        envelopes: dict[int, BlockNodeEnvelope],
+        cancel_event: threading.Event,
+    ) -> None:
+        super().__init__()
+        self.generation = int(generation)
+        self.executable = Path(executable)
+        self.dot_input = dot_input
+        self.graph = graph
+        self.envelopes = envelopes
+        self.cancel_event = cancel_event
+
+    def run(self) -> None:
+        try:
+            layout = calculate_graphviz_layout(
+                self.executable,
+                self.dot_input,
+                self.graph,
+                self.envelopes,
+                cancel_event=self.cancel_event,
+            )
+        except GraphvizLayoutError as exc:
+            self.finished.emit(self.generation, None, exc)
+        except Exception as exc:  # pragma: no cover - proteção da thread Qt
+            self.finished.emit(
+                self.generation,
+                None,
+                GraphvizLayoutError(str(exc)),
+            )
+        else:
+            self.finished.emit(self.generation, layout, None)
+
+
 class BlockGraphView(QGraphicsView):
     """Canvas do grafo com zoom, pan, enquadramento e seleção."""
 
@@ -725,6 +955,8 @@ class BlockGraphView(QGraphicsView):
         self.layout_result = BlockGraphLayout({}, {}, (), frozenset())
         self.layout_mode = BlockGraphLayoutMode.TREE
         self._coordinate_positions: dict[int, tuple[float, float]] = {}
+        self._selected_circuit_indices: frozenset[int] = frozenset()
+        self._layout_aspect_ratio = 16.0 / 9.0
         self.scale_by_power = False
         self._block_circuit_indices: dict[int, int | None] = {}
         self._block_identities: dict[int, BlockDisplayIdentity] = {}
@@ -836,13 +1068,31 @@ class BlockGraphView(QGraphicsView):
             self._circuit_label(end_index),
         )
 
+    def _current_layout_aspect_ratio(self) -> float:
+        width = max(1, self.viewport().width())
+        height = max(1, self.viewport().height())
+        return min(3.0, max(0.5, width / height))
+
+    @staticmethod
+    def _edge_label_sizes(graph: BlockGraph) -> dict[int, tuple[float, float]]:
+        metrics = QFontMetricsF(QApplication.font())
+        return {
+            edge.switch_index: (
+                metrics.boundingRect(edge.label).width() + 10.0,
+                metrics.boundingRect(edge.label).height() + 4.0,
+            )
+            for edge in graph.edges
+        }
+
     def set_graph(
         self,
         graph: BlockGraph,
         *,
         scale_by_power: bool,
         layout_mode: BlockGraphLayoutMode = BlockGraphLayoutMode.TREE,
+        precomputed_layout: BlockGraphLayout | None = None,
         coordinate_positions: dict[int, tuple[float, float]] | None = None,
+        selected_circuit_indices: frozenset[int] | set[int] | tuple[int, ...] = (),
         preserve_camera: bool = False,
     ) -> None:
         previous_selection = self._selected_block_id
@@ -854,34 +1104,54 @@ class BlockGraphView(QGraphicsView):
         self.scale_by_power = bool(scale_by_power)
         self.layout_mode = BlockGraphLayoutMode(layout_mode)
         self._coordinate_positions = dict(coordinate_positions or {})
-        if (
+        self._selected_circuit_indices = frozenset(
+            int(value) for value in selected_circuit_indices
+        )
+        diameters = block_node_diameters(graph.nodes, self.scale_by_power)
+        envelopes = block_node_envelopes(
+            graph.nodes,
+            diameters,
+            caption_width=BlockNodeItem.CAPTION_WIDTH,
+            caption_height=BlockNodeItem.CAPTION_HEIGHT,
+        )
+        edge_label_sizes = self._edge_label_sizes(graph)
+        self._layout_aspect_ratio = self._current_layout_aspect_ratio()
+        if precomputed_layout is not None:
+            if set(precomputed_layout.positions) != set(graph.node_ids):
+                raise ValueError(
+                    "O layout pré-calculado não corresponde aos nós visíveis."
+                )
+            self.layout_result = precomputed_layout
+        elif (
             self.layout_mode is BlockGraphLayoutMode.COORDINATES
             and all(
                 block_id in self._coordinate_positions
                 for block_id in graph.node_ids
             )
         ):
-            self.layout_result = BlockGraphLayout(
-                positions={
-                    block_id: self._coordinate_positions[block_id]
-                    for block_id in graph.node_ids
-                },
-                depths={},
-                root_ids=tuple(
-                    record.block_id
-                    for record in graph.nodes
-                    if record.contains_source
-                ),
-                tree_edge_indices=frozenset(range(len(graph.edges))),
+            self.layout_result = layout_block_graph_by_coordinates(
+                graph,
+                self._coordinate_positions,
+                node_envelopes=envelopes,
+                block_circuit_indices=self._block_circuit_indices,
+                selected_circuit_indices=self._selected_circuit_indices,
+                target_aspect_ratio=self._layout_aspect_ratio,
+                edge_label_sizes=edge_label_sizes,
             )
         else:
             self.layout_mode = BlockGraphLayoutMode.TREE
-            self.layout_result = layout_block_graph(graph)
+            self.layout_result = layout_block_graph(
+                graph,
+                node_envelopes=envelopes,
+                block_circuit_indices=self._block_circuit_indices,
+                selected_circuit_indices=self._selected_circuit_indices,
+                target_aspect_ratio=self._layout_aspect_ratio,
+                edge_label_sizes=edge_label_sizes,
+            )
         self._scene.clear()
         self.node_items.clear()
         self.edge_items.clear()
 
-        diameters = block_node_diameters(graph.nodes, self.scale_by_power)
         points = {
             block_id: QPointF(*position)
             for block_id, position in self.layout_result.positions.items()
@@ -892,11 +1162,13 @@ class BlockGraphView(QGraphicsView):
 
         node_rects = tuple(
             QRectF(
-                points[record.block_id].x() - diameters[record.block_id] / 2.0,
-                points[record.block_id].y() - diameters[record.block_id] / 2.0,
-                diameters[record.block_id],
-                diameters[record.block_id],
-            ).adjusted(-8.0, -8.0, 8.0, 8.0)
+                points[record.block_id].x()
+                - envelopes[record.block_id].width / 2.0,
+                points[record.block_id].y()
+                - envelopes[record.block_id].height / 2.0,
+                envelopes[record.block_id].width,
+                envelopes[record.block_id].height,
+            )
             for record in graph.nodes
         )
 
@@ -914,14 +1186,22 @@ class BlockGraphView(QGraphicsView):
                 offset = 36.0
             else:
                 offset = 0.0
-            path = _edge_path(
-                edge,
-                points[edge.start_block_id],
-                points[edge.end_block_id],
-                offset,
-                diameters[edge.start_block_id],
+            route = self.layout_result.edge_routes.get(edge.switch_index)
+            path = (
+                _edge_route_path(route)
+                if route is not None
+                else _edge_path(
+                    edge,
+                    points[edge.start_block_id],
+                    points[edge.end_block_id],
+                    offset,
+                    diameters[edge.start_block_id],
+                )
             )
             intercircuit, start_circuit, end_circuit = self._edge_style(edge)
+            raw_leader = self.layout_result.edge_label_leaders.get(
+                edge.switch_index
+            )
             item = BlockEdgeItem(
                 edge,
                 path,
@@ -930,8 +1210,19 @@ class BlockGraphView(QGraphicsView):
                 end_circuit=end_circuit,
                 start_block_label=self._block_label(edge.start_block_id),
                 end_block_label=self._block_label(edge.end_block_id),
+                label_leader=(
+                    (QPointF(*raw_leader[0]), QPointF(*raw_leader[1]))
+                    if raw_leader is not None
+                    else None
+                ),
             )
-            item.position_label_away_from(node_rects)
+            label_position = self.layout_result.edge_label_positions.get(
+                edge.switch_index
+            )
+            if label_position is None:
+                item.position_label_away_from(node_rects)
+            else:
+                item.label_item.setPos(QPointF(*label_position))
             self._scene.addItem(item)
             self.edge_items.append(item)
 
@@ -975,6 +1266,17 @@ class BlockGraphView(QGraphicsView):
             self._fit_pending = True
             self._schedule_fit()
 
+    def clear_for_pending_layout(self) -> None:
+        """Limpa itens obsoletos sem perder a identidade da seleção atual."""
+
+        self._scene.clear()
+        self.node_items.clear()
+        self.edge_items.clear()
+        self._content_rect = QRectF()
+        self.setSceneRect(QRectF(-1.0, -1.0, 2.0, 2.0))
+        self._fit_pending = False
+        self.viewport().update()
+
     def set_scale_by_power(self, enabled: bool) -> None:
         normalized = bool(enabled)
         if normalized == self.scale_by_power:
@@ -984,6 +1286,7 @@ class BlockGraphView(QGraphicsView):
             scale_by_power=normalized,
             layout_mode=self.layout_mode,
             coordinate_positions=self._coordinate_positions,
+            selected_circuit_indices=self._selected_circuit_indices,
             preserve_camera=True,
         )
 
@@ -1103,6 +1406,25 @@ class BlockGraphView(QGraphicsView):
         self.fit_to_content()
 
     def fit_to_content(self) -> None:
+        current_aspect = self._current_layout_aspect_ratio()
+        aspect_changed = abs(
+            math.log(current_aspect / max(self._layout_aspect_ratio, 1.0e-9))
+        ) >= math.log(1.12)
+        if (
+            self.graph.nodes
+            and aspect_changed
+            and self.layout_mode is not BlockGraphLayoutMode.GRAPHVIZ_DOT
+        ):
+            # O novo set_graph agenda o enquadramento depois que a geometria
+            # adequada à proporção atual estiver pronta.
+            self.set_graph(
+                self.graph,
+                scale_by_power=self.scale_by_power,
+                layout_mode=self.layout_mode,
+                coordinate_positions=self._coordinate_positions,
+                selected_circuit_indices=self._selected_circuit_indices,
+            )
+            return
         self.resetTransform()
         if (
             self.node_items
@@ -1314,7 +1636,11 @@ class BlockGraphWindow(QDialog):
         self.scale_nodes_by_power = bool(scale_nodes_by_power)
         self.layout_mode = BlockGraphLayoutMode.TREE
         self._coordinate_anchors: dict[int, tuple[float, float]] = {}
-        self._coordinate_layout = BlockGraphLayout({}, {}, (), frozenset())
+        self._graphviz_runtime: GraphvizRuntimeStatus = probe_graphviz_runtime()
+        self._graphviz_generation = 0
+        self._graphviz_jobs: dict[int, tuple[object, ...]] = {}
+        self._graphviz_cache: OrderedDict[str, BlockGraphLayout] = OrderedDict()
+        self._graphviz_warning_shown = False
 
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
@@ -1353,7 +1679,14 @@ class BlockGraphWindow(QDialog):
         self.layout_mode_label = QLabel("Posicionamento:", self)
         self.layout_mode_combo = QComboBox(self)
         self.layout_mode_combo.setObjectName("block_graph_layout_mode_combo")
-        self.layout_mode_combo.addItem("Árvore", BlockGraphLayoutMode.TREE.value)
+        self.layout_mode_combo.addItem(
+            "Árvore — Interno",
+            BlockGraphLayoutMode.TREE.value,
+        )
+        self.layout_mode_combo.addItem(
+            "Árvore — Graphviz dot (experimental)",
+            BlockGraphLayoutMode.GRAPHVIZ_DOT.value,
+        )
         self.layout_mode_combo.addItem(
             "Coordenadas da rede",
             BlockGraphLayoutMode.COORDINATES.value,
@@ -1364,6 +1697,12 @@ class BlockGraphWindow(QDialog):
         )
         display_options.addWidget(self.layout_mode_label)
         display_options.addWidget(self.layout_mode_combo)
+        self.graphviz_status_label = QLabel("", self)
+        self.graphviz_status_label.setObjectName("block_graph_graphviz_status")
+        self.graphviz_status_label.setStyleSheet("color: #8A2D00;")
+        self.graphviz_status_label.setToolTip("")
+        self.graphviz_status_label.hide()
+        display_options.addWidget(self.graphviz_status_label)
         display_options.addStretch(1)
         display_options.addWidget(self.scale_by_power_checkbox)
         layout.addLayout(display_options)
@@ -1416,7 +1755,6 @@ class BlockGraphWindow(QDialog):
         self._coordinate_anchors = (
             {} if result is None else block_coordinate_anchors(result)
         )
-        self._rebuild_coordinate_layout()
         self._sync_layout_mode_control()
         self._selected_circuit_indices = frozenset()
         self._include_unresolved = False
@@ -1449,7 +1787,6 @@ class BlockGraphWindow(QDialog):
             self.scale_by_power_checkbox.setChecked(normalized)
             self.scale_by_power_checkbox.blockSignals(blocked)
         self.scale_nodes_by_power = normalized
-        self._rebuild_coordinate_layout()
         self._refresh_filtered_graph(preserve_camera=True)
 
     def _scale_by_power_toggled(self, enabled: bool) -> None:
@@ -1459,48 +1796,60 @@ class BlockGraphWindow(QDialog):
     @property
     def coordinate_layout_available(self) -> bool:
         return bool(self._full_graph.nodes) and all(
-            block_id in self._coordinate_layout.positions
-            for block_id in self._full_graph.node_ids
-        )
-
-    def _rebuild_coordinate_layout(self) -> None:
-        if not self._full_graph.nodes or not all(
             block_id in self._coordinate_anchors
             for block_id in self._full_graph.node_ids
-        ):
-            self._coordinate_layout = BlockGraphLayout({}, {}, (), frozenset())
-            return
-        diameters = block_node_diameters(
-            self._full_graph.nodes,
-            self.scale_nodes_by_power,
         )
-        try:
-            self._coordinate_layout = layout_block_graph_by_coordinates(
-                self._full_graph,
-                self._coordinate_anchors,
-                diameters,
-            )
-        except ValueError:
-            self._coordinate_layout = BlockGraphLayout({}, {}, (), frozenset())
+
+    @property
+    def graphviz_layout_available(self) -> bool:
+        return self._graphviz_runtime.available
 
     def _sync_layout_mode_control(self) -> None:
-        available = self.coordinate_layout_available
+        coordinate_available = self.coordinate_layout_available
         if (
             self.result is not None
             and self.layout_mode is BlockGraphLayoutMode.COORDINATES
-            and not available
+            and not coordinate_available
         ):
             self.layout_mode = BlockGraphLayoutMode.TREE
+        if (
+            self.layout_mode is BlockGraphLayoutMode.GRAPHVIZ_DOT
+            and not self.graphviz_layout_available
+        ):
+            self.layout_mode = BlockGraphLayoutMode.TREE
+        coordinate_position = self.layout_mode_combo.findData(
+            BlockGraphLayoutMode.COORDINATES.value
+        )
+        graphviz_position = self.layout_mode_combo.findData(
+            BlockGraphLayoutMode.GRAPHVIZ_DOT.value
+        )
+        model = self.layout_mode_combo.model()
+        coordinate_item = model.item(coordinate_position)
+        graphviz_item = model.item(graphviz_position)
+        if coordinate_item is not None:
+            coordinate_item.setEnabled(coordinate_available)
+            coordinate_item.setToolTip(
+                "Preserva a disposição espacial aproximada da rede."
+                if coordinate_available
+                else "Requer coordenadas válidas para todos os blocos."
+            )
+        if graphviz_item is not None:
+            graphviz_item.setEnabled(self.graphviz_layout_available)
+            graphviz_item.setToolTip(
+                "Usa somente a engine dot para calcular a geometria."
+                if self.graphviz_layout_available
+                else self._graphviz_runtime.reason
+            )
         position = self.layout_mode_combo.findData(self.layout_mode.value)
         blocked = self.layout_mode_combo.blockSignals(True)
         if position >= 0:
             self.layout_mode_combo.setCurrentIndex(position)
         self.layout_mode_combo.blockSignals(blocked)
-        self.layout_mode_combo.setEnabled(available)
+        self.layout_mode_combo.setEnabled(
+            self.result is not None and bool(self._full_graph.nodes)
+        )
         self.layout_mode_combo.setToolTip(
-            "Escolha entre a organização topológica e a disposição espacial da rede"
-            if available
-            else "O modo espacial requer coordenadas válidas para todos os blocos"
+            "Escolha o algoritmo usado para calcular a geometria; o desenho permanece no Qt."
         )
 
     def set_layout_mode(self, mode: BlockGraphLayoutMode | str) -> None:
@@ -1508,6 +1857,11 @@ class BlockGraphWindow(QDialog):
         if (
             normalized is BlockGraphLayoutMode.COORDINATES
             and not self.coordinate_layout_available
+        ):
+            normalized = BlockGraphLayoutMode.TREE
+        if (
+            normalized is BlockGraphLayoutMode.GRAPHVIZ_DOT
+            and not self.graphviz_layout_available
         ):
             normalized = BlockGraphLayoutMode.TREE
         if normalized is self.layout_mode:
@@ -1616,7 +1970,172 @@ class BlockGraphWindow(QDialog):
             self.result is not None and bool(self._circuit_labels)
         )
 
+    def _cancel_graphviz_jobs(self) -> int:
+        self._graphviz_generation += 1
+        for job in self._graphviz_jobs.values():
+            cancel_event = job[2]
+            cancel_event.set()
+        return self._graphviz_generation
+
+    def _show_graphviz_warning(self, detail: str) -> None:
+        if self._graphviz_warning_shown:
+            return
+        self._graphviz_warning_shown = True
+        message = "Graphviz indisponível; usando Árvore — Interno."
+        self.graphviz_status_label.setText(message)
+        self.graphviz_status_label.setToolTip(str(detail))
+        self.graphviz_status_label.show()
+
+    def _fallback_from_graphviz(self, graph: BlockGraph, detail: str) -> None:
+        self.layout_mode = BlockGraphLayoutMode.TREE
+        self._sync_layout_mode_control()
+        self._show_graphviz_warning(detail)
+        self.view.set_graph(
+            graph,
+            scale_by_power=self.scale_nodes_by_power,
+            layout_mode=BlockGraphLayoutMode.TREE,
+            coordinate_positions=self._coordinate_anchors,
+            selected_circuit_indices=self._selected_circuit_indices,
+        )
+        self.fit_button.setEnabled(bool(graph.nodes))
+        self.view.set_empty_message("")
+
+    def _render_graphviz_layout(
+        self,
+        graph: BlockGraph,
+        layout: BlockGraphLayout,
+        *,
+        preserve_camera: bool,
+    ) -> None:
+        previous_block = self.view.selected_block_id
+        previous_switch = self.view.selected_switch_index
+        self.view.set_graph(
+            graph,
+            scale_by_power=self.scale_nodes_by_power,
+            layout_mode=BlockGraphLayoutMode.GRAPHVIZ_DOT,
+            precomputed_layout=layout,
+            coordinate_positions=self._coordinate_anchors,
+            selected_circuit_indices=self._selected_circuit_indices,
+            preserve_camera=preserve_camera,
+        )
+        self.fit_button.setEnabled(bool(graph.nodes))
+        self.view.set_empty_message("")
+        if (
+            previous_block is not None
+            and self.view.selected_block_id is None
+        ) or (
+            previous_switch is not None
+            and self.view.selected_switch_index is None
+        ):
+            self.selectionCleared.emit()
+
+    def _start_graphviz_layout(
+        self,
+        graph: BlockGraph,
+        *,
+        preserve_camera: bool,
+    ) -> None:
+        executable = self._graphviz_runtime.executable
+        version = self._graphviz_runtime.version
+        if executable is None or version is None:
+            self._fallback_from_graphviz(
+                graph,
+                self._graphviz_runtime.reason or "Runtime Graphviz inválido.",
+            )
+            return
+        diameters = block_node_diameters(graph.nodes, self.scale_nodes_by_power)
+        envelopes = block_node_envelopes(
+            graph.nodes,
+            diameters,
+            caption_width=BlockNodeItem.CAPTION_WIDTH,
+            caption_height=BlockNodeItem.CAPTION_HEIGHT,
+        )
+        try:
+            dot_input = serialize_graphviz_dot(
+                graph,
+                node_envelopes=envelopes,
+                block_circuit_indices=self._block_circuit_indices,
+                selected_circuit_indices=self._selected_circuit_indices,
+            )
+        except GraphvizLayoutError as exc:
+            self._fallback_from_graphviz(graph, str(exc))
+            return
+        cache_key = graphviz_layout_cache_key(dot_input, version)
+        cached = self._graphviz_cache.get(cache_key)
+        if cached is not None:
+            self._graphviz_cache.move_to_end(cache_key)
+            self._render_graphviz_layout(
+                graph,
+                cached,
+                preserve_camera=preserve_camera,
+            )
+            return
+
+        generation = self._graphviz_generation
+        cancel_event = threading.Event()
+        thread = QThread(self)
+        worker = _GraphvizLayoutWorker(
+            generation,
+            executable,
+            dot_input,
+            graph,
+            envelopes,
+            cancel_event,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._graphviz_layout_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda generation=generation: self._graphviz_jobs.pop(
+                generation,
+                None,
+            )
+        )
+        self._graphviz_jobs[generation] = (
+            thread,
+            worker,
+            cancel_event,
+            graph,
+            preserve_camera,
+            cache_key,
+        )
+        self.view.clear_for_pending_layout()
+        self.fit_button.setEnabled(False)
+        self.view.set_empty_message("Calculando layout Graphviz dot…")
+        thread.start()
+
+    def _graphviz_layout_finished(
+        self,
+        generation: int,
+        layout: object,
+        error: object,
+    ) -> None:
+        job = self._graphviz_jobs.get(int(generation))
+        if job is None or generation != self._graphviz_generation:
+            return
+        graph = job[3]
+        preserve_camera = bool(job[4])
+        cache_key = str(job[5])
+        if isinstance(error, GraphvizLayoutCancelled):
+            return
+        if error is not None or not isinstance(layout, BlockGraphLayout):
+            self._fallback_from_graphviz(graph, str(error or "Resultado inválido."))
+            return
+        self._graphviz_cache[cache_key] = layout
+        self._graphviz_cache.move_to_end(cache_key)
+        while len(self._graphviz_cache) > GRAPHVIZ_CACHE_SIZE:
+            self._graphviz_cache.popitem(last=False)
+        self._render_graphviz_layout(
+            graph,
+            layout,
+            preserve_camera=preserve_camera,
+        )
+
     def _refresh_filtered_graph(self, *, preserve_camera: bool = False) -> None:
+        self._cancel_graphviz_jobs()
         previous_block = self.view.selected_block_id
         previous_switch = self.view.selected_switch_index
         graph = filter_block_graph(
@@ -1625,11 +2144,21 @@ class BlockGraphWindow(QDialog):
             self._selected_circuit_indices,
             include_unresolved=self._include_unresolved,
         )
+        if (
+            self.layout_mode is BlockGraphLayoutMode.GRAPHVIZ_DOT
+            and graph.nodes
+        ):
+            self._start_graphviz_layout(
+                graph,
+                preserve_camera=preserve_camera,
+            )
+            return
         self.view.set_graph(
             graph,
             scale_by_power=self.scale_nodes_by_power,
             layout_mode=self.layout_mode,
-            coordinate_positions=self._coordinate_layout.positions,
+            coordinate_positions=self._coordinate_anchors,
+            selected_circuit_indices=self._selected_circuit_indices,
             preserve_camera=preserve_camera,
         )
         self.fit_button.setEnabled(bool(graph.nodes))
@@ -1741,6 +2270,21 @@ class BlockGraphWindow(QDialog):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        self._cancel_graphviz_jobs()
+        self.circuit_selector_popup.close()
+        super().closeEvent(event)
+
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802
+        super().showEvent(event)
+        if (
+            self.layout_mode is BlockGraphLayoutMode.GRAPHVIZ_DOT
+            and self.result is not None
+            and not self.view.node_items
+            and self._graphviz_generation not in self._graphviz_jobs
+        ):
+            QTimer.singleShot(0, self._refresh_filtered_graph)
 
     def changeEvent(self, event: QEvent) -> None:  # noqa: N802
         super().changeEvent(event)

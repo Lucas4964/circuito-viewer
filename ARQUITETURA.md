@@ -102,7 +102,8 @@ CIRCUITO_VIEWER/
 │   ├── opendss_powerflow.py   # execução do fluxo e associação dos resultados
 │   ├── branch_analysis.py     # análise topológica de ramais
 │   ├── block_analysis.py      # regiões delimitadas por chaves manobráveis
-│   ├── block_graph.py         # multigrafo e layout hierárquico sem Qt
+│   ├── block_graph.py         # multigrafo, layouts e roteamento sem Qt
+│   ├── graphviz_layout.py     # adaptador geométrico para o dot portátil
 │   ├── equivalent_network.py  # projeção simplificada / cargas equivalentes
 │   ├── branch_power_source.py # método de obtenção da potência dos ramais
 │   ├── branch_power_flow.py   # potência do ramal medida no fluxo de potência
@@ -138,7 +139,7 @@ CIRCUITO_VIEWER/
 │   └── theme.py               # tema claro/escuro escolhido manualmente
 │
 ├── tests/                     # 78 arquivos de teste (unittest + pytest-qt)
-├── benchmarks/                # 8 benchmarks com modo --enforce
+├── benchmarks/                # 9 benchmarks com modo --enforce
 ├── README.md                  # documentação de uso
 ├── ARQUITETURA.md             # este documento
 └── pyproject.toml             # metadados, dependências, entry point
@@ -2295,21 +2296,55 @@ apenas pela lista de fronteiras. Assim, chaves paralelas continuam sendo arestas
 distintas e uma chave contornada por outro caminho aparece como autoenlace, não
 é descartada.
 
-`layout_block_graph()` separa componentes e executa BFS simultânea a partir de
-todos os blocos-fonte. Componentes sem fonte usam o menor `block_id`. As arestas
-que descobrem nós formam a floresta de posicionamento; pais ficam centralizados
-sobre os filhos e a coordenada Y é a profundidade. Arestas restantes continuam
-no resultado e a interface as desenha curvas, preservando ciclos e paralelismo.
+`build_block_graph_forest()` constrói a floresta BFS compartilhada pelos dois
+modos hierárquicos. `layout_block_graph()` usa essa floresta para construir uma
+árvore local para cada circuito a partir dos blocos-fonte; componentes sem fonte usam o menor `block_id`. Paralelas e
+autoenlaces não influenciam a descoberta, mas permanecem na renderização.
+A profundidade BFS define camadas Y rígidas; nenhuma camada é dobrada para outra
+altura. A etapa Sugiyama usa varreduras baricêntricas para ordenar irmãos e
+escolher pais em ciclos, e o posicionamento tidy mantém cada subárvore contígua
+com o pai centralizado sobre os filhos. Os envelopes completos definem a
+separação horizontal e toda aresta da floresta liga uma camada à imediatamente
+inferior. Um metagrafo aproxima circuitos relacionados e pode inverter somente
+o eixo X de uma árvore local; raízes no topo e crescimento vertical são
+preservados quando as caixas de circuitos e componentes são distribuídas pela
+janela. A razão de aspecto é uma orientação para distribuir caixas, não uma
+autorização para dobrar níveis: uma camada intrinsecamente larga permanece em um
+único Y mesmo quando isso produz um canvas mais largo. A partir da profundidade
+2, o `ranksep` pode crescer deterministicamente de 56 até 240 px para melhorar a
+proporção sem alterar os ranks. Todo esse pipeline interno é Python puro e não
+depende de Graphviz.
+
+`graphviz_layout.py` oferece o modo experimental alternativo. Ele serializa a
+mesma floresta em DOT determinístico: relações pai-filho são direcionadas e
+participam dos ranks, enquanto ciclos, paralelas, autoenlaces e interligações
+continuam visíveis com `constraint=false`. Os envelopes completos viram
+`width`/`height` fixos e os códigos das chaves viram labels. O processo chama
+somente `bin/dot.exe -Kdot -Tjson` por stdin/stdout; o parser inverte Y,
+centraliza o canvas e converte posições, splines cúbicas e `lp` para
+`BlockGraphLayout`. Um nó, rota, âncora ou valor finito ausente invalida o
+resultado inteiro, nunca apenas um item.
 
 `block_coordinate_anchors()` oferece o segundo modo sem acoplar o núcleo ao Qt:
 reúne, sem duplicação, as barras nas pontas das chaves pertencentes a cada bloco
-e usa seu centroide; sem fronteiras, usa todas as barras do bloco. O Y é
-invertido como no mapa. `layout_block_graph_by_coordinates()` centraliza essas
-âncoras e aplica uma transformação uniforme que leva a mediana das distâncias
-entre blocos conectados a 200 unidades lógicas. Uma passada determinística move
-somente os círculos que ainda colidiriam, mantendo 24 px de folga. O layout é
-calculado sobre o grafo completo e o filtro apenas seleciona posições, evitando
-que os nós saltem ao marcar circuitos.
+e calcula uma referência robusta; sem fronteiras, usa todas as barras do bloco.
+O Y é invertido como no mapa. `layout_block_graph_by_coordinates()` trabalha
+sobre o subgrafo visível, normaliza cada componente separadamente e aplica raiz
+quadrada às distâncias, com comprimento típico de 190 unidades e limites entre
+160 e 420. Um relaxamento determinístico usa molas nas arestas, atração às
+âncoras para preservar direção e norte e uma grade espacial para separar os
+envelopes. Blocos externos mostrados para manobra permanecem próximos da
+fronteira do circuito selecionado, sem iniciar a expansão do alimentador vizinho.
+
+`BlockGraphLayout` transporta, além das posições, profundidades, raízes e arestas
+da floresta, `edge_routes`, `edge_label_positions` e `edge_label_leaders`
+indexados pelo `switch_index`. As rotas começam na borda dos nós: canais
+hierárquicos atendem a árvore e arestas secundárias ou intercircuito escolhem
+entre reta, desvios e curvas conforme colisões, comprimento e cruzamentos.
+Autoenlaces reservam área própria e paralelas recebem curvas simétricas. A
+alocação global das etiquetas prioriza interligações e evita envelopes de nós,
+legendas, rotas e etiquetas já ocupadas; posições afastadas mantêm no terceiro
+mapa um pequeno conector até a aresta.
 
 `BlockGraphWindow` desenha o modelo em uma cena própria. Nós são
 `QGraphicsObject` clicáveis e arestas são `QGraphicsPathItem`; o canvas branco
@@ -2323,15 +2358,26 @@ fronteira; não inclui outros enlaces desses blocos nem prossegue pelo
 alimentador vizinho. Com várias escolhas o recorte permanece induzido. Um
 circuito é marcado automaticamente; catálogos com dois ou
 mais começam vazios, e a associação neutra é uma opção separada. O grafo
-completo permanece imutável na janela e cada mudança de filtro recalcula apenas
-o subgrafo visível; o modo Árvore recalcula seus níveis e o modo espacial
-reutiliza as posições estáveis calculadas para a rede completa.
+completo permanece imutável na janela e cada mudança de filtro recalcula a
+geometria somente do subgrafo visível nos dois modos. O resultado é
+determinístico para a mesma seleção, embora posições possam mudar entre filtros
+para eliminar os vazios deixados por circuitos ocultos.
 
-O cabeçalho oferece `Árvore` e `Coordenadas da rede`. A escolha não usa
-`QSettings`: cada processo começa em Árvore e mantém a opção apenas durante a
-sessão. Trocar o modo preserva a seleção e reenquadra a geometria. Sem
-coordenadas válidas para todos os blocos, a alternativa espacial fica
-indisponível e a janela permanece em Árvore.
+O cabeçalho oferece `Árvore — Interno`, `Árvore — Graphviz dot (experimental)`
+e `Coordenadas da rede`. A escolha não usa `QSettings`: cada processo começa no
+modo interno e mantém a opção apenas durante a sessão. Trocar o modo preserva a
+seleção e reenquadra a geometria. Sem coordenadas válidas, apenas a alternativa
+espacial fica indisponível; a disponibilidade do Graphviz é independente.
+
+O pacote oficial Graphviz 15.1.1 para Windows x64 é redistribuído intacto em
+`circuit_viewer/vendor/graphviz-15.1.1-win64`, sem instalador, download em
+execução ou alteração do `PATH`. A versão é validada por `dot -V`. A janela
+executa o processo em `QThread`, cancela gerações obsoletas, ignora resultados
+atrasados e aplica timeout de 30 segundos. Um LRU de oito entradas usa o DOT
+determinístico — que contém topologia, envelopes e labels — junto à versão do
+runtime como chave; cores não entram na geometria. Erros mudam o seletor para o
+modo interno e geram um único aviso não bloqueante por sessão. Resize e
+**Enquadrar** mudam apenas a câmera do resultado Graphviz já calculado.
 
 `MainWindow` resolve o único circuito de cada bloco pelas barras alcançadas e,
 como fallback, pelo
@@ -2351,6 +2397,15 @@ reutiliza `focus_segments()`, e no vazio limpa o estado e chama `_fit_all()`.
 Linha e rótulo compartilham uma área de hit-test ampliada. No sentido inverso,
 os sinais da tabela atualizam a seleção gráfica sem reemissão.
 
+O `BlockGraphView` aplica nível de detalhe pelo diâmetro projetado: abaixo de 18
+px oculta os textos do nó, entre 18 e 36 px conserva apenas sua identidade e a
+partir de 36 px acrescenta a potência. Etiquetas de chaves sem espaço viram um
+marcador com a cor do estado. Hover e seleção exibem o conteúdo completo sem
+alterar os limites geométricos nem a área de hit-test. Resize significativo sem
+câmera manual pode recalcular a distribuição das caixas dos circuitos, sem
+alterar suas camadas verticais; **Enquadrar** sempre usa a razão de aspecto
+atual.
+
 `BlocksWindow` recebe o mesmo mapa de identidades usado pelo grafo. Sua tabela
 mostra **CIRCUITO** e **BLOCO**, e o proxy filtra pelo `circuit_index`, nunca
 pelo texto visível; assim códigos repetidos continuam seguros. Seleções vindas
@@ -2365,11 +2420,12 @@ A preferência `block_graph/scale_nodes_by_power` fica no `QSettings` e seu
 controle fica no cabeçalho do próprio grafo. Desligada, o diâmetro é 56 px;
 ligada, varia de 36 a 72 px pela fórmula
 `sqrt(36² + (potência/máxima) × (72²−36²))`, tornando a área proporcional.
-Valores ausentes, negativos ou nulos usam o mínimo. O layout usa passos de 200
-px na horizontal, 170 px na vertical e 260 px entre componentes; as legendas de
-arestas procuram uma posição central que não intercepte os nós. A análise é
-calculada uma vez, compartilhada pelas duas janelas e invalidada junto com suas
-fontes.
+Valores ausentes, negativos ou nulos usam o mínimo. O layout recebe um
+`BlockNodeEnvelope` por bloco, incluindo círculo e textos, e aplica mais 24 px
+de folga entre os envelopes; a árvore parte de 56 px entre camadas, com ajuste
+até 240 px nas camadas profundas, além de 96 px entre circuitos e 120 px entre
+componentes. A análise é calculada uma vez, compartilhada pelas duas janelas e
+invalidada junto com suas fontes.
 
 ---
 
@@ -2902,7 +2958,7 @@ determinística.
 python -m unittest discover -s tests -v
 ```
 
-### Benchmarks (`benchmarks/`, 8 arquivos)
+### Benchmarks (`benchmarks/`, 9 arquivos)
 
 Cada benchmark gera dados sintéticos em escala, mede tempos e aceita
 `--enforce` para falhar quando os limiares são ultrapassados — útil em CI e
@@ -2910,12 +2966,29 @@ como guarda de regressão de performance.
 
 ```bash
 python benchmarks\benchmark_100k.py --enforce
+python benchmarks\benchmark_block_graph_layout.py --enforce
 ```
 
 Cobertura: importação/indexação de 100 mil barras, desenho agregado em
 1920×1080, p95 da seleção geométrica de trechos, paleta e categorização de
 circuitos, busca global, 100 mil cargas, 400 mil patamares e a cadeia completa
-de ramais (análise → agregação → máscaras → destaque vetorial).
+de ramais (análise → agregação → máscaras → destaque vetorial). O benchmark de
+layout monta 26 circuitos e 1.560 blocos com ciclos, paralelas, autoenlaces e
+interligações; mede Árvore — Interno, Graphviz dot e Coordenadas e exige
+resultados completos, finitos e determinísticos. No Windows x64, o Graphviz
+embarcado também precisa terminar abaixo do timeout. Um recorte de seis circuitos protege contra layouts espaciais
+em forma de faixa e uma árvore isolada protege o uso cotidiano com um único
+circuito. As metas de legibilidade limitam distorção da razão de aspecto, baixa
+ocupação dos envelopes e arestas extremas; uma grade espacial também conta
+cruzamentos próprios entre arestas da floresta, ignorando secundárias,
+paralelas, autoenlaces e pares com terminal compartilhado. Contratos
+hierárquicos separados exigem um único Y por profundidade dentro de cada
+circuito, raízes no topo, arestas da floresta sempre descendentes, pais sobre a
+faixa dos filhos e subárvores sem intercalação; assim um layout radial ou com
+quebra de camada falha mesmo que seu bounding box pareça compacto. Limites de
+comprimento da Árvore usam somente `tree_edge_indices`; atalhos, ciclos e outras
+relações secundárias continuam sendo relatados à parte, mas não obrigam a
+sacrificar a hierarquia vertical para satisfazer a proporção do viewport.
 
 ---
 

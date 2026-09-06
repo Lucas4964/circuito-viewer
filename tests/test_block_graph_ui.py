@@ -3,20 +3,22 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt6.QtCore import QPoint, QPointF, QSettings, Qt
-    from PyQt6.QtGui import QPalette
+    from PyQt6.QtCore import QPoint, QPointF, QRectF, QSettings, Qt
+    from PyQt6.QtGui import QPalette, QTransform
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication
 
     from circuit_viewer.block_graph import (
         FIXED_NODE_DIAMETER,
         MAX_NODE_DIAMETER,
+        BlockGraph,
         BlockGraphLayoutMode,
     )
     from circuit_viewer.block_graph_window import (
@@ -24,7 +26,10 @@ try:
         CANVAS_BACKGROUND,
         DEFAULT_NODE_COLOR,
         INTERCIRCUIT_COLOR,
+        NODE_POWER_MIN_PROJECTED_DIAMETER,
+        NODE_TEXT_MIN_PROJECTED_DIAMETER,
         SWITCH_CLOSED_COLOR,
+        SWITCH_LABEL_TEXT_MIN_PROJECTED_HEIGHT,
         SWITCH_OPEN_COLOR,
         SWITCH_UNKNOWN_COLOR,
         BlockGraphWindow,
@@ -32,6 +37,7 @@ try:
         parse_scale_nodes_by_power,
         save_scale_nodes_by_power,
     )
+    from circuit_viewer.graphviz_layout import GRAPHVIZ_CACHE_SIZE
     from circuit_viewer.blocks_window import BlockTableModel, BlocksWindow
     from circuit_viewer.display_identity import BlockDisplayIdentity
     from circuit_viewer.main_window import MainWindow
@@ -65,6 +71,44 @@ class BlockGraphWindowTests(unittest.TestCase):
         )
         return window, result
 
+    @staticmethod
+    def _recording_painter(scale: float):  # noqa: ANN205
+        class RecordingPainter:
+            def __init__(self) -> None:
+                self.drawn_texts: list[str] = []
+                self.rounded_rects = []
+                self._font = QApplication.font()
+                self._transform = QTransform.fromScale(scale, scale)
+
+            def worldTransform(self):  # noqa: ANN201, N802
+                return self._transform
+
+            def font(self):  # noqa: ANN201
+                return self._font
+
+            def setFont(self, font) -> None:  # noqa: ANN001, N802
+                self._font = font
+
+            def drawText(self, *arguments) -> None:  # noqa: ANN002, N802
+                self.drawn_texts.append(str(arguments[-1]))
+
+            def drawRoundedRect(self, rect, *_arguments) -> None:  # noqa: ANN001, ANN002, N802
+                self.rounded_rects.append(QRectF(rect))
+
+            def setRenderHint(self, *_arguments) -> None:  # noqa: ANN002, N802
+                pass
+
+            def setBrush(self, *_arguments) -> None:  # noqa: ANN002, N802
+                pass
+
+            def setPen(self, *_arguments) -> None:  # noqa: ANN002, N802
+                pass
+
+            def drawEllipse(self, *_arguments) -> None:  # noqa: ANN002, N802
+                pass
+
+        return RecordingPainter()
+
     def test_the_window_starts_with_a_blank_graph(self) -> None:
         window = BlockGraphWindow()
         self.addCleanup(window.close)
@@ -83,6 +127,109 @@ class BlockGraphWindowTests(unittest.TestCase):
             item = window.view.node_items[record.block_id]
             self.assertIn(f"Bloco B{record.block_id}", item.toolTip())
             self.assertIn("kVA", item.toolTip())
+
+    def test_view_uses_layout_routes_and_global_label_anchors(self) -> None:
+        window, _ = self._window()
+        edge_item = window.view.edge_items[0]
+        switch_index = edge_item.edge.switch_index
+        route = window.view.layout_result.edge_routes[switch_index]
+        label_anchor = window.view.layout_result.edge_label_positions[switch_index]
+        first = edge_item.path().elementAt(0)
+
+        self.assertAlmostEqual(first.x, route.points[0][0])
+        self.assertAlmostEqual(first.y, route.points[0][1])
+        self.assertNotEqual(
+            route.points[0],
+            window.view.layout_result.positions[edge_item.edge.start_block_id],
+        )
+        self.assertAlmostEqual(edge_item.label_item.pos().x(), label_anchor[0])
+        self.assertAlmostEqual(edge_item.label_item.pos().y(), label_anchor[1])
+
+    def test_node_level_of_detail_follows_projected_diameter(self) -> None:
+        window, _ = self._window()
+        item = window.view.node_items[1]
+        original_bounds = QRectF(item.boundingRect())
+        original_shape = item.shape().boundingRect()
+
+        hidden = self._recording_painter(
+            (NODE_TEXT_MIN_PROJECTED_DIAMETER - 1.0) / item.diameter
+        )
+        item.paint(hidden, None)
+        self.assertEqual(hidden.drawn_texts, [])
+
+        identity = self._recording_painter(
+            (
+                NODE_TEXT_MIN_PROJECTED_DIAMETER
+                + NODE_POWER_MIN_PROJECTED_DIAMETER
+            )
+            / 2.0
+            / item.diameter
+        )
+        item.paint(identity, None)
+        self.assertEqual(identity.drawn_texts, [item.display_label])
+
+        complete = self._recording_painter(
+            NODE_POWER_MIN_PROJECTED_DIAMETER / item.diameter
+        )
+        item.paint(complete, None)
+        self.assertEqual(
+            complete.drawn_texts,
+            [item.display_label, f"{float(item.record.total_power):n} kVA"],
+        )
+        self.assertEqual(item.boundingRect(), original_bounds)
+        self.assertEqual(item.shape().boundingRect(), original_shape)
+
+    def test_selected_or_hovered_node_forces_complete_details(self) -> None:
+        window, _ = self._window()
+        item = window.view.node_items[1]
+        tiny_scale = 1.0 / item.diameter
+
+        item.set_selected(True)
+        selected = self._recording_painter(tiny_scale)
+        item.paint(selected, None)
+        self.assertEqual(len(selected.drawn_texts), 2)
+
+        item.set_selected(False)
+        item._set_hovered(True)
+        hovered = self._recording_painter(tiny_scale)
+        item.paint(hovered, None)
+        self.assertEqual(len(hovered.drawn_texts), 2)
+        item._set_hovered(False)
+
+    def test_switch_label_compacts_without_changing_hit_geometry(self) -> None:
+        window, _ = self._window()
+        edge = window.view.edge_items[0]
+        label = edge.label_item
+        original_bounds = QRectF(label.boundingRect())
+        original_shape = edge.shape().boundingRect()
+        compact_scale = (
+            SWITCH_LABEL_TEXT_MIN_PROJECTED_HEIGHT - 1.0
+        ) / label.boundingRect().height()
+
+        compact = self._recording_painter(compact_scale)
+        label.paint(compact, None)
+        self.assertEqual(compact.drawn_texts, [])
+        self.assertEqual(compact.rounded_rects, [label.marker_rect])
+
+        edge.set_selected(True)
+        selected = self._recording_painter(compact_scale)
+        label.paint(selected, None)
+        self.assertEqual(selected.drawn_texts, [edge.edge.label])
+        self.assertEqual(label.boundingRect(), original_bounds)
+        self.assertEqual(edge.shape().boundingRect(), original_shape)
+
+        edge.set_selected(False)
+        edge._set_hovered(True)
+        hovered = self._recording_painter(compact_scale)
+        label.paint(hovered, None)
+        self.assertEqual(hovered.drawn_texts, [edge.edge.label])
+        edge._set_hovered(False)
+
+        label._set_hovered(True)
+        hovered_label = self._recording_painter(compact_scale)
+        label.paint(hovered_label, None)
+        self.assertEqual(hovered_label.drawn_texts, [edge.edge.label])
+        label._set_hovered(False)
 
     def test_nodes_and_edge_tooltips_use_the_composite_block_identity(self) -> None:
         window, result = self._window()
@@ -115,7 +262,11 @@ class BlockGraphWindowTests(unittest.TestCase):
 
         self.assertTrue(window.layout_mode_combo.isEnabled())
         self.assertEqual(window.layout_mode, BlockGraphLayoutMode.TREE)
-        self.assertEqual(window.layout_mode_combo.currentText(), "Árvore")
+        self.assertEqual(
+            window.layout_mode_combo.currentText(),
+            "Árvore — Interno",
+        )
+        self.assertEqual(window.layout_mode_combo.count(), 3)
 
         window.layout_mode_combo.setCurrentIndex(
             window.layout_mode_combo.findData(
@@ -146,17 +297,26 @@ class BlockGraphWindowTests(unittest.TestCase):
         window.set_result(replace(result, source_segments=None))
 
         self.assertFalse(window.coordinate_layout_available)
-        self.assertFalse(window.layout_mode_combo.isEnabled())
+        self.assertTrue(window.layout_mode_combo.isEnabled())
+        coordinate_index = window.layout_mode_combo.findData(
+            BlockGraphLayoutMode.COORDINATES.value
+        )
+        self.assertFalse(
+            window.layout_mode_combo.model().item(coordinate_index).isEnabled()
+        )
         window.set_layout_mode(BlockGraphLayoutMode.COORDINATES)
         self.assertEqual(window.layout_mode, BlockGraphLayoutMode.TREE)
 
-    def test_coordinate_positions_stay_stable_while_filtering_circuits(self) -> None:
-        result, _, _ = sample_result()
+    def test_coordinate_layout_is_recomputed_for_the_visible_selection(self) -> None:
+        bars = make_bars(5)
+        network = make_network(bars, [0, 1, 2, 3], [1, 2, 3, 4])
+        switches = make_switches(network, [(1, "1", "1"), (3, "1", "1")])
+        result = analyze_blocks(make_catalog(network, switches), switches)
         window = BlockGraphWindow()
         self.addCleanup(window.close)
         window.set_result(result)
         window.set_circuit_styles(
-            {1: 0, 2: 1},
+            {1: 0, 2: 1, 3: 1},
             ("#112233", "#DDEEFF"),
             ("C1", "C2"),
         )
@@ -167,8 +327,23 @@ class BlockGraphWindowTests(unittest.TestCase):
         window._circuit_selection_changed(frozenset({0}), False)
 
         filtered = window.view.node_items[1].scenePos()
-        self.assertAlmostEqual(filtered.x(), original.x())
-        self.assertAlmostEqual(filtered.y(), original.y())
+        self.assertEqual(set(window.view.node_items), {1, 2})
+        self.assertTrue(
+            abs(filtered.x() - original.x()) > 1.0e-6
+            or abs(filtered.y() - original.y()) > 1.0e-6
+        )
+
+        first_pass = {
+            block_id: (item.scenePos().x(), item.scenePos().y())
+            for block_id, item in window.view.node_items.items()
+        }
+        window._circuit_selection_changed(frozenset({0, 1}), False)
+        window._circuit_selection_changed(frozenset({0}), False)
+        second_pass = {
+            block_id: (item.scenePos().x(), item.scenePos().y())
+            for block_id, item in window.view.node_items.items()
+        }
+        self.assertEqual(first_pass, second_pass)
 
     def test_layout_choice_is_not_inherited_by_a_new_window(self) -> None:
         window, _ = self._window()
@@ -177,7 +352,124 @@ class BlockGraphWindowTests(unittest.TestCase):
         self.addCleanup(fresh.close)
 
         self.assertEqual(fresh.layout_mode, BlockGraphLayoutMode.TREE)
-        self.assertEqual(fresh.layout_mode_combo.currentText(), "Árvore")
+        self.assertEqual(
+            fresh.layout_mode_combo.currentText(),
+            "Árvore — Interno",
+        )
+
+    def test_graphviz_dot_is_an_experimental_geometry_only_mode(self) -> None:
+        window, _ = self._window()
+        graphviz_index = window.layout_mode_combo.findData(
+            BlockGraphLayoutMode.GRAPHVIZ_DOT.value
+        )
+
+        self.assertGreaterEqual(graphviz_index, 0)
+        self.assertEqual(
+            window.layout_mode_combo.itemText(graphviz_index),
+            "Árvore — Graphviz dot (experimental)",
+        )
+        self.assertEqual(
+            window.layout_mode_combo.model().item(graphviz_index).isEnabled(),
+            window.graphviz_layout_available,
+        )
+        if not window.graphviz_layout_available:
+            self.assertTrue(
+                window.layout_mode_combo.model().item(graphviz_index).toolTip()
+            )
+            return
+
+        window.select_block(2)
+        window.set_layout_mode(BlockGraphLayoutMode.GRAPHVIZ_DOT)
+        for _attempt in range(200):
+            self.app.processEvents()
+            if window.view.node_items:
+                break
+            QTest.qWait(10)
+
+        self.assertEqual(window.layout_mode, BlockGraphLayoutMode.GRAPHVIZ_DOT)
+        self.assertEqual(
+            window.view.layout_mode,
+            BlockGraphLayoutMode.GRAPHVIZ_DOT,
+        )
+        self.assertEqual(window.view.selected_block_id, 2)
+        self.assertTrue(window.view.layout_result.edge_routes[0].cubic)
+        self.assertGreaterEqual(len(window._graphviz_cache), 1)
+
+    def test_obsolete_graphviz_result_is_ignored(self) -> None:
+        window, _ = self._window()
+        original_layout = window.view.layout_result
+        window._graphviz_generation = 9
+        window._graphviz_jobs[8] = (
+            None,
+            None,
+            threading.Event(),
+            window.view.graph,
+            False,
+            "obsolete-key",
+        )
+
+        window._graphviz_layout_finished(8, original_layout, None)
+
+        self.assertIs(window.view.layout_result, original_layout)
+        self.assertNotIn("obsolete-key", window._graphviz_cache)
+
+    def test_graphviz_choice_survives_network_replacement_in_the_session(self) -> None:
+        window, result = self._window()
+        if not window.graphviz_layout_available:
+            self.skipTest(window._graphviz_runtime.reason)
+        window.set_layout_mode(BlockGraphLayoutMode.GRAPHVIZ_DOT)
+        window.set_result(None)
+
+        self.assertEqual(window.layout_mode, BlockGraphLayoutMode.GRAPHVIZ_DOT)
+
+        window.set_result(result)
+        window.set_circuit_styles(
+            {record.block_id: 0 for record in result.records},
+            ("#2878B5",),
+            ("C1",),
+        )
+        for _attempt in range(200):
+            self.app.processEvents()
+            if window.view.node_items:
+                break
+            QTest.qWait(10)
+
+        self.assertEqual(window.layout_mode, BlockGraphLayoutMode.GRAPHVIZ_DOT)
+        self.assertEqual(set(window.view.node_items), {1, 2})
+
+    def test_graphviz_failure_falls_back_with_only_one_session_warning(self) -> None:
+        window, _ = self._window()
+        window.layout_mode = BlockGraphLayoutMode.GRAPHVIZ_DOT
+
+        window._fallback_from_graphviz(window.view.graph, "primeiro erro")
+        window._show_graphviz_warning("segundo erro")
+
+        self.assertEqual(window.layout_mode, BlockGraphLayoutMode.TREE)
+        self.assertTrue(window.graphviz_status_label.isVisibleTo(window))
+        self.assertEqual(window.graphviz_status_label.toolTip(), "primeiro erro")
+
+    def test_graphviz_cache_keeps_only_the_eight_most_recent_results(self) -> None:
+        window, _ = self._window()
+        graph = window.view.graph
+        layout = window.view.layout_result
+        for generation in range(GRAPHVIZ_CACHE_SIZE + 2):
+            cache_key = f"cache-{generation}"
+            window._graphviz_generation = generation
+            window._graphviz_jobs[generation] = (
+                None,
+                None,
+                threading.Event(),
+                graph,
+                True,
+                cache_key,
+            )
+            window._graphviz_layout_finished(generation, layout, None)
+
+        self.assertEqual(len(window._graphviz_cache), GRAPHVIZ_CACHE_SIZE)
+        self.assertNotIn("cache-0", window._graphviz_cache)
+        self.assertNotIn("cache-1", window._graphviz_cache)
+        self.assertIn(f"cache-{GRAPHVIZ_CACHE_SIZE + 1}", window._graphviz_cache)
+        window._graphviz_jobs.clear()
 
     def test_coordinate_choice_survives_a_new_network_in_the_same_session(self) -> None:
         window, result = self._window()
@@ -455,11 +747,11 @@ class BlockGraphWindowTests(unittest.TestCase):
             )
         )
 
-    def test_edge_labels_do_not_intersect_node_circles_at_maximum_size(self) -> None:
+    def test_edge_labels_do_not_intersect_complete_node_envelopes(self) -> None:
         window, _ = self._window(scale=True)
 
         node_bounds = tuple(
-            item.mapToScene(item.shape()).boundingRect()
+            item.sceneBoundingRect()
             for item in window.view.node_items.values()
         )
         for edge in window.view.edge_items:
@@ -554,6 +846,53 @@ class BlockGraphWindowTests(unittest.TestCase):
             places=6,
         )
 
+    def test_fit_recalculates_layout_after_a_relevant_aspect_change(self) -> None:
+        result, _, _ = sample_result()
+        template = result.records[0]
+        records = tuple(
+            replace(
+                template,
+                block_id=block_id,
+                contains_source=block_id == 1,
+            )
+            for block_id in range(1, 10)
+        )
+        graph = BlockGraph(records, ())
+        window = BlockGraphWindow()
+        self.addCleanup(window.close)
+        window.resize(480, 900)
+        window.show()
+        self.app.processEvents()
+        window.view.set_circuit_styles(
+            {block_id: block_id - 1 for block_id in graph.node_ids},
+            tuple("#2878B5" for _ in graph.node_ids),
+            tuple(f"C{block_id}" for block_id in graph.node_ids),
+        )
+        window.view.set_graph(
+            graph,
+            scale_by_power=False,
+            selected_circuit_indices=frozenset(range(len(graph.nodes))),
+        )
+        window.view.fit_to_content()
+        portrait_aspect = window.view._layout_aspect_ratio
+        portrait_positions = dict(window.view.layout_result.positions)
+
+        window.resize(1_200, 420)
+        self.app.processEvents()
+        window.view.fit_to_content()
+        self.app.processEvents()
+
+        landscape_aspect = window.view._layout_aspect_ratio
+        self.assertGreater(landscape_aspect, portrait_aspect * 1.5)
+        self.assertNotEqual(
+            window.view.layout_result.positions,
+            portrait_positions,
+        )
+        self.assertFalse(window.view._fit_pending)
+        projected = window.view.transform().mapRect(window.view._content_rect)
+        self.assertLessEqual(projected.width(), window.view.viewport().width())
+        self.assertLessEqual(projected.height(), window.view.viewport().height())
+
     def test_edge_line_and_label_are_clickable(self) -> None:
         window, _ = self._window()
         received: list[int] = []
@@ -631,22 +970,26 @@ class BlockGraphWindowTests(unittest.TestCase):
         self.assertEqual(switches, [edge.edge.switch_index])
         self.assertEqual(resets, [True])
 
-    def test_power_scaling_preserves_zoom_and_view_center(self) -> None:
+    def test_power_scaling_preserves_manual_camera_and_selection(self) -> None:
         window, _ = self._window()
         window.show()
         self.app.processEvents()
         window.view.fit_to_content()
+        window.select_block(2)
         cursor = QPoint(300, 220)
         window.view.zoom_by_steps(2.0, cursor)
-        before_scale = window.view.transform().m11()
+        before_transform = window.view.transform()
         before_center = window.view.mapToScene(window.view.viewport().rect().center())
 
         window.scale_by_power_checkbox.setChecked(True)
 
         after_center = window.view.mapToScene(window.view.viewport().rect().center())
-        self.assertAlmostEqual(window.view.transform().m11(), before_scale, places=6)
+        self.assertEqual(window.view.transform(), before_transform)
         self.assertAlmostEqual(after_center.x(), before_center.x(), delta=1.0)
         self.assertAlmostEqual(after_center.y(), before_center.y(), delta=1.0)
+        self.assertTrue(window.view._camera_modified)
+        self.assertFalse(window.view._fit_pending)
+        self.assertEqual(window.view.selected_block_id, 2)
 
 
 @unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")

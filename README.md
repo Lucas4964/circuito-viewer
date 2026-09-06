@@ -1689,16 +1689,42 @@ sincronização interna. No grafo, a identidade visível combina os dois campos,
 por exemplo `001001-1`; blocos neutros usam `SEM-CIRCUITO-1`. Ordenação, filtro
 e modo de posicionamento não renumeram os blocos.
 
-Em **Posicionamento: Árvore**, modo padrão de cada execução, os blocos-fonte
-ocupam o topo e os demais são distribuídos em níveis pela menor quantidade de
-chaves até uma fonte. Redes desconectadas aparecem lado a lado. A opção
-**Coordenadas da rede**, no mesmo cabeçalho, aproxima a disposição do desenho
-original: cada bloco usa o centro das barras situadas nas pontas de suas chaves,
-com fallback para o centro de todas as barras do bloco. A orientação e as
-proporções são preservadas por uma escala uniforme; somente nós sobrepostos
-recebem uma pequena separação. A escolha dura durante a sessão, mas não é salva.
-Ciclos, chaves paralelas e chaves cujas pontas pertencem ao mesmo bloco não são
-omitidos: aparecem como curvas ou autoenlaces.
+Em **Posicionamento: Árvore — Interno**, modo padrão de cada execução, cada circuito forma
+uma floresta vertical a partir dos blocos-fonte. A BFS fixa uma camada horizontal
+para cada profundidade e uma ordenação no estilo Sugiyama reduz cruzamentos sem
+alterar essa hierarquia. As subárvores permanecem contíguas, cada pai fica
+centralizado sobre seus filhos e toda aresta da floresta aponta para uma camada
+inferior. Níveis largos nunca são dobrados ou quebrados em outras alturas. Um
+metagrafo aproxima circuitos ligados por chaves magenta, mas cada circuito
+permanece com raízes no topo e crescimento vertical, mesmo quando as caixas são
+distribuídas para aproveitar a janela. Quando uma camada é naturalmente larga,
+a fidelidade hierárquica prevalece sobre forçar o desenho à proporção da janela;
+nas profundidades seguintes, o espaço vertical pode crescer para equilibrar a
+leitura sem quebrar a camada. Zoom e enquadramento continuam disponíveis para
+navegar pelo resultado.
+
+**Árvore — Graphviz dot (experimental)** usa o runtime portátil Graphviz
+15.1.1 incluído no aplicativo para calcular somente a geometria hierárquica:
+posições dos blocos, splines das chaves e âncoras de etiquetas. Cores, símbolos,
+nível de detalhe, seleção, hit-test e toda a pintura continuam no Qt; o
+aplicativo não usa imagens SVG ou PNG do Graphviz. O cálculo ocorre em segundo
+plano, tem limite de 30 segundos e é cancelado quando uma seleção mais recente
+o substitui. Os oito últimos resultados ficam em cache, portanto alterações de
+cor não repetem o layout. Se o runtime faltar, estiver em plataforma diferente
+de Windows 64 bits ou devolver geometria inválida, a opção fica indisponível ou
+o grafo retorna integralmente para **Árvore — Interno**, com aviso não
+bloqueante.
+
+**Coordenadas da rede**, no mesmo cabeçalho, usa uma referência espacial robusta
+das barras nas fronteiras de cada bloco, com fallback para suas demais barras.
+Cada componente visível é normalizado separadamente, distâncias extremas são
+comprimidas e um relaxamento ancorado combina molas topológicas, atração às
+coordenadas e separação por grade. A orientação geral e o norte são preservados,
+mas a legibilidade prevalece sobre a proporcionalidade geográfica rigorosa. O
+layout é recalculado para a seleção atual, evitando vazios causados por circuitos
+ocultos. A escolha dura durante a sessão, mas não é salva. Ciclos, chaves
+paralelas e chaves cujas pontas pertencem ao mesmo bloco não são omitidos:
+aparecem como curvas ou autoenlaces.
 
 O botão **Circuitos exibidos: N/M**, no cabeçalho da janela, abre sob demanda
 uma lista com caixas de seleção e a cor de cada circuito. A lista não ocupa o
@@ -1729,13 +1755,24 @@ O zoom é limitado pela escala absoluta de `1e-6` a `8.0`, portanto um
 enquadramento inicial muito reduzido não impede a aproximação até uma escala
 legível.
 
+As linhas partem da borda dos círculos e procuram canais que não atravessem nós.
+Arestas secundárias e intercircuito podem usar desvios ou curvas para encurtar o
+percurso e reduzir cruzamentos. As etiquetas são distribuídas em conjunto,
+priorizando as interligações e evitando nós, legendas e outras etiquetas; quando
+precisam se afastar, um pequeno conector conserva a associação visual. O nível
+de detalhe acompanha o zoom: abaixo de 18 px o círculo aparece sem texto, entre
+18 e 36 px mostra somente o identificador e, a partir de 36 px, também mostra a
+potência. Etiquetas sem espaço viram marcadores coloridos, mas hover e seleção
+sempre restauram o texto completo e a área clicável permanece estável.
+
 Na própria janela do grafo, **Dimensionar nós dos blocos por potência instalada**
 faz a área dos círculos representar a soma de `SNOM` das cargas de cada bloco. A
 opção começa desligada e é lembrada entre sessões. Ligada, usa diâmetros de 36 a
 72 px, com área proporcional à potência relativa ao maior bloco; potência
 ausente, negativa ou zero usa o tamanho mínimo. Desligada, todos os nós têm 56
-px. O limite menor, o espaçamento ampliado e o reposicionamento das legendas
-evitam que nós grandes cubram outros nós ou códigos de chaves.
+px. O posicionamento considera o envelope inteiro do nó, incluindo a legenda de
+potência e uma folga de 24 px, para que o dimensionamento não volte a cobrir nós
+ou códigos de chaves.
 
 O conteúdo da janela usa fundo branco mesmo com o tema escuro. Cada nó recebe a
 cor cadastrada para seu circuito, com texto preto ou branco escolhido pelo maior
@@ -1763,6 +1800,7 @@ python benchmarks\benchmark_global_search.py --enforce
 python benchmarks\benchmark_loads_100k.py --enforce
 python benchmarks\benchmark_load_patterns_400k.py --enforce
 python benchmarks\benchmark_branches_100k.py --enforce
+python benchmarks\benchmark_block_graph_layout.py --enforce
 ```
 
 Os benchmarks geram temporariamente 100 mil barras, 17 mil trechos e 17 mil
@@ -1771,7 +1809,19 @@ latência p95 da seleção geométrica de trechos. O benchmark de circuitos tamb
 mede a geração da paleta, a categorização agregada e a troca de cor sem reconstruir
 a geometria. O benchmark de ramais cobre 100 mil trechos, 100 circuitos, 100 mil
 cargas e 400 mil registros de patamares, incluindo análise, agregação equivalente,
-atualização das máscaras e construção do destaque vetorial.
+atualização das máscaras e construção do destaque vetorial. O benchmark do
+grafo cria 26 circuitos e 1.560 blocos, incluindo ciclos, chaves paralelas,
+autoenlaces e interligações, e mede Árvore — Interno, Graphviz dot e
+Coordenadas com verificação de geometria finita e determinismo. Ele também
+recorta seis circuitos alinhados para
+impedir a regressão de uma faixa espacial excessivamente larga e isola uma
+árvore de um circuito para proteger o caso de uso cotidiano. As validações
+cobrem razão de aspecto, ocupação dos envelopes, cauda do comprimento das
+arestas e cruzamentos entre as arestas da árvore. Também confirmam que cada
+profundidade ocupa um único Y, raízes ficam no topo, arestas da floresta sempre
+descem e nenhuma camada sofre quebra de linha. As metas de comprimento da Árvore
+consideram somente sua floresta; atalhos, ciclos e demais relações secundárias
+são medidos e informados separadamente, sem distorcer o contrato hierárquico.
 
 ## Organização
 
@@ -1805,6 +1855,7 @@ atualizado junto com mudanças relevantes de arquitetura.
 - `circuit_viewer/branch_analysis.py`: análise topológica dos ramais.
 - `circuit_viewer/block_analysis.py`: identificação e grandezas dos blocos.
 - `circuit_viewer/block_graph.py`: multigrafo e layout hierárquico dos blocos.
+- `circuit_viewer/graphviz_layout.py`: adaptador geométrico isolado para o `dot` portátil.
 - `circuit_viewer/block_graph_window.py`: canvas interativo e persistência visual.
 - `circuit_viewer/equivalent_network.py`: projeção e agregação das cargas equivalentes.
 - `circuit_viewer/branch_window.py`: tabela, filtro e avisos dos ramais.

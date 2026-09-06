@@ -10,20 +10,27 @@ import numpy as np
 from circuit_viewer.block_analysis import BlockRecord, analyze_blocks
 from circuit_viewer.block_graph import (
     FIXED_NODE_DIAMETER,
-    HORIZONTAL_NODE_GAP,
+    GEOGRAPHIC_TARGET_EDGE_LENGTH,
+    MAX_COORDINATE_EDGE_LENGTH,
     MAX_NODE_DIAMETER,
+    MIN_COORDINATE_EDGE_LENGTH,
     MIN_NODE_DIAMETER,
-    VERTICAL_NODE_GAP,
+    TREE_BAND_GAP,
+    TREE_SIBLING_GAP,
     BlockGraph,
     BlockGraphEdge,
+    BlockGraphLayout,
+    BlockNodeEnvelope,
     block_coordinate_anchors,
     block_node_diameters,
+    block_node_envelopes,
     build_block_graph,
     direct_circuit_neighbors,
     filter_block_graph,
     layout_block_graph,
     layout_block_graph_by_coordinates,
     resolve_block_circuit_indices,
+    route_block_graph_edges,
 )
 
 from test_block_analysis import make_bars, make_catalog, make_network, make_switches
@@ -121,6 +128,22 @@ class BlockGraphBuildTests(unittest.TestCase):
 
 
 class BlockGraphLayoutTests(unittest.TestCase):
+    def test_layout_metadata_defaults_keep_the_old_constructor_compatible(self) -> None:
+        layout = BlockGraphLayout({}, {}, (), frozenset())
+
+        self.assertEqual(layout.edge_routes, {})
+        self.assertEqual(layout.edge_label_positions, {})
+        self.assertEqual(layout.edge_label_leaders, {})
+
+    def test_node_envelope_reserves_caption_and_keeps_the_circle_diameter(self) -> None:
+        record = _record(1)
+
+        envelope = block_node_envelopes((record,), {1: 72.0})[1]
+
+        self.assertGreaterEqual(envelope.width, 138.0)
+        self.assertGreater(envelope.height, 72.0 + 22.0)
+        self.assertEqual(envelope.node_diameter, 72.0)
+
     def test_sources_are_roots_and_bfs_defines_the_levels(self) -> None:
         graph = BlockGraph(
             (
@@ -140,11 +163,11 @@ class BlockGraphLayoutTests(unittest.TestCase):
         self.assertEqual(len(layout.tree_edge_indices), 3)
         self.assertGreaterEqual(
             abs(layout.positions[2][0] - layout.positions[4][0]),
-            HORIZONTAL_NODE_GAP,
+            FIXED_NODE_DIAMETER + TREE_SIBLING_GAP,
         )
         self.assertEqual(
             layout.positions[2][1] - layout.positions[1][1],
-            VERTICAL_NODE_GAP,
+            BlockNodeEnvelope().height + TREE_BAND_GAP,
         )
 
     def test_multiple_sources_share_the_first_level_and_cycles_remain(self) -> None:
@@ -163,6 +186,8 @@ class BlockGraphLayoutTests(unittest.TestCase):
         self.assertEqual(layout.depths[1], 0)
         self.assertEqual(layout.depths[3], 0)
         self.assertEqual(layout.depths[2], 1)
+        self.assertEqual(layout.positions[1][1], layout.positions[3][1])
+        self.assertLess(layout.positions[1][1], layout.positions[2][1])
         self.assertEqual(len(graph.edges), 3)
         self.assertLess(len(layout.tree_edge_indices), len(graph.edges))
 
@@ -178,6 +203,326 @@ class BlockGraphLayoutTests(unittest.TestCase):
         self.assertEqual(layout.depths[3], 0)
         self.assertEqual(layout.depths[4], 1)
         self.assertGreater(layout.positions[3][0], layout.positions[1][0])
+
+    def test_a_wide_star_keeps_all_children_on_one_compact_level(self) -> None:
+        graph = BlockGraph(
+            tuple(_record(block_id, source=block_id == 1) for block_id in range(1, 22)),
+            tuple(_edge(index, 1, index + 2) for index in range(20)),
+        )
+        envelopes = {
+            block_id: BlockNodeEnvelope(60.0, 80.0, diameter=56.0)
+            for block_id in graph.node_ids
+        }
+
+        first = layout_block_graph(graph, node_envelopes=envelopes)
+        second = layout_block_graph(graph, node_envelopes=envelopes)
+
+        self.assertEqual(first, second)
+        leaves = tuple(range(2, 22))
+        leaf_y = {first.positions[block_id][1] for block_id in leaves}
+        self.assertEqual(leaf_y, {first.positions[2][1]})
+        self.assertTrue(all(first.depths[block_id] == 1 for block_id in leaves))
+        self.assertLess(first.positions[1][1], first.positions[2][1])
+
+        leaf_x = sorted(first.positions[block_id][0] for block_id in leaves)
+        expected_width = (len(leaves) - 1) * (60.0 + TREE_SIBLING_GAP)
+        self.assertLessEqual(leaf_x[-1] - leaf_x[0], expected_width + 1.0e-6)
+        self.assertAlmostEqual(
+            first.positions[1][0],
+            (leaf_x[0] + leaf_x[-1]) / 2.0,
+        )
+        for left, right in zip(leaf_x, leaf_x[1:]):
+            self.assertGreaterEqual(
+                right - left,
+                60.0 + TREE_SIBLING_GAP - 1.0e-6,
+            )
+
+    def test_balanced_tree_has_vertical_layers_and_contiguous_subtrees(self) -> None:
+        graph = BlockGraph(
+            tuple(_record(block_id, source=block_id == 1) for block_id in range(1, 16)),
+            tuple(
+                _edge(index, parent, child)
+                for index, (parent, child) in enumerate(
+                    (
+                        (1, 2),
+                        (1, 3),
+                        (2, 4),
+                        (2, 5),
+                        (3, 6),
+                        (3, 7),
+                        (4, 8),
+                        (4, 9),
+                        (5, 10),
+                        (5, 11),
+                        (6, 12),
+                        (6, 13),
+                        (7, 14),
+                        (7, 15),
+                    )
+                )
+            ),
+        )
+        envelopes = {
+            block_id: BlockNodeEnvelope(60.0, 80.0, diameter=56.0)
+            for block_id in graph.node_ids
+        }
+
+        layout = layout_block_graph(graph, node_envelopes=envelopes)
+
+        level_y: dict[int, float] = {}
+        for depth in range(4):
+            values = {
+                layout.positions[block_id][1]
+                for block_id, block_depth in layout.depths.items()
+                if block_depth == depth
+            }
+            self.assertEqual(len(values), 1)
+            level_y[depth] = values.pop()
+        self.assertEqual(
+            [level_y[depth] for depth in range(4)],
+            sorted(level_y.values()),
+        )
+        for depth in range(3):
+            self.assertAlmostEqual(
+                level_y[depth + 1] - level_y[depth],
+                80.0 + TREE_BAND_GAP,
+            )
+
+        children = {
+            1: (2, 3),
+            2: (4, 5),
+            3: (6, 7),
+            4: (8, 9),
+            5: (10, 11),
+            6: (12, 13),
+            7: (14, 15),
+        }
+        for parent, descendants in children.items():
+            descendant_x = [layout.positions[value][0] for value in descendants]
+            self.assertAlmostEqual(
+                layout.positions[parent][0],
+                (min(descendant_x) + max(descendant_x)) / 2.0,
+            )
+
+        left_branch = (2, 4, 5, 8, 9, 10, 11)
+        right_branch = (3, 6, 7, 12, 13, 14, 15)
+        left_span = (
+            min(layout.positions[value][0] for value in left_branch),
+            max(layout.positions[value][0] for value in left_branch),
+        )
+        right_span = (
+            min(layout.positions[value][0] for value in right_branch),
+            max(layout.positions[value][0] for value in right_branch),
+        )
+        self.assertTrue(
+            left_span[1] < right_span[0] or right_span[1] < left_span[0]
+        )
+
+        edge_lengths = [
+            math.dist(
+                layout.positions[edge.start_block_id],
+                layout.positions[edge.end_block_id],
+            )
+            for edge in graph.edges
+        ]
+        self.assertLessEqual(max(edge_lengths), 2.0 * (80.0 + TREE_BAND_GAP))
+
+    def test_a_deep_tree_is_a_straight_compact_vertical_hierarchy(self) -> None:
+        graph = BlockGraph(
+            tuple(_record(block_id, source=block_id == 1) for block_id in range(1, 11)),
+            tuple(_edge(index, index + 1, index + 2) for index in range(9)),
+        )
+        envelopes = {
+            block_id: BlockNodeEnvelope(60.0, 80.0, diameter=56.0)
+            for block_id in graph.node_ids
+        }
+
+        layout = layout_block_graph(graph, node_envelopes=envelopes)
+
+        self.assertEqual(layout.root_ids, (1,))
+        expected_depths = {
+            block_id: block_id - 1 for block_id in graph.node_ids
+        }
+        self.assertEqual(layout.depths, expected_depths)
+        self.assertEqual(
+            {round(layout.positions[block_id][0], 9) for block_id in graph.node_ids},
+            {round(layout.positions[1][0], 9)},
+        )
+        for parent in range(1, 10):
+            self.assertAlmostEqual(
+                layout.positions[parent + 1][1] - layout.positions[parent][1],
+                80.0 + TREE_BAND_GAP,
+            )
+
+    def test_disconnected_components_keep_roots_above_children(self) -> None:
+        graph = BlockGraph(
+            (
+                _record(1, source=True),
+                _record(2),
+                _record(3),
+                _record(10, source=True),
+                _record(11),
+                _record(12),
+                _record(20),
+            ),
+            (
+                _edge(0, 1, 2),
+                _edge(1, 2, 3),
+                _edge(2, 10, 11),
+                _edge(3, 11, 12),
+            ),
+        )
+
+        layout = layout_block_graph(graph)
+
+        self.assertEqual(set(layout.root_ids), {1, 10, 20})
+        for root, child, grandchild in ((1, 2, 3), (10, 11, 12)):
+            self.assertEqual(
+                (layout.depths[root], layout.depths[child], layout.depths[grandchild]),
+                (0, 1, 2),
+            )
+            self.assertLess(
+                layout.positions[root][1],
+                layout.positions[child][1],
+            )
+            self.assertLess(
+                layout.positions[child][1],
+                layout.positions[grandchild][1],
+            )
+        self.assertEqual(layout.depths[20], 0)
+
+    def test_cycles_parallel_edges_and_self_loops_do_not_break_layers(self) -> None:
+        graph = BlockGraph(
+            tuple(_record(block_id, source=block_id == 1) for block_id in range(1, 6)),
+            (
+                _edge(0, 1, 2),
+                _edge(1, 1, 3),
+                _edge(2, 2, 4),
+                _edge(3, 3, 5),
+                _edge(4, 2, 3),
+                _edge(5, 4, 5),
+                _edge(6, 1, 2),
+                _edge(7, 4, 4),
+            ),
+        )
+
+        layout = layout_block_graph(graph)
+
+        self.assertEqual(layout.depths, {1: 0, 2: 1, 3: 1, 4: 2, 5: 2})
+        self.assertEqual(len(layout.tree_edge_indices), len(graph.nodes) - 1)
+        self.assertNotIn(6, layout.tree_edge_indices)
+        self.assertNotIn(7, layout.tree_edge_indices)
+        self.assertEqual(set(layout.edge_routes), set(range(8)))
+        y_by_depth = {
+            depth: {
+                layout.positions[block_id][1]
+                for block_id, block_depth in layout.depths.items()
+                if block_depth == depth
+            }
+            for depth in range(3)
+        }
+        self.assertTrue(all(len(values) == 1 for values in y_by_depth.values()))
+        self.assertLess(
+            next(iter(y_by_depth[0])),
+            next(iter(y_by_depth[1])),
+        )
+        self.assertLess(
+            next(iter(y_by_depth[1])),
+            next(iter(y_by_depth[2])),
+        )
+
+    def test_hierarchical_positions_do_not_depend_on_input_order(self) -> None:
+        nodes = tuple(
+            _record(block_id, source=block_id == 1) for block_id in range(1, 8)
+        )
+        edges = (
+            _edge(40, 1, 2),
+            _edge(41, 1, 3),
+            _edge(42, 2, 4),
+            _edge(43, 2, 5),
+            _edge(44, 3, 6),
+            _edge(45, 3, 7),
+        )
+
+        forward = layout_block_graph(BlockGraph(nodes, edges))
+        reversed_input = layout_block_graph(
+            BlockGraph(tuple(reversed(nodes)), tuple(reversed(edges)))
+        )
+
+        self.assertEqual(forward.positions, reversed_input.positions)
+        self.assertEqual(forward.depths, reversed_input.depths)
+        self.assertEqual(forward.root_ids, reversed_input.root_ids)
+
+    def test_single_circuit_external_block_is_a_leaf_and_never_a_root(self) -> None:
+        graph = BlockGraph(
+            (_record(1, source=True), _record(2), _record(3, source=True)),
+            (_edge(0, 1, 2), _edge(1, 2, 3)),
+        )
+
+        layout = layout_block_graph(
+            graph,
+            block_circuit_indices={1: 0, 2: 0, 3: 1},
+            selected_circuit_indices={0},
+        )
+
+        self.assertEqual(layout.root_ids, (1,))
+        self.assertEqual(layout.depths[3], layout.depths[2] + 1)
+
+
+class BlockGraphRoutingTests(unittest.TestCase):
+    def test_routes_and_labels_use_original_switch_indices(self) -> None:
+        graph = BlockGraph(
+            (_record(1), _record(2), _record(3)),
+            (_edge(17, 1, 3),),
+        )
+        positions = {1: (0.0, 0.0), 2: (100.0, 0.0), 3: (200.0, 0.0)}
+
+        routes, labels, leaders = route_block_graph_edges(graph, positions)
+
+        self.assertEqual(set(routes), {17})
+        self.assertEqual(set(labels), {17})
+        self.assertIsInstance(leaders, dict)
+        self.assertGreaterEqual(len(routes[17].points), 3)
+        self.assertNotEqual(routes[17].points[0], positions[1])
+        self.assertNotEqual(routes[17].points[-1], positions[3])
+
+    def test_route_is_clipped_at_the_real_circle_not_the_caption_envelope(self) -> None:
+        graph = BlockGraph((_record(1), _record(2)), (_edge(3, 1, 2),))
+        envelopes = {
+            block_id: BlockNodeEnvelope(138.0, 130.0, diameter=72.0)
+            for block_id in graph.node_ids
+        }
+
+        routes, _labels, _leaders = route_block_graph_edges(
+            graph,
+            {1: (0.0, 0.0), 2: (240.0, 0.0)},
+            envelopes,
+        )
+
+        self.assertAlmostEqual(routes[3].points[0][0], 36.0)
+        self.assertAlmostEqual(routes[3].points[-1][0], 204.0)
+
+    def test_parallel_edges_and_self_loops_keep_distinct_symmetric_routes(self) -> None:
+        graph = BlockGraph(
+            (_record(1), _record(2)),
+            (
+                _edge(10, 1, 2),
+                _edge(11, 1, 2),
+                _edge(12, 1, 1),
+                _edge(13, 1, 1),
+            ),
+        )
+
+        routes, _labels, _leaders = route_block_graph_edges(
+            graph,
+            {1: (0.0, 0.0), 2: (200.0, 0.0)},
+        )
+
+        self.assertNotEqual(routes[10], routes[11])
+        self.assertTrue(routes[10].curved)
+        self.assertTrue(routes[11].curved)
+        self.assertNotEqual(routes[12], routes[13])
+        self.assertTrue(routes[12].curved)
 
 
 class BlockGraphCoordinateLayoutTests(unittest.TestCase):
@@ -248,10 +593,57 @@ class BlockGraphCoordinateLayoutTests(unittest.TestCase):
         first = layout.positions[1]
         second = layout.positions[2]
         third = layout.positions[3]
-        self.assertAlmostEqual(math.dist(first, second), 200.0)
-        self.assertAlmostEqual(math.dist(second, third), 200.0)
+        self.assertAlmostEqual(
+            math.dist(first, second),
+            GEOGRAPHIC_TARGET_EDGE_LENGTH,
+        )
+        self.assertAlmostEqual(
+            math.dist(second, third),
+            GEOGRAPHIC_TARGET_EDGE_LENGTH,
+        )
         self.assertAlmostEqual(first[1], second[1])
         self.assertLess(third[1], second[1])
+
+    def test_circuit_clusters_keep_east_west_and_north_south_orientation(self) -> None:
+        graph = BlockGraph(
+            tuple(_record(block_id) for block_id in range(1, 5)),
+            (
+                _edge(0, 1, 2),
+                _edge(1, 2, 3),
+                _edge(2, 3, 4),
+                _edge(3, 4, 1),
+            ),
+        )
+        # As coordenadas já usam o eixo Y da visualização: norte é
+        # negativo, como nas âncoras produzidas por block_coordinate_anchors.
+        anchors = {
+            1: (0.0, 0.0),
+            2: (100.0, 0.0),
+            3: (100.0, -100.0),
+            4: (0.0, -100.0),
+        }
+        circuits = {block_id: block_id - 1 for block_id in graph.node_ids}
+
+        first = layout_block_graph_by_coordinates(
+            graph,
+            anchors,
+            block_circuit_indices=circuits,
+            selected_circuit_indices=frozenset(circuits.values()),
+        )
+        second = layout_block_graph_by_coordinates(
+            graph,
+            anchors,
+            block_circuit_indices=circuits,
+            selected_circuit_indices=frozenset(circuits.values()),
+        )
+
+        self.assertEqual(first, second)
+        west_x = (first.positions[1][0] + first.positions[4][0]) / 2.0
+        east_x = (first.positions[2][0] + first.positions[3][0]) / 2.0
+        south_y = (first.positions[1][1] + first.positions[2][1]) / 2.0
+        north_y = (first.positions[3][1] + first.positions[4][1]) / 2.0
+        self.assertLess(west_x, east_x)
+        self.assertLess(north_y, south_y)
 
     def test_coincident_nodes_receive_only_a_deterministic_minimum_separation(self) -> None:
         graph = BlockGraph(
@@ -268,6 +660,51 @@ class BlockGraphCoordinateLayoutTests(unittest.TestCase):
             math.dist(first.positions[1], first.positions[2]),
             FIXED_NODE_DIAMETER + 24.0,
         )
+
+    def test_extreme_coordinate_outlier_is_compressed_to_safe_edge_lengths(self) -> None:
+        graph = BlockGraph(
+            tuple(_record(block_id) for block_id in range(1, 5)),
+            tuple(_edge(index, index + 1, index + 2) for index in range(3)),
+        )
+        anchors = {
+            1: (0.0, 0.0),
+            2: (10.0, 0.0),
+            3: (20.0, 0.0),
+            4: (10_000.0, 0.0),
+        }
+
+        layout = layout_block_graph_by_coordinates(graph, anchors)
+        lengths = [
+            math.dist(layout.positions[index], layout.positions[index + 1])
+            for index in range(1, 4)
+        ]
+
+        self.assertGreaterEqual(min(lengths), MIN_COORDINATE_EDGE_LENGTH - 0.1)
+        self.assertLessEqual(max(lengths), MAX_COORDINATE_EDGE_LENGTH + 0.1)
+
+    def test_coordinate_collisions_use_the_full_visual_envelope(self) -> None:
+        graph = BlockGraph(
+            (_record(1), _record(2), _record(3)),
+            (_edge(0, 1, 2), _edge(1, 2, 3)),
+        )
+        anchors = {1: (0.0, 0.0), 2: (0.0, 0.0), 3: (0.0, 0.0)}
+        envelopes = {
+            block_id: BlockNodeEnvelope(72.0, 110.0) for block_id in graph.node_ids
+        }
+
+        layout = layout_block_graph_by_coordinates(
+            graph,
+            anchors,
+            node_envelopes=envelopes,
+        )
+
+        for left in graph.node_ids:
+            for right in graph.node_ids:
+                if right <= left:
+                    continue
+                dx = abs(layout.positions[left][0] - layout.positions[right][0])
+                dy = abs(layout.positions[left][1] - layout.positions[right][1])
+                self.assertTrue(dx >= 96.0 or dy >= 134.0)
 
     def test_missing_source_geometry_disables_coordinate_anchors(self) -> None:
         result = SimpleNamespace(
