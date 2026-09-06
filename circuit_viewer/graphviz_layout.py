@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from functools import lru_cache
 import hashlib
 import json
@@ -42,6 +43,188 @@ GRAPHVIZ_SHA256 = (
 GRAPHVIZ_TIMEOUT_SECONDS = 30.0
 GRAPHVIZ_CACHE_SIZE = 8
 _POINTS_PER_INCH = 72.0
+GRAPHVIZ_NODE_SEPARATION_RANGE = (2.0, 500.0)
+GRAPHVIZ_RANK_SEPARATION_RANGE = (2.0, 800.0)
+GRAPHVIZ_TREE_EDGE_WEIGHT_RANGE = (1, 100)
+GRAPHVIZ_TREE_EDGE_MINLEN_RANGE = (1, 10)
+GRAPHVIZ_CROSSING_MINIMIZATION_RANGE = (0.1, 4.0)
+
+
+class GraphvizEdgeRouting(str, Enum):
+    """Traçados compatíveis com etiquetas e com o parser geométrico Qt."""
+
+    SPLINE = "spline"
+    POLYLINE = "polyline"
+    LINE = "line"
+
+
+@dataclass(frozen=True, slots=True)
+class GraphvizLayoutSettings:
+    """Parâmetros seguros de geometria expostos ao ajuste fino do usuário."""
+
+    node_separation_px: float = 32.0
+    rank_separation_px: float = 56.0
+    edge_routing: GraphvizEdgeRouting = GraphvizEdgeRouting.SPLINE
+    equal_rank_spacing: bool = False
+    tree_edge_weight: int = 8
+    tree_edge_minlen: int = 1
+    crossing_minimization: float = 1.0
+
+    def __post_init__(self) -> None:
+        node_separation = float(self.node_separation_px)
+        rank_separation = float(self.rank_separation_px)
+        crossing_minimization = float(self.crossing_minimization)
+        integer_values: list[int] = []
+        for raw, label in (
+            (self.tree_edge_weight, "Peso das arestas hierárquicas"),
+            (self.tree_edge_minlen, "Distância mínima em níveis"),
+        ):
+            try:
+                numeric = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{label} deve ser um número inteiro.") from exc
+            if not math.isfinite(numeric) or not numeric.is_integer():
+                raise ValueError(f"{label} deve ser um número inteiro.")
+            integer_values.append(int(numeric))
+        tree_edge_weight, tree_edge_minlen = integer_values
+        edge_routing = GraphvizEdgeRouting(self.edge_routing)
+        if not isinstance(self.equal_rank_spacing, bool):
+            raise ValueError("A uniformização entre níveis deve ser booleana.")
+        validations = (
+            (
+                node_separation,
+                GRAPHVIZ_NODE_SEPARATION_RANGE,
+                "Espaçamento horizontal",
+            ),
+            (
+                rank_separation,
+                GRAPHVIZ_RANK_SEPARATION_RANGE,
+                "Espaçamento vertical",
+            ),
+            (
+                crossing_minimization,
+                GRAPHVIZ_CROSSING_MINIMIZATION_RANGE,
+                "Esforço para reduzir cruzamentos",
+            ),
+        )
+        for value, limits, label in validations:
+            if not math.isfinite(value) or not limits[0] <= value <= limits[1]:
+                raise ValueError(
+                    f"{label} deve estar entre {limits[0]:g} e {limits[1]:g}."
+                )
+        integer_validations = (
+            (
+                tree_edge_weight,
+                GRAPHVIZ_TREE_EDGE_WEIGHT_RANGE,
+                "Peso das arestas hierárquicas",
+            ),
+            (
+                tree_edge_minlen,
+                GRAPHVIZ_TREE_EDGE_MINLEN_RANGE,
+                "Distância mínima em níveis",
+            ),
+        )
+        for value, limits, label in integer_validations:
+            if not limits[0] <= value <= limits[1]:
+                raise ValueError(
+                    f"{label} deve estar entre {limits[0]} e {limits[1]}."
+                )
+        object.__setattr__(self, "node_separation_px", node_separation)
+        object.__setattr__(self, "rank_separation_px", rank_separation)
+        object.__setattr__(self, "edge_routing", edge_routing)
+        object.__setattr__(
+            self,
+            "equal_rank_spacing",
+            bool(self.equal_rank_spacing),
+        )
+        object.__setattr__(self, "tree_edge_weight", tree_edge_weight)
+        object.__setattr__(self, "tree_edge_minlen", tree_edge_minlen)
+        object.__setattr__(self, "crossing_minimization", crossing_minimization)
+
+    def as_mapping(self) -> dict[str, float | int | str | bool]:
+        return {
+            "node_separation_px": self.node_separation_px,
+            "rank_separation_px": self.rank_separation_px,
+            "edge_routing": self.edge_routing.value,
+            "equal_rank_spacing": self.equal_rank_spacing,
+            "tree_edge_weight": self.tree_edge_weight,
+            "tree_edge_minlen": self.tree_edge_minlen,
+            "crossing_minimization": self.crossing_minimization,
+        }
+
+
+DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS = GraphvizLayoutSettings()
+
+
+def _setting_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"1", "true", "yes", "sim", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "não", "nao", "off"}:
+            return False
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    return default
+
+
+def graphviz_layout_settings_from_mapping(
+    values: Mapping[str, object],
+) -> GraphvizLayoutSettings:
+    """Converte preferências heterogêneas, recuperando cada campo inválido."""
+
+    defaults = DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS
+
+    def bounded_float(name: str, limits: tuple[float, float]) -> float:
+        try:
+            value = float(values.get(name, getattr(defaults, name)))
+        except (TypeError, ValueError):
+            return float(getattr(defaults, name))
+        if math.isfinite(value) and limits[0] <= value <= limits[1]:
+            return value
+        return float(getattr(defaults, name))
+
+    def bounded_int(name: str, limits: tuple[int, int]) -> int:
+        try:
+            raw = values.get(name, getattr(defaults, name))
+            value = int(raw)
+            if isinstance(raw, float) and not raw.is_integer():
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            return int(getattr(defaults, name))
+        if limits[0] <= value <= limits[1]:
+            return value
+        return int(getattr(defaults, name))
+
+    try:
+        edge_routing = GraphvizEdgeRouting(
+            values.get("edge_routing", defaults.edge_routing.value)
+        )
+    except (TypeError, ValueError):
+        edge_routing = defaults.edge_routing
+    return GraphvizLayoutSettings(
+        node_separation_px=bounded_float(
+            "node_separation_px", GRAPHVIZ_NODE_SEPARATION_RANGE
+        ),
+        rank_separation_px=bounded_float(
+            "rank_separation_px", GRAPHVIZ_RANK_SEPARATION_RANGE
+        ),
+        edge_routing=edge_routing,
+        equal_rank_spacing=_setting_bool(
+            values.get("equal_rank_spacing"), defaults.equal_rank_spacing
+        ),
+        tree_edge_weight=bounded_int(
+            "tree_edge_weight", GRAPHVIZ_TREE_EDGE_WEIGHT_RANGE
+        ),
+        tree_edge_minlen=bounded_int(
+            "tree_edge_minlen", GRAPHVIZ_TREE_EDGE_MINLEN_RANGE
+        ),
+        crossing_minimization=bounded_float(
+            "crossing_minimization", GRAPHVIZ_CROSSING_MINIMIZATION_RANGE
+        ),
+    )
 
 
 class GraphvizLayoutError(RuntimeError):
@@ -194,6 +377,7 @@ def serialize_graphviz_dot(
     node_envelopes: Mapping[int, BlockNodeEnvelope],
     block_circuit_indices: Mapping[int, int | None] | None = None,
     selected_circuit_indices: Sequence[int] | frozenset[int] | set[int] = (),
+    settings: GraphvizLayoutSettings = DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS,
 ) -> GraphvizDotInput:
     """Produz DOT determinístico e a floresta que define suas restrições."""
 
@@ -250,10 +434,18 @@ def serialize_graphviz_dot(
         edge_index: block_id
         for block_id, edge_index in parent_edge_by_node.items()
     }
+    node_separation = settings.node_separation_px / _POINTS_PER_INCH
+    rank_separation_value = settings.rank_separation_px / _POINTS_PER_INCH
+    rank_separation = f"{rank_separation_value:.9f}"
+    if settings.equal_rank_spacing:
+        rank_separation = _dot_quote(f"{rank_separation} equally")
     lines = [
         "digraph BlockGraph {",
-        "  graph [rankdir=TB, splines=spline, outputorder=edgesfirst, "
-        'nodesep=0.444444, ranksep=0.777778, pad=0.20, margin=0];',
+        f"  graph [rankdir=TB, splines={settings.edge_routing.value}, "
+        "outputorder=edgesfirst, "
+        f"nodesep={node_separation:.9f}, ranksep={rank_separation}, "
+        f"mclimit={settings.crossing_minimization:.9f}, "
+        "pad=0.20, margin=0];",
         '  node [shape=ellipse, label="", fixedsize=true, margin=0];',
         '  edge [dir=none, fontname="Arial", fontsize=10];',
     ]
@@ -294,7 +486,12 @@ def serialize_graphviz_dot(
             if owner is None:  # pragma: no cover - invariante da floresta
                 raise GraphvizLayoutError("Aresta de árvore sem nó pai.")
             tail, head = owner, child
-            attributes.append("weight=8")
+            attributes.extend(
+                (
+                    f"weight={settings.tree_edge_weight}",
+                    f"minlen={settings.tree_edge_minlen}",
+                )
+            )
         else:
             attributes.append("constraint=false")
         lines.append(
@@ -584,20 +781,29 @@ def calculate_graphviz_layout(
 
 
 __all__ = [
+    "DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS",
     "GRAPHVIZ_CACHE_SIZE",
+    "GRAPHVIZ_CROSSING_MINIMIZATION_RANGE",
     "GRAPHVIZ_DISTRIBUTION",
     "GRAPHVIZ_DOWNLOAD_URL",
+    "GRAPHVIZ_NODE_SEPARATION_RANGE",
+    "GRAPHVIZ_RANK_SEPARATION_RANGE",
     "GRAPHVIZ_SHA256",
     "GRAPHVIZ_TIMEOUT_SECONDS",
+    "GRAPHVIZ_TREE_EDGE_MINLEN_RANGE",
+    "GRAPHVIZ_TREE_EDGE_WEIGHT_RANGE",
     "GRAPHVIZ_VERSION",
     "GraphvizDotInput",
+    "GraphvizEdgeRouting",
     "GraphvizLayoutCancelled",
     "GraphvizLayoutError",
+    "GraphvizLayoutSettings",
     "GraphvizRuntimeStatus",
     "bundled_graphviz_dot",
     "bundled_graphviz_root",
     "calculate_graphviz_layout",
     "graphviz_layout_cache_key",
+    "graphviz_layout_settings_from_mapping",
     "parse_graphviz_json",
     "probe_graphviz_runtime",
     "run_graphviz_dot",

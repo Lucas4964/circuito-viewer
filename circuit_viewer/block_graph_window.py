@@ -76,16 +76,19 @@ from .block_graph import (
 from .circuit_colors import contrasting_text_color, normalize_hex_color
 from .display_identity import BlockDisplayIdentity
 from .graphviz_layout import (
+    DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS,
     GRAPHVIZ_CACHE_SIZE,
     GraphvizDotInput,
     GraphvizLayoutCancelled,
     GraphvizLayoutError,
+    GraphvizLayoutSettings,
     GraphvizRuntimeStatus,
     calculate_graphviz_layout,
     graphviz_layout_cache_key,
     probe_graphviz_runtime,
     serialize_graphviz_dot,
 )
+from .graphviz_settings_dialog import GraphvizSettingsDialog
 from .model import CLOSED_SWITCH_STATE, OPEN_SWITCH_STATE, switch_state_label
 
 
@@ -1602,11 +1605,15 @@ class BlockGraphWindow(QDialog):
     selectionCleared = pyqtSignal()
     resetRequested = pyqtSignal()
     scaleNodesByPowerChanged = pyqtSignal(bool)
+    graphvizLayoutSettingsChanged = pyqtSignal(object)
 
     def __init__(
         self,
         *,
         scale_nodes_by_power: bool = DEFAULT_SCALE_NODES_BY_POWER,
+        graphviz_layout_settings: GraphvizLayoutSettings = (
+            DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS
+        ),
         parent=None,  # noqa: ANN001
     ) -> None:
         super().__init__(parent)
@@ -1634,6 +1641,7 @@ class BlockGraphWindow(QDialog):
         self._include_unresolved = False
         self._selection_needs_initialization = False
         self.scale_nodes_by_power = bool(scale_nodes_by_power)
+        self.graphviz_layout_settings = graphviz_layout_settings
         self.layout_mode = BlockGraphLayoutMode.TREE
         self._coordinate_anchors: dict[int, tuple[float, float]] = {}
         self._graphviz_runtime: GraphvizRuntimeStatus = probe_graphviz_runtime()
@@ -1697,6 +1705,19 @@ class BlockGraphWindow(QDialog):
         )
         display_options.addWidget(self.layout_mode_label)
         display_options.addWidget(self.layout_mode_combo)
+        self.graphviz_settings_button = QPushButton("Configurar Graphviz…", self)
+        self.graphviz_settings_button.setObjectName(
+            "block_graph_graphviz_settings_button"
+        )
+        self.graphviz_settings_button.setEnabled(
+            self._graphviz_runtime.available
+        )
+        self.graphviz_settings_button.setToolTip(
+            "Ajustar espaçamentos, rotas e otimização do Graphviz dot."
+            if self._graphviz_runtime.available
+            else self._graphviz_runtime.reason
+        )
+        display_options.addWidget(self.graphviz_settings_button)
         self.graphviz_status_label = QLabel("", self)
         self.graphviz_status_label.setObjectName("block_graph_graphviz_status")
         self.graphviz_status_label.setStyleSheet("color: #8A2D00;")
@@ -1725,6 +1746,9 @@ class BlockGraphWindow(QDialog):
         )
         self.layout_mode_combo.currentIndexChanged.connect(
             self._layout_mode_changed
+        )
+        self.graphviz_settings_button.clicked.connect(
+            self._open_graphviz_settings
         )
         self.view.blockClicked.connect(self.blockRequested)
         self.view.blockActivated.connect(self.blockActivated)
@@ -1875,6 +1899,31 @@ class BlockGraphWindow(QDialog):
         value = self.layout_mode_combo.currentData()
         if value is not None:
             self.set_layout_mode(str(value))
+
+    def _open_graphviz_settings(self) -> None:
+        dialog = GraphvizSettingsDialog(self.graphviz_layout_settings, self)
+        dialog.settingsApplied.connect(self._graphviz_settings_applied)
+        dialog.exec()
+
+    def set_graphviz_layout_settings(
+        self,
+        settings: GraphvizLayoutSettings,
+    ) -> None:
+        """Atualiza os parâmetros e recalcula apenas quando o dot está ativo."""
+
+        if settings == self.graphviz_layout_settings:
+            return
+        self.graphviz_layout_settings = settings
+        if self.layout_mode is BlockGraphLayoutMode.GRAPHVIZ_DOT:
+            self._refresh_filtered_graph()
+
+    def _graphviz_settings_applied(self, settings: object) -> None:
+        if not isinstance(settings, GraphvizLayoutSettings):
+            return
+        changed = settings != self.graphviz_layout_settings
+        self.set_graphviz_layout_settings(settings)
+        if changed:
+            self.graphvizLayoutSettingsChanged.emit(settings)
 
     def set_circuit_styles(
         self,
@@ -2056,6 +2105,7 @@ class BlockGraphWindow(QDialog):
                 node_envelopes=envelopes,
                 block_circuit_indices=self._block_circuit_indices,
                 selected_circuit_indices=self._selected_circuit_indices,
+                settings=self.graphviz_layout_settings,
             )
         except GraphvizLayoutError as exc:
             self._fallback_from_graphviz(graph, str(exc))

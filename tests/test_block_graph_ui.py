@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from dataclasses import replace
+from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -13,7 +14,7 @@ try:
     from PyQt6.QtCore import QPoint, QPointF, QRectF, QSettings, Qt
     from PyQt6.QtGui import QPalette, QTransform
     from PyQt6.QtTest import QTest
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtWidgets import QApplication, QDialog
 
     from circuit_viewer.block_graph import (
         FIXED_NODE_DIAMETER,
@@ -37,7 +38,18 @@ try:
         parse_scale_nodes_by_power,
         save_scale_nodes_by_power,
     )
-    from circuit_viewer.graphviz_layout import GRAPHVIZ_CACHE_SIZE
+    from circuit_viewer.graphviz_layout import (
+        DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS,
+        GRAPHVIZ_CACHE_SIZE,
+        GraphvizEdgeRouting,
+        GraphvizLayoutSettings,
+    )
+    from circuit_viewer.graphviz_settings_dialog import (
+        GRAPHVIZ_SETTINGS_PREFIX,
+        GraphvizSettingsDialog,
+        load_graphviz_layout_settings,
+        save_graphviz_layout_settings,
+    )
     from circuit_viewer.blocks_window import BlockTableModel, BlocksWindow
     from circuit_viewer.display_identity import BlockDisplayIdentity
     from circuit_viewer.main_window import MainWindow
@@ -394,6 +406,53 @@ class BlockGraphWindowTests(unittest.TestCase):
         self.assertEqual(window.view.selected_block_id, 2)
         self.assertTrue(window.view.layout_result.edge_routes[0].cubic)
         self.assertGreaterEqual(len(window._graphviz_cache), 1)
+
+    def test_graphviz_settings_button_follows_runtime_availability(self) -> None:
+        window, _ = self._window()
+
+        self.assertEqual(
+            window.graphviz_settings_button.isEnabled(),
+            window.graphviz_layout_available,
+        )
+        if window.graphviz_layout_available:
+            self.assertIn(
+                "espaçamentos",
+                window.graphviz_settings_button.toolTip(),
+            )
+        else:
+            self.assertEqual(
+                window.graphviz_settings_button.toolTip(),
+                window._graphviz_runtime.reason,
+            )
+
+    def test_settings_only_recalculate_while_graphviz_mode_is_active(self) -> None:
+        window, _ = self._window()
+        custom = GraphvizLayoutSettings(node_separation_px=80.0)
+        refresh = Mock()
+        window._refresh_filtered_graph = refresh
+
+        window.set_graphviz_layout_settings(custom)
+
+        self.assertEqual(window.graphviz_layout_settings, custom)
+        refresh.assert_not_called()
+
+        window.layout_mode = BlockGraphLayoutMode.GRAPHVIZ_DOT
+        updated = GraphvizLayoutSettings(node_separation_px=96.0)
+        window.set_graphviz_layout_settings(updated)
+
+        refresh.assert_called_once_with()
+
+    def test_dialog_application_updates_window_and_emits_once(self) -> None:
+        window, _ = self._window()
+        emitted: list[GraphvizLayoutSettings] = []
+        window.graphvizLayoutSettingsChanged.connect(emitted.append)
+        custom = GraphvizLayoutSettings(rank_separation_px=90.0)
+
+        window._graphviz_settings_applied(custom)
+        window._graphviz_settings_applied(custom)
+
+        self.assertEqual(window.graphviz_layout_settings, custom)
+        self.assertEqual(emitted, [custom])
 
     def test_obsolete_graphviz_result_is_ignored(self) -> None:
         window, _ = self._window()
@@ -1017,6 +1076,107 @@ class BlockGraphSettingsTests(unittest.TestCase):
         self.assertTrue(load_scale_nodes_by_power(reloaded))
         self.assertTrue(reloaded.value(BLOCK_GRAPH_SCALE_SETTINGS_KEY, type=bool))
 
+    def test_graphviz_settings_are_saved_and_reloaded(self) -> None:
+        expected = GraphvizLayoutSettings(
+            node_separation_px=48.0,
+            rank_separation_px=112.0,
+            edge_routing=GraphvizEdgeRouting.LINE,
+            equal_rank_spacing=True,
+            tree_edge_weight=16,
+            tree_edge_minlen=2,
+            crossing_minimization=2.4,
+        )
+
+        save_graphviz_layout_settings(self.settings, expected)
+        reloaded = QSettings(
+            self.settings.fileName(),
+            QSettings.Format.IniFormat,
+        )
+
+        self.assertEqual(load_graphviz_layout_settings(reloaded), expected)
+        self.assertEqual(
+            reloaded.value(f"{GRAPHVIZ_SETTINGS_PREFIX}edge_routing"),
+            "line",
+        )
+
+    def test_invalid_graphviz_preferences_fall_back_field_by_field(self) -> None:
+        self.settings.setValue(
+            f"{GRAPHVIZ_SETTINGS_PREFIX}node_separation_px",
+            "inválido",
+        )
+        self.settings.setValue(
+            f"{GRAPHVIZ_SETTINGS_PREFIX}rank_separation_px",
+            140.0,
+        )
+        self.settings.setValue(
+            f"{GRAPHVIZ_SETTINGS_PREFIX}edge_routing",
+            "ortho",
+        )
+
+        loaded = load_graphviz_layout_settings(self.settings)
+
+        self.assertEqual(loaded.node_separation_px, 32.0)
+        self.assertEqual(loaded.rank_separation_px, 140.0)
+        self.assertEqual(loaded.edge_routing, GraphvizEdgeRouting.SPLINE)
+
+    def test_graphviz_dialog_applies_and_restores_without_implicit_run(self) -> None:
+        initial = GraphvizLayoutSettings(
+            node_separation_px=75.0,
+            rank_separation_px=125.0,
+            edge_routing=GraphvizEdgeRouting.POLYLINE,
+            equal_rank_spacing=True,
+            tree_edge_weight=14,
+            tree_edge_minlen=2,
+            crossing_minimization=2.0,
+        )
+        dialog = GraphvizSettingsDialog(initial)
+        self.addCleanup(dialog.close)
+        applied: list[GraphvizLayoutSettings] = []
+        dialog.settingsApplied.connect(applied.append)
+
+        self.assertFalse(dialog.advanced_panel.isVisible())
+        dialog.advanced_button.setChecked(True)
+        self.assertFalse(dialog.advanced_panel.isHidden())
+        dialog.restore_defaults()
+
+        self.assertEqual(dialog.settings(), DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS)
+        self.assertEqual(dialog.applied_settings, initial)
+        self.assertEqual(applied, [])
+
+        dialog.apply_settings()
+        dialog.apply_settings()
+
+        self.assertEqual(
+            dialog.applied_settings,
+            DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS,
+        )
+        self.assertEqual(applied, [DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS])
+
+    def test_graphviz_dialog_cancel_discards_unapplied_values(self) -> None:
+        dialog = GraphvizSettingsDialog(DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS)
+        self.addCleanup(dialog.close)
+        applied: list[GraphvizLayoutSettings] = []
+        dialog.settingsApplied.connect(applied.append)
+        dialog.node_separation_input.setValue(222.0)
+
+        dialog.reject()
+
+        self.assertEqual(dialog.applied_settings, DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS)
+        self.assertEqual(applied, [])
+
+    def test_graphviz_dialog_ok_applies_and_accepts(self) -> None:
+        dialog = GraphvizSettingsDialog(DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS)
+        self.addCleanup(dialog.close)
+        applied: list[GraphvizLayoutSettings] = []
+        dialog.settingsApplied.connect(applied.append)
+        dialog.rank_separation_input.setValue(88.0)
+
+        dialog.accept_settings()
+
+        self.assertEqual(dialog.result(), int(QDialog.DialogCode.Accepted))
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(applied[0].rank_separation_px, 88.0)
+
 
 @unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
 class BlockGraphIntegrationTests(unittest.TestCase):
@@ -1227,6 +1387,29 @@ class BlockGraphIntegrationTests(unittest.TestCase):
             reloaded.block_graph_window.scale_by_power_checkbox.isChecked()
         )
         self.assertTrue(reloaded.block_graph_window.scale_nodes_by_power)
+
+    def test_graphviz_fine_tuning_is_persisted_by_main_window(self) -> None:
+        window, _ = self._window()
+        expected = GraphvizLayoutSettings(
+            node_separation_px=64.0,
+            rank_separation_px=108.0,
+            edge_routing=GraphvizEdgeRouting.POLYLINE,
+            equal_rank_spacing=True,
+            tree_edge_weight=10,
+            tree_edge_minlen=2,
+            crossing_minimization=1.8,
+        )
+
+        window.block_graph_window._graphviz_settings_applied(expected)
+
+        self.assertEqual(load_graphviz_layout_settings(self.settings), expected)
+        reloaded = MainWindow(settings=self.settings)
+        self.addCleanup(reloaded.close)
+        self.assertEqual(reloaded._graphviz_layout_settings, expected)
+        self.assertEqual(
+            reloaded.block_graph_window.graphviz_layout_settings,
+            expected,
+        )
 
     def test_editing_a_circuit_color_updates_the_graph_node(self) -> None:
         window, _ = self._window()

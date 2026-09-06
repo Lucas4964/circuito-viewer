@@ -17,13 +17,17 @@ from circuit_viewer.block_graph import (
     build_block_graph_forest,
 )
 from circuit_viewer.graphviz_layout import (
+    DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS,
     GRAPHVIZ_VERSION,
     GraphvizDotInput,
+    GraphvizEdgeRouting,
     GraphvizLayoutCancelled,
     GraphvizLayoutError,
+    GraphvizLayoutSettings,
     bundled_graphviz_dot,
     calculate_graphviz_layout,
     graphviz_layout_cache_key,
+    graphviz_layout_settings_from_mapping,
     parse_graphviz_json,
     probe_graphviz_runtime,
     run_graphviz_dot,
@@ -69,6 +73,57 @@ def _edge(
 
 
 class GraphvizSerializationTests(unittest.TestCase):
+    def test_settings_defaults_match_the_original_dot_geometry(self) -> None:
+        self.assertEqual(
+            DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS,
+            GraphvizLayoutSettings(
+                node_separation_px=32.0,
+                rank_separation_px=56.0,
+                edge_routing=GraphvizEdgeRouting.SPLINE,
+                equal_rank_spacing=False,
+                tree_edge_weight=8,
+                tree_edge_minlen=1,
+                crossing_minimization=1.0,
+            ),
+        )
+
+    def test_invalid_saved_fields_fall_back_independently(self) -> None:
+        settings = graphviz_layout_settings_from_mapping(
+            {
+                "node_separation_px": "inválido",
+                "rank_separation_px": 120,
+                "edge_routing": "ortho",
+                "equal_rank_spacing": "sim",
+                "tree_edge_weight": 101,
+                "tree_edge_minlen": 3,
+                "crossing_minimization": float("nan"),
+            }
+        )
+
+        self.assertEqual(settings.node_separation_px, 32.0)
+        self.assertEqual(settings.rank_separation_px, 120.0)
+        self.assertEqual(settings.edge_routing, GraphvizEdgeRouting.SPLINE)
+        self.assertTrue(settings.equal_rank_spacing)
+        self.assertEqual(settings.tree_edge_weight, 8)
+        self.assertEqual(settings.tree_edge_minlen, 3)
+        self.assertEqual(settings.crossing_minimization, 1.0)
+
+    def test_settings_reject_values_outside_the_public_ranges(self) -> None:
+        with self.assertRaises(ValueError):
+            GraphvizLayoutSettings(node_separation_px=1.0)
+        with self.assertRaises(ValueError):
+            GraphvizLayoutSettings(rank_separation_px=801.0)
+        with self.assertRaises(ValueError):
+            GraphvizLayoutSettings(tree_edge_weight=0)
+        with self.assertRaises(ValueError):
+            GraphvizLayoutSettings(tree_edge_weight=2.5)
+        with self.assertRaises(ValueError):
+            GraphvizLayoutSettings(tree_edge_minlen=11)
+        with self.assertRaises(ValueError):
+            GraphvizLayoutSettings(crossing_minimization=4.1)
+        with self.assertRaises(ValueError):
+            GraphvizLayoutSettings(equal_rank_spacing="false")
+
     def test_forest_is_shared_and_ignores_parallel_and_self_edges(self) -> None:
         graph = BlockGraph(
             (_record(1, source=True), _record(2), _record(3)),
@@ -148,6 +203,41 @@ class GraphvizSerializationTests(unittest.TestCase):
         self.assertNotIn(
             'id="switch_1", label="COD-1", constraint=false',
             dot_input.source,
+        )
+
+    def test_custom_settings_are_serialized_and_change_the_cache_key(self) -> None:
+        graph = BlockGraph(
+            (_record(1, source=True), _record(2)),
+            (_edge(10, 1, 2),),
+        )
+        envelopes = {
+            block_id: BlockNodeEnvelope() for block_id in graph.node_ids
+        }
+        settings = GraphvizLayoutSettings(
+            node_separation_px=72.0,
+            rank_separation_px=144.0,
+            edge_routing=GraphvizEdgeRouting.POLYLINE,
+            equal_rank_spacing=True,
+            tree_edge_weight=12,
+            tree_edge_minlen=2,
+            crossing_minimization=2.5,
+        )
+
+        original = serialize_graphviz_dot(graph, node_envelopes=envelopes)
+        customized = serialize_graphviz_dot(
+            graph,
+            node_envelopes=envelopes,
+            settings=settings,
+        )
+
+        self.assertIn("splines=polyline", customized.source)
+        self.assertIn("nodesep=1.000000000", customized.source)
+        self.assertIn('ranksep="2.000000000 equally"', customized.source)
+        self.assertIn("mclimit=2.500000000", customized.source)
+        self.assertIn("weight=12, minlen=2", customized.source)
+        self.assertNotEqual(
+            graphviz_layout_cache_key(original, GRAPHVIZ_VERSION),
+            graphviz_layout_cache_key(customized, GRAPHVIZ_VERSION),
         )
 
 
@@ -391,6 +481,53 @@ class BundledGraphvizSmokeTests(unittest.TestCase):
                 envelopes,
                 cancel_event=cancelled,
             )
+
+    def test_supported_edge_routing_modes_return_complete_geometry(self) -> None:
+        status = probe_graphviz_runtime()
+        if not status.available:
+            self.skipTest(status.reason)
+        graph = BlockGraph(
+            (_record(1, source=True), _record(2), _record(3)),
+            (
+                _edge(0, 1, 2),
+                _edge(1, 1, 2),
+                _edge(2, 2, 3),
+                _edge(3, 3, 3),
+            ),
+        )
+        envelopes = {
+            block_id: BlockNodeEnvelope(138.0, 110.0, 56.0)
+            for block_id in graph.node_ids
+        }
+
+        for routing in GraphvizEdgeRouting:
+            with self.subTest(routing=routing.value):
+                dot_input = serialize_graphviz_dot(
+                    graph,
+                    node_envelopes=envelopes,
+                    settings=GraphvizLayoutSettings(
+                        node_separation_px=48.0,
+                        rank_separation_px=90.0,
+                        edge_routing=routing,
+                        equal_rank_spacing=True,
+                        tree_edge_weight=12,
+                        tree_edge_minlen=2,
+                        crossing_minimization=2.0,
+                    ),
+                )
+                layout = calculate_graphviz_layout(
+                    status.executable,
+                    dot_input,
+                    graph,
+                    envelopes,
+                )
+
+                self.assertEqual(set(layout.positions), set(graph.node_ids))
+                self.assertEqual(set(layout.edge_routes), {0, 1, 2, 3})
+                self.assertEqual(
+                    set(layout.edge_label_positions),
+                    {0, 1, 2, 3},
+                )
 
 
 if __name__ == "__main__":

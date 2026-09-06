@@ -1715,6 +1715,24 @@ de Windows 64 bits ou devolver geometria inválida, a opção fica indisponível
 o grafo retorna integralmente para **Árvore — Interno**, com aviso não
 bloqueante.
 
+O botão **Configurar Graphviz…**, ao lado do seletor de posicionamento, abre o
+ajuste fino sem ocupar permanentemente a área do grafo. Os controles principais
+definem o espaçamento horizontal entre nós (`nodesep`, originalmente 32 px), o
+espaçamento vertical entre níveis (`ranksep`, originalmente 56 px), a
+uniformização dos níveis e o traçado curvo, poligonal ou reto das arestas. A
+seção **Opções avançadas** reúne o peso hierárquico (`weight`, 8), a distância
+mínima em níveis (`minlen`, 1) e o esforço de redução de cruzamentos (`mclimit`,
+1,0). Valores maiores de `mclimit` podem aumentar o tempo de cálculo.
+
+**Aplicar** salva e recalcula o modo Graphviz sem fechar o diálogo; **OK** faz o
+mesmo e fecha. **Cancelar** descarta apenas edições ainda não aplicadas e
+**Restaurar configurações originais** repõe nos campos os valores acima,
+aguardando Aplicar ou OK. As escolhas ficam em `block_graph/graphviz/*` no
+`QSettings` e são usadas na próxima execução. Se outro posicionamento estiver
+ativo, os valores são salvos sem recalcular até que **Árvore — Graphviz dot**
+seja selecionado. Aplicar no modo Graphviz preserva a seleção, substitui um
+cálculo obsoleto e reenquadra a nova geometria.
+
 **Coordenadas da rede**, no mesmo cabeçalho, usa uma referência espacial robusta
 das barras nas fronteiras de cada bloco, com fallback para suas demais barras.
 Cada componente visível é normalizado separadamente, distâncias extremas são

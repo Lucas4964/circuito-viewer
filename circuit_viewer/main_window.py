@@ -62,6 +62,11 @@ from .block_graph_window import (
     load_scale_nodes_by_power,
     save_scale_nodes_by_power,
 )
+from .graphviz_layout import GraphvizLayoutSettings
+from .graphviz_settings_dialog import (
+    load_graphviz_layout_settings,
+    save_graphviz_layout_settings,
+)
 from .blocks_window import BlocksWindow, BlockTableModel
 from .branch_window import BranchesWindow, BranchTableModel
 from .display_identity import (
@@ -742,6 +747,9 @@ class MainWindow(QMainWindow):
         self._scale_block_graph_nodes_by_power = load_scale_nodes_by_power(
             self._settings
         )
+        self._graphviz_layout_settings = load_graphviz_layout_settings(
+            self._settings
+        )
 
         self._model: CircuitModel | None = None
         self._line_model: LineNetworkModel | None = None
@@ -965,6 +973,7 @@ class MainWindow(QMainWindow):
         self.blocks_window = BlocksWindow(self.block_table_model, self)
         self.block_graph_window = BlockGraphWindow(
             scale_nodes_by_power=self._scale_block_graph_nodes_by_power,
+            graphviz_layout_settings=self._graphviz_layout_settings,
             parent=self,
         )
         self.cable_table_model = CableTableModel(self)
@@ -2284,6 +2293,9 @@ class MainWindow(QMainWindow):
         )
         self.block_graph_window.scaleNodesByPowerChanged.connect(
             self._set_scale_block_graph_nodes_by_power
+        )
+        self.block_graph_window.graphvizLayoutSettingsChanged.connect(
+            self._set_graphviz_layout_settings
         )
         self.branches_window.branchSelected.connect(self._select_branch)
         self.branches_window.branchActivated.connect(self._activate_branch)
@@ -7137,6 +7149,14 @@ class MainWindow(QMainWindow):
         self.block_graph_window.set_scale_nodes_by_power(
             self._scale_block_graph_nodes_by_power
         )
+
+    def _set_graphviz_layout_settings(
+        self,
+        settings: GraphvizLayoutSettings,
+    ) -> None:
+        self._graphviz_layout_settings = settings
+        save_graphviz_layout_settings(self._settings, settings)
+        self.block_graph_window.set_graphviz_layout_settings(settings)
 
     def _sync_block_graph_styles(self, *args) -> None:  # noqa: ANN002
         del args

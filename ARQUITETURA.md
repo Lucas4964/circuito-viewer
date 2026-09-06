@@ -119,6 +119,7 @@ CIRCUITO_VIEWER/
 │   ├── branch_window.py       # tabela de ramais (filtro, ordenação, avisos)
 │   ├── blocks_window.py       # tabela e seleção sincronizada dos blocos
 │   ├── block_graph_window.py  # grafo QGraphicsView dos blocos e chaves
+│   ├── graphviz_settings_dialog.py # ajuste fino e QSettings do layout dot
 │   ├── cables_window.py       # tabela do catálogo de cabos
 │   ├── opendss_export_dialog.py  # seleção dos circuitos a exportar
 │   ├── opendss_settings_dialog.py # Configurações → OpenDSS… + QSettings
@@ -2325,6 +2326,23 @@ centraliza o canvas e converte posições, splines cúbicas e `lp` para
 `BlockGraphLayout`. Um nó, rota, âncora ou valor finito ausente invalida o
 resultado inteiro, nunca apenas um item.
 
+`GraphvizLayoutSettings` é o contrato imutável dos ajustes aceitos pelo
+serializador. Espaçamentos em pixels são convertidos para polegadas por 72 antes
+de virar `nodesep` e `ranksep`; o restante controla `splines`, `weight`,
+`minlen`, `mclimit` e o modificador `equally`. A validação recupera cada valor
+persistido inválido de forma independente. O DOT completo continua sendo a
+entrada da chave do cache, portanto qualquer mudança geométrica produz outra
+entrada enquanto mudanças de cor continuam sem custo de layout.
+
+`graphviz_settings_dialog.py` contém o editor modal e a persistência em
+`block_graph/graphviz/*`. Opções comuns ficam visíveis e os parâmetros de
+otimização permanecem num painel avançado recolhível. Aplicar emite uma nova
+configuração sem fechar o diálogo; a janela cancela a geração anterior, mantém
+a seleção e solicita uma geometria reenquadrada somente se o modo Graphviz
+estiver ativo. Restaurar repõe os defaults originais nos campos, mas não salva
+nem executa o `dot` até Aplicar ou OK. `MainWindow` continua sendo o proprietário
+do `QSettings` e retransmite o retrato validado à janela do grafo.
+
 `block_coordinate_anchors()` oferece o segundo modo sem acoplar o núcleo ao Qt:
 reúne, sem duplicação, as barras nas pontas das chaves pertencentes a cada bloco
 e calcula uma referência robusta; sem fronteiras, usa todas as barras do bloco.
@@ -2367,7 +2385,10 @@ O cabeçalho oferece `Árvore — Interno`, `Árvore — Graphviz dot (experimen
 e `Coordenadas da rede`. A escolha não usa `QSettings`: cada processo começa no
 modo interno e mantém a opção apenas durante a sessão. Trocar o modo preserva a
 seleção e reenquadra a geometria. Sem coordenadas válidas, apenas a alternativa
-espacial fica indisponível; a disponibilidade do Graphviz é independente.
+espacial fica indisponível; a disponibilidade do Graphviz é independente. O
+botão **Configurar Graphviz…** permanece acessível nos outros modos quando o
+runtime é válido, permitindo preparar preferências persistentes sem recalcular
+o grafo atual.
 
 O pacote oficial Graphviz 15.1.1 para Windows x64 é redistribuído intacto em
 `circuit_viewer/vendor/graphviz-15.1.1-win64`, sem instalador, download em
