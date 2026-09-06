@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 
 from .graphviz_layout import (
     DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS,
+    GRAPHVIZ_CIRCUIT_SEPARATION_RANGE,
     GRAPHVIZ_CROSSING_MINIMIZATION_RANGE,
     GRAPHVIZ_NODE_SEPARATION_RANGE,
     GRAPHVIZ_RANK_SEPARATION_RANGE,
@@ -83,6 +84,18 @@ class GraphvizSettingsDialog(QDialog):
         layout.addWidget(explanation)
 
         main_form = QFormLayout()
+        self.circuit_separation_input = self._distance_input(
+            "graphviz_circuit_separation_input",
+            GRAPHVIZ_CIRCUIT_SEPARATION_RANGE,
+        )
+        self.circuit_separation_input.setToolTip(
+            "Distância visual mínima entre circuitos após o cálculo do dot."
+        )
+        main_form.addRow(
+            "Espaçamento mínimo entre circuitos:",
+            self.circuit_separation_input,
+        )
+
         self.node_separation_input = self._distance_input(
             "graphviz_node_separation_input",
             GRAPHVIZ_NODE_SEPARATION_RANGE,
@@ -232,6 +245,7 @@ class GraphvizSettingsDialog(QDialog):
     def settings(self) -> GraphvizLayoutSettings:
         routing = self.edge_routing_combo.currentData()
         return GraphvizLayoutSettings(
+            circuit_separation_px=self.circuit_separation_input.value(),
             node_separation_px=self.node_separation_input.value(),
             rank_separation_px=self.rank_separation_input.value(),
             edge_routing=GraphvizEdgeRouting(str(routing)),
@@ -242,6 +256,7 @@ class GraphvizSettingsDialog(QDialog):
         )
 
     def set_settings(self, settings: GraphvizLayoutSettings) -> None:
+        self.circuit_separation_input.setValue(settings.circuit_separation_px)
         self.node_separation_input.setValue(settings.node_separation_px)
         self.rank_separation_input.setValue(settings.rank_separation_px)
         routing_index = self.edge_routing_combo.findData(

@@ -1078,6 +1078,7 @@ class BlockGraphSettingsTests(unittest.TestCase):
 
     def test_graphviz_settings_are_saved_and_reloaded(self) -> None:
         expected = GraphvizLayoutSettings(
+            circuit_separation_px=180.0,
             node_separation_px=48.0,
             rank_separation_px=112.0,
             edge_routing=GraphvizEdgeRouting.LINE,
@@ -1101,6 +1102,10 @@ class BlockGraphSettingsTests(unittest.TestCase):
 
     def test_invalid_graphviz_preferences_fall_back_field_by_field(self) -> None:
         self.settings.setValue(
+            f"{GRAPHVIZ_SETTINGS_PREFIX}circuit_separation_px",
+            -1.0,
+        )
+        self.settings.setValue(
             f"{GRAPHVIZ_SETTINGS_PREFIX}node_separation_px",
             "inválido",
         )
@@ -1115,12 +1120,14 @@ class BlockGraphSettingsTests(unittest.TestCase):
 
         loaded = load_graphviz_layout_settings(self.settings)
 
+        self.assertEqual(loaded.circuit_separation_px, 120.0)
         self.assertEqual(loaded.node_separation_px, 32.0)
         self.assertEqual(loaded.rank_separation_px, 140.0)
         self.assertEqual(loaded.edge_routing, GraphvizEdgeRouting.SPLINE)
 
     def test_graphviz_dialog_applies_and_restores_without_implicit_run(self) -> None:
         initial = GraphvizLayoutSettings(
+            circuit_separation_px=220.0,
             node_separation_px=75.0,
             rank_separation_px=125.0,
             edge_routing=GraphvizEdgeRouting.POLYLINE,
@@ -1135,6 +1142,7 @@ class BlockGraphSettingsTests(unittest.TestCase):
         dialog.settingsApplied.connect(applied.append)
 
         self.assertFalse(dialog.advanced_panel.isVisible())
+        self.assertEqual(dialog.circuit_separation_input.value(), 220.0)
         dialog.advanced_button.setChecked(True)
         self.assertFalse(dialog.advanced_panel.isHidden())
         dialog.restore_defaults()
@@ -1157,7 +1165,7 @@ class BlockGraphSettingsTests(unittest.TestCase):
         self.addCleanup(dialog.close)
         applied: list[GraphvizLayoutSettings] = []
         dialog.settingsApplied.connect(applied.append)
-        dialog.node_separation_input.setValue(222.0)
+        dialog.circuit_separation_input.setValue(222.0)
 
         dialog.reject()
 
@@ -1391,6 +1399,7 @@ class BlockGraphIntegrationTests(unittest.TestCase):
     def test_graphviz_fine_tuning_is_persisted_by_main_window(self) -> None:
         window, _ = self._window()
         expected = GraphvizLayoutSettings(
+            circuit_separation_px=196.0,
             node_separation_px=64.0,
             rank_separation_px=108.0,
             edge_routing=GraphvizEdgeRouting.POLYLINE,

@@ -13,11 +13,14 @@ from circuit_viewer.block_analysis import BlockRecord
 from circuit_viewer.block_graph import (
     BlockGraph,
     BlockGraphEdge,
+    BlockGraphEdgeRoute,
+    BlockGraphLayout,
     BlockNodeEnvelope,
     build_block_graph_forest,
 )
 from circuit_viewer.graphviz_layout import (
     DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS,
+    GRAPHVIZ_CIRCUIT_SEPARATION_RANGE,
     GRAPHVIZ_VERSION,
     GraphvizDotInput,
     GraphvizEdgeRouting,
@@ -31,6 +34,7 @@ from circuit_viewer.graphviz_layout import (
     parse_graphviz_json,
     probe_graphviz_runtime,
     run_graphviz_dot,
+    separate_graphviz_circuit_groups,
     serialize_graphviz_dot,
 )
 
@@ -77,6 +81,7 @@ class GraphvizSerializationTests(unittest.TestCase):
         self.assertEqual(
             DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS,
             GraphvizLayoutSettings(
+                circuit_separation_px=120.0,
                 node_separation_px=32.0,
                 rank_separation_px=56.0,
                 edge_routing=GraphvizEdgeRouting.SPLINE,
@@ -90,6 +95,7 @@ class GraphvizSerializationTests(unittest.TestCase):
     def test_invalid_saved_fields_fall_back_independently(self) -> None:
         settings = graphviz_layout_settings_from_mapping(
             {
+                "circuit_separation_px": 1001,
                 "node_separation_px": "inválido",
                 "rank_separation_px": 120,
                 "edge_routing": "ortho",
@@ -100,6 +106,7 @@ class GraphvizSerializationTests(unittest.TestCase):
             }
         )
 
+        self.assertEqual(settings.circuit_separation_px, 120.0)
         self.assertEqual(settings.node_separation_px, 32.0)
         self.assertEqual(settings.rank_separation_px, 120.0)
         self.assertEqual(settings.edge_routing, GraphvizEdgeRouting.SPLINE)
@@ -109,6 +116,9 @@ class GraphvizSerializationTests(unittest.TestCase):
         self.assertEqual(settings.crossing_minimization, 1.0)
 
     def test_settings_reject_values_outside_the_public_ranges(self) -> None:
+        self.assertEqual(GRAPHVIZ_CIRCUIT_SEPARATION_RANGE, (0.0, 1000.0))
+        with self.assertRaises(ValueError):
+            GraphvizLayoutSettings(circuit_separation_px=-1.0)
         with self.assertRaises(ValueError):
             GraphvizLayoutSettings(node_separation_px=1.0)
         with self.assertRaises(ValueError):
@@ -198,6 +208,7 @@ class GraphvizSerializationTests(unittest.TestCase):
         )
 
         self.assertEqual(dot_input.source.count("subgraph circuit_"), 1)
+        self.assertEqual(dot_input.layout_groups, ((1, 2, 3),))
         self.assertIn('group="circuit_0"', dot_input.source)
         self.assertIn('"n_2" -> "n_3"', dot_input.source)
         self.assertNotIn(
@@ -214,6 +225,7 @@ class GraphvizSerializationTests(unittest.TestCase):
             block_id: BlockNodeEnvelope() for block_id in graph.node_ids
         }
         settings = GraphvizLayoutSettings(
+            circuit_separation_px=240.0,
             node_separation_px=72.0,
             rank_separation_px=144.0,
             edge_routing=GraphvizEdgeRouting.POLYLINE,
@@ -239,6 +251,196 @@ class GraphvizSerializationTests(unittest.TestCase):
             graphviz_layout_cache_key(original, GRAPHVIZ_VERSION),
             graphviz_layout_cache_key(customized, GRAPHVIZ_VERSION),
         )
+
+    def test_circuit_separation_changes_cache_without_changing_dot(self) -> None:
+        graph = BlockGraph((_record(1), _record(2)), ())
+        envelopes = {block_id: BlockNodeEnvelope() for block_id in graph.node_ids}
+
+        compact = serialize_graphviz_dot(
+            graph,
+            node_envelopes=envelopes,
+            block_circuit_indices={1: 0, 2: 1},
+            settings=GraphvizLayoutSettings(circuit_separation_px=0.0),
+        )
+        separated = serialize_graphviz_dot(
+            graph,
+            node_envelopes=envelopes,
+            block_circuit_indices={1: 0, 2: 1},
+            settings=GraphvizLayoutSettings(circuit_separation_px=240.0),
+        )
+
+        self.assertEqual(compact.source, separated.source)
+        self.assertNotEqual(
+            graphviz_layout_cache_key(compact, GRAPHVIZ_VERSION),
+            graphviz_layout_cache_key(separated, GRAPHVIZ_VERSION),
+        )
+
+
+class GraphvizCircuitSeparationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.graph = BlockGraph(
+            (_record(1), _record(2), _record(3), _record(4)),
+            (
+                _edge(10, 1, 2),
+                _edge(11, 3, 4),
+                _edge(12, 1, 3),
+            ),
+        )
+        self.envelopes = {
+            block_id: BlockNodeEnvelope(40.0, 40.0, 40.0)
+            for block_id in self.graph.node_ids
+        }
+        self.layout = BlockGraphLayout(
+            positions={
+                1: (-40.0, 0.0),
+                2: (-40.0, 100.0),
+                3: (40.0, 0.0),
+                4: (40.0, 100.0),
+            },
+            depths={1: 0, 2: 1, 3: 0, 4: 1},
+            root_ids=(1, 3),
+            tree_edge_indices=frozenset({0, 1}),
+            edge_routes={
+                10: BlockGraphEdgeRoute(((-40.0, 20.0), (-40.0, 80.0))),
+                11: BlockGraphEdgeRoute(((40.0, 20.0), (40.0, 80.0))),
+                12: BlockGraphEdgeRoute(
+                    ((-20.0, 0.0), (0.0, -20.0), (0.0, 20.0), (20.0, 0.0)),
+                    cubic=True,
+                ),
+            },
+            edge_label_positions={
+                10: (-40.0, 50.0),
+                11: (40.0, 50.0),
+                12: (0.0, 0.0),
+            },
+        )
+
+    @staticmethod
+    def _node_bounds(
+        layout: BlockGraphLayout,
+        block_ids: tuple[int, ...],
+    ) -> tuple[float, float]:
+        centers = [layout.positions[block_id][0] for block_id in block_ids]
+        return min(centers) - 20.0, max(centers) + 20.0
+
+    def test_zero_and_single_group_preserve_original_geometry(self) -> None:
+        disabled = separate_graphviz_circuit_groups(
+            self.layout,
+            self.graph,
+            ((1, 2), (3, 4)),
+            self.envelopes,
+            minimum_separation=0.0,
+        )
+        single = separate_graphviz_circuit_groups(
+            self.layout,
+            self.graph,
+            ((1, 2, 3, 4),),
+            self.envelopes,
+            minimum_separation=120.0,
+        )
+
+        self.assertIs(disabled, self.layout)
+        self.assertIs(single, self.layout)
+
+    def test_groups_move_rigidly_and_keep_the_requested_gap(self) -> None:
+        separated = separate_graphviz_circuit_groups(
+            self.layout,
+            self.graph,
+            ((1, 2), (3, 4)),
+            self.envelopes,
+            minimum_separation=120.0,
+            edge_label_sizes={10: (24.0, 12.0), 11: (24.0, 12.0)},
+        )
+
+        first = self._node_bounds(separated, (1, 2))
+        second = self._node_bounds(separated, (3, 4))
+        self.assertAlmostEqual(second[0] - first[1], 120.0)
+        self.assertEqual(
+            separated.positions[2][0] - separated.positions[1][0],
+            self.layout.positions[2][0] - self.layout.positions[1][0],
+        )
+        self.assertEqual(
+            separated.positions[4][0] - separated.positions[3][0],
+            self.layout.positions[4][0] - self.layout.positions[3][0],
+        )
+        self.assertEqual(
+            {point[1] for point in separated.positions.values()},
+            {0.0, 100.0},
+        )
+        self.assertTrue(separated.edge_routes[12].cubic)
+        for block_id, point_index in ((1, 0), (3, -1)):
+            center = separated.positions[block_id]
+            endpoint = separated.edge_routes[12].points[point_index]
+            self.assertAlmostEqual(math.dist(center, endpoint), 20.0)
+
+    def test_vertically_distant_groups_still_receive_horizontal_gap(self) -> None:
+        vertical_layout = BlockGraphLayout(
+            positions={1: (0.0, 0.0), 2: (0.0, 300.0)},
+            depths={1: 0, 2: 1},
+            root_ids=(1,),
+            tree_edge_indices=frozenset(),
+        )
+        graph = BlockGraph((_record(1), _record(2)), ())
+        envelopes = {1: self.envelopes[1], 2: self.envelopes[2]}
+
+        separated = separate_graphviz_circuit_groups(
+            vertical_layout,
+            graph,
+            ((1,), (2,)),
+            envelopes,
+            minimum_separation=120.0,
+        )
+
+        first = self._node_bounds(separated, (1,))
+        second = self._node_bounds(separated, (2,))
+        self.assertAlmostEqual(second[0] - first[1], 120.0)
+        self.assertEqual(separated.positions[1][1], 0.0)
+        self.assertEqual(separated.positions[2][1], 300.0)
+
+    def test_four_groups_all_participate_in_the_horizontal_spacing(self) -> None:
+        graph = BlockGraph(tuple(_record(block_id) for block_id in range(1, 5)), ())
+        envelopes = {
+            block_id: BlockNodeEnvelope(40.0, 40.0, 40.0)
+            for block_id in graph.node_ids
+        }
+        layout = BlockGraphLayout(
+            positions={
+                block_id: (0.0, block_id * 100.0)
+                for block_id in graph.node_ids
+            },
+            depths={block_id: 0 for block_id in graph.node_ids},
+            root_ids=graph.node_ids,
+            tree_edge_indices=frozenset(),
+        )
+
+        separated = separate_graphviz_circuit_groups(
+            layout,
+            graph,
+            ((1,), (2,), (3,), (4,)),
+            envelopes,
+            minimum_separation=120.0,
+        )
+
+        ordered = sorted(
+            separated.positions,
+            key=lambda block_id: separated.positions[block_id][0],
+        )
+        for previous, current in zip(ordered, ordered[1:]):
+            previous_right = separated.positions[previous][0] + 20.0
+            current_left = separated.positions[current][0] - 20.0
+            self.assertAlmostEqual(current_left - previous_right, 120.0)
+        self.assertNotEqual(separated.positions[2][0], layout.positions[2][0])
+        self.assertNotEqual(separated.positions[3][0], layout.positions[3][0])
+
+    def test_invalid_or_incomplete_groups_are_rejected(self) -> None:
+        with self.assertRaises(GraphvizLayoutError):
+            separate_graphviz_circuit_groups(
+                self.layout,
+                self.graph,
+                ((1, 2), (2, 3, 4)),
+                self.envelopes,
+                minimum_separation=120.0,
+            )
 
 
 class GraphvizParserTests(unittest.TestCase):
@@ -505,6 +707,8 @@ class BundledGraphvizSmokeTests(unittest.TestCase):
                 dot_input = serialize_graphviz_dot(
                     graph,
                     node_envelopes=envelopes,
+                    block_circuit_indices={1: 0, 2: 0, 3: 1},
+                    selected_circuit_indices={0, 1},
                     settings=GraphvizLayoutSettings(
                         node_separation_px=48.0,
                         rank_separation_px=90.0,
@@ -528,6 +732,52 @@ class BundledGraphvizSmokeTests(unittest.TestCase):
                     set(layout.edge_label_positions),
                     {0, 1, 2, 3},
                 )
+
+    def test_bundled_dot_respects_the_visual_gap_between_circuits(self) -> None:
+        status = probe_graphviz_runtime()
+        if not status.available:
+            self.skipTest(status.reason)
+        graph = BlockGraph(
+            (_record(1), _record(2), _record(3), _record(4)),
+            (
+                _edge(0, 1, 2),
+                _edge(1, 3, 4),
+                _edge(2, 2, 3),
+            ),
+        )
+        envelopes = {
+            block_id: BlockNodeEnvelope(72.0, 90.0, 56.0)
+            for block_id in graph.node_ids
+        }
+        dot_input = serialize_graphviz_dot(
+            graph,
+            node_envelopes=envelopes,
+            block_circuit_indices={1: 0, 2: 0, 3: 1, 4: 1},
+            selected_circuit_indices={0, 1},
+            settings=GraphvizLayoutSettings(circuit_separation_px=120.0),
+        )
+
+        layout = calculate_graphviz_layout(
+            status.executable,
+            dot_input,
+            graph,
+            envelopes,
+        )
+
+        def bounds(block_ids: tuple[int, ...]) -> tuple[float, float, float, float]:
+            positions = [layout.positions[block_id] for block_id in block_ids]
+            return (
+                min(point[0] for point in positions) - 36.0,
+                min(point[1] for point in positions) - 45.0,
+                max(point[0] for point in positions) + 36.0,
+                max(point[1] for point in positions) + 45.0,
+            )
+
+        first = bounds((1, 2))
+        second = bounds((3, 4))
+        horizontal_gap = max(first[0] - second[2], second[0] - first[2], 0.0)
+        vertical_gap = max(first[1] - second[3], second[1] - first[3], 0.0)
+        self.assertGreaterEqual(max(horizontal_gap, vertical_gap), 120.0 - 1.0e-6)
 
 
 if __name__ == "__main__":

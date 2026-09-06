@@ -906,6 +906,7 @@ class _GraphvizLayoutWorker(QObject):
         dot_input: GraphvizDotInput,
         graph: BlockGraph,
         envelopes: dict[int, BlockNodeEnvelope],
+        edge_label_sizes: dict[int, tuple[float, float]],
         cancel_event: threading.Event,
     ) -> None:
         super().__init__()
@@ -914,6 +915,7 @@ class _GraphvizLayoutWorker(QObject):
         self.dot_input = dot_input
         self.graph = graph
         self.envelopes = envelopes
+        self.edge_label_sizes = edge_label_sizes
         self.cancel_event = cancel_event
 
     def run(self) -> None:
@@ -924,6 +926,7 @@ class _GraphvizLayoutWorker(QObject):
                 self.graph,
                 self.envelopes,
                 cancel_event=self.cancel_event,
+                edge_label_sizes=self.edge_label_sizes,
             )
         except GraphvizLayoutError as exc:
             self.finished.emit(self.generation, None, exc)
@@ -2099,6 +2102,7 @@ class BlockGraphWindow(QDialog):
             caption_width=BlockNodeItem.CAPTION_WIDTH,
             caption_height=BlockNodeItem.CAPTION_HEIGHT,
         )
+        edge_label_sizes = self.view._edge_label_sizes(graph)
         try:
             dot_input = serialize_graphviz_dot(
                 graph,
@@ -2130,6 +2134,7 @@ class BlockGraphWindow(QDialog):
             dot_input,
             graph,
             envelopes,
+            edge_label_sizes,
             cancel_event,
         )
         worker.moveToThread(thread)

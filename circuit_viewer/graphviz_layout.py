@@ -43,6 +43,7 @@ GRAPHVIZ_SHA256 = (
 GRAPHVIZ_TIMEOUT_SECONDS = 30.0
 GRAPHVIZ_CACHE_SIZE = 8
 _POINTS_PER_INCH = 72.0
+GRAPHVIZ_CIRCUIT_SEPARATION_RANGE = (0.0, 1000.0)
 GRAPHVIZ_NODE_SEPARATION_RANGE = (2.0, 500.0)
 GRAPHVIZ_RANK_SEPARATION_RANGE = (2.0, 800.0)
 GRAPHVIZ_TREE_EDGE_WEIGHT_RANGE = (1, 100)
@@ -62,6 +63,7 @@ class GraphvizEdgeRouting(str, Enum):
 class GraphvizLayoutSettings:
     """Parâmetros seguros de geometria expostos ao ajuste fino do usuário."""
 
+    circuit_separation_px: float = 120.0
     node_separation_px: float = 32.0
     rank_separation_px: float = 56.0
     edge_routing: GraphvizEdgeRouting = GraphvizEdgeRouting.SPLINE
@@ -71,6 +73,7 @@ class GraphvizLayoutSettings:
     crossing_minimization: float = 1.0
 
     def __post_init__(self) -> None:
+        circuit_separation = float(self.circuit_separation_px)
         node_separation = float(self.node_separation_px)
         rank_separation = float(self.rank_separation_px)
         crossing_minimization = float(self.crossing_minimization)
@@ -91,6 +94,11 @@ class GraphvizLayoutSettings:
         if not isinstance(self.equal_rank_spacing, bool):
             raise ValueError("A uniformização entre níveis deve ser booleana.")
         validations = (
+            (
+                circuit_separation,
+                GRAPHVIZ_CIRCUIT_SEPARATION_RANGE,
+                "Espaçamento entre circuitos",
+            ),
             (
                 node_separation,
                 GRAPHVIZ_NODE_SEPARATION_RANGE,
@@ -130,6 +138,11 @@ class GraphvizLayoutSettings:
                     f"{label} deve estar entre {limits[0]} e {limits[1]}."
                 )
         object.__setattr__(self, "node_separation_px", node_separation)
+        object.__setattr__(
+            self,
+            "circuit_separation_px",
+            circuit_separation,
+        )
         object.__setattr__(self, "rank_separation_px", rank_separation)
         object.__setattr__(self, "edge_routing", edge_routing)
         object.__setattr__(
@@ -143,6 +156,7 @@ class GraphvizLayoutSettings:
 
     def as_mapping(self) -> dict[str, float | int | str | bool]:
         return {
+            "circuit_separation_px": self.circuit_separation_px,
             "node_separation_px": self.node_separation_px,
             "rank_separation_px": self.rank_separation_px,
             "edge_routing": self.edge_routing.value,
@@ -205,6 +219,9 @@ def graphviz_layout_settings_from_mapping(
     except (TypeError, ValueError):
         edge_routing = defaults.edge_routing
     return GraphvizLayoutSettings(
+        circuit_separation_px=bounded_float(
+            "circuit_separation_px", GRAPHVIZ_CIRCUIT_SEPARATION_RANGE
+        ),
         node_separation_px=bounded_float(
             "node_separation_px", GRAPHVIZ_NODE_SEPARATION_RANGE
         ),
@@ -249,6 +266,8 @@ class GraphvizDotInput:
     depths: dict[int, int]
     root_ids: tuple[int, ...]
     tree_edge_indices: frozenset[int]
+    layout_groups: tuple[tuple[int, ...], ...] = ()
+    circuit_separation_px: float = 0.0
 
 
 def bundled_graphviz_root() -> Path:
@@ -503,6 +522,11 @@ def serialize_graphviz_dot(
         depths=depths,
         root_ids=tuple(roots),
         tree_edge_indices=tree_edges,
+        layout_groups=tuple(
+            groups[key]
+            for key in sorted(groups, key=lambda value: (value[0], value[1]))
+        ),
+        circuit_separation_px=settings.circuit_separation_px,
     )
 
 
@@ -511,6 +535,8 @@ def graphviz_layout_cache_key(dot_input: GraphvizDotInput, version: str) -> str:
     digest.update(version.encode("ascii", errors="strict"))
     digest.update(b"\0")
     digest.update(dot_input.source.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(f"{dot_input.circuit_separation_px:.9f}".encode("ascii"))
     return digest.hexdigest()
 
 
@@ -762,6 +788,272 @@ def parse_graphviz_json(
     )
 
 
+def _route_fractions(
+    points: Sequence[tuple[float, float]],
+) -> tuple[float, ...]:
+    lengths = [math.dist(start, end) for start, end in zip(points, points[1:])]
+    total = math.fsum(lengths)
+    if total <= 1.0e-12:
+        denominator = max(1, len(points) - 1)
+        return tuple(index / denominator for index in range(len(points)))
+    traversed = 0.0
+    fractions = [0.0]
+    for length in lengths:
+        traversed += length
+        fractions.append(traversed / total)
+    return tuple(fractions)
+
+
+def _point_route_fraction(
+    point: tuple[float, float],
+    route: Sequence[tuple[float, float]],
+) -> float:
+    """Localiza aproximadamente um ponto ao longo de uma rota lógica."""
+
+    if len(route) < 2:
+        return 0.5
+    lengths = [math.dist(start, end) for start, end in zip(route, route[1:])]
+    total = math.fsum(lengths)
+    if total <= 1.0e-12:
+        return 0.5
+    best_distance = math.inf
+    best_fraction = 0.5
+    traversed = 0.0
+    for start, end, length in zip(route, route[1:], lengths):
+        if length <= 1.0e-12:
+            traversed += length
+            continue
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        projection = max(
+            0.0,
+            min(
+                1.0,
+                ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy)
+                / (length * length),
+            ),
+        )
+        nearest = (
+            start[0] + dx * projection,
+            start[1] + dy * projection,
+        )
+        distance = math.dist(point, nearest)
+        if distance < best_distance:
+            best_distance = distance
+            best_fraction = (traversed + length * projection) / total
+        traversed += length
+    return best_fraction
+
+
+def separate_graphviz_circuit_groups(
+    layout: BlockGraphLayout,
+    graph: BlockGraph,
+    layout_groups: Sequence[Sequence[int]],
+    node_envelopes: Mapping[int, BlockNodeEnvelope],
+    *,
+    minimum_separation: float,
+    edge_label_sizes: Mapping[int, Sequence[float]] | None = None,
+) -> BlockGraphLayout:
+    """Afasta grupos do ``dot`` sem modificar sua geometria interna.
+
+    O eixo Y permanece intocado para preservar os ranks. Uma varredura
+    horizontal mantém a ordem original e garante a folga entre todos os grupos,
+    mesmo quando seus envelopes ocupam alturas diferentes. Arestas entre grupos
+    são alongadas pela interpolação dos deslocamentos das duas pontas.
+    """
+
+    separation = float(minimum_separation)
+    if not math.isfinite(separation) or separation < 0.0:
+        raise GraphvizLayoutError("Espaçamento entre circuitos inválido.")
+    groups = tuple(
+        tuple(int(block_id) for block_id in group)
+        for group in layout_groups
+    )
+    if separation <= 0.0 or len(groups) < 2:
+        return layout
+
+    expected_nodes = set(graph.node_ids)
+    grouped_nodes = [block_id for group in groups for block_id in group]
+    if (
+        len(grouped_nodes) != len(set(grouped_nodes))
+        or set(grouped_nodes) != expected_nodes
+    ):
+        raise GraphvizLayoutError("Os grupos Graphviz não correspondem aos blocos.")
+    if set(node_envelopes) != expected_nodes or set(layout.positions) != expected_nodes:
+        raise GraphvizLayoutError("Os envelopes Graphviz não correspondem aos blocos.")
+
+    group_by_node = {
+        block_id: group_index
+        for group_index, group in enumerate(groups)
+        for block_id in group
+    }
+    bounds = [
+        [math.inf, math.inf, -math.inf, -math.inf]
+        for _group in groups
+    ]
+
+    def include_point(group_index: int, point: tuple[float, float]) -> None:
+        box = bounds[group_index]
+        box[0] = min(box[0], point[0])
+        box[1] = min(box[1], point[1])
+        box[2] = max(box[2], point[0])
+        box[3] = max(box[3], point[1])
+
+    for block_id, center in layout.positions.items():
+        envelope = node_envelopes[block_id]
+        half_width = envelope.width / 2.0
+        half_height = envelope.height / 2.0
+        group_index = group_by_node[block_id]
+        include_point(group_index, (center[0] - half_width, center[1] - half_height))
+        include_point(group_index, (center[0] + half_width, center[1] + half_height))
+
+    edge_by_switch = {edge.switch_index: edge for edge in graph.edges}
+    for switch_index, route in layout.edge_routes.items():
+        edge = edge_by_switch.get(switch_index)
+        if edge is None:
+            continue
+        start_group = group_by_node[edge.start_block_id]
+        if start_group != group_by_node[edge.end_block_id]:
+            continue
+        for point in route.points:
+            include_point(start_group, point)
+        label = layout.edge_label_positions.get(switch_index)
+        size = None if edge_label_sizes is None else edge_label_sizes.get(switch_index)
+        if label is not None and size is not None and len(size) >= 2:
+            width = float(size[0])
+            height = float(size[1])
+            if all(math.isfinite(value) and value >= 0.0 for value in (width, height)):
+                include_point(
+                    start_group,
+                    (label[0] - width / 2.0, label[1] - height / 2.0),
+                )
+                include_point(
+                    start_group,
+                    (label[0] + width / 2.0, label[1] + height / 2.0),
+                )
+        leader = layout.edge_label_leaders.get(switch_index)
+        if leader is not None:
+            include_point(start_group, leader[0])
+            include_point(start_group, leader[1])
+
+    if any(not all(math.isfinite(value) for value in box) for box in bounds):
+        raise GraphvizLayoutError("Envelope de circuito Graphviz inválido.")
+
+    order = sorted(
+        range(len(groups)),
+        key=lambda index: (
+            (bounds[index][0] + bounds[index][2]) / 2.0,
+            groups[index],
+        ),
+    )
+    translations: dict[int, float] = {}
+    for order_index, group_index in enumerate(order):
+        left = bounds[group_index][0]
+        translation = 0.0
+        for previous in order[:order_index]:
+            previous_right = bounds[previous][2]
+            translation = max(
+                translation,
+                previous_right + translations[previous] + separation - left,
+            )
+        translations[group_index] = translation
+
+    if not any(abs(value) > 1.0e-9 for value in translations.values()):
+        return layout
+    final_left = min(
+        bounds[index][0] + translations[index] for index in range(len(groups))
+    )
+    final_right = max(
+        bounds[index][2] + translations[index] for index in range(len(groups))
+    )
+    center_x = (final_left + final_right) / 2.0
+    translations = {
+        index: value - center_x for index, value in translations.items()
+    }
+    translated_positions = {
+        block_id: (
+            position[0] + translations[group_by_node[block_id]],
+            position[1],
+        )
+        for block_id, position in layout.positions.items()
+    }
+
+    translated_routes: dict[int, BlockGraphEdgeRoute] = {}
+    translated_labels: dict[int, tuple[float, float]] = {}
+    translated_leaders: dict[
+        int,
+        tuple[tuple[float, float], tuple[float, float]],
+    ] = {}
+    for switch_index, route in layout.edge_routes.items():
+        edge = edge_by_switch[switch_index]
+        start_group = group_by_node[edge.start_block_id]
+        end_group = group_by_node[edge.end_block_id]
+        start_translation = translations[start_group]
+        end_translation = translations[end_group]
+        raw_points = route.points
+        fractions = _route_fractions(raw_points)
+        points = [
+            (
+                point[0]
+                + start_translation
+                + (end_translation - start_translation) * fraction,
+                point[1],
+            )
+            for point, fraction in zip(raw_points, fractions)
+        ]
+        if edge.start_block_id != edge.end_block_id and len(points) >= 2:
+            start_toward = points[1]
+            end_toward = points[-2]
+            points[0] = _circle_endpoint(
+                translated_positions[edge.start_block_id],
+                start_toward,
+                node_envelopes[edge.start_block_id].node_diameter,
+            )
+            points[-1] = _circle_endpoint(
+                translated_positions[edge.end_block_id],
+                end_toward,
+                node_envelopes[edge.end_block_id].node_diameter,
+            )
+        translated_routes[switch_index] = BlockGraphEdgeRoute(
+            tuple(points),
+            curved=route.curved,
+            cubic=route.cubic,
+        )
+
+        label = layout.edge_label_positions.get(switch_index)
+        if label is not None:
+            fraction = _point_route_fraction(label, raw_points)
+            translated_labels[switch_index] = (
+                label[0]
+                + start_translation
+                + (end_translation - start_translation) * fraction,
+                label[1],
+            )
+        leader = layout.edge_label_leaders.get(switch_index)
+        if leader is not None:
+            translated = tuple(
+                (
+                    point[0]
+                    + start_translation
+                    + (end_translation - start_translation)
+                    * _point_route_fraction(point, raw_points),
+                    point[1],
+                )
+                for point in leader
+            )
+            translated_leaders[switch_index] = (translated[0], translated[1])
+
+    return BlockGraphLayout(
+        positions=translated_positions,
+        depths=dict(layout.depths),
+        root_ids=layout.root_ids,
+        tree_edge_indices=layout.tree_edge_indices,
+        edge_routes=translated_routes,
+        edge_label_positions=translated_labels,
+        edge_label_leaders=translated_leaders,
+    )
+
+
 def calculate_graphviz_layout(
     executable: Path | str,
     dot_input: GraphvizDotInput,
@@ -770,6 +1062,7 @@ def calculate_graphviz_layout(
     *,
     timeout: float = GRAPHVIZ_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
+    edge_label_sizes: Mapping[int, Sequence[float]] | None = None,
 ) -> BlockGraphLayout:
     payload = run_graphviz_dot(
         executable,
@@ -777,12 +1070,21 @@ def calculate_graphviz_layout(
         timeout=timeout,
         cancel_event=cancel_event,
     )
-    return parse_graphviz_json(payload, graph, dot_input, node_envelopes)
+    layout = parse_graphviz_json(payload, graph, dot_input, node_envelopes)
+    return separate_graphviz_circuit_groups(
+        layout,
+        graph,
+        dot_input.layout_groups,
+        node_envelopes,
+        minimum_separation=dot_input.circuit_separation_px,
+        edge_label_sizes=edge_label_sizes,
+    )
 
 
 __all__ = [
     "DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS",
     "GRAPHVIZ_CACHE_SIZE",
+    "GRAPHVIZ_CIRCUIT_SEPARATION_RANGE",
     "GRAPHVIZ_CROSSING_MINIMIZATION_RANGE",
     "GRAPHVIZ_DISTRIBUTION",
     "GRAPHVIZ_DOWNLOAD_URL",
@@ -807,5 +1109,6 @@ __all__ = [
     "parse_graphviz_json",
     "probe_graphviz_runtime",
     "run_graphviz_dot",
+    "separate_graphviz_circuit_groups",
     "serialize_graphviz_dot",
 ]

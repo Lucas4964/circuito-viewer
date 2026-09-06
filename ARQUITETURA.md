@@ -2334,6 +2334,15 @@ persistido inválido de forma independente. O DOT completo continua sendo a
 entrada da chave do cache, portanto qualquer mudança geométrica produz outra
 entrada enquanto mudanças de cor continuam sem custo de layout.
 
+O espaçamento mínimo entre circuitos, padrão 120 px, é um pós-processamento do
+`BlockGraphLayout`, pois o `dot` não oferece uma distância confiável entre
+subgrafos conectados. A associação de grupos produzida pelo serializador mantém
+os blocos externos de manobra junto ao único circuito selecionado. Uma varredura
+determinística preserva a ordem horizontal e os ranks, garante a folga entre
+todos os grupos consecutivos, translada rigidamente seus envelopes completos e
+interpola o deslocamento nas splines intercircuito. O valor também participa da
+chave do cache, embora não altere o DOT enviado ao executável.
+
 `graphviz_settings_dialog.py` contém o editor modal e a persistência em
 `block_graph/graphviz/*`. Opções comuns ficam visíveis e os parâmetros de
 otimização permanecem num painel avançado recolhível. Aplicar emite uma nova

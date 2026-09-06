@@ -1717,12 +1717,21 @@ bloqueante.
 
 O botão **Configurar Graphviz…**, ao lado do seletor de posicionamento, abre o
 ajuste fino sem ocupar permanentemente a área do grafo. Os controles principais
-definem o espaçamento horizontal entre nós (`nodesep`, originalmente 32 px), o
-espaçamento vertical entre níveis (`ranksep`, originalmente 56 px), a
-uniformização dos níveis e o traçado curvo, poligonal ou reto das arestas. A
-seção **Opções avançadas** reúne o peso hierárquico (`weight`, 8), a distância
-mínima em níveis (`minlen`, 1) e o esforço de redução de cruzamentos (`mclimit`,
-1,0). Valores maiores de `mclimit` podem aumentar o tempo de cálculo.
+definem o espaçamento mínimo entre circuitos (120 px), o espaçamento horizontal
+entre nós (`nodesep`, originalmente 32 px), o espaçamento vertical entre níveis
+(`ranksep`, originalmente 56 px), a uniformização dos níveis e o traçado curvo,
+poligonal ou reto das arestas. A seção **Opções avançadas** reúne o peso
+hierárquico (`weight`, 8), a distância mínima em níveis (`minlen`, 1) e o
+esforço de redução de cruzamentos (`mclimit`, 1,0). Valores maiores de `mclimit`
+podem aumentar o tempo de cálculo.
+
+O afastamento entre circuitos é aplicado pela aplicação depois do cálculo do
+`dot`: todos os circuitos visíveis são ordenados e deslocados horizontalmente
+como blocos rígidos, mantendo seus níveis e sua geometria interna. Cada par
+consecutivo respeita a distância configurada, mesmo quando os circuitos ocupam
+alturas diferentes. As interligações magenta são alongadas para acompanhar as
+novas posições. O valor zero desativa esse pós-processamento e reproduz a
+geometria original entregue pelo Graphviz.
 
 **Aplicar** salva e recalcula o modo Graphviz sem fechar o diálogo; **OK** faz o
 mesmo e fecha. **Cancelar** descarta apenas edições ainda não aplicadas e
