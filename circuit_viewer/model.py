@@ -822,6 +822,8 @@ class LoadModel:
         "_secondary_line_voltages",
         "_phases",
         "_connection_types",
+        "_consumer_counts",
+        "_consumer_count_sources",
         "_by_id",
         "_spatial_index",
         "_name_suffixes",
@@ -843,6 +845,8 @@ class LoadModel:
         *,
         source_path: str | None = None,
         name_suffixes: tuple[str, ...] | None = None,
+        consumer_counts: Iterable[int | None] | None = None,
+        consumer_count_sources: Iterable[str] | None = None,
     ) -> None:
         ids = tuple(str(value) for value in load_ids)
         text_columns = tuple(
@@ -859,6 +863,14 @@ class LoadModel:
         )
         associated_bars = np.ascontiguousarray(bar_indices, dtype=np.intp)
         size = len(ids)
+        counts = tuple(consumer_counts) if consumer_counts is not None else (None,) * size
+        count_sources = tuple(consumer_count_sources) if consumer_count_sources is not None else ("",) * size
+        if len(counts) != size or len(count_sources) != size:
+            raise ValueError("As contagens de consumidores devem corresponder às cargas.")
+        if any(value is not None and (isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 0) for value in counts):
+            raise ValueError("A quantidade de consumidores deve ser inteira, não negativa ou desconhecida.")
+        self._consumer_counts = tuple(None if value is None else int(value) for value in counts)
+        self._consumer_count_sources = tuple(str(value) for value in count_sources)
         if size == 0:
             raise ValueError("O modelo deve conter ao menos uma carga.")
         if any(len(values) != size for values in text_columns):
@@ -909,6 +921,15 @@ class LoadModel:
     @property
     def load_ids(self) -> tuple[str, ...]:
         return self._load_ids
+
+    @property
+    def consumer_counts(self) -> tuple[int | None, ...]:
+        """UC cadastradas por carga; None indica cadastro não disponível."""
+        return self._consumer_counts
+
+    @property
+    def consumer_count_sources(self) -> tuple[str, ...]:
+        return self._consumer_count_sources
 
     @property
     def bar_indices(self) -> IndexArray:

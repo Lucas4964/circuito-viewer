@@ -93,6 +93,7 @@ class BlockRecord:
     total_power: float | None
     total_length: float | None
     contains_source: bool
+    consumer_count: int | None = None  # UC cadastradas; None se alguma carga não tem contagem.
 
     def __post_init__(self) -> None:
         for values in (
@@ -379,6 +380,9 @@ def analyze_blocks(
     records: list[BlockRecord] = []
     for block in range(total):
         boundary_indices = sorted(boundaries_by_block[block])
+        consumer_values = [] if loads is None else [loads.consumer_counts[i] for i in loads_by_block[block]]
+        consumer_count = (None if loads is None or any(value is None for value in consumer_values)
+                          else sum(consumer_values))
         records.append(
             BlockRecord(
                 block_id=len(records) + 1,
@@ -395,6 +399,7 @@ def analyze_blocks(
                 total_power=_total(tuple(power_by_block[block])),
                 total_length=_total(tuple(lengths_by_block[block])),
                 contains_source=block in source_blocks,
+                consumer_count=consumer_count,
             )
         )
 

@@ -351,7 +351,7 @@ class BlockNodeItem(QGraphicsObject):
 
     clicked = pyqtSignal(int)
     CAPTION_WIDTH = 132.0
-    CAPTION_HEIGHT = 22.0
+    CAPTION_HEIGHT = 40.0
 
     def __init__(
         self,
@@ -381,9 +381,21 @@ class BlockNodeItem(QGraphicsObject):
             f"Barras: {self.record.bar_count:n}\n"
             f"Trechos: {self.record.segment_count:n}\n"
             f"Cargas: {self.record.load_count:n}\n"
+            f"Unidades consumidoras cadastradas: {self.consumer_count_text}\n"
+            "UC associadas às cargas do bloco; não indica quantas estão energizadas.\n"
             f"Chaves de fronteira: {switches}\n"
             f"Bloco-fonte: {'sim' if self.record.contains_source else 'não'}"
         )
+
+    @property
+    def consumer_count_text(self) -> str:
+        return ("indisponível" if self.record.consumer_count is None
+                else f"{self.record.consumer_count:n}")
+
+    @property
+    def caption_text(self) -> str:
+        count = "—" if self.record.consumer_count is None else self.consumer_count_text
+        return f"{_power_text(self.record)}\nUC: {count}"
 
     def set_display_label(self, label: str) -> None:
         normalized = str(label)
@@ -512,7 +524,7 @@ class BlockNodeItem(QGraphicsObject):
         painter.drawText(
             caption,
             Qt.AlignmentFlag.AlignHCenter,
-            _power_text(self.record),
+            self.caption_text,
         )
 
     def hoverEnterEvent(self, event) -> None:  # noqa: ANN001, N802

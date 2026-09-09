@@ -328,11 +328,11 @@ def block_node_envelopes(
     diameters: Mapping[int, float] | None = None,
     *,
     caption_width: float = 132.0,
-    caption_height: float = 22.0,
+    caption_height: float = 40.0,
     caption_gap: float = 4.0,
     outline: float = 3.0,
 ) -> dict[int, BlockNodeEnvelope]:
-    """Cria envelopes consistentes para o círculo e a legenda de potência."""
+    """Reserva o círculo e as duas linhas da legenda: potência e UC."""
 
     caption_width = max(0.0, float(caption_width))
     caption = max(0.0, float(caption_height))

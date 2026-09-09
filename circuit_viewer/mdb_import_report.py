@@ -53,6 +53,7 @@ def issue_lines(result: MdbImportResult) -> tuple[str, ...]:
     omitted = 0
     if result.allocation_error is not None:
         lines.append("Alocação por energia: " + result.allocation_error)
+    lines.extend(result.consumer_count_diagnostics)
     if result.allocations is not None:
         for issue in result.allocations.issues:
             if len(lines) >= MAX_REPORTED_LINES:

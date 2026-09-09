@@ -186,7 +186,7 @@ class BlockGraphWindowTests(unittest.TestCase):
         item.paint(complete, None)
         self.assertEqual(
             complete.drawn_texts,
-            [item.display_label, f"{float(item.record.total_power):n} kVA"],
+            [item.display_label, f"{float(item.record.total_power):n} kVA\nUC: —"],
         )
         self.assertEqual(item.boundingRect(), original_bounds)
         self.assertEqual(item.shape().boundingRect(), original_shape)

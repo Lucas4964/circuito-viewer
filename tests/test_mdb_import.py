@@ -658,8 +658,11 @@ class PartialDatabaseTests(unittest.TestCase):
         del database._tables["REGULADOR"]
         self.assertTrue(run(database).has_warnings)
 
-    def test_a_complete_import_needs_no_report(self) -> None:
-        self.assertFalse(run(network_database()).has_warnings)
+    def test_import_without_uc_tables_reports_unknown_consumer_count(self) -> None:
+        result = run(network_database())
+        self.assertTrue(result.has_warnings)
+        self.assertEqual(result.loads.model.consumer_counts, (None,))
+        self.assertIn("Contagem de UC indisponível", result.consumer_count_diagnostics[0])
 
 
 class OverrideTests(unittest.TestCase):

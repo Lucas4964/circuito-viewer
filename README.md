@@ -1842,6 +1842,25 @@ cargas equivalentes, e **Enquadrar tudo** usa os limites da projeção ativa.
 
 ## Blocos e grafo topológico
 
+Cada nó exibe a potência instalada e **UC: quantidade**, a soma das unidades
+consumidoras cadastradas nas cargas daquele bloco. O tooltip detalha a contagem.
+Ela é lida durante a importação Access: `BT_CONS.ID → ET_ID → BT_ET.ID →
+MT_CAR_ID → CARGA_ID`, somada a `MT_CONS.ID → CARGA_ID`. IDs repetidos com o
+mesmo vínculo são contados uma vez em cada tabela; BT e MT são domínios distintos.
+O mapeamento manual da tabela de consumidores MT é respeitado. A contagem não
+depende de consumo, fases, geradores ou alocação de energia, e inclui todos os
+cadastros, sem filtro de `ATIVO`: não representa apenas os consumidores energizados.
+
+Os totais e a descrição da origem ficam no estado do projeto, acompanhando
+importações parciais, revisão de alterações e recomposição das fontes. O grafo
+não reabre o banco. Tabelas/colunas ausentes ou vínculos ambíguos produzem
+**UC: —** e diagnóstico no relatório, sem substituir por zero nem usar os
+contadores `MC2_NC_*` como aproximação. Consumidores sem uma carga válida importada
+são relatados e não são atribuídos artificialmente a um bloco. Uma reimportação
+sem essas tabelas preserva as contagens já conhecidas. Para obter a informação
+em uma sessão importada com uma versão anterior, reimporte os alimentadores e
+confirme a atualização.
+
 **Ferramentas → Blocos…** identifica as regiões delimitadas por chaves
 manobráveis e as apresenta na tabela existente. O botão **Visualizar grafo…**
 dessa janela e **Ferramentas → Grafo de blocos…** abrem uma segunda janela não

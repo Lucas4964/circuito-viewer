@@ -487,7 +487,7 @@ class SingleSourceTests(unittest.TestCase):
                      "catalog", "circuit_levels"):
             with self.subTest(name):
                 self.assertIs(getattr(composed, name), getattr(source, name))
-        self.assertFalse(composed.report.has_warnings)
+        self.assertEqual(composed.report.notes, source.diagnostics)
         self.assertTrue(composed.provenance.single_source)
 
     def test_the_provenance_answers_even_with_one_source(self) -> None:

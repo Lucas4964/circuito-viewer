@@ -7,6 +7,8 @@ from .network_registry_dialog import ENTITY_NAMES
 
 
 FIELD_NAMES = {
+    "consumer_counts": "Unidades consumidoras cadastradas",
+    "consumer_count_sources": "Origem da contagem de UC",
     "codes": "Código", "code": "Código", "states": "Estado atual", "normal_states": "Estado normal",
     "vnom_values": "Tensão nominal (kV)", "snom_values": "Potência nominal (kVA)",
     "nominal_voltage": "Tensão nominal (kV)", "root_bar_id": "Barra inicial",

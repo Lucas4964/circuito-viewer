@@ -359,10 +359,12 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(any(line.startswith("Chaves:") for line in lines))
 
     def test_a_clean_import_has_no_issue_lines(self) -> None:
-        self.assertEqual(issue_lines(run_import(network_database())), ())
+        database = network_database(BT_ET=(["ID", "MT_CAR_ID"], []), BT_CONS=(["ID", "ET_ID"], []))
+        self.assertEqual(issue_lines(run_import(database)), ())
 
     def test_the_issue_panel_is_hidden_when_there_is_nothing_to_say(self) -> None:
-        window = MdbImportReportWindow(run_import(network_database()))
+        database = network_database(BT_ET=(["ID", "MT_CAR_ID"], []), BT_CONS=(["ID", "ET_ID"], []))
+        window = MdbImportReportWindow(run_import(database))
         self.addCleanup(window.close)
         self.assertFalse(window.issues_view.isVisible())
 
@@ -375,7 +377,8 @@ class ReportVisibilityTests(unittest.TestCase):
         self.addCleanup(self.window.close)
 
     def test_a_clean_import_only_touches_the_status_bar(self) -> None:
-        result = run_import(network_database())
+        database = network_database(BT_ET=(["ID", "MT_CAR_ID"], []), BT_CONS=(["ID", "ET_ID"], []))
+        result = run_import(database)
         self.assertFalse(result.has_warnings)
         self.window._show_mdb_import_report(result)
         self.assertIn("Banco importado", self.window.statusBar().currentMessage())

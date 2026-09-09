@@ -292,7 +292,13 @@ def _merged_record(project, proposal, key, incoming, current, force, conflicts, 
         if (key.entity, name) in proposal.dataset.omitted_fields:
             continue
         old, baseline = before.get(name, _MISSING), base.get(name, _MISSING)
-        if force or _equal(old, baseline) or _equal(old, value):
+        # Uma contagem indisponível na importação anterior não é edição local.
+        # Campos omitidos não estão no baseline, mas o modelo contém o sentinela.
+        unknown_uc = (key.entity == "loads" and baseline is _MISSING
+                      and ((name == "consumer_counts" and old is None)
+                           or (name == "consumer_count_sources" and old == ""))
+                      and field_origins.get(name, current.origins[0]).kind == "import")
+        if force or unknown_uc or _equal(old, baseline) or _equal(old, value):
             merged[name] = value
             if not _equal(old, value):
                 field_origins[name] = incoming.accepted_origin

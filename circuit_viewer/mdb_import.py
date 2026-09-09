@@ -17,7 +17,7 @@ das chaves para calcular a topologia energizada.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import PurePath
 from typing import Any, Callable, Iterator, Sequence
@@ -52,6 +52,7 @@ from .csv_import import (
 )
 from .generator_import import GeneratorCsvResult, parse_generator_rows
 from .load_import import LoadCsvResult, parse_load_rows
+from .consumer_counts import read_consumer_counts
 from .load_pattern_import import LoadPatternCsvResult, parse_load_pattern_rows
 from .mdb_engine import AccessDatabase
 from .mdb_mapping import (
@@ -63,7 +64,7 @@ from .mdb_mapping import (
     ResolvedMapping,
     resolve_mapping,
 )
-from .model import UtmCrs
+from .model import LoadModel, UtmCrs, constructor_columns
 from .source_composition import (
     ComposedModels,
     SourceDataset,
@@ -150,6 +151,7 @@ class MdbImportResult:
     applied_scale: float = 1.0
     empty_entities: tuple[str, ...] = ()
     omitted_fields: tuple[tuple[str, str], ...] = ()
+    consumer_count_diagnostics: tuple[str, ...] = ()
 
     def outcome_for(self, entity: str) -> MdbEntityOutcome | None:
         for item in self.outcomes:
@@ -176,6 +178,7 @@ class MdbImportResult:
         if (
             self.failures
             or self.allocation_error is not None
+            or bool(self.consumer_count_diagnostics)
             or (self.allocations is not None and bool(self.allocations.issues))
         ):
             return True
@@ -253,6 +256,7 @@ def dataset_from_result(
         provided_entities=frozenset(entities[name] for name in (*result.imported_entities, *result.empty_entities)),
         source_tables=tuple((entities[item.entity], item.table) for item in result.outcomes if item.table),
         omitted_fields=result.omitted_fields,
+        diagnostics=result.consumer_count_diagnostics,
     )
 
 
@@ -409,6 +413,7 @@ def load_database(
 
     outcomes: list[MdbEntityOutcome] = []
     results: dict[str, Any] = {}
+    consumer_count_diagnostics = ()
 
     def record(entity: str, table: str | None, result: Any, error: str | None) -> None:
         outcomes.append(
@@ -507,6 +512,15 @@ def load_database(
             record(entity, table, None, str(exc))
             continue
 
+        if entity == "cargas":
+            mt_target = plan.get(GENERATOR_CONSUMER_ENTITY)
+            counted = read_consumer_counts(database, result.model, cancel_event=cancel_event,
+                                          mt_table=None if mt_target is None else mt_target.table)
+            columns = constructor_columns(result.model)
+            columns.update(consumer_counts=counted.counts, consumer_count_sources=counted.sources)
+            result = replace(result, model=LoadModel(result.model.bars, **columns,
+                                                     source_path=result.model.source_path))
+            consumer_count_diagnostics = counted.diagnostics
         results[entity] = result
         table = (
             f"{target.table} + {consumer_target.table}"
@@ -549,6 +563,8 @@ def load_database(
             except Exception:
                 pass  # Uma falha de metadados não autoriza exclusões.
     omitted_fields = []
+    if results.get("cargas") is not None and all(value is None for value in results["cargas"].model.consumer_counts):
+        omitted_fields.extend(("loads", name) for name in ("consumer_counts", "consumer_count_sources"))
     circuit_target = plan.get("circuitos")
     if circuit_target is not None:
         try:
@@ -586,6 +602,7 @@ def load_database(
         applied_scale=scale,
         empty_entities=tuple(empty_entities),
         omitted_fields=tuple(omitted_fields),
+        consumer_count_diagnostics=consumer_count_diagnostics,
     )
 
 
