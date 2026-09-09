@@ -322,6 +322,7 @@ class PowerFlowResult:
     step_voltages: tuple[StepVoltages, ...] = ()
     issues: tuple[PowerFlowIssue, ...] = ()
     omitted_issues: int = 0
+    input_revision: object | None = None
 
     @property
     def has_warnings(self) -> bool:
@@ -1154,6 +1155,10 @@ def run_power_flow(
 
     selected = _selected_indices(catalog, circuit_indices)
     line_parameter_mode = OpenDssLineParameterMode(line_parameter_mode)
+    from .project_topology import coupled_study_reason
+    reason = coupled_study_reason(catalog, selected)
+    if reason:
+        raise ValueError(reason)
 
     def build_circuit_export(circuit_index: int) -> OpenDssExportBundle:
         return build_export(

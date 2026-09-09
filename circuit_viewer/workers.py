@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 import threading
+import re
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
@@ -36,8 +37,14 @@ from .capacitor_import import load_capacitors_csv
 from .load_import import load_loads_csv
 from .load_pattern_import import load_load_patterns_csv
 from .equivalent_network import EquivalentNetworkResult, build_equivalent_network
-from .mdb_engine import open_database
-from .mdb_import import load_database
+from .mdb_engine import MdbEngineError, MdbPasswordError, open_database
+from .mdb_inspection import inspect_database
+from .network_registry import FileIdentity, register_import
+from .mdb_import import (
+    MdbSourceLoad,
+    dataset_from_result,
+    load_database,
+)
 from .model import (
     CapacitorModel,
     CableModel,
@@ -50,6 +57,10 @@ from .model import (
     RegulatorModel,
     SwitchModel,
     UtmCrs,
+)
+from .source_composition import (
+    SourceWorkspace,
+    compose,
 )
 from .opendss_engine import acquire_engine, ascii_workspace
 from .opendss_allocation_export import build_allocation_export
@@ -497,6 +508,59 @@ class AllocationMeasurementImportWorker(QObject):
             self.finished.emit(result)
 
 
+class MdbInspectionWorker(QObject):
+    """Abre e fecha a conexão na própria thread antes de entregar o retrato."""
+
+    finished = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+    password_required = pyqtSignal(int)
+    completed = pyqtSignal()
+
+    def __init__(self, request_id, path, *, password=None, table_mapping=None, overrides=None):
+        super().__init__()
+        self.request_id = request_id
+        self.path = path
+        self._password = password
+        self.table_mapping = table_mapping
+        self.overrides = dict(overrides or {})
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            if self._cancel_event.is_set():
+                return
+            with open_database(self.path, self._password) as database:
+                result = inspect_database(database, self.table_mapping,
+                                          overrides=self.overrides,
+                                          cancel_event=self._cancel_event)
+            if not self._cancel_event.is_set():
+                self.finished.emit(self.request_id, result)
+        except MdbPasswordError:
+            if not self._cancel_event.is_set():
+                self.password_required.emit(self.request_id)
+        except InterruptedError:
+            pass
+        except MdbEngineError as exc:
+            if not self._cancel_event.is_set():
+                message = str(exc)
+                if self._password:
+                    message = message.replace(self._password, "[senha omitida]")
+                message = re.sub(r"(?i)\bPWD\s*=.*", "PWD=[omitida]", message)
+                self.failed.emit(self.request_id, message)
+        except Exception:
+            if not self._cancel_event.is_set():
+                # Exceções ODBC podem conter a conexão, incluindo PWD.
+                self.failed.emit(self.request_id,
+                                 "Não foi possível ler o banco. Verifique o arquivo e o driver Access.")
+        finally:
+            self._password = None
+            self.completed.emit()
+
+
 class MdbImportWorker(QObject):
     """Importa as dez entidades lógicas de um banco Access numa única execução.
 
@@ -512,6 +576,9 @@ class MdbImportWorker(QObject):
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
+    review_required = pyqtSignal(object)
+    project_review_required = pyqtSignal(object)
+    field_review_required = pyqtSignal(object)
 
     def __init__(
         self,
@@ -524,6 +591,12 @@ class MdbImportWorker(QObject):
         scale: float = 1.0,
         phase_configuration: PhaseConfiguration | None = None,
         switch_types: SwitchTypeConfiguration | None = None,
+        circuit_ids: tuple[str, ...] = (),
+        workspace: SourceWorkspace | None = None,
+        replace_workspace: bool = True,
+        target_tag: str | None = None,
+        correspondences: tuple = (),
+        project=None,
     ) -> None:
         super().__init__()
         self.path = path
@@ -535,14 +608,49 @@ class MdbImportWorker(QObject):
         self.scale = float(scale)
         self.phase_configuration = phase_configuration
         self.switch_types = switch_types
+        # Vazio quer dizer "o banco inteiro", nunca "nenhum circuito".
+        self.circuit_ids = tuple(circuit_ids)
+        # As fontes já carregadas são imutáveis, então atravessam a fronteira de
+        # thread sem cuidado nenhum — e compor fora da thread da UI é o que
+        # impede a janela de congelar com vários bancos grandes.
+        self.workspace = workspace if workspace is not None else SourceWorkspace()
+        self.replace_workspace = bool(replace_workspace)
+        self.target_tag = target_tag
+        self.correspondences = tuple(correspondences)
+        self.project = project
         self._cancel_event = threading.Event()
+        self._review_event = threading.Event()
+        self._review_decisions = None
 
     def cancel(self) -> None:
         self._cancel_event.set()
+        self._review_event.set()
+
+    def resolve_review(self, decisions) -> None:
+        """Chamado pela UI; só publica dados imutáveis e desperta o worker."""
+        self._review_decisions = None if decisions is None else dict(decisions)
+        self._review_event.set()
+
+    def _review(self, conflicts):
+        return self._request_review(self.review_required, conflicts)
+
+    def _request_review(self, signal, payload):
+        self._review_decisions = None
+        self._review_event.clear()
+        if self._cancel_event.is_set():
+            raise InterruptedError()
+        signal.emit(payload)
+        while not self._review_event.wait(0.1):
+            if self._cancel_event.is_set():
+                raise InterruptedError()
+        if self._cancel_event.is_set():
+            raise InterruptedError()
+        return self._review_decisions
 
     @pyqtSlot()
     def run(self) -> None:
         try:
+            identity = FileIdentity.read(self.path, self._cancel_event.is_set)
             with open_database(self.path, self._password) as database:
                 result = load_database(
                     database,
@@ -558,7 +666,84 @@ class MdbImportWorker(QObject):
                     phase_configuration=self.phase_configuration,
                     switch_types=self.switch_types,
                 )
+            # A leitura acabou e a conexão já fechou: o que vem a seguir é só
+            # numpy, e pode ser cancelado do mesmo jeito.
+            if FileIdentity.read(self.path, self._cancel_event.is_set) != identity:
+                raise ValueError("O banco mudou durante a leitura. Tente novamente.")
+            project_change = None
+            if self.project is not None:
+                from .project_state import propose_import, resolve_import, ProjectChangeSet
+                proposal = propose_import(self.project, dataset_from_result(result, tag=self.workspace.next_tag()), identity,
+                                          circuit_ids=self.circuit_ids, target_tag=self.target_tag,
+                                          correspondences=self.correspondences, cancel_check=self._cancel_event.is_set)
+                choices = self._request_review(self.project_review_required, proposal)
+                if choices is None:
+                    raise InterruptedError()
+                project_change = resolve_import(self.project, proposal, choices, cancel_check=self._cancel_event.is_set)
+                if not isinstance(project_change, ProjectChangeSet):
+                    decisions = self._request_review(self.field_review_required, project_change)
+                    if decisions is None:
+                        raise InterruptedError()
+                    project_change = resolve_import(self.project, proposal, choices, decisions,
+                                                    cancel_check=self._cancel_event.is_set)
+                if not isinstance(project_change, ProjectChangeSet):
+                    raise ValueError("Ainda existem conflitos não resolvidos.")
+                workspace, composed = project_change.state.workspace, project_change.composed
+                dataset = workspace.dataset_for(proposal.dataset.tag) or proposal.dataset
+            else:
+                workspace, dataset = register_import(
+                    self.workspace, dataset_from_result(result, tag=self.workspace.next_tag()), identity,
+                    circuit_ids=self.circuit_ids, replace_workspace=self.replace_workspace,
+                    target_tag=self.target_tag, correspondences=self.correspondences,
+                    resolve_conflicts=self._review, cancel_check=self._cancel_event.is_set,
+                )
+                composed = compose(workspace.datasets, cancel_check=self._cancel_event.is_set)
         except CsvImportCancelled:
+            self.cancelled.emit()
+        except InterruptedError:
+            self.cancelled.emit()
+        except Exception as exc:
+            message = str(exc)
+            if self._password:
+                message = message.replace(self._password, "***")
+            self.failed.emit(message)
+        else:
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+                return
+            self.finished.emit(
+                MdbSourceLoad(
+                    dataset=dataset,
+                    workspace=workspace,
+                    composed=composed,
+                    result=result,
+                    project_change=project_change,
+                )
+            )
+        finally:
+            self._password = None
+
+
+class ProjectOperationWorker(QObject):
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, operation):
+        super().__init__()
+        self.operation = operation
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            result = self.operation(self._cancel_event.is_set)
+            if self._cancel_event.is_set():
+                raise InterruptedError()
+        except InterruptedError:
             self.cancelled.emit()
         except Exception as exc:
             self.failed.emit(str(exc))

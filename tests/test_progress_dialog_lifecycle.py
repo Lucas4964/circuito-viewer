@@ -7,6 +7,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
+    from PyQt6.QtCore import QObject, pyqtSignal
     from PyQt6.QtWidgets import QApplication
 
     from circuit_viewer.main_window import MainWindow, _close_progress_dialog
@@ -14,6 +15,11 @@ try:
     PYQT_AVAILABLE = True
 except ModuleNotFoundError:
     PYQT_AVAILABLE = False
+
+
+if PYQT_AVAILABLE:
+    class SignalProbe(QObject):
+        triggered = pyqtSignal()
 
 
 class ReentrantProgressDialog:
@@ -181,13 +187,15 @@ class ProgressDialogLifecycleTests(unittest.TestCase):
         for worker_attr, dialog_attr, callback in cases:
             with self.subTest(dialog=dialog_attr):
                 current_worker = object()
-                stale_worker = object()
+                stale_worker = SignalProbe()
                 dialog = ReentrantProgressDialog()
+                setattr(self.window, worker_attr, stale_worker)
+                self.window._connect_operation_signal(stale_worker.triggered, stale_worker, callback)
                 setattr(self.window, worker_attr, current_worker)
                 setattr(self.window, dialog_attr, dialog)
 
-                with patch.object(MainWindow, "sender", return_value=stale_worker):
-                    callback()
+                with patch.object(MainWindow, "sender", side_effect=AssertionError("sender não deve ser consultado")):
+                    stale_worker.triggered.emit()
 
                 self.assertEqual(dialog.calls, [])
                 setattr(self.window, worker_attr, None)
@@ -248,15 +256,17 @@ class ProgressDialogLifecycleTests(unittest.TestCase):
         for thread_attr, worker_attr, dialog_attr, callback in cases:
             with self.subTest(dialog=dialog_attr):
                 current_thread = object()
-                stale_thread = object()
+                stale_thread = SignalProbe()
                 current_worker = object()
                 dialog = ReentrantProgressDialog()
+                setattr(self.window, thread_attr, stale_thread)
+                self.window._connect_operation_signal(stale_thread.triggered, stale_thread, callback)
                 setattr(self.window, thread_attr, current_thread)
                 setattr(self.window, worker_attr, current_worker)
                 setattr(self.window, dialog_attr, dialog)
 
-                with patch.object(MainWindow, "sender", return_value=stale_thread):
-                    callback()
+                with patch.object(MainWindow, "sender", side_effect=AssertionError("sender não deve ser consultado")):
+                    stale_thread.triggered.emit()
 
                 self.assertIs(getattr(self.window, thread_attr), current_thread)
                 self.assertIs(getattr(self.window, worker_attr), current_worker)

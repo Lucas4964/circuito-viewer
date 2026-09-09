@@ -33,6 +33,7 @@ try:
         resolve_mapping,
     )
     from circuit_viewer.model import UtmCrs
+    from circuit_viewer.mdb_inspection import DatabaseSchema
 
     PYQT_AVAILABLE = True
 except ModuleNotFoundError:  # pragma: no cover - ambiente sem PyQt6
@@ -168,6 +169,7 @@ class ImportDialogTests(unittest.TestCase):
             self.plan,
             self.database.tables(),
             suggested_scale=10.0,
+            schema=DatabaseSchema(self.database.tables(), {t: self.database.columns(t) for t in self.database.tables()}),
         )
         self.addCleanup(self.dialog.close)
 
@@ -217,7 +219,8 @@ class ImportDialogTests(unittest.TestCase):
         database = network_database()
         del database._tables["REGULADOR"]
         dialog = MdbImportDialog(
-            r"C:\dados\rede.mdb", resolve_mapping(database), database.tables()
+            r"C:\dados\rede.mdb", resolve_mapping(database), database.tables(),
+            schema=DatabaseSchema(database.tables(), {t: database.columns(t) for t in database.tables()})
         )
         self.addCleanup(dialog.close)
         self.assertNotIn("reguladores", dialog.selected_entities())
@@ -229,7 +232,8 @@ class ImportDialogTests(unittest.TestCase):
         del database._tables["REGULADOR"]
         database._tables["REGU"] = network_database()._tables["REGULADOR"]
         dialog = MdbImportDialog(
-            r"C:\dados\rede.mdb", resolve_mapping(database), database.tables()
+            r"C:\dados\rede.mdb", resolve_mapping(database), database.tables(),
+            schema=DatabaseSchema(database.tables(), {t: database.columns(t) for t in database.tables()})
         )
         self.addCleanup(dialog.close)
         combo = dialog.entity_combos["reguladores"]
@@ -242,7 +246,8 @@ class ImportDialogTests(unittest.TestCase):
         del database._tables["MT_CONS"]
         database._tables["CONS_ALT"] = network_database()._tables["MT_CONS"]
         dialog = MdbImportDialog(
-            r"C:\dados\rede.mdb", resolve_mapping(database), database.tables()
+            r"C:\dados\rede.mdb", resolve_mapping(database), database.tables(),
+            schema=DatabaseSchema(database.tables(), {t: database.columns(t) for t in database.tables()})
         )
         self.addCleanup(dialog.close)
         self.assertNotIn("geradores", dialog.selected_entities())
@@ -266,7 +271,8 @@ class ImportDialogTests(unittest.TestCase):
         self.assertNotIn("patamares", self.dialog.selected_entities())
 
     def test_bars_are_required_to_confirm(self) -> None:
-        ok = self.dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.dialog.whole_database_check.setChecked(True)
+        ok = self.dialog.load_button
         self.assertTrue(ok.isEnabled())
         self.dialog.entity_checks["barras"].setChecked(False)
         self.assertFalse(ok.isEnabled())

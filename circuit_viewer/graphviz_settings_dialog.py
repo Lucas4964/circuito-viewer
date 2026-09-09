@@ -154,6 +154,19 @@ class GraphvizSettingsDialog(QDialog):
         self.advanced_panel = QWidget(self)
         self.advanced_panel.setObjectName("graphviz_advanced_options_panel")
         advanced_form = QFormLayout(self.advanced_panel)
+        self.switches_as_nodes_checkbox = QCheckBox(
+            "Considerar chaves como nós no cálculo (experimental)",
+            self.advanced_panel,
+        )
+        self.switches_as_nodes_checkbox.setObjectName(
+            "graphviz_switches_as_nodes_checkbox"
+        )
+        self.switches_as_nodes_checkbox.setToolTip(
+            "Faz o dot reservar um nó invisível com o tamanho da etiqueta para "
+            "cada chave. No restante da aplicação, as chaves continuam sendo arestas."
+        )
+        advanced_form.addRow("", self.switches_as_nodes_checkbox)
+
         self.tree_edge_weight_input = QSpinBox(self.advanced_panel)
         self.tree_edge_weight_input.setObjectName("graphviz_tree_edge_weight_input")
         self.tree_edge_weight_input.setRange(*GRAPHVIZ_TREE_EDGE_WEIGHT_RANGE)
@@ -250,6 +263,7 @@ class GraphvizSettingsDialog(QDialog):
             rank_separation_px=self.rank_separation_input.value(),
             edge_routing=GraphvizEdgeRouting(str(routing)),
             equal_rank_spacing=self.equal_rank_spacing_checkbox.isChecked(),
+            switches_as_nodes=self.switches_as_nodes_checkbox.isChecked(),
             tree_edge_weight=self.tree_edge_weight_input.value(),
             tree_edge_minlen=self.tree_edge_minlen_input.value(),
             crossing_minimization=self.crossing_minimization_input.value(),
@@ -264,6 +278,7 @@ class GraphvizSettingsDialog(QDialog):
         )
         self.edge_routing_combo.setCurrentIndex(max(0, routing_index))
         self.equal_rank_spacing_checkbox.setChecked(settings.equal_rank_spacing)
+        self.switches_as_nodes_checkbox.setChecked(settings.switches_as_nodes)
         self.tree_edge_weight_input.setValue(settings.tree_edge_weight)
         self.tree_edge_minlen_input.setValue(settings.tree_edge_minlen)
         self.crossing_minimization_input.setValue(

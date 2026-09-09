@@ -29,10 +29,10 @@ from __future__ import annotations
 
 import math
 import re
-import unicodedata
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
+from .dss_names import sanitize_dss_name
 from .model import (
     CLOSED_SWITCH_STATE,
     CableModel,
@@ -154,7 +154,6 @@ REGULATOR_SEGMENT_LENGTH_WARNING_M = 10.0
 # que passaria despercebida por gerar um modelo aceito e absurdo.
 REGULATOR_VOLTAGE_TOLERANCE = 0.10
 
-_INVALID_NAME_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 _NUMBER_PATTERN = re.compile(
     r"^[+-]?(?:(?:\d+(?:[.,]\d*)?)|(?:[.,]\d+))(?:[eE][+-]?\d+)?$"
 )
@@ -378,6 +377,7 @@ class OpenDssExportBundle:
     capacitors: OpenDssCapacitorExportResult | None = None
     master: OpenDssMasterExportResult | None = None
     library: OpenDssLibraryExportResult | None = None
+    input_revision: object | None = None
 
     @property
     def loads_by_phase_count(
@@ -463,12 +463,18 @@ class OpenDssExportBundle:
     @property
     def files(self) -> tuple[tuple[str, str], ...]:
         master = self.master
+        metadata = ()
+        if self.input_revision is not None:
+            import json
+            from dataclasses import asdict
+            metadata = (("estudo.json", json.dumps(asdict(self.input_revision), ensure_ascii=False, indent=2)),)
         if master is None or not master.text:
-            return self.element_files
+            return (*self.element_files, *metadata)
         return (
             *self.element_files,
             (master.master_filename, master.text),
             (master.buscoords_filename, master.buscoords_text),
+            *metadata,
         )
 
     @property
@@ -518,19 +524,6 @@ class OpenDssExportBundle:
             or (self.capacitors is not None and self.capacitors.has_warnings)
             or (self.master is not None and self.master.has_warnings)
         )
-
-
-def sanitize_dss_name(value: str) -> str:
-    """Reduz um código a um nome aceito pelo OpenDSS.
-
-    O ponto separa nós de barra e o espaço separa propriedades, então nenhum dos
-    dois pode sobreviver em um nome. Acentos são reduzidos a ASCII para o
-    arquivo continuar legível por instalações que não leem UTF-8.
-    """
-
-    decomposed = unicodedata.normalize("NFKD", str(value))
-    ascii_only = decomposed.encode("ascii", "ignore").decode("ascii")
-    return _INVALID_NAME_CHARS.sub("_", ascii_only).strip("_")
 
 
 def parse_number(value: str) -> float | None:
@@ -721,13 +714,24 @@ def bus_namer(catalog: CircuitCatalogModel) -> Callable[[int], str]:
     ``Bus1``/``Bus2`` dos trechos, o ``bus1`` das cargas, as coordenadas do
     ``Buscoords`` e a leitura dos resultados do fluxo de potência precisam
     concordar, e uma segunda definição divergiria em silêncio.
+
+    Quando o modelo é composto de várias fontes, ``bars.name_suffixes`` traz o
+    desempate já calculado: dois bancos podem ter o mesmo CODIGO para barras
+    diferentes, e sem o sufixo elas virariam **uma** barra no OpenDSS. O
+    desempate vem pronto porque esta função é construída dentro de laços sobre
+    todas as barras — calcular aqui seria custo quadrático.
     """
 
     bars = catalog.segments.bars
+    suffixes = bars.name_suffixes
 
     def bus_name(bar_index: int) -> str:
         code = sanitize_dss_name(bars.codes[bar_index])
-        return code or sanitize_dss_name(bars.bar_ids[bar_index])
+        base = code or sanitize_dss_name(bars.bar_ids[bar_index])
+        if suffixes is None:
+            return base
+        suffix = suffixes[bar_index]
+        return f"{base}_{suffix}" if suffix else base
 
     return bus_name
 
@@ -1493,10 +1497,12 @@ def build_switch_export(
     report = _ExportReport()
     bus_name = bus_namer(catalog)
 
-    total = sum(
-        int(catalog.membership(index).switch_segment_indices.size)
-        for index in selected
-    )
+    from .project_topology import physical_switch_scope
+    internal_switches, boundary_switches = physical_switch_scope(catalog, selected)
+    for segment in boundary_switches:
+        report.add(segments.segment_ids[segment],
+                   "chave de fronteira: uma ponta está fora do escopo exportado")
+    total = len(internal_switches)
     processed = 0
     lines: list[str] = []
     open_commands: list[str] = []
@@ -1506,9 +1512,8 @@ def build_switch_export(
     exported_segments: list[tuple[str, int]] = []
     seen_segments: set[int] = set()
 
-    for circuit_index in selected:
-        membership = catalog.membership(circuit_index)
-        for raw_index in membership.switch_segment_indices:
+    for circuit_index in selected[:1]:
+        for raw_index in internal_switches:
             if cancel_check is not None and processed % 4_096 == 0 and cancel_check():
                 raise InterruptedError("Exportação cancelada.")
             processed += 1
@@ -2059,6 +2064,9 @@ def build_load_export(
     shapes: list[str] = []
     entries: list[str] = []
     used_names: dict[str, str] = {}
+    # Duas fontes podem ter o mesmo CODIGO de carga. Sem o desempate, a segunda
+    # seria descartada inteira mais abaixo, por nome já usado.
+    load_suffixes = loads.name_suffixes
     exported = 0
     skipped_other_phase = 0
 
@@ -2162,6 +2170,10 @@ def build_load_export(
                 "o CARGA_ID",
                 discarded=False,
             )
+        # O sufixo entra ANTES do infixo de fases, para que o nome continue
+        # terminando em "-3F-D" e as regras de leitura do fluxo sigam valendo.
+        if load_suffixes is not None and load_suffixes[load_index]:
+            base_name = f"{base_name}_{load_suffixes[load_index]}"
         phase_names = [
             f"{base_name}-{phase_count}F-{letter}" for letter in letters
         ]
@@ -2810,6 +2822,11 @@ def build_master_export(
     base = _master_base_name(definition)
     master_filename = f"{base}{MASTER_FILENAME_SUFFIX}"
     buscoords_filename = f"{base}{BUSCOORDS_FILENAME_SUFFIX}"
+    from .project_topology import coupled_study_reason
+    reason = coupled_study_reason(catalog, selected)
+    if reason:
+        report.add(definition.circuit_id, reason)
+        return _empty_master(report, master_filename, buscoords_filename)
     if not sanitize_dss_name(definition.code):
         report.add(
             definition.circuit_id,

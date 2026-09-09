@@ -2107,6 +2107,7 @@ class BlockGraphWindow(QDialog):
             dot_input = serialize_graphviz_dot(
                 graph,
                 node_envelopes=envelopes,
+                edge_label_sizes=edge_label_sizes,
                 block_circuit_indices=self._block_circuit_indices,
                 selected_circuit_indices=self._selected_circuit_indices,
                 settings=self.graphviz_layout_settings,

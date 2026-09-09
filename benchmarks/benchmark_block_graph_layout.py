@@ -34,6 +34,7 @@ from circuit_viewer.block_graph import (
 )
 from circuit_viewer.graphviz_layout import (
     GRAPHVIZ_TIMEOUT_SECONDS,
+    GraphvizLayoutSettings,
     calculate_graphviz_layout,
     probe_graphviz_runtime,
     serialize_graphviz_dot,
@@ -684,9 +685,16 @@ def main() -> int:
     coordinate_layout, coordinate_seconds = _measure(coordinate_call)
     graphviz_status = probe_graphviz_runtime()
     graphviz_layout = None
+    graphviz_switch_node_layout = None
     graphviz_seconds = 0.0
+    graphviz_switch_node_seconds = 0.0
     graphviz_deterministic = True
+    graphviz_switch_node_deterministic = True
     if graphviz_status.available and envelopes is not None:
+        graphviz_label_sizes = {
+            edge.switch_index: (max(24.0, len(edge.label) * 7.0), 18.0)
+            for edge in visible_graph.edges
+        }
         dot_input = serialize_graphviz_dot(
             visible_graph,
             node_envelopes=envelopes,
@@ -700,11 +708,42 @@ def main() -> int:
                 dot_input,
                 visible_graph,
                 envelopes,
+                edge_label_sizes=graphviz_label_sizes,
             )
 
         graphviz_layout, graphviz_seconds = _measure(graphviz_call)
         _validate_layout(graphviz_layout, visible_graph, require_routes=True)
         graphviz_deterministic = graphviz_layout == graphviz_call()
+
+        switch_node_input = serialize_graphviz_dot(
+            visible_graph,
+            node_envelopes=envelopes,
+            edge_label_sizes=graphviz_label_sizes,
+            block_circuit_indices=block_circuits,
+            selected_circuit_indices=selected,
+            settings=GraphvizLayoutSettings(switches_as_nodes=True),
+        )
+
+        def graphviz_switch_node_call() -> object:
+            return calculate_graphviz_layout(
+                graphviz_status.executable,
+                switch_node_input,
+                visible_graph,
+                envelopes,
+                edge_label_sizes=graphviz_label_sizes,
+            )
+
+        graphviz_switch_node_layout, graphviz_switch_node_seconds = _measure(
+            graphviz_switch_node_call
+        )
+        _validate_layout(
+            graphviz_switch_node_layout,
+            visible_graph,
+            require_routes=True,
+        )
+        graphviz_switch_node_deterministic = (
+            graphviz_switch_node_layout == graphviz_switch_node_call()
+        )
     extended_api = "node_envelopes" in inspect.signature(
         layout_block_graph
     ).parameters
@@ -866,6 +905,12 @@ def main() -> int:
             f"{graphviz_seconds:.3f} s "
             f"(determinístico: {'sim' if graphviz_deterministic else 'não'})"
         )
+        print(
+            "Layout Graphviz dot (chaves como nós): "
+            f"{graphviz_switch_node_seconds:.3f} s "
+            "(determinístico: "
+            f"{'sim' if graphviz_switch_node_deterministic else 'não'})"
+        )
     else:
         print(f"Layout Graphviz dot: indisponível ({graphviz_status.reason})")
     print(f"Layout Árvore (1 circuito): {single_tree_seconds:.3f} s")
@@ -899,6 +944,9 @@ def main() -> int:
             and (
                 graphviz_seconds > GRAPHVIZ_TARGET_SECONDS
                 or not graphviz_deterministic
+                or graphviz_switch_node_layout is None
+                or graphviz_switch_node_seconds > GRAPHVIZ_TARGET_SECONDS
+                or not graphviz_switch_node_deterministic
             )
         )
         or tree_crossings > MAX_TREE_EDGE_CROSSINGS

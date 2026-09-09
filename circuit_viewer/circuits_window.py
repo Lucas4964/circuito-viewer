@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .model import CircuitCatalogModel, CircuitVisibilityController
+from .source_composition import ComposedProvenance
 
 
 class CircuitTableModel(QAbstractTableModel):
@@ -38,17 +39,26 @@ class CircuitTableModel(QAbstractTableModel):
         "TRAFO_ID",
         "CODIGO_TRAFO",
         "S_NOM",
+        # Acrescentada no fim, e não no meio: assim ROOT_BAR_COLUMN e o
+        # ``values[column - 2]`` de ``data`` seguem valendo sem tocar em nada.
+        # Com uma fonte só ela fica escondida, e a janela é a de sempre.
+        "Fonte",
     )
+
+    #: Índice da coluna que diz de que banco o circuito veio.
+    SOURCE_COLUMN = len(HEADERS) - 1
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
         self.catalog: CircuitCatalogModel | None = None
         self.controller: CircuitVisibilityController | None = None
+        self.provenance: ComposedProvenance | None = None
 
     def set_source(
         self,
         catalog: CircuitCatalogModel | None,
         controller: CircuitVisibilityController | None,
+        provenance: ComposedProvenance | None = None,
     ) -> None:
         if (catalog is None) != (controller is None):
             raise ValueError("Catálogo e controlador devem ser definidos juntos.")
@@ -57,7 +67,12 @@ class CircuitTableModel(QAbstractTableModel):
         self.beginResetModel()
         self.catalog = catalog
         self.controller = controller
+        self.provenance = provenance
         self.endResetModel()
+
+    @property
+    def multi_source(self) -> bool:
+        return self.provenance is not None and not self.provenance.single_source
 
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: ANN001, N802
         if parent.isValid() or self.catalog is None:
@@ -118,6 +133,16 @@ class CircuitTableModel(QAbstractTableModel):
             Qt.ItemDataRole.ToolTipRole,
         }:
             return None
+        if column == self.SOURCE_COLUMN:
+            provenance = self.provenance
+            if provenance is None:
+                return "—"
+            tag = provenance.tag_of("circuits", row)
+            name = provenance.name_of("circuits", row)
+            if role == Qt.ItemDataRole.ToolTipRole:
+                native = provenance.native_id("circuits", row)
+                return f"{name} — CIRC_ID no banco: {native}"
+            return f"{tag} · {name}" if name else tag
         definition = self.catalog.definition(row)
         values = (
             definition.circuit_id,
@@ -264,6 +289,17 @@ class CircuitsWindow(QDialog):
         # fora de `setEditTriggers`, então não disputa com nenhum editor.
         self.table.doubleClicked.connect(self._double_clicked)
         layout.addWidget(self.table)
+
+        self.table_model = table_model
+        table_model.modelReset.connect(self._sync_source_column)
+        self._sync_source_column()
+
+    def _sync_source_column(self) -> None:
+        """A coluna "Fonte" só faz sentido quando há mais de uma."""
+
+        self.table.setColumnHidden(
+            CircuitTableModel.SOURCE_COLUMN, not self.table_model.multi_source
+        )
 
     def _double_clicked(self, index: QModelIndex) -> None:
         """Só a coluna da barra inicial enquadra.

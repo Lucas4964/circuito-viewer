@@ -49,6 +49,7 @@ GRAPHVIZ_RANK_SEPARATION_RANGE = (2.0, 800.0)
 GRAPHVIZ_TREE_EDGE_WEIGHT_RANGE = (1, 100)
 GRAPHVIZ_TREE_EDGE_MINLEN_RANGE = (1, 10)
 GRAPHVIZ_CROSSING_MINIMIZATION_RANGE = (0.1, 4.0)
+GRAPHVIZ_SWITCH_NODE_CLEARANCE_PX = 4.0
 
 
 class GraphvizEdgeRouting(str, Enum):
@@ -68,6 +69,7 @@ class GraphvizLayoutSettings:
     rank_separation_px: float = 56.0
     edge_routing: GraphvizEdgeRouting = GraphvizEdgeRouting.SPLINE
     equal_rank_spacing: bool = False
+    switches_as_nodes: bool = False
     tree_edge_weight: int = 8
     tree_edge_minlen: int = 1
     crossing_minimization: float = 1.0
@@ -93,6 +95,8 @@ class GraphvizLayoutSettings:
         edge_routing = GraphvizEdgeRouting(self.edge_routing)
         if not isinstance(self.equal_rank_spacing, bool):
             raise ValueError("A uniformização entre níveis deve ser booleana.")
+        if not isinstance(self.switches_as_nodes, bool):
+            raise ValueError("A modelagem das chaves como nós deve ser booleana.")
         validations = (
             (
                 circuit_separation,
@@ -150,6 +154,7 @@ class GraphvizLayoutSettings:
             "equal_rank_spacing",
             bool(self.equal_rank_spacing),
         )
+        object.__setattr__(self, "switches_as_nodes", bool(self.switches_as_nodes))
         object.__setattr__(self, "tree_edge_weight", tree_edge_weight)
         object.__setattr__(self, "tree_edge_minlen", tree_edge_minlen)
         object.__setattr__(self, "crossing_minimization", crossing_minimization)
@@ -161,6 +166,7 @@ class GraphvizLayoutSettings:
             "rank_separation_px": self.rank_separation_px,
             "edge_routing": self.edge_routing.value,
             "equal_rank_spacing": self.equal_rank_spacing,
+            "switches_as_nodes": self.switches_as_nodes,
             "tree_edge_weight": self.tree_edge_weight,
             "tree_edge_minlen": self.tree_edge_minlen,
             "crossing_minimization": self.crossing_minimization,
@@ -232,6 +238,9 @@ def graphviz_layout_settings_from_mapping(
         equal_rank_spacing=_setting_bool(
             values.get("equal_rank_spacing"), defaults.equal_rank_spacing
         ),
+        switches_as_nodes=_setting_bool(
+            values.get("switches_as_nodes"), defaults.switches_as_nodes
+        ),
         tree_edge_weight=bounded_int(
             "tree_edge_weight", GRAPHVIZ_TREE_EDGE_WEIGHT_RANGE
         ),
@@ -268,6 +277,7 @@ class GraphvizDotInput:
     tree_edge_indices: frozenset[int]
     layout_groups: tuple[tuple[int, ...], ...] = ()
     circuit_separation_px: float = 0.0
+    switches_as_nodes: bool = False
 
 
 def bundled_graphviz_root() -> Path:
@@ -394,6 +404,7 @@ def serialize_graphviz_dot(
     graph: BlockGraph,
     *,
     node_envelopes: Mapping[int, BlockNodeEnvelope],
+    edge_label_sizes: Mapping[int, Sequence[float]] | None = None,
     block_circuit_indices: Mapping[int, int | None] | None = None,
     selected_circuit_indices: Sequence[int] | frozenset[int] | set[int] = (),
     settings: GraphvizLayoutSettings = DEFAULT_GRAPHVIZ_LAYOUT_SETTINGS,
@@ -458,6 +469,25 @@ def serialize_graphviz_dot(
     rank_separation = f"{rank_separation_value:.9f}"
     if settings.equal_rank_spacing:
         rank_separation = _dot_quote(f"{rank_separation} equally")
+    switch_node_sizes: dict[int, tuple[float, float]] = {}
+    if settings.switches_as_nodes:
+        expected_switches = {edge.switch_index for edge in graph.edges}
+        if edge_label_sizes is None or set(edge_label_sizes) != expected_switches:
+            raise GraphvizLayoutError(
+                "Os envelopes das etiquetas não correspondem às chaves do grafo."
+            )
+        for switch_index in sorted(expected_switches):
+            raw_size = edge_label_sizes[switch_index]
+            if len(raw_size) < 2:
+                raise GraphvizLayoutError("Envelope de etiqueta Graphviz inválido.")
+            width = float(raw_size[0]) + 2.0 * GRAPHVIZ_SWITCH_NODE_CLEARANCE_PX
+            height = float(raw_size[1]) + 2.0 * GRAPHVIZ_SWITCH_NODE_CLEARANCE_PX
+            if not all(
+                math.isfinite(value) and value > 0.0 for value in (width, height)
+            ):
+                raise GraphvizLayoutError("Envelope de etiqueta Graphviz inválido.")
+            switch_node_sizes[switch_index] = (width, height)
+
     lines = [
         "digraph BlockGraph {",
         f"  graph [rankdir=TB, splines={settings.edge_routing.value}, "
@@ -468,16 +498,41 @@ def serialize_graphviz_dot(
         '  node [shape=ellipse, label="", fixedsize=true, margin=0];',
         '  edge [dir=none, fontname="Arial", fontsize=10];',
     ]
-    for group_number, key in enumerate(
-        sorted(groups, key=lambda value: (value[0], value[1]))
-    ):
+    ordered_group_keys = sorted(groups, key=lambda value: (value[0], value[1]))
+    group_name_by_key = {
+        key: f"circuit_{group_number}"
+        for group_number, key in enumerate(ordered_group_keys)
+    }
+    switch_group: dict[int, str] = {}
+    switches_by_group: dict[str, list[int]] = defaultdict(list)
+    if settings.switches_as_nodes:
+        for edge in graph.edges:
+            start_group = group_for_node[edge.start_block_id]
+            end_group = group_for_node[edge.end_block_id]
+            if start_group == end_group:
+                group_name = group_name_by_key[start_group]
+                switch_group[edge.switch_index] = group_name
+                switches_by_group[group_name].append(edge.switch_index)
+
+    def switch_node_declaration(switch_index: int, indent: str) -> str:
+        width, height = switch_node_sizes[switch_index]
+        group = switch_group.get(switch_index)
+        group_attribute = "" if group is None else f', group="{group}"'
+        return (
+            f'{indent}"s_{switch_index}" [id="switch_node_{switch_index}", '
+            'shape=box, style=invis, label="", fixedsize=true, margin=0, '
+            f"width={width / _POINTS_PER_INCH:.9f}, "
+            f"height={height / _POINTS_PER_INCH:.9f}{group_attribute}];"
+        )
+
+    for key in ordered_group_keys:
         # Subgrafos comuns agrupam a serializacao sem ativar o mecanismo de
         # clusters do ``dot``. Clusters invisiveis provocam ``init_rank`` e
         # ``routesplines`` em grafos grandes com muitas arestas
         # ``constraint=false`` (inclusive no runtime oficial 15.1.1). O
         # atributo ``group`` preserva a afinidade vertical do circuito sem
         # criar caixas ou participar da renderizacao.
-        group_name = f"circuit_{group_number}"
+        group_name = group_name_by_key[key]
         lines.append(f"  subgraph {group_name} {{")
         for block_id in groups[key]:
             envelope = node_envelopes[block_id]
@@ -488,34 +543,105 @@ def serialize_graphviz_dot(
                 f'group="{group_name}", width={width:.9f}, '
                 f"height={height:.9f}];"
             )
+        if settings.switches_as_nodes:
+            for switch_index in sorted(switches_by_group[group_name]):
+                lines.append(switch_node_declaration(switch_index, "    "))
         lines.append("  }")
+
+    if settings.switches_as_nodes:
+        for edge in sorted(graph.edges, key=lambda value: value.switch_index):
+            if edge.switch_index not in switch_group:
+                lines.append(switch_node_declaration(edge.switch_index, "  "))
+
+        layer_members: dict[int, list[str]] = defaultdict(list)
+        for block_id in node_ids:
+            layer_members[2 * depths[block_id]].append(f"n_{block_id}")
+        for edge_index, edge in sorted(
+            enumerate(graph.edges),
+            key=lambda value: (value[1].switch_index, value[0]),
+        ):
+            if edge_index in tree_edges:
+                child = child_by_edge[edge_index]
+                owner = parent_by_node[child]
+                if owner is None:  # pragma: no cover - invariante da floresta
+                    raise GraphvizLayoutError("Aresta de árvore sem nó pai.")
+                layer = 2 * depths[owner] + 1
+            else:
+                start_depth = depths[edge.start_block_id]
+                end_depth = depths[edge.end_block_id]
+                if (
+                    edge.start_block_id == edge.end_block_id
+                    or start_depth == end_depth
+                ):
+                    layer = 2 * start_depth + 1
+                else:
+                    layer = start_depth + end_depth
+            layer_members[layer].append(f"s_{edge.switch_index}")
+
+        highest_layer = max(layer_members, default=0)
+        for layer in range(highest_layer + 1):
+            lines.append(
+                f'  "rank_anchor_{layer}" [shape=point, style=invis, label="", '
+                'fixedsize=true, width=0.01, height=0.01];'
+            )
+        for layer in range(highest_layer + 1):
+            members = sorted(
+                layer_members.get(layer, ()),
+                key=lambda name: (name[0] != "n", int(name[2:])),
+            )
+            rank_nodes = " ".join(
+                _dot_quote(name) + ";" for name in members
+            )
+            lines.append(
+                f'  subgraph rank_layer_{layer} {{ rank=same; '
+                f'"rank_anchor_{layer}"; {rank_nodes} }}'
+            )
+        for layer in range(highest_layer):
+            lines.append(
+                f'  "rank_anchor_{layer}" -> "rank_anchor_{layer + 1}" '
+                "[style=invis, weight=100, minlen=1];"
+            )
+
     for edge_index, edge in sorted(
         enumerate(graph.edges),
         key=lambda value: (value[1].switch_index, value[0]),
     ):
         tail = edge.start_block_id
         head = edge.end_block_id
-        attributes = [
-            f'id={_dot_quote(f"switch_{edge.switch_index}")}',
-            f'label={_dot_quote(edge.label)}',
-        ]
+        attributes: list[str] = []
         if edge_index in tree_edges:
             child = child_by_edge[edge_index]
             owner = parent_by_node[child]
             if owner is None:  # pragma: no cover - invariante da floresta
                 raise GraphvizLayoutError("Aresta de árvore sem nó pai.")
             tail, head = owner, child
-            attributes.extend(
-                (
-                    f"weight={settings.tree_edge_weight}",
-                    f"minlen={settings.tree_edge_minlen}",
-                )
-            )
+            attributes.extend((
+                f"weight={settings.tree_edge_weight}",
+                f"minlen={settings.tree_edge_minlen}",
+            ))
         else:
             attributes.append("constraint=false")
-        lines.append(
-            f'  "n_{tail}" -> "n_{head}" [{", ".join(attributes)}];'
-        )
+        if settings.switches_as_nodes:
+            common = ", ".join(attributes)
+            separator = ", " if common else ""
+            lines.append(
+                f'  "n_{tail}" -> "s_{edge.switch_index}" '
+                f'[id={_dot_quote(f"switch_{edge.switch_index}_a")}'
+                f"{separator}{common}];"
+            )
+            lines.append(
+                f'  "s_{edge.switch_index}" -> "n_{head}" '
+                f'[id={_dot_quote(f"switch_{edge.switch_index}_b")}'
+                f"{separator}{common}];"
+            )
+        else:
+            attributes[:0] = [
+                f'id={_dot_quote(f"switch_{edge.switch_index}")}',
+                f'label={_dot_quote(edge.label)}',
+            ]
+            lines.append(
+                f'  "n_{tail}" -> "n_{head}" [{", ".join(attributes)}];'
+            )
     lines.append("}")
     return GraphvizDotInput(
         source="\n".join(lines) + "\n",
@@ -523,10 +649,10 @@ def serialize_graphviz_dot(
         root_ids=tuple(roots),
         tree_edge_indices=tree_edges,
         layout_groups=tuple(
-            groups[key]
-            for key in sorted(groups, key=lambda value: (value[0], value[1]))
+            groups[key] for key in ordered_group_keys
         ),
         circuit_separation_px=settings.circuit_separation_px,
+        switches_as_nodes=settings.switches_as_nodes,
     )
 
 
@@ -641,6 +767,51 @@ def _circle_endpoint(
     return (center[0] + dx / length * radius, center[1] + dy / length * radius)
 
 
+@dataclass(frozen=True, slots=True)
+class _GraphvizRoutePart:
+    tail_name: str
+    head_name: str
+    points: tuple[tuple[float, float], ...]
+    cubic: bool
+
+
+def _merge_switch_route_parts(
+    first: _GraphvizRoutePart,
+    second: _GraphvizRoutePart,
+    switch_center: tuple[float, float],
+) -> BlockGraphEdgeRoute:
+    """Une as duas splines ocultando a emenda sob a etiqueta Qt."""
+
+    if first.cubic != second.cubic:
+        raise GraphvizLayoutError("As duas metades da chave têm traçados incompatíveis.")
+    points = list(first.points)
+    if first.cubic:
+        for destination in (switch_center, second.points[0]):
+            origin = points[-1]
+            if origin == destination:
+                continue
+            points.extend(
+                (
+                    (
+                        origin[0] + (destination[0] - origin[0]) / 3.0,
+                        origin[1] + (destination[1] - origin[1]) / 3.0,
+                    ),
+                    (
+                        origin[0] + 2.0 * (destination[0] - origin[0]) / 3.0,
+                        origin[1] + 2.0 * (destination[1] - origin[1]) / 3.0,
+                    ),
+                    destination,
+                )
+            )
+        points.extend(second.points[1:])
+        return BlockGraphEdgeRoute(tuple(points), cubic=True)
+
+    for point in (switch_center, *second.points):
+        if point != points[-1]:
+            points.append(point)
+    return BlockGraphEdgeRoute(tuple(points))
+
+
 def parse_graphviz_json(
     payload: bytes | str | Mapping[str, object],
     graph: BlockGraph,
@@ -669,6 +840,8 @@ def parse_graphviz_json(
         return (point[0] - center_x, center_y - point[1])
 
     positions: dict[int, tuple[float, float]] = {}
+    switch_positions: dict[int, tuple[float, float]] = {}
+    object_names: dict[int, str] = {}
     raw_objects = document.get("objects", ())
     if not isinstance(raw_objects, Sequence) or isinstance(
         raw_objects, (str, bytes, bytearray)
@@ -678,20 +851,36 @@ def parse_graphviz_json(
         if not isinstance(raw, Mapping):
             continue
         name = str(raw.get("name", ""))
-        if not name.startswith("n_"):
-            continue
         try:
-            block_id = int(name[2:])
-            positions[block_id] = convert(_parse_point(raw["pos"]))
-        except (KeyError, ValueError) as exc:
+            if "_gvid" in raw:
+                object_index = int(raw["_gvid"])
+                if object_index in object_names:
+                    raise ValueError("_gvid duplicado")
+                object_names[object_index] = name
+            elif dot_input.switches_as_nodes:
+                raise KeyError("_gvid")
+            if name.startswith("n_"):
+                block_id = int(name[2:])
+                if block_id in positions:
+                    raise ValueError("bloco duplicado")
+                positions[block_id] = convert(_parse_point(raw["pos"]))
+            elif dot_input.switches_as_nodes and name.startswith("s_"):
+                switch_index = int(name[2:])
+                if switch_index in switch_positions:
+                    raise ValueError("chave duplicada")
+                switch_positions[switch_index] = convert(_parse_point(raw["pos"]))
+        except (KeyError, TypeError, ValueError) as exc:
             raise GraphvizLayoutError("Posição de nó Graphviz inválida.") from exc
     expected_nodes = set(graph.node_ids)
     if set(positions) != expected_nodes:
         raise GraphvizLayoutError("O Graphviz não posicionou todos os blocos.")
 
     edge_by_switch = {edge.switch_index: edge for edge in graph.edges}
+    if dot_input.switches_as_nodes and set(switch_positions) != set(edge_by_switch):
+        raise GraphvizLayoutError("O Graphviz não posicionou todas as chaves.")
     routes: dict[int, BlockGraphEdgeRoute] = {}
     labels: dict[int, tuple[float, float]] = {}
+    route_parts: dict[int, dict[str, _GraphvizRoutePart]] = defaultdict(dict)
     raw_edges = document.get("edges", ())
     if not isinstance(raw_edges, Sequence) or isinstance(
         raw_edges, (str, bytes, bytearray)
@@ -703,11 +892,24 @@ def parse_graphviz_json(
         identifier = str(raw.get("id", ""))
         if not identifier.startswith("switch_"):
             continue
+        raw_identifier = identifier[len("switch_") :]
+        half = ""
+        if dot_input.switches_as_nodes:
+            raw_identifier, separator, half = raw_identifier.rpartition("_")
+            if separator != "_" or half not in {"a", "b"}:
+                raise GraphvizLayoutError(
+                    "Identificador de metade de chave Graphviz inválido."
+                )
         try:
-            switch_index = int(identifier[len("switch_") :])
+            switch_index = int(raw_identifier)
         except ValueError as exc:
             raise GraphvizLayoutError("Identificador de aresta Graphviz inválido.") from exc
-        if switch_index not in edge_by_switch or switch_index in routes:
+        if switch_index not in edge_by_switch:
+            raise GraphvizLayoutError("Aresta Graphviz ausente ou duplicada.")
+        if dot_input.switches_as_nodes:
+            if half in route_parts[switch_index]:
+                raise GraphvizLayoutError("Metade de chave Graphviz duplicada.")
+        elif switch_index in routes:
             raise GraphvizLayoutError("Aresta Graphviz ausente ou duplicada.")
         raw_draw = raw.get("_draw_", ())
         if not isinstance(raw_draw, Sequence) or isinstance(
@@ -733,35 +935,39 @@ def parse_graphviz_json(
             math.isfinite(value) for point in points for value in point
         ):
             raise GraphvizLayoutError("Spline Graphviz ausente ou inválida.")
-        edge = edge_by_switch[switch_index]
-        start_center = positions[edge.start_block_id]
-        end_center = positions[edge.end_block_id]
-        if edge.start_block_id == edge.end_block_id:
-            points[0] = _circle_endpoint(
-                start_center,
-                points[1],
-                node_envelopes[edge.start_block_id].node_diameter,
-            )
-            points[-1] = _circle_endpoint(
-                end_center,
-                points[-2],
-                node_envelopes[edge.end_block_id].node_diameter,
-            )
-        else:
-            points[0] = _circle_endpoint(
-                start_center,
-                points[1],
-                node_envelopes[edge.start_block_id].node_diameter,
-            )
-            points[-1] = _circle_endpoint(
-                end_center,
-                points[-2],
-                node_envelopes[edge.end_block_id].node_diameter,
-            )
         cubic = (
             len(spline_operations) == 1
             and spline_operations[0].get("op") in {"b", "B"}
             and (len(points) - 1) % 3 == 0
+        )
+        if dot_input.switches_as_nodes:
+            try:
+                tail_name = object_names[int(raw["tail"])]
+                head_name = object_names[int(raw["head"])]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise GraphvizLayoutError(
+                    "Extremidades de chave Graphviz inválidas."
+                ) from exc
+            route_parts[switch_index][half] = _GraphvizRoutePart(
+                tail_name,
+                head_name,
+                tuple(points),
+                cubic,
+            )
+            continue
+
+        edge = edge_by_switch[switch_index]
+        start_center = positions[edge.start_block_id]
+        end_center = positions[edge.end_block_id]
+        points[0] = _circle_endpoint(
+            start_center,
+            points[1],
+            node_envelopes[edge.start_block_id].node_diameter,
+        )
+        points[-1] = _circle_endpoint(
+            end_center,
+            points[-2],
+            node_envelopes[edge.end_block_id].node_diameter,
         )
         routes[switch_index] = BlockGraphEdgeRoute(
             tuple(points),
@@ -774,6 +980,90 @@ def parse_graphviz_json(
             if label_position is not None
             else _route_midpoint(points)
         )
+
+    if dot_input.switches_as_nodes:
+        for switch_index, edge in sorted(edge_by_switch.items()):
+            parts = route_parts.get(switch_index, {})
+            if set(parts) != {"a", "b"}:
+                raise GraphvizLayoutError("O Graphviz não calculou as duas metades da chave.")
+            switch_name = f"s_{switch_index}"
+            start_name = f"n_{edge.start_block_id}"
+            end_name = f"n_{edge.end_block_id}"
+
+            def oriented(
+                part: _GraphvizRoutePart,
+                expected_tail: str,
+                expected_head: str,
+            ) -> _GraphvizRoutePart:
+                if (part.tail_name, part.head_name) == (
+                    expected_tail,
+                    expected_head,
+                ):
+                    return part
+                if (part.tail_name, part.head_name) == (
+                    expected_head,
+                    expected_tail,
+                ):
+                    return _GraphvizRoutePart(
+                        expected_tail,
+                        expected_head,
+                        tuple(reversed(part.points)),
+                        part.cubic,
+                    )
+                raise GraphvizLayoutError(
+                    "Uma metade da chave não liga os nós esperados."
+                )
+
+            if edge.start_block_id == edge.end_block_id:
+                first = oriented(parts["a"], start_name, switch_name)
+                second = oriented(parts["b"], switch_name, end_name)
+            else:
+                start_part = next(
+                    (
+                        part
+                        for part in parts.values()
+                        if {part.tail_name, part.head_name}
+                        == {start_name, switch_name}
+                    ),
+                    None,
+                )
+                end_part = next(
+                    (
+                        part
+                        for part in parts.values()
+                        if {part.tail_name, part.head_name}
+                        == {end_name, switch_name}
+                    ),
+                    None,
+                )
+                if start_part is None or end_part is None or start_part is end_part:
+                    raise GraphvizLayoutError(
+                        "As metades da chave não correspondem aos blocos."
+                    )
+                first = oriented(start_part, start_name, switch_name)
+                second = oriented(end_part, switch_name, end_name)
+            route = _merge_switch_route_parts(
+                first,
+                second,
+                switch_positions[switch_index],
+            )
+            points = list(route.points)
+            points[0] = _circle_endpoint(
+                positions[edge.start_block_id],
+                points[1],
+                node_envelopes[edge.start_block_id].node_diameter,
+            )
+            points[-1] = _circle_endpoint(
+                positions[edge.end_block_id],
+                points[-2],
+                node_envelopes[edge.end_block_id].node_diameter,
+            )
+            routes[switch_index] = BlockGraphEdgeRoute(
+                tuple(points),
+                curved=route.curved,
+                cubic=route.cubic,
+            )
+            labels[switch_index] = switch_positions[switch_index]
     if set(routes) != set(edge_by_switch) or set(labels) != set(edge_by_switch):
         raise GraphvizLayoutError("O Graphviz não calculou todas as chaves.")
     if set(dot_input.depths) != expected_nodes:

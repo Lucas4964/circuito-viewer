@@ -19,6 +19,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from itertools import islice
+from pathlib import PurePath
 from typing import Any, Callable, Iterator, Sequence
 
 from .allocation import (
@@ -63,6 +64,13 @@ from .mdb_mapping import (
     resolve_mapping,
 )
 from .model import UtmCrs
+from .source_composition import (
+    ComposedModels,
+    SourceDataset,
+    SourceWorkspace,
+    compose,
+    restrict_to_circuits,
+)
 from .phase_config import PhaseConfiguration
 from .regulator_import import RegulatorLoadResult, parse_regulator_rows
 from .segment_import import SegmentLoadResult, parse_segment_rows
@@ -140,6 +148,8 @@ class MdbImportResult:
     allocation_error: str | None = None
     outcomes: tuple[MdbEntityOutcome, ...] = ()
     applied_scale: float = 1.0
+    empty_entities: tuple[str, ...] = ()
+    omitted_fields: tuple[tuple[str, str], ...] = ()
 
     def outcome_for(self, entity: str) -> MdbEntityOutcome | None:
         for item in self.outcomes:
@@ -183,6 +193,67 @@ class MdbImportResult:
             self.circuit_levels,
         )
         return any(item is not None and item.has_warnings for item in results)
+
+
+@dataclass(frozen=True, slots=True)
+class MdbSourceLoad:
+    """O que uma importação entrega quando há um espaço de trabalho.
+
+    Carrega as quatro coisas juntas porque elas só fazem sentido juntas: o
+    relatório íntegro do banco lido, o retrato já restrito aos circuitos
+    escolhidos, o espaço de trabalho **candidato** e a cadeia composta pronta
+    para instalar. Nada disso toca a janela principal até a composição dar
+    certo — é a mesma disciplina transacional dos outros importadores.
+    """
+
+    dataset: SourceDataset
+    workspace: SourceWorkspace
+    composed: ComposedModels
+    #: ``None`` quando a recomposição não leu banco nenhum (remover uma fonte).
+    result: MdbImportResult | None = None
+    project_change: object | None = None
+
+
+def dataset_from_result(
+    result: MdbImportResult,
+    *,
+    tag: str,
+    name: str | None = None,
+) -> SourceDataset:
+    """O retrato de uma fonte a partir do que a importação devolveu.
+
+    Mora aqui, e não em ``source_composition``, porque é este módulo que conhece
+    a forma do ``MdbImportResult``. A composição não pode importar a importação
+    — ela precisa rodar sobre modelos vindos de qualquer origem.
+    """
+
+    def model(value: object) -> object | None:
+        return None if value is None else value.model
+
+    entities = dict(zip(ENTITY_ORDER, ("bars", "cables", "segments", "loads", "capacitors", "generators",
+                                      "patterns", "switches", "regulators", "circuits", "circuit_levels")))
+
+    return SourceDataset(
+        tag=tag,
+        name=name or PurePath(result.source_path).name or result.source_path,
+        source_path=result.source_path,
+        applied_scale=result.applied_scale,
+        bars=result.bars.model,
+        cables=model(result.cables),
+        segments=model(result.segments),
+        loads=model(result.loads),
+        capacitors=model(result.capacitors),
+        generators=model(result.generators),
+        patterns=model(result.patterns),
+        switches=model(result.switches),
+        regulators=model(result.regulators),
+        catalog=model(result.circuits),
+        circuit_levels=model(result.circuit_levels),
+        allocations=result.allocations,
+        provided_entities=frozenset(entities[name] for name in (*result.imported_entities, *result.empty_entities)),
+        source_tables=tuple((entities[item.entity], item.table) for item in result.outcomes if item.table),
+        omitted_fields=result.omitted_fields,
+    )
 
 
 def source_label(source_path: str, table: str) -> str:
@@ -468,6 +539,34 @@ def load_database(
         except Exception as exc:  # noqa: BLE001 — agregado não derruba a rede
             allocation_error = str(exc)
 
+    empty_entities = []
+    for entity in wanted:
+        target = plan.get(entity)
+        if target is not None:
+            try:
+                if database.row_count(target.table) == 0:
+                    empty_entities.append(entity)
+            except Exception:
+                pass  # Uma falha de metadados não autoriza exclusões.
+    omitted_fields = []
+    circuit_target = plan.get("circuitos")
+    if circuit_target is not None:
+        try:
+            tables = {table.casefold(): table for table in database.tables()}
+            circuit_columns = {name.casefold() for name in database.columns(circuit_target.table)}
+            for table, link, columns in (
+                ("se", "se_id", (("codigo", "substation_code"), ("nome", "substation_name"))),
+                ("se_trafo", "trafo_id", (("codigo", "transformer_code"), ("snom", "transformer_power"))),
+            ):
+                available = {name.casefold() for name in database.columns(tables[table])} if table in tables else set()
+                for column, field_name in columns:
+                    if link not in circuit_columns or column not in available:
+                        omitted_fields.append(("circuits", field_name))
+            if "trafo_id" not in circuit_columns:
+                omitted_fields.append(("circuits", "transformer_id"))
+        except Exception:
+            omitted_fields.extend(("circuits", name) for name in (
+                "substation_code", "substation_name", "transformer_id", "transformer_code", "transformer_power"))
     return MdbImportResult(
         source_path=source_path,
         bars=bars,
@@ -485,6 +584,8 @@ def load_database(
         allocation_error=allocation_error,
         outcomes=tuple(outcomes),
         applied_scale=scale,
+        empty_entities=tuple(empty_entities),
+        omitted_fields=tuple(omitted_fields),
     )
 
 
@@ -594,21 +695,21 @@ def _load_substation_links(
 ) -> dict[str, SubstationLink]:
     """De onde cada circuito sai: ``{CIRC_ID: SubstationLink}``.
 
-    Segue o molde de :func:`_load_transformer_allocations` — ler tabela auxiliar
-    direto do banco, tolerando a ausencia. Um banco sem ``SE``, sem ``SE_TRAFO``
-    ou sem as colunas de ligacao devolve vazio, a importacao segue e as colunas
-    de origem ficam em branco. Elas sao informativas; nenhuma delas pode custar
-    o catalogo de circuitos.
+    Lê subestações e transformadores independentemente, tolerando a ausência
+    das tabelas e das colunas de ligação. Os dados de origem são informativos;
+    nenhuma ausência pode custar o catálogo de circuitos.
 
     A tabela de circuitos e a **resolvida pelo mapeamento**, nunca o literal
     ``CIRCUITO``: e o ``mdb_tabelas.json`` que decide de onde os circuitos vem.
     """
 
     table_by_name = {name.casefold(): name for name in database.tables()}
-    link_columns = _resolve_columns(
-        database, circuits_target.table, _CIRCUIT_LINK_COLUMNS
-    )
-    if link_columns is None:
+    if "se" not in table_by_name and "se_trafo" not in table_by_name:
+        return {}
+    available = {name.casefold(): name for name in database.columns(circuits_target.table)}
+    link_names = tuple(name for name in _CIRCUIT_LINK_COLUMNS if name.casefold() in available)
+    link_columns = tuple(available[name.casefold()] for name in link_names)
+    if not link_columns:
         return {}
     # O CIRC_ID pode ter sido renomeado pelo mapeamento; os demais nao passam
     # por ele, entao sao procurados pelo nome canonico.
@@ -622,12 +723,10 @@ def _load_substation_links(
         _SUBSTATION_TRANSFORMER_TABLE,
     ):
         table = table_by_name.get(canonical.casefold())
-        if table is None:
-            return {}
-        columns = _resolve_columns(database, table, wanted)
-        if columns is None:
-            return {}
-        lookups[canonical] = _index_by_first_column(database, table, columns)
+        columns = None if table is None else _resolve_columns(database, table, wanted)
+        lookups[canonical] = (
+            {} if columns is None else _index_by_first_column(database, table, columns)
+        )
 
     substations = lookups[_SUBSTATION_TABLE[0]]
     transformers = lookups[_SUBSTATION_TRANSFORMER_TABLE[0]]
@@ -636,9 +735,10 @@ def _load_substation_links(
     for row in database.iter_rows(
         circuits_target.table, (circuit_id_column, *link_columns)
     ):
-        circuit_id, substation_id, transformer_id = (
-            value.strip() for value in row
-        )
+        circuit_id = row[0].strip()
+        values = dict(zip(link_names, (value.strip() for value in row[1:]), strict=True))
+        substation_id = values.get("SE_ID", "")
+        transformer_id = values.get("TRAFO_ID", "")
         if not circuit_id:
             continue
         reasons: list[str] = []
@@ -669,6 +769,133 @@ def _load_substation_links(
             reason="; ".join(reasons) or None,
         )
     return links
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitChoice:
+    """Uma linha da lista de circuitos oferecida antes da importação."""
+
+    circuit_id: str
+    code: str = ""
+    nominal_voltage: str = ""
+    substation_code: str = ""
+    substation_name: str = ""
+    transformer_code: str = ""
+    substation_id: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SubstationChoice:
+    """Identidade e rótulos de uma subestação, inclusive sem alimentadores."""
+
+    substation_id: str
+    code: str = ""
+    name: str = ""
+
+
+def list_substations(database: AccessDatabase) -> tuple[SubstationChoice, ...]:
+    table = next((name for name in database.tables() if name.casefold() == "se"), None)
+    if table is None:
+        return ()
+    available = {name.casefold(): name for name in database.columns(table)}
+    if "se_id" not in available:
+        return ()
+    names = tuple(name for name in ("se_id", "codigo", "nome") if name in available)
+    result: dict[str, SubstationChoice] = {}
+    for row in database.iter_rows(table, tuple(available[name] for name in names)):
+        values = dict(zip(names, (value.strip() for value in row), strict=True))
+        key = values["se_id"]
+        if key and key not in result:
+            result[key] = SubstationChoice(key, values.get("codigo", ""), values.get("nome", ""))
+    return tuple(result.values())
+
+
+def list_circuits(
+    database: AccessDatabase,
+    circuits_target: ResolvedEntity | None,
+    *,
+    diagnostics: list[str] | None = None,
+    substations: tuple[SubstationChoice, ...] | None = None,
+) -> tuple[CircuitChoice, ...]:
+    """Os circuitos declarados pelo banco, para o usuário escolher quais trazer.
+
+    Roda na conexão de **inspeção**, antes da importação de verdade: a tabela de
+    circuitos tem centenas de linhas, não milhares, e escolher depois de uma
+    barra de progresso de vários minutos seria o pior lugar possível para uma
+    decisão.
+
+    Sem catálogo legível, devolve vazio e registra o motivo para a interface
+    oferecer explicitamente a importação sem seleção de alimentadores.
+    """
+
+    if circuits_target is None:
+        return ()
+    try:
+        header = tuple(circuits_target.header)
+        columns = tuple(circuits_target.columns)
+        wanted = ("CIRC_ID", "CODIGO", "VNOM")
+        positions = [header.index(name) for name in wanted if name in header]
+        if not positions or header.index("CIRC_ID") not in positions:
+            return ()
+        selected = tuple(columns[position] for position in positions)
+        # A hierarquia exige apenas SE_ID; transformadores são informativos.
+        if substations is None:
+            try:
+                substations = list_substations(database)
+            except InterruptedError:
+                raise
+            except Exception:
+                substations = ()
+                if diagnostics is not None:
+                    diagnostics.append("Não foi possível ler a tabela SE.")
+        stations_by_id = {item.substation_id: item for item in substations}
+        try:
+            links = _load_substation_links(database, circuits_target)
+        except InterruptedError:
+            raise
+        except Exception:
+            links = {}  # Dados de transformadores não bloqueiam a hierarquia.
+        available = {name.casefold(): name for name in database.columns(circuits_target.table)}
+        se_column = available.get("se_id")
+        if se_column is not None:
+            selected = (*selected, se_column)
+        choices: list[CircuitChoice] = []
+        seen: set[str] = set()
+        for row in database.iter_rows(circuits_target.table, selected):
+            names = tuple(header[i] for i in positions) + (("SE_ID",) if se_column else ())
+            values = dict(zip(names, row, strict=True))
+            circuit_id = values.get("CIRC_ID", "").strip()
+            if not circuit_id or circuit_id in seen:
+                continue
+            seen.add(circuit_id)
+            substation_id = values.get("SE_ID", "").strip()
+            substation = stations_by_id.get(substation_id)
+            link = links.get(circuit_id)
+            choices.append(
+                CircuitChoice(
+                    circuit_id=circuit_id,
+                    code=values.get("CODIGO", "").strip(),
+                    nominal_voltage=values.get("VNOM", "").strip(),
+                    substation_code="" if substation is None else substation.code,
+                    substation_name="" if substation is None else substation.name,
+                    transformer_code="" if link is None else link.transformer_code,
+                    substation_id=substation_id,
+                    reason=(
+                        "" if substation is not None else
+                        f"SE_ID '{substation_id}' sem correspondência em SE."
+                        if substation_id else "Alimentador sem vínculo SE_ID."
+                    ),
+                )
+            )
+        return tuple(choices)
+    except InterruptedError:
+        raise
+    except Exception:  # noqa: BLE001 — a lista é uma conveniência; um banco
+        # que não a entregue continua importável por inteiro.
+        if diagnostics is not None:
+            diagnostics.append("Não foi possível listar os alimentadores; verifique a tabela de circuitos.")
+        return ()
 
 
 def _load_transformer_allocations(

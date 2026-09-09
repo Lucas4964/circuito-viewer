@@ -187,7 +187,7 @@ rede desenhada.
 ## Importação por banco de dados (`.mdb`)
 
 **Arquivo > Importar banco de dados…** lê um banco Microsoft Access e importa as
-dez entidades lógicas de uma vez, dispensando exportar cada tabela para CSV. Os dados
+entidades lógicas de uma vez, dispensando exportar cada tabela para CSV. Os dados
 são os mesmos e passam pelas mesmas validações — a única diferença é a fonte.
 
 O banco é aberto **somente para leitura**, em quatro camadas: `ReadOnly=1` na
@@ -220,12 +220,23 @@ fica desabilitado, com o motivo na dica.
 
 ### O diálogo
 
-Escolhido o arquivo, um diálogo mostra as tabelas detectadas, uma por entidade,
-com a contagem de registros. Cada linha tem uma caixa de seleção e uma lista com
-todas as tabelas do banco: **a detecção automática é sempre ajustável à mão**, e
-escolher uma tabela reabilita uma entidade que não foi encontrada. As barras são
-obrigatórias — sem elas não há o que desenhar — e o botão de confirmação fica
-desabilitado enquanto não estiverem marcadas.
+A janela abre antes da escolha do arquivo. Use **Procurar…** para selecionar
+um `.mdb` ou `.accdb`; o caminho fica visível no topo. A inspeção de tabelas,
+contagens, subestações e alimentadores roda em segundo plano. Trocar de arquivo
+reinicia as escolhas; cancelar aguarda o fechamento da conexão sem instalar
+nenhum dado no mapa. A janela acompanha o tema claro ou escuro do aplicativo.
+
+As configurações ficam em três abas:
+
+- **Alimentadores:** subestações com busca e duas listas para montar a seleção.
+- **Tabelas:** entidades, tabelas detectadas, contagens e ajustes manuais. Uma
+  escolha manual só habilita a entidade se suas colunas forem compatíveis.
+  A aba também informa a finalidade e disponibilidade das tabelas auxiliares.
+- **Coordenadas:** zona UTM, hemisfério e unidade das coordenadas.
+
+Barras são sempre obrigatórias. Para importar alimentadores selecionados,
+Trechos e Circuitos também precisam estar habilitados e compatíveis. Bancos
+incompletos continuam acessíveis para corrigir o mapeamento na aba Tabelas.
 
 **Geradores** aparecem como uma única entidade lógica, mas sua linha contém dois
 seletores identificados: `MT_GERADOR_CONS` e `MT_CONS`. A opção só inicia
@@ -240,10 +251,14 @@ O mesmo diálogo pede zona, hemisfério e **unidade das coordenadas**, como na
 importação de barras por CSV. **Decímetros** já vem selecionado, sem leitura de
 amostra para inferir a unidade, e pode ser alterado manualmente.
 
-**Se o banco tiver senha**, a aplicação a pede antes de abrir e repergunta
-quando não confere, em vez de mostrar o erro do driver. A senha é usada apenas
-para abrir a conexão: não é gravada em disco, não vai para log e não aparece em
-mensagem de erro.
+**Se o banco tiver senha**, a aplicação tenta automaticamente a senha padrão
+configurada no Gerenciador de Credenciais do Windows. Se ela não funcionar, ou
+não houver uma credencial configurada, abre a janela para digitar outra senha.
+A tentativa automática ocorre uma vez por abertura de arquivo; senhas manuais
+incorretas permitem tentar novamente. Bancos sem senha abrem diretamente.
+A senha padrão fica no cofre do usuário Windows, fora do código do projeto;
+as senhas digitadas na janela permanecem somente em memória. Nenhuma senha
+aparece em logs ou mensagens de erro.
 
 ### Ordem e dependências
 
@@ -314,6 +329,159 @@ tabelas:
 A regra do valor inteiro não é cosmética: `ESTADO` lido como `"1.0"` faria toda
 chave fechada virar aberta, e `FASES2` como `"13.0"` não casaria com o
 `fases2.json`.
+
+### Escolher quais alimentadores trazer
+
+A aba **Alimentadores** lista as subestações da tabela `SE`, incluindo as sem
+alimentadores. A associação usa `SE_ID` da tabela de circuitos resolvida pelo
+mapeamento, sem depender de `SE_TRAFO` ou `TRAFO_ID`. Alimentadores sem vínculo
+válido ficam em **Sem subestação**, com o motivo na dica da linha.
+
+Nenhum alimentador começa selecionado. Escolha uma subestação e transfira os
+alimentadores de **Disponíveis** para **Selecionados**:
+
+- **>** adiciona as linhas destacadas; **>>** adiciona todos os disponíveis após
+  o filtro, apenas da subestação ativa.
+- **<** remove as linhas destacadas; **<<** limpa toda a seleção acumulada.
+- Duplo clique adiciona ou remove uma linha. Ctrl/Shift permitem seleção múltipla.
+
+As buscas ignoram caixa e acentos. A busca de alimentadores afeta somente os
+disponíveis da subestação ativa. Trocar de subestação, pesquisar ou alternar
+abas preserva os escolhidos de todas as subestações. O resumo mostra a quantidade
+selecionada; o botão **Carregar alimentadores na memória** só habilita com ao
+menos um alimentador e as tabelas obrigatórias válidas.
+
+A seleção traz apenas os modelos associados aos circuitos escolhidos. O banco
+continua sendo lido antes da restrição; somente a rede selecionada permanece na
+fonte instalada no mapa. Escolher todos os alimentadores também envia seus IDs
+explicitamente, sem converter a seleção em importação irrestrita.
+
+Chaves de interligação com as duas pontas na rede selecionada também são
+preservadas, inclusive quando `CIRC_ID` é `-1`, vazio ou sem correspondência.
+Assim, o cálculo dos blocos e as ligações magenta entre alimentadores continuam
+disponíveis. Essa preservação não acrescenta alimentadores externos à seleção.
+
+Para bancos sem catálogo, ou para carregar as tabelas marcadas sem restringir a
+rede, ative **Importar banco sem seleção de alimentadores**. Essa opção é
+explícita e começa desmarcada. Ela desabilita a navegação hierárquica e muda o
+botão para **Carregar banco na memória**. Esvaziar a seleção jamais ativa esse
+modo automaticamente. Trocar a tabela de circuitos limpa a seleção e refaz a
+inspeção da hierarquia.
+
+## Projeto autônomo e importação de bancos
+
+Evidências e limites desta entrega: [validação do projeto autônomo](docs/projeto-autonomo-validacao.md).
+
+O **estado completo do projeto em memória** é a fonte da verdade do estudo.
+Ocultar circuitos, filtrar listas ou mudar o zoom afeta somente a apresentação.
+Depois da leitura, análises e exportações funcionam sem consultar novamente o
+MDB. Esta versão não salva nem abre arquivos de projeto; encerrar a aplicação
+encerra o estudo em memória.
+
+**Arquivo → Importar banco de dados…** inclui ou revisa dados no projeto atual.
+A antiga ação Adicionar foi incorporada a esse fluxo. **Arquivo → Novo projeto**
+começa do zero, após confirmação. **Desfazer última operação** (`Ctrl+Z`) restaura
+a operação anterior de importação, edição, exclusão ou desvinculação.
+
+### Revisão de alimentadores e conflitos
+
+Todos os alimentadores recebidos aparecem na revisão, inclusive os já existentes
+sem diferenças. Para cada alimentador existente, escolha explicitamente:
+
+- **Manter atual:** preserva o conteúdo atual; outros alimentadores novos podem entrar.
+- **Atualizar:** compara o último retrato recebido, os valores do projeto e os
+  novos valores. Preserva edições locais e solicita decisão por campo quando
+  ambos os lados mudaram de forma diferente.
+- **Substituir:** aplica o conjunto recebido dentro das tabelas e alimentadores
+  abrangidos. A revisão lista previamente as exclusões; equipamentos manuais e
+  compartilhados são preservados. Referências quebradas impedem a confirmação.
+
+Ausência em uma tabela não fornecida não significa exclusão. Cancelar a revisão
+não altera o projeto nem o retrato usado na próxima comparação. Falhas de leitura,
+resultados de uma revisão antiga e falhas na instalação preservam o projeto anterior.
+
+Equipamentos possuem UUID interno estável. Caminho, assinatura SHA-256 e IDs
+externos servem para reconhecimento e correspondências. Arquivos independentes
+com IDs ou nomes iguais não são fundidos automaticamente: a revisão mostra a
+possível correspondência. Use **Vincular à rede…** e **Correspondências…** quando
+souber que representam a mesma rede. Configure o mesmo CRS para arquivos vinculados.
+
+### Origem, histórico e conexões
+
+O botão **Origem e histórico…**, no painel do elemento selecionado, mostra UUID,
+arquivo, tabela, ID original, lote, transformação de coordenadas, observações e
+origem dos campos editados. **Visualizar → Fontes…** permite enquadrar e renomear
+redes, consultar histórico/pendências, **desvincular arquivos** sem excluir
+os equipamentos ou **excluir a rede do projeto**, após apresentar seu alcance.
+O histórico de criação continua disponível após a desvinculação.
+
+Conexões com uma ponta ausente ficam pendentes. Quando a outra ponta é importada
+na mesma identidade de rede, a conexão é resolvida com os dados já guardados,
+sem reler o primeiro banco. A proximidade geográfica nunca cria uma conexão.
+A topologia física mantém as chaves abertas; a operacional considera o estado
+atual. No painel da chave, **Abrir no estudo** e **Fechar no estudo** alteram o
+projeto e atualizam a topologia. Estado desconhecido bloqueia condução e produz
+diagnóstico. O estado normal permanece separado.
+
+Edições de reguladores e de patamares por circuito integram o projeto e sobrevivem
+a outras importações. Cada commit incrementa a revisão e invalida análises antigas.
+Cores e visibilidade são preservadas por identidade; alterações visuais não
+recalculam a rede elétrica. Cálculos pesados continuam sob solicitação.
+
+A solução elétrica multifonte ainda não está implementada. Alimentadores unidos
+por conexões condutoras são detectados; o fluxo independente e o master de uma
+fonte são bloqueados nesses casos. Exportações comuns incluem `estudo.json` com
+identificação do projeto, revisão e assinatura das configurações/bibliotecas.
+Chaves internas ao escopo são avaliadas mesmo sem `CIRC_ID` válido; dados elétricos
+incompletos são recusados com motivo explícito. Por exemplo, uma chave com
+`FASES2 = 0` sem mapeamento de fases permanece no projeto, mas não é exportável.
+
+### Identificadores repetidos entre redes independentes
+
+O esperado é que cada identificador seja único. Quando não é, a primeira fonte a
+usar um `BARRA_ID`, `TRECHO_ID`, `CIRC_ID`, `CARGA_ID`, `CAPAC_ID`,
+`GERADOR_ID`, `CHAVE_ID` ou `REGU_ID` o mantém como está, e a fonte seguinte
+recebe a forma qualificada `<id>__F2`. **Toda colisão é relatada** numa janela
+ao fim da composição — nada é renomeado em silêncio. Com um banco só, nada
+colide e nenhum identificador muda, então os arquivos de mapeamento
+(`mapa_cabos.json`, `curvas.json`) seguem casando como sempre.
+
+Cabos são a exceção: dois bancos da mesma concessionária compartilham `CABO_ID`
+para o mesmo cabo, então cabos de conteúdo **idêntico** viram uma linha só, em
+vez de serem qualificados — qualificá-los quebraria o `mapa_cabos.json` para
+toda fonte além da primeira. Só cabos de conteúdo diferente sob o mesmo id são
+tratados como colisão.
+
+O `CODIGO` **nunca** é alterado: ele é rótulo, não chave, e mudá-lo mentiria
+para quem lê a tela. Um `CODIGO` repetido entre fontes é relatado, e a
+desambiguação acontece só dentro do arquivo do OpenDSS, onde dois nomes iguais
+fariam o exportador descartar a segunda linha — lá a barra sai como
+`COD-A_F2`.
+
+### Fusos diferentes
+
+O CRS do espaço de trabalho é o da **primeira** fonte. Uma fonte em outro fuso
+UTM é reprojetada com o `pyproj` na composição, e o relatório diz de qual zona
+para qual e qual foi o deslocamento máximo aplicado. Se a primeira fonte for
+removida, o CRS da nova primeira passa a valer e as demais são reprojetadas de
+novo. Coordenadas que caiam fora do domínio válido do fuso alvo fazem a
+composição falhar nomeando a fonte, em vez de produzir um mapa inutilizável.
+
+A unidade das coordenadas não precisa de acerto: o divisor é aplicado na
+leitura, e todo modelo já está em metros quando chega à composição. O painel de
+Fontes mostra a unidade de cada uma justamente para que um divisor errado — que
+joga a fonte a milhões de metros das outras — fique visível.
+
+### O que muda com mais de uma fonte
+
+- A **importação por CSV** fica desabilitada, com o motivo na dica: ela
+  substitui uma entidade inteira e não sabe de que fonte ela veio.
+- A **exportação para o OpenDSS**, a **análise de ramais**, os **blocos** e o
+  **fluxo de potência** continuam funcionando sobre os circuitos selecionados,
+  venham do banco que vierem. Arquivos vinculados à mesma rede são reunidos
+  no cadastro antes da composição entre redes independentes.
+- As **edições de regulador** confirmadas pertencem ao projeto e são preservadas
+  ao acrescentar outra fonte. Atualizações conflitantes exigem revisão.
 
 ## Controles
 
@@ -1249,9 +1417,9 @@ eles e apresenta um aviso.
 Cada circuito começa como uma cópia virtual de `CIRCUITO_PATAMARES`. Salvar uma
 edição de circuito altera somente a memória da sessão: não grava JSON, CSV,
 MDB nem o banco. Fechar e reabrir a janela preserva essa cópia enquanto a
-aplicação estiver aberta; encerrar a aplicação ou reimportar com sucesso
-descarta as edições virtuais e recria as agendas a partir da fonte. Cancelar ou
-falhar uma importação mantém o estado atual.
+aplicação estiver aberta. As edições confirmadas integram o projeto, podem ser
+desfeitas e sobrevivem a novas importações; alterações externas conflitantes
+exigem revisão. Encerrar a aplicação encerra o projeto em memória.
 
 As edições ficam pendentes até **Salvar**. Trocar a configuração ou fechar com
 alterações oferece salvar, descartar ou continuar editando; descartar restaura
@@ -1725,6 +1893,17 @@ hierárquico (`weight`, 8), a distância mínima em níveis (`minlen`, 1) e o
 esforço de redução de cruzamentos (`mclimit`, 1,0). Valores maiores de `mclimit`
 podem aumentar o tempo de cálculo.
 
+A seção avançada também oferece **Considerar chaves como nós no cálculo
+(experimental)**, desativada originalmente. Quando ligada, cada chave ocupa no
+`dot` um nó auxiliar invisível com o tamanho real de sua etiqueta. As relações
+da árvore passam por uma camada intermediária e ciclos, paralelas,
+interligações e autoenlaces recebem camadas explícitas para que suas etiquetas
+não flutuem no desenho. Depois do cálculo, as duas metades são reunidas numa
+única aresta Qt e a caixa colorida da chave é centralizada na posição do nó
+auxiliar. Para seleção, detalhes, cores e navegação, a chave continua sendo uma
+aresta. Como o `ranksep` integral vale em cada subcamada, esse modo pode deixar
+o grafo mais alto. Autoenlaces reais continuam sendo desenhados como loops.
+
 O afastamento entre circuitos é aplicado pela aplicação depois do cálculo do
 `dot`: todos os circuitos visíveis são ordenados e deslocados horizontalmente
 como blocos rígidos, mantendo seus níveis e sua geometria interna. Cada par
@@ -1828,6 +2007,7 @@ python benchmarks\benchmark_loads_100k.py --enforce
 python benchmarks\benchmark_load_patterns_400k.py --enforce
 python benchmarks\benchmark_branches_100k.py --enforce
 python benchmarks\benchmark_block_graph_layout.py --enforce
+python benchmarks\benchmark_multi_source.py --enforce
 ```
 
 Os benchmarks geram temporariamente 100 mil barras, 17 mil trechos e 17 mil
@@ -1838,8 +2018,9 @@ a geometria. O benchmark de ramais cobre 100 mil trechos, 100 circuitos, 100 mil
 cargas e 400 mil registros de patamares, incluindo análise, agregação equivalente,
 atualização das máscaras e construção do destaque vetorial. O benchmark do
 grafo cria 26 circuitos e 1.560 blocos, incluindo ciclos, chaves paralelas,
-autoenlaces e interligações, e mede Árvore — Interno, Graphviz dot e
-Coordenadas com verificação de geometria finita e determinismo. Ele também
+autoenlaces e interligações, e mede Árvore — Interno, Graphviz dot com arestas,
+Graphviz dot com nós auxiliares e Coordenadas, verificando geometria finita,
+determinismo e o limite de 30 segundos. Ele também
 recorta seis circuitos alinhados para
 impedir a regressão de uma faixa espacial excessivamente larga e isola uma
 árvore de um circuito para proteger o caso de uso cotidiano. As validações
@@ -1870,7 +2051,8 @@ atualizado junto com mudanças relevantes de arquitetura.
 - `circuit_viewer/generator_update.py`: cálculo puro das demandas e potências por fase dos geradores.
 - `circuit_viewer/generator_update_dialog.py`: escolha da curva e da agenda efetiva por circuito.
 - `circuit_viewer/generator_update_table.py`: tabelas do resultado no painel lateral.
-- `circuit_viewer/mdb_import_dialog.py`: escolha de tabelas, senha e UTM.
+- `circuit_viewer/mdb_inspection.py`: metadados, catálogo de subestações e inspeção cancelável.
+- `circuit_viewer/mdb_import_dialog.py`: janela em abas, seleção hierárquica, senha e UTM.
 - `circuit_viewer/mdb_import_report.py`: relatório consolidado da importação.
 - `circuit_viewer/segment_import.py`: importação e vínculo dos trechos.
 - `circuit_viewer/switch_import.py`: importação e associação das chaves.

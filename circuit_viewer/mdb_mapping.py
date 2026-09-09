@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping, Protocol, Sequence
 
 from .cable_import import EXPECTED_CABLE_HEADER
 from .capacitor_import import EXPECTED_CAPACITOR_HEADER
@@ -28,7 +28,6 @@ from .csv_import import EXPECTED_HEADER as EXPECTED_BAR_HEADER
 from .generator_import import CONSUMER_HEADER, GENERATOR_HEADER
 from .load_import import EXPECTED_LOAD_HEADER
 from .load_pattern_import import EXPECTED_LOAD_PATTERN_HEADER
-from .mdb_engine import AccessDatabase
 from .regulator_import import EXPECTED_REGULATOR_HEADER
 from .segment_import import EXPECTED_SEGMENT_HEADER
 from .switch_import import EXPECTED_SWITCH_HEADER
@@ -101,6 +100,14 @@ MANDATORY_ENTITIES: frozenset[str] = frozenset({"barras"})
 
 class MdbMappingError(ValueError):
     """Erro legível ao carregar ou validar ``mdb_tabelas.json``."""
+
+
+class DatabaseMetadata(Protocol):
+    """A resolução usa metadados, vindos de conexão ou retrato de inspeção."""
+
+    def tables(self) -> tuple[str, ...]: ...
+
+    def columns(self, table: str) -> tuple[str, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,7 +303,7 @@ def _index_without_case(names: Sequence[str]) -> dict[str, str]:
 
 
 def resolve_mapping(
-    database: AccessDatabase,
+    database: DatabaseMetadata,
     mapping: Sequence[EntityMapping] | None = None,
     *,
     overrides: Mapping[str, str] | None = None,

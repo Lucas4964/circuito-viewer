@@ -654,6 +654,35 @@ class BlockGraphWindowTests(unittest.TestCase):
         self.assertEqual(set(window.view.node_items), {1, 2})
         self.assertEqual(len(window.view.edge_items), 1)
 
+    def test_imported_unassigned_interconnection_is_drawn_magenta(self) -> None:
+        from circuit_viewer.block_graph import resolve_block_circuit_indices
+        from circuit_viewer.source_composition import restrict_to_circuits
+        from tests.test_source_composition import interconnected_dataset
+
+        source = restrict_to_circuits(interconnected_dataset(), ("2", "3"))
+        result = analyze_blocks(source.catalog, source.switches, source.loads)
+        window = BlockGraphWindow()
+        self.addCleanup(window.close)
+        window.set_result(result)
+        window.set_circuit_styles(
+            resolve_block_circuit_indices(result, source.catalog),
+            ("#112233", "#DDEEFF"),
+            tuple(definition.code for definition in source.catalog.definitions),
+        )
+        window._circuit_selection_changed(frozenset({0, 1}), False)
+
+        self.assertEqual(len(window.view.edge_items), 1)
+        edge = window.view.edge_items[0]
+        self.assertEqual(edge.edge.switch_code, "INTERLIGACAO-AB")
+        self.assertTrue(edge.intercircuit)
+        self.assertEqual(edge.stroke_color.name().upper(), INTERCIRCUIT_COLOR)
+        self.assertEqual(edge.label_item.border_color.name().upper(), INTERCIRCUIT_COLOR)
+        self.assertIn("ALIM-A ↔ ALIM-B", edge.toolTip())
+
+        window._circuit_selection_changed(frozenset({0}), False)
+        window.circuit_selector_popup.include_neighbors_button.click()
+        self.assertEqual(window.selected_circuit_indices, frozenset({0, 1}))
+
     def test_color_update_preserves_the_filtered_circuit_selection(self) -> None:
         result, _, _ = sample_result()
         window = BlockGraphWindow()
@@ -1083,6 +1112,7 @@ class BlockGraphSettingsTests(unittest.TestCase):
             rank_separation_px=112.0,
             edge_routing=GraphvizEdgeRouting.LINE,
             equal_rank_spacing=True,
+            switches_as_nodes=True,
             tree_edge_weight=16,
             tree_edge_minlen=2,
             crossing_minimization=2.4,
@@ -1098,6 +1128,12 @@ class BlockGraphSettingsTests(unittest.TestCase):
         self.assertEqual(
             reloaded.value(f"{GRAPHVIZ_SETTINGS_PREFIX}edge_routing"),
             "line",
+        )
+        self.assertTrue(
+            reloaded.value(
+                f"{GRAPHVIZ_SETTINGS_PREFIX}switches_as_nodes",
+                type=bool,
+            )
         )
 
     def test_invalid_graphviz_preferences_fall_back_field_by_field(self) -> None:
@@ -1117,6 +1153,10 @@ class BlockGraphSettingsTests(unittest.TestCase):
             f"{GRAPHVIZ_SETTINGS_PREFIX}edge_routing",
             "ortho",
         )
+        self.settings.setValue(
+            f"{GRAPHVIZ_SETTINGS_PREFIX}switches_as_nodes",
+            "talvez",
+        )
 
         loaded = load_graphviz_layout_settings(self.settings)
 
@@ -1124,6 +1164,7 @@ class BlockGraphSettingsTests(unittest.TestCase):
         self.assertEqual(loaded.node_separation_px, 32.0)
         self.assertEqual(loaded.rank_separation_px, 140.0)
         self.assertEqual(loaded.edge_routing, GraphvizEdgeRouting.SPLINE)
+        self.assertFalse(loaded.switches_as_nodes)
 
     def test_graphviz_dialog_applies_and_restores_without_implicit_run(self) -> None:
         initial = GraphvizLayoutSettings(
@@ -1132,6 +1173,7 @@ class BlockGraphSettingsTests(unittest.TestCase):
             rank_separation_px=125.0,
             edge_routing=GraphvizEdgeRouting.POLYLINE,
             equal_rank_spacing=True,
+            switches_as_nodes=True,
             tree_edge_weight=14,
             tree_edge_minlen=2,
             crossing_minimization=2.0,
@@ -1143,6 +1185,7 @@ class BlockGraphSettingsTests(unittest.TestCase):
 
         self.assertFalse(dialog.advanced_panel.isVisible())
         self.assertEqual(dialog.circuit_separation_input.value(), 220.0)
+        self.assertTrue(dialog.switches_as_nodes_checkbox.isChecked())
         dialog.advanced_button.setChecked(True)
         self.assertFalse(dialog.advanced_panel.isHidden())
         dialog.restore_defaults()
@@ -1165,6 +1208,7 @@ class BlockGraphSettingsTests(unittest.TestCase):
         self.addCleanup(dialog.close)
         applied: list[GraphvizLayoutSettings] = []
         dialog.settingsApplied.connect(applied.append)
+        self.assertFalse(dialog.switches_as_nodes_checkbox.isChecked())
         dialog.circuit_separation_input.setValue(222.0)
 
         dialog.reject()

@@ -86,6 +86,8 @@ CIRCUITO_VIEWER/
 │   ├── mdb_engine.py          # único acesso ao pyodbc (opcional) + conversão
 │   ├── mdb_mapping.py         # tabela/coluna → entidade, a partir do JSON
 │   ├── mdb_import.py          # importação encadeada das dez entidades lógicas
+│   ├── source_composition.py  # NÚCLEO: compõe N fontes numa cadeia só
+│   ├── dss_names.py           # NÚCLEO: saneamento de nomes do OpenDSS
 │   ├── circuit_level_import.py # parser CSV/MDB dos patamares por circuito
 │   ├── circuit_calculation_levels.py # fonte imutável e cópia de sessão
 │   │
@@ -116,6 +118,7 @@ CIRCUITO_VIEWER/
 │   ├── workers.py             # wrappers QObject para execução em QThread
 │   ├── main_window.py         # orquestração da UI e do estado da aplicação
 │   ├── circuits_window.py     # tabela de circuitos (visibilidade + cor)
+│   ├── sources_window.py      # tabela das fontes carregadas (remover, enquadrar)
 │   ├── branch_window.py       # tabela de ramais (filtro, ordenação, avisos)
 │   ├── blocks_window.py       # tabela e seleção sincronizada dos blocos
 │   ├── block_graph_window.py  # grafo QGraphicsView dos blocos e chaves
@@ -261,6 +264,8 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | `mdb_engine.py` | Único acesso ao `pyodbc`; conexão somente leitura, sniff do formato, detecção de senha, `cell_to_text` | Conhecer entidades do modelo |
 | `mdb_mapping.py` | Ler `mdb_tabelas.json`; casar entidade → tabela → colunas reais | Ler linhas |
 | `mdb_import.py` | Encadear as dez entidades lógicas na ordem de dependência | Validar linhas (delega às `parse_*_rows`) |
+| `source_composition.py` | Restringir uma fonte aos circuitos escolhidos e compor N fontes numa cadeia única, com unicidade de identificadores e reprojeção | Ler banco, conhecer Qt |
+| `dss_names.py` | `sanitize_dss_name`, isolado de quem exporta | Qualquer outra coisa |
 | `circuit_level_import.py` | Compartilhar leitura e validação de `CIRCUITO_PATAMARES` entre CSV e MDB | Manter estado editável da sessão |
 | `circuit_calculation_levels.py` | Vincular agendas importadas ao `CircuitCatalogModel` e manter a cópia virtual | Persistir dados em disco |
 
@@ -289,6 +294,7 @@ os demais importadores, mais os utilitários do seam: `normalize_header`,
 | `mdb_import_report.py` | Relatório consolidado das dez entidades lógicas — não modal, como o de sobreposições, porque os dois abrem sozinhos ao fim de uma operação |
 | `main_window.py` | Dono de todo o estado da aplicação; coordena importações, invalidações em cascata, máscaras efetivas, painel de detalhes e menus |
 | `circuits_window.py` | `QAbstractTableModel` fino sobre `CircuitVisibilityController` + delegate de cor |
+| `sources_window.py` | `QAbstractTableModel` fino sobre `SourceWorkspace`; remover, renomear e enquadrar uma fonte |
 | `branch_window.py` | Tabela de ramais com `QSortFilterProxyModel` (ordenação por `UserRole`, filtro por circuito), demanda máxima cacheada, faixa de destaque da linha corrente e exportações JSON/CSV das linhas visíveis |
 | `overlap_report.py` | Tabela derivada de `overlapping_segment_indices` |
 | `cables_window.py` | Tabela do catálogo de cabos (ordenação numérica por `UserRole`) + rótulos `cable_summary`/`cable_tooltip` reutilizados no painel de trechos |
@@ -373,6 +379,187 @@ if self._model is None or result.model.bars is not self._model:
 
 Isso torna impossível combinar modelos de importações diferentes e é o mecanismo
 central de consistência transacional entre threads.
+
+### Projeto canônico em memória (`project_state.py`)
+
+`ProjectState` é a autoridade do estudo. Mantém identidade UUID do projeto,
+revisão monotônica, equipamentos, retratos anteriores por origem, escopos nominais
+por alimentador, conexões pendentes, histórico e uma versão anterior para desfazer.
+Os modelos NumPy e os controladores Qt são projeções desse estado.
+Não há leitura Access no núcleo nem arquivo de projeto nesta entrega.
+
+`RegistryRecord.equipment_id` é o UUID interno estável do equipamento.
+`EquipmentKey(network_id, entity, native_id)` é seu índice de correspondência;
+`network_id` também é um UUID no fluxo novo. `RecordOrigin` registra arquivo,
+assinatura, tabela, ID, lote, data e transformação; `field_origins` identifica
+campos atualizados localmente ou por importação. `SourceBinding` conserva os
+mapeamentos externos. IDs de equipamentos removidos ficam no histórico para
+reconhecimento em uma reimportação explícita; isso não recria equipamentos sozinho.
+
+`propose_import()` recebe somente dados já lidos e produz `ImportProposal` sobre
+uma revisão específica. A conexão já está fechada. A revisão é por alimentador,
+inclusive sem diferenças. Nomes/IDs semelhantes em redes independentes são
+sugestões, sem correspondência automática. `resolve_import()` exige decisões e
+compara três valores por campo: retrato anterior, projeto e recebido. Devolve
+`FieldConflict` enquanto faltar resolução ou `ProjectChangeSet` completo.
+O retrato anterior só avança no commit, inclusive quando a decisão foi Manter.
+
+`SourceDataset.provided_entities`, `source_tables` e `omitted_fields` distinguem
+entidades realmente fornecidas de tabelas/colunas ausentes. Substituição só propõe
+exclusões dentro do escopo declarado; preserva criação manual e equipamentos
+compartilhados. Referências por índice e referências existentes por ID são
+validadas antes da instalação. Patamares sem registros não criam entidades vazias,
+para manter equivalência entre importação conjunta e em grupos.
+
+`NetworkRegistry.materialize(operational=True)` resolve referências e constrói os
+modelos exclusivamente do cadastro corrente. Adicionar outra origem não recupera
+os valores de uma importação antiga. Reguladores, estados de chave e agendas por
+circuito usam `edit_equipment()` e o mesmo mecanismo transacional. Os importadores
+CSV e `register_import()` permanecem como adaptadores legados para compatibilidade;
+a ação CSV continua suspensa no menu.
+
+`detach_origins()` remove vínculos de reconhecimento, preservando equipamentos e
+proveniência. `remove_network()` exclui explicitamente os equipamentos da rede;
+`undo()` restaura a última operação e cria uma revisão nova. Não existe gravação
+ou sincronização automática com Access.
+
+### Topologia, estudos e instalação
+
+`project_topology.py` produz `TopologySnapshot(project_id, revision, ...)` no worker.
+A conectividade física inclui todas as chaves; a operacional só conduz estados
+fechados conhecidos. `CIRC_ID` é classificação nominal, não barreira de condução.
+Conexões incompletas guardam seus registros e dependências até que os extremos
+sejam carregados no mesmo domínio de identidade. Proximidade não cria conexões.
+`feeder_scopes` conserva a cobertura nominal usada na revisão/substituição.
+
+O snapshot identifica componentes com mais de uma raiz de alimentador. O solver
+atual e o master de fonte única recusam esses estudos acoplados. A exportação de
+chaves percorre conexões físicas internas ao escopo, incluindo interligações sem
+dono nominal; fronteiras e dados elétricos incompatíveis recebem diagnóstico.
+Não há inferência de fases para chaves com `FASES2 = 0`.
+
+`MdbImportWorker` e `ProjectOperationWorker` constroem candidatos completos antes
+do sinal de sucesso. Os sinais capturam a operação, sem depender de `QObject.sender()`;
+workers possuem identificação da operação e revisão de entrada. Resultado antigo
+ou cancelado é descartado antes do commit. O instalador restaura a cadeia anterior
+se um setter falhar e limpa explicitamente modelos opcionais ausentes, inclusive
+cabos. Filtros/cores/zoom não mudam a revisão; alterações do projeto invalidam
+resultados elétricos, blocos e ramais anteriores.
+
+`StudyInputRevision` identifica revisão do projeto e SHA-256 do conteúdo de fases,
+configurações, curvas, patamares globais e bibliotecas usadas. O fluxo guarda essa
+identificação no resultado e a revalida antes de publicar. Exportações comuns
+recebem `estudo.json` com a mesma identificação. Cálculos pesados são solicitados
+pelo usuário; a conectividade é reconstruída automaticamente no commit.
+
+`project_dialogs.py` oferece revisão de alimentadores, exclusões previstas,
+conflitos por campo e consulta de origem/histórico/pendências. Importar/Adicionar
+convergem para a importação no projeto; Novo projeto é a operação de reinício.
+
+A regressão de Qt usa um único `QApplication` de sessão em `tests/conftest.py`.
+Os TestCase antigos podiam destruir seu aplicativo enquanto outros widgets ainda
+existiam, causando falhas nativas em `sender()`/`findChildren()`. A suíte agora
+reproduz a propriedade única do aplicativo real.
+
+
+### Composição de fontes (`source_composition.py`)
+
+Nesta seção, cada fonte Access já representa uma **rede unificada** produzida
+pelo cadastro acima. As otimizações por disjunção se aplicam entre essas redes,
+não entre arquivos que o usuário vinculou à mesma rede.
+
+A regra de identidade **não** é relaxada para permitir vários bancos no mesmo
+mapa. O que acontece é o contrário: a aplicação continua com **uma** cadeia, e é
+o modelo que passa a poder ser composto. Os circuitos escolhidos de N fontes são
+concatenados numa cadeia válida, deslocando os arrays de índice, e todo o resto
+do programa — topologia, catálogo, visibilidade, ramais, blocos, exportação,
+fluxo, busca, satélite — segue enxergando uma cadeia só.
+
+Isso é barato porque o armazenamento já é colunar, imutável e referenciado por
+índice: concatenar-e-deslocar é a operação natural sobre ele. E como cada
+construtor revalida tudo, um erro de composição estoura alto, na construção, em
+vez de baixo, no desenho.
+
+**As colunas vêm da assinatura do construtor**, via `model.constructor_columns`,
+e não de uma segunda lista: acrescentar uma coluna a um modelo não exige tocar na
+composição, e uma cópia manual divergiria em silêncio. O que sobra de
+conhecimento específico é a tabela `ENTITIES`, com quatro campos por entidade —
+o modelo-pai, a coluna de identificadores, as colunas de índice e as colunas de
+**referência** (a chave cita o `CIRC_ID`, o trecho cita o `CABO_ID`, os dois por
+texto).
+
+| Modelo | Arrays deslocadas | Por |
+|---|---|---|
+| `LineNetworkModel` | `start_indices`, `end_indices` | offset de barras |
+| `LoadModel`, `CapacitorModel` | `bar_indices` | offset de barras |
+| `GeneratorModel` | **só** `load_indices` | offset de cargas |
+| `SwitchModel`, `RegulatorModel` | `segment_indices` | offset de trechos |
+| `CircuitMembership` | `bar_indices` | offset de barras |
+| `CircuitMembership` | `common_segment_indices`, `switch_segment_indices`, `segment_indices` | offset de trechos |
+| CSR do catálogo, `_record_by_segment`, `GeneratorModel._bar_indices` | **nada** — derivados pelos construtores | — |
+
+As três arrays de trecho da membership são deslocadas **independentemente**, e
+não recalculadas como concatenação das outras duas: o deslocamento uniforme
+preserva a identidade entre elas, e re-derivar mudaria em silêncio a ordem de que
+o `CircuitVisibilityController` depende.
+
+#### As associações são deslocadas, não retraçadas
+
+`CircuitCatalogModel.__init__` aceita as `memberships` prontas e **nunca**
+constrói um `NetworkTopology`; só `build()` o faz, e é lá que mora o BFS por
+circuito, o custo dominante da importação. Deslocar índices equivale a refazer o
+traçado sob cinco pré-condições:
+
+1. **Disjunção de vértices** — concatenar linhas de barra garante que nenhuma
+   linha é compartilhada entre fontes, nem com coordenadas idênticas.
+2. **Localidade do BFS** — `trace` só enfileira `incidence_neighbors`, que após o
+   deslocamento permanecem dentro do bloco da fonte.
+3. **`CIRC_ID` único entre fontes** — `switch_circuit_assignments` casa chave e
+   circuito por **igualdade de string**, não por conectividade. É a única
+   pré-condição que depende dos dados, e é o que torna a qualificação de
+   `CIRC_ID` estrutural em vez de cosmética: a qualificação reescreve
+   `SwitchModel._circuit_ids` no mesmo passo.
+4. **A restrição mantém os extremos dos trechos de chave** — uma chave *aberta*
+   faz `trace` desistir do vizinho antes de enfileirá-lo, mas o trecho dela entra
+   em `switch_segment_indices` por casamento de `CIRC_ID`. Podar só pelas barras
+   traçadas deixaria um trecho apontando para barra removida.
+5. **`topology_warnings` é recalculado** para o subconjunto de chaves que sobrou.
+
+`tests/test_source_composition.py` trava a equivalência comparando as memberships
+compostas com um `CircuitCatalogModel.build()` sobre a cadeia composta, e um
+teste-companheiro exige que a igualdade **falhe** com a qualificação de `CIRC_ID`
+desligada — provando que a pré-condição 3 é estrutural. O ganho medido é de 183×
+(`benchmarks/benchmark_multi_source.py`).
+
+#### Unicidade de identificadores
+
+Otimista e função pura da lista ordenada de fontes: a primeira a reivindicar um
+id o mantém **nu**, e uma fonte posterior em colisão recebe `<id>__F2`. Com uma
+fonte só nada colide, então uma sessão de um banco é byte a byte a de sempre — e
+é isso que mantém os JSON globais chaveados por id nativo (`mapa_cabos.json`,
+`curvas.json`) casando no caso comum. O separador `__` sobrevive a
+`sanitize_dss_name`, que só remove `_` das bordas.
+
+Cabos são deduplicados **por conteúdo** antes de qualquer qualificação: dois
+bancos da mesma concessionária compartilham `CABO_ID` para o mesmo cabo, e
+qualificá-lo quebraria o `mapa_cabos.json` para toda fonte além da primeira.
+
+`CODIGO` nunca é alterado no modelo — é rótulo, não chave. A desambiguação vive
+em `name_suffixes`, um vetor por linha em `CircuitModel` e `LoadModel`, `None`
+com fonte única. Só o exportador o consulta, em `bus_namer` e no nomeador de
+cargas. Fica **guardado**, e não calculado sob demanda, porque
+`opendss_allocation_export` constrói `bus_namer` dentro de uma compreensão sobre
+todas as barras: qualquer pré-cálculo por barra lá dentro viraria custo
+quadrático.
+
+#### `ComposedProvenance`
+
+Fonte e id nativo de cada linha, alinhados por índice com os modelos. É a ponte
+entre o modelo composto — cujos ids podem ter sido qualificados — e tudo que é
+chaveado pelo id nativo: os JSON globais e o estado de sessão do usuário. A
+chave estável de uma linha é `(etiqueta da fonte, id nativo)`, nunca o id
+composto, que é valor derivado e muda quando uma colisão aparece ou desaparece.
+Com uma fonte, nenhum array é alocado.
 
 ### Entidades (dataclasses imutáveis, `frozen=True, slots=True`)
 
@@ -665,6 +852,29 @@ parsing e sim o BFS; por isso propaga `cancel_check` para dentro do `trace`.
 
 ### Importação por banco Access
 
+**Janela de importação.** O arquivo e a ação principal ficam fixos; as abas são
+Alimentadores, Tabelas e Coordenadas. `list_substations` preserva cada `SE_ID`,
+inclusive sem circuitos. `CircuitChoice.substation_id` liga o catálogo à tabela
+de circuitos resolvida; rótulos iguais não fundem subestações. Transformadores
+são opcionais e não condicionam a hierarquia. Vínculos ausentes ou inválidos
+formam o grupo Sem subestação.
+
+`MdbInspection` contém `DatabaseSchema`, mapeamentos automático e efetivo,
+contagens, subestações, alimentadores, tabelas auxiliares e diagnósticos.
+O retrato do esquema permite validar overrides na UI sem acessar ODBC; alterar
+a tabela de circuitos dispara nova inspeção e limpa a seleção. Cada solicitação
+recebe um identificador: sinais atrasados não alteram a janela. Cancelar ou
+fechar mantém as threads vivas até encerrarem, descartando o resultado.
+
+`MdbImportSelection.mode` distingue `CIRCUITS` de `DATABASE`. No primeiro modo,
+`import_circuit_ids()` exige IDs explícitos, inclusive quando todos foram
+selecionados; no segundo adapta para `()` do worker/restritor legado. A janela
+começa sem seleção e exige Barras, Trechos e Circuitos no modo por alimentadores;
+a opção explícita de banco sem seleção mantém a importação parcial com Barras.
+A restrição dos modelos e a composição de fontes continuam dentro do worker
+original de importação. Coordenadas permanecem em zona 21, Sul, decímetros.
+
+
 `load_database()` percorre `ENTITY_ORDER` — `barras → cabos → trechos → cargas →
 geradores → patamares → chaves → reguladores → circuitos` — e entrega as linhas de cada
 tabela à `parse_*_rows` correspondente. A ordem é a das dependências entre
@@ -715,10 +925,64 @@ _on_import_finished()  → barras: limpa cargas e trechos ANTES de assumir o nov
                          modelo (eles referenciam o modelo antigo)
 ```
 
+Os quatro setters que mexem na rede — trechos, cargas, chaves e catálogo —
+descartam juntos o fluxo de potência, a análise de ramais **e os blocos**. Os
+blocos ficaram de fora dessa lista por muito tempo sem consequência visível,
+porque a única forma de trocar a rede era substituí-la inteira e ninguém
+reabria a janela; com fontes que se acrescentam, o resultado antigo passou a
+sobreviver a um mapa maior, e as duas janelas de bloco mostravam só a primeira
+fonte. `_ensure_blocks_result` ainda confere a identidade do resultado guardado
+contra os três modelos vigentes antes de reaproveitá-lo — `BlockAnalysisResult`
+carrega `source_segments`/`source_switches`/`source_loads` justamente para isso,
+e `block_graph` desenha a partir deles, então um resultado de outra época não
+erraria só a contagem.
+
 O caso de `_set_switch_model` é o mais sutil: importar chaves depois de
 circuitos muda a topologia energizada, então o catálogo é reconstruído com as
 mesmas `definitions` e o estado visual é remapeado por `circuit_id` — o usuário
 não perde as cores nem os filtros que escolheu.
+
+O remapeamento por `circuit_id` virou `_circuit_display_state` /
+`_circuit_display_for`, que chaveiam por `(fonte, id nativo)` e toleram circuito
+que entrou e que saiu — antes era um `dict[...]` sem guarda, que estouraria
+`KeyError` contra outro conjunto de definições.
+
+### Restringir, então compor
+
+Importar por banco passou a ter dois passos depois da leitura, ambos dentro do
+worker:
+
+```
+load_database(...)          → MdbImportResult, o banco inteiro
+dataset_from_result(...)    → SourceDataset, o retrato daquela fonte
+restrict_to_circuits(...)   → o mesmo retrato, só com os circuitos escolhidos
+workspace.added/replaced_by → o espaço de trabalho candidato
+compose(...)                → ComposedModels, a cadeia pronta
+```
+
+A associação de um circuito exige o traçado completo, então o banco é lido
+inteiro e só depois podado: a escolha economiza **memória residente e custo de
+recomposição**, não a leitura. É o que torna N bancos viáveis; não é uma
+importação mais rápida.
+
+O recorte mantém também os trechos de chave cujas duas barras já foram
+preservadas. Essas interligações físicas podem ter `CIRC_ID = -1` e ficar fora
+de todas as `CircuitMembership`; descartá-las faria desaparecer as arestas
+magenta mesmo com todos os alimentadores selecionados. A regra não expande as
+barras mantidas, não cria associações de circuito e preserva estado e tipo das
+chaves. A classificação intercircuito continua vindo dos blocos nas duas pontas.
+
+`MdbSourceLoad` carrega os quatro resultados juntos porque eles só fazem sentido
+juntos, e nada toca a janela até a composição dar certo — a mesma disciplina
+transacional dos demais importadores. As fontes já carregadas são imutáveis,
+então atravessam a fronteira de thread sem cuidado nenhum.
+
+`MainWindow._install_composed_chain` é o **único** caminho de instalação:
+substituir, acrescentar e remover passam todos por ele, reusando os mesmos
+`_set_*_model` na mesma ordem. `_on_mdb_import_finished` ainda aceita um
+`MdbImportResult` cru — é o que os testes injetam —, embrulhando-o numa fonte só;
+e compor uma fonte devolve os **próprios** modelos dela, sem cópia, de modo que
+os mesmos objetos atravessam os mesmos setters.
 
 ---
 
@@ -1126,9 +1390,10 @@ anterior: dividir em dez threads exigiria sequenciá-las de qualquer forma, e
 ainda multiplicaria as revalidações de identidade na chegada. Uma restrição
 física reforça a escolha — **uma conexão ODBC não é segura para atravessar
 threads**, então `MdbImportWorker` abre a sua própria conexão dentro de `run()` e
-a fecha antes de emitir o sinal. A conexão que a `MainWindow` usa para inspecionar
-o banco (tabelas, contagens, amostra de coordenadas) é fechada assim que o
-diálogo é montado.
+a fecha antes de emitir o sinal. A inspeção também tem seu worker:
+`MdbInspectionWorker` abre a conexão dentro de `run()`, chama `inspect_database`
+e fecha antes de emitir `MdbInspection`. `MainWindow` abre o diálogo vazio;
+nenhuma consulta ODBC roda na thread da interface.
 
 **O fluxo de potência entra nessa exclusão, e a exportação não.** A diferença é
 o destino do resultado: a exportação escreve em disco e pode conviver com
@@ -2249,8 +2514,16 @@ o driver, e recusar aqui bloquearia um arquivo válido a mais.
 
 **A senha vira exceção própria.** O ACE responde `-1905`/`1907` e é localizado,
 então `is_password_error()` casa por código **e** por palavra. `MdbPasswordError`
-existe para a interface reperguntar em vez de mostrar o erro ODBC cru. A senha
-nunca é gravada, nunca entra em mensagem de erro e o `__repr__` do banco a omite.
+existe para a interface reperguntar em vez de mostrar o erro ODBC cru. Antes da
+primeira solicitação manual por arquivo, o diálogo tenta uma vez a credencial
+padrão lida por `mdb_credentials.load_default_password()`. O módulo acessa o
+Gerenciador de Credenciais do usuário Windows por `CredReadW`/`CredWriteW`;
+nenhuma senha é embutida no código ou gravada em configuração do projeto.
+Se o cofre estiver indisponível, sem credencial, ou se a senha não conferir,
+o diálogo manual permanece disponível. Bancos desprotegidos abrem antes dessa
+tentativa. Senhas manuais só vivem em memória, não substituem a padrão e são
+descartadas ao trocar de arquivo ou encerrar a operação. Nenhuma senha entra
+em mensagem de erro e o `__repr__` do banco a omite.
 
 **O mapeamento é externo**, `config/mdb_tabelas.json`, pelo mesmo motivo do
 `fases2.json`: nome de tabela é convenção da concessionária. As colunas
@@ -2326,13 +2599,25 @@ centraliza o canvas e converte posições, splines cúbicas e `lp` para
 `BlockGraphLayout`. Um nó, rota, âncora ou valor finito ausente invalida o
 resultado inteiro, nunca apenas um item.
 
+Opcionalmente, `switches_as_nodes` troca somente a representação enviada ao
+`dot`: cada `switch_index` cria um nó auxiliar retangular invisível, com
+`fixedsize=true` e o envelope medido pela fonte Qt, ligado aos dois blocos por
+duas arestas identificadas. Profundidades BFS são duplicadas para intercalar
+camadas de blocos e chaves; `rank=same` e uma cadeia de âncoras invisíveis
+mantêm também ciclos, paralelas, interligações e autoenlaces em camadas
+determinísticas. O parser valida as duas metades, recompõe uma única
+`BlockGraphEdgeRoute` orientada pelos blocos originais e usa o centro do nó
+auxiliar como `edge_label_positions`. O segmento de junção fica sob a caixa
+opaca da etiqueta. Nenhuma API posterior passa a tratar uma chave como nó.
+
 `GraphvizLayoutSettings` é o contrato imutável dos ajustes aceitos pelo
 serializador. Espaçamentos em pixels são convertidos para polegadas por 72 antes
 de virar `nodesep` e `ranksep`; o restante controla `splines`, `weight`,
-`minlen`, `mclimit` e o modificador `equally`. A validação recupera cada valor
-persistido inválido de forma independente. O DOT completo continua sendo a
-entrada da chave do cache, portanto qualquer mudança geométrica produz outra
-entrada enquanto mudanças de cor continuam sem custo de layout.
+`minlen`, `mclimit`, o modificador `equally` e a modelagem experimental das
+chaves. A validação recupera cada valor persistido inválido de forma
+independente. O DOT completo continua sendo a entrada da chave do cache;
+portanto a modelagem, os envelopes das etiquetas e qualquer mudança geométrica
+produzem outra entrada, enquanto mudanças de cor continuam sem custo de layout.
 
 O espaçamento mínimo entre circuitos, padrão 120 px, é um pós-processamento do
 `BlockGraphLayout`, pois o `dot` não oferece uma distância confiável entre
@@ -2834,6 +3119,49 @@ e evita que uma heurística errada corrompa silenciosamente toda a importação.
    dicionário literal, e sem a chave nova a linha da entidade aparece na tabela
    mas as ocorrências dela somem em silêncio.
 
+### Fazer uma entidade sobreviver à composição de fontes
+
+As colunas saem de `model.constructor_columns`, derivado da assinatura do
+construtor, então uma coluna nova é carregada sozinha — **inclusive
+keyword-only**. O espelho carrega tudo e exclui só `model.PROVENANCE_PARAMETERS`
+(`source_path`, `source_paths`, `name_suffixes`), que descrevem o modelo inteiro
+e não uma linha dele.
+
+O padrão é esse, e não "só o que é posicional", porque os dois erros não custam o
+mesmo. Esquecer uma coluna **some em silêncio**: foi assim que
+`SwitchModel.type_names` e `switchable_values` — keyword-only por causa dos vinte
+e cinco pontos que constroem o modelo posicionalmente — se perderam ao
+reconstruir uma fonte restrita a alguns circuitos, deixando toda chave sem TIPO e
+sem MANOBRAVEL e a análise de blocos sem nenhuma fronteira, com a rede inteira
+num bloco só. Carregar um metadado por engano, ao contrário, estoura na
+construção.
+
+O que precisa ser declarado à mão:
+
+1. O parâmetro do modelo-pai em `model.PARENT_PARAMETER` — a única lista escrita
+   à mão da mecânica, conferida contra as assinaturas reais por
+   `tests/test_source_composition.py`.
+2. Uma entrada em `source_composition.ENTITIES` com a coluna de identificadores,
+   o rótulo dela no cadastro, as colunas de **índice** (coluna → entidade
+   indexada) e as de **referência** (coluna de texto que cita o id de outra
+   entidade).
+3. O tipo em `source_composition.MODEL_TYPES` e o campo em `SourceDataset`.
+4. O ramo em `restrict_to_circuits`, se a entidade não se reduzir a "filtrar por
+   um índice que sobreviveu" — é o caso dos patamares, das alocações e do
+   catálogo, que têm formas próprias.
+5. `mdb_import.dataset_from_result`, para o campo vir do `MdbImportResult`.
+
+Uma entidade cuja coluna de referência ficar de fora **não** estoura em lugar
+nenhum: ela só passa a apontar para o id errado depois da primeira colisão entre
+fontes. É por isso que `CollisionTests`, em `tests/test_source_composition.py`,
+exercita cada reescrita referencial separadamente.
+
+Pela mesma razão, `ConstructorColumnsTests` compara o espelho com a assinatura
+real de cada construtor, e `SwitchTypeSurvivalTests` faz a ida e volta pelos
+`record()`, não pelas colunas: comparar o espelho com o espelho é cego
+exatamente às colunas que o espelho descarta, e foi o que deixou a perda do
+TIPO/MANOBRAVEL passar pela suíte.
+
 ### Adicionar um modo de coloração
 
 `LineNetworkItem` e `SwitchNetworkItem` já aceitam qualquer
@@ -2965,6 +3293,10 @@ lido por uma build anterior.
 | `test_mdb_engine.py` | `cell_to_text` exaustivo (o inteiro sem `.0`, o decimal íntegro, Sim/Não, nulo, binário), sniff de formato por versão do Access, detecção de senha, cadeia de conexão somente leitura **sem chaves em `DBQ` nem em `PWD`** e comparada com a forma comprovadamente funcional, recuo do `SQL_MODE_READ_ONLY`, senha fora das mensagens, e a garantia de que só `SELECT` é emitido |
 | `test_mdb_mapping.py` | apelidos de coluna, casamento sem caixa, tabela de reserva, tabela e coluna ausentes desabilitando só a própria entidade, tabela ilegível reportada, `MSys*` nunca escolhidas, override que não cai de volta na detecção, e o JSON distribuído conferido contra a base real |
 | `test_mdb_import.py` | com um **banco falso**: ordem de dependência (chaves antes de circuitos), identidade encadeada dos modelos, projeção só das colunas obrigatórias, `CENARIO_ID` ignorado, dedução de decímetros, entidade ausente não derrubando as demais, barras fatais, cancelamento nunca virando falha de entidade, progresso único da cadeia, e a **regressão de tipos**: `ESTADO` inteiro e `float` mantendo a chave fechada e a topologia alcançando as três barras |
+| `test_source_composition.py` | espelho de `constructor_columns` contra a assinatura de cada construtor (inclusive as colunas keyword-only de `SwitchModel`, cuja perda deixava a análise de blocos com um bloco só), ida e volta pelos `record()` de uma fonte restrita a todos os seus circuitos, fronteira de bloco sobrevivendo a uma escolha parcial, restrição por circuito (remapeamento de índices, extremos do trecho de chave aberta, modelo que esvazia virando `None`), fonte única devolvendo os **mesmos** objetos, deslocamento de cada entidade, dedução de cabos por conteúdo, qualificação de identificadores e as reescritas referenciais, reprojeção entre fusos, etiquetas nunca reutilizadas — e a **propriedade central**: memberships deslocadas iguais a um `CircuitCatalogModel.build()` sobre a cadeia composta |
+| `test_export_name_scope.py` | `name_suffixes` ausente com fonte única, presente só na fonte posterior, `CODIGO` nunca alterado, nomes de barra distintos no OpenDSS, sufixo e id qualificado sobrevivendo a `sanitize_dss_name`, e `bus_namer` sem trabalho por barra na construção |
+| `test_multi_source_ui.py` | blocos e grafo de blocos acompanhando o espaço de trabalho (acrescentar, remover, e a guarda de identidade do resultado guardado), as duas ações de banco e suas dicas, `_install_composed_chain` como caminho único, `MdbImportResult` cru ainda instalando, painel de Fontes (listar, renomear, remover, esvaziar), cor e visibilidade sobrevivendo a acrescentar **e** remover, coluna Fonte escondida com uma fonte só, grupo de escolha de circuitos no diálogo, e o CSV desabilitado com o motivo |
+| `test_mdb_inspection.py` · `test_mdb_browser_ui.py` | identidade das subestações, vínculos opcionais, aliases, transferência e buscas, modo explícito, overrides, inspeção em thread, troca de arquivo, senha, cancelamento e integração Importar/Adicionar |
 | `test_mdb_import_ui.py` | com um `MdbImportResult` injetado: instalação dos dez modelos pelos setters existentes, catálogo sobrevivendo à cascata das chaves, banco parcial, diálogo (pré-seleção, override manual reabilitando entidade, barras obrigatórias), senha mascarada, e o relatório não modal |
 | `test_search.py` | índice de busca (sem Qt) |
 | `test_curvas.py` | invariantes da curva (24 pontos, sem `nan`/`inf`, negativos e zero aceitos), `curve_id` sobrevivendo à renomeação, unicidade de nome sem caixa, horas faltantes em base 1, e o parser de colagem: `\r\n`/`\r`, linha vazia final descartada mas a do meio preservada, bloco de duas colunas, vírgula decimal e recusa de `1.234,56` |
@@ -2996,6 +3328,7 @@ como guarda de regressão de performance.
 
 ```bash
 python benchmarks\benchmark_100k.py --enforce
+python benchmarks\benchmark_multi_source.py --enforce
 python benchmarks\benchmark_block_graph_layout.py --enforce
 ```
 
@@ -3004,9 +3337,10 @@ Cobertura: importação/indexação de 100 mil barras, desenho agregado em
 circuitos, busca global, 100 mil cargas, 400 mil patamares e a cadeia completa
 de ramais (análise → agregação → máscaras → destaque vetorial). O benchmark de
 layout monta 26 circuitos e 1.560 blocos com ciclos, paralelas, autoenlaces e
-interligações; mede Árvore — Interno, Graphviz dot e Coordenadas e exige
-resultados completos, finitos e determinísticos. No Windows x64, o Graphviz
-embarcado também precisa terminar abaixo do timeout. Um recorte de seis circuitos protege contra layouts espaciais
+interligações; mede Árvore — Interno, Graphviz dot direto, Graphviz dot com
+nós auxiliares e Coordenadas e exige resultados completos, finitos e
+determinísticos. No Windows x64, as duas modelagens Graphviz precisam terminar
+abaixo do timeout. Um recorte de seis circuitos protege contra layouts espaciais
 em forma de faixa e uma árvore isolada protege o uso cotidiano com um único
 circuito. As metas de legibilidade limitam distorção da razão de aspecto, baixa
 ocupação dos envelopes e arestas extremas; uma grade espacial também conta

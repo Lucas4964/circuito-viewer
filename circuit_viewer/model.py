@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Collection
+from functools import lru_cache
 from typing import Iterable, Literal, Sequence
 
 import numpy as np
@@ -16,6 +18,74 @@ from .circuit_colors import generate_circuit_palette, normalize_hex_color
 FloatArray = NDArray[np.float64]
 IndexArray = NDArray[np.intp]
 BoolArray = NDArray[np.bool_]
+
+
+#: O parâmetro de ``__init__`` que carrega o modelo-pai de cada modelo
+#: encadeado, ou ``None`` para os modelos-raiz. É a única lista escrita à mão
+#: desta mecânica; ``test_model.py`` a confere contra as assinaturas reais.
+PARENT_PARAMETER: dict[str, str | None] = {
+    "CircuitModel": None,
+    "CableModel": None,
+    "LineNetworkModel": "bars",
+    "LoadModel": "bars",
+    "CapacitorModel": "bars",
+    "GeneratorModel": "loads",
+    "LoadPatternModel": "loads",
+    "SwitchModel": "segments",
+    "RegulatorModel": "segments",
+}
+
+
+#: Parâmetros que descrevem o modelo **inteiro**, não uma coluna dele. Tudo o
+#: mais que o construtor aceita é coluna, e a composição carrega.
+#:
+#: A exclusão é por nome, e não por "ser keyword-only", porque os dois erros não
+#: custam o mesmo. Esquecer uma coluna some em silêncio: foi assim que
+#: ``SwitchModel.type_names`` e ``switchable_values`` — keyword-only por causa
+#: dos vinte e cinco pontos que constroem o modelo posicionalmente — sumiram ao
+#: reconstruir um modelo restrito, deixando toda chave sem tipo e sem
+#: ``MANOBRAVEL``, e a análise de blocos sem nenhuma fronteira. Carregar um
+#: metadado por engano, ao contrário, estoura na construção.
+PROVENANCE_PARAMETERS = frozenset({"source_path", "source_paths", "name_suffixes"})
+
+
+@lru_cache(maxsize=None)
+def _column_parameters(cls: type) -> tuple[str, ...]:
+    parent = PARENT_PARAMETER.get(cls.__name__)
+    parameters = list(inspect.signature(cls.__init__).parameters.values())[1:]
+    return tuple(
+        parameter.name
+        for parameter in parameters
+        if parameter.name != parent and parameter.name not in PROVENANCE_PARAMETERS
+    )
+
+
+def constructor_columns(model: object) -> dict[str, object]:
+    """As colunas de um modelo, na forma dos argumentos de ``__init__``.
+
+    Deriva da **própria assinatura** do construtor, não de uma segunda lista:
+    é o que impede que acrescentar uma coluna a um modelo quebre em silêncio a
+    composição de fontes, que é quem reconstrói os modelos a partir daqui.
+    Uma cópia manual divergiria sem que nenhum teste percebesse.
+
+    Entra tudo, menos o modelo-pai (``bars``, ``segments``, ``loads``) e os
+    :data:`PROVENANCE_PARAMETERS`, porque quem recompõe é que escolhe os dois — o
+    pai é o modelo novo, e a origem passa a ser a composição, não o arquivo. Ser
+    keyword-only **não** exclui: uma coluna pode sê-lo por compatibilidade, como
+    as duas de tipo de chave.
+
+    Cada coluna é lida do slot ``_<nome>``, com recuo para o atributo público de
+    mesmo nome: ``CircuitModel.crs`` é parâmetro do construtor e atributo
+    público, não coluna privada.
+    """
+
+    values: dict[str, object] = {}
+    for name in _column_parameters(type(model)):
+        try:
+            values[name] = getattr(model, f"_{name}")
+        except AttributeError:
+            values[name] = getattr(model, name)
+    return values
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +141,37 @@ class UtmCrs:
     def label(self) -> str:
         suffix = "N" if self.northern else "S"
         return f"UTM {self.zone}{suffix} — EPSG:{self.epsg}"
+
+
+def _checked_name_suffixes(
+    values: tuple[str, ...] | None,
+    size: int,
+) -> tuple[str, ...] | None:
+    """Valida o vetor de sufixos de rótulo.
+
+    ``name_suffixes`` desambigua o **rótulo**, nunca a chave.
+
+        ``None`` é "fonte única, nada a desambiguar", que é o que todo
+        construtor produz hoje. Não-``None`` é um sufixo por linha — vazio para
+        quem não colide, a etiqueta da fonte para quem colide com outra. O
+        ``CODIGO`` em si nunca é alterado: ele é o que o cadastro afirma, e
+        adulterá-lo mentiria para quem lê a tela. Quem usa isto é o espaço de
+        nomes do OpenDSS, onde dois nomes iguais fazem o exportador **descartar**
+        a segunda linha.
+
+        Fica guardado, e não calculado sob demanda, porque ``bus_namer`` é
+        construído dentro de laços sobre todas as barras: qualquer pré-cálculo
+        por barra lá dentro viraria custo quadrático.
+    """
+
+    if values is None:
+        return None
+    suffixes = tuple(str(value) for value in values)
+    if len(suffixes) != size:
+        raise ValueError(
+            "Os sufixos de desambiguação devem ter uma posição por linha."
+        )
+    return suffixes
 
 
 @dataclass(frozen=True, slots=True)
@@ -603,6 +704,7 @@ class CircuitModel:
         "_by_id",
         "_bounds",
         "_spatial_index",
+        "_name_suffixes",
         "crs",
         "source_path",
     )
@@ -616,6 +718,7 @@ class CircuitModel:
         crs: UtmCrs,
         *,
         source_path: str | None = None,
+        name_suffixes: tuple[str, ...] | None = None,
     ) -> None:
         ids = tuple(str(value) for value in bar_ids)
         code_values = tuple(str(value) for value in codes)
@@ -654,8 +757,15 @@ class CircuitModel:
             float(y_array.max()),
         )
         self._spatial_index = StaticPointIndex(x_array, y_array)
+        self._name_suffixes = _checked_name_suffixes(name_suffixes, size)
         self.crs = crs
         self.source_path = source_path
+
+    @property
+    def name_suffixes(self) -> tuple[str, ...] | None:
+        """Sufixo de desambiguação por linha, ou ``None`` com fonte única."""
+
+        return self._name_suffixes
 
     def __len__(self) -> int:
         return len(self._bar_ids)
@@ -714,6 +824,7 @@ class LoadModel:
         "_connection_types",
         "_by_id",
         "_spatial_index",
+        "_name_suffixes",
         "source_path",
     )
 
@@ -731,6 +842,7 @@ class LoadModel:
         connection_types: Iterable[str],
         *,
         source_path: str | None = None,
+        name_suffixes: tuple[str, ...] | None = None,
     ) -> None:
         ids = tuple(str(value) for value in load_ids)
         text_columns = tuple(
@@ -782,7 +894,14 @@ class LoadModel:
             bars.x[associated_bars],
             bars.y[associated_bars],
         )
+        self._name_suffixes = _checked_name_suffixes(name_suffixes, size)
         self.source_path = source_path
+
+    @property
+    def name_suffixes(self) -> tuple[str, ...] | None:
+        """Sufixo de desambiguação por linha, ou ``None`` com fonte única."""
+
+        return self._name_suffixes
 
     def __len__(self) -> int:
         return len(self._load_ids)
@@ -1991,6 +2110,7 @@ class NetworkTopology:
         direct_switch_indices: Iterable[int] | IndexArray = (),
         *,
         cancel_check: Callable[[], bool] | None = None,
+        respect_circuit_owner: bool = True,
     ) -> CircuitMembership:
         """Executa BFS, descobrindo barras e somente trechos que não são chaves."""
 
@@ -2032,8 +2152,8 @@ class NetworkTopology:
                     assert self.switches is not None
                     traversable = (
                         self.switches.states[switch_record_index].strip() == "1"
-                        and self.switches.circuit_ids[switch_record_index].strip()
-                        == circuit_id
+                        and (not respect_circuit_owner or
+                             self.switches.circuit_ids[switch_record_index].strip() == circuit_id)
                     )
                     if not traversable:
                         continue
@@ -2050,6 +2170,10 @@ class NetworkTopology:
             raise InterruptedError("Construção da topologia cancelada.")
         bar_array = _readonly_indices(bars)
         common_array = _readonly_indices(common_segments)
+        if not respect_circuit_owner and self.switches is not None:
+            direct_switch_indices = [int(segment) for segment in self.switches.segment_indices
+                                     if self._bar_marks[self.segments.start_indices[segment]] == generation
+                                     and self._bar_marks[self.segments.end_indices[segment]] == generation]
         switch_array = _readonly_indices(direct_switch_indices)
         if common_array.size and switch_array.size:
             all_segments = _readonly_indices(
@@ -2065,6 +2189,48 @@ class NetworkTopology:
             switch_segment_indices=switch_array,
             segment_indices=all_segments,
         )
+
+
+def switch_circuit_assignments(
+    switches: "SwitchModel | None",
+    valid_circuit_ids: Collection[str],
+) -> tuple[dict[str, list[int]], tuple[str, ...]]:
+    """Trechos de chave por circuito, e os avisos do que não coube.
+
+    A associação **não** é topológica: uma chave vai para o circuito cujo
+    ``CIRC_ID`` casa com o seu, esteja ela conectada a ele ou não. É essa
+    igualdade de string que obriga o ``CIRC_ID`` a ser único quando fontes
+    diferentes convivem no mesmo modelo — sem isso, uma chave de uma fonte
+    entraria no circuito homônimo de outra.
+
+    Devolve as duas coisas juntas de propósito: ``CircuitCatalogModel.build``
+    precisa das associações e dos avisos, e quem recompõe um catálogo a partir
+    de associações já prontas precisa só dos avisos, recalculados para o
+    subconjunto de chaves que sobrou. Duas funções divergiriam em silêncio.
+    """
+
+    ids = set(valid_circuit_ids)
+    direct_switches: dict[str, list[int]] = {circuit_id: [] for circuit_id in ids}
+    warnings: list[str] = []
+    if switches is None:
+        return direct_switches, ()
+    for record_index, segment_value in enumerate(switches.segment_indices):
+        switch_id = switches.switch_ids[record_index]
+        circuit_id = switches.circuit_ids[record_index].strip()
+        state = switches.states[record_index].strip()
+        if state not in {"0", "1"}:
+            warnings.append(
+                f"Chave {switch_id}: ESTADO '{state or '<vazio>'}' inválido; "
+                "a travessia foi bloqueada."
+            )
+        if circuit_id not in ids:
+            warnings.append(
+                f"Chave {switch_id}: CIRC_ID '{circuit_id or '<vazio>'}' "
+                "não existe no catálogo; a chave ficou sem circuito."
+            )
+            continue
+        direct_switches[circuit_id].append(int(segment_value))
+    return direct_switches, tuple(warnings)
 
 
 class CircuitCatalogModel:
@@ -2155,30 +2321,15 @@ class CircuitCatalogModel:
         *,
         source_path: str | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        operational: bool = False,
     ) -> "CircuitCatalogModel":
         definition_values = tuple(definitions)
-        valid_ids = {definition.circuit_id for definition in definition_values}
-        direct_switches: dict[str, list[int]] = {
-            circuit_id: [] for circuit_id in valid_ids
-        }
-        warnings: list[str] = []
-        if switches is not None:
-            for record_index, segment_value in enumerate(switches.segment_indices):
-                switch_id = switches.switch_ids[record_index]
-                circuit_id = switches.circuit_ids[record_index].strip()
-                state = switches.states[record_index].strip()
-                if state not in {"0", "1"}:
-                    warnings.append(
-                        f"Chave {switch_id}: ESTADO '{state or '<vazio>'}' inválido; "
-                        "a travessia foi bloqueada."
-                    )
-                if circuit_id not in valid_ids:
-                    warnings.append(
-                        f"Chave {switch_id}: CIRC_ID '{circuit_id or '<vazio>'}' "
-                        "não existe no catálogo; a chave ficou sem circuito."
-                    )
-                    continue
-                direct_switches[circuit_id].append(int(segment_value))
+        direct_switches, warnings = switch_circuit_assignments(
+            switches,
+            {definition.circuit_id for definition in definition_values},
+        )
+        if operational:
+            warnings = tuple(warning for warning in warnings if "CIRC_ID" not in warning)
 
         topology = NetworkTopology(segments, switches)
         memberships: list[CircuitMembership] = []
@@ -2196,6 +2347,7 @@ class CircuitCatalogModel:
                     root_index,
                     direct_switches[definition.circuit_id],
                     cancel_check=cancel_check,
+                    respect_circuit_owner=not operational,
                 )
             )
         return cls(

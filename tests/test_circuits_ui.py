@@ -135,6 +135,7 @@ class CircuitsWindowTests(unittest.TestCase):
                 "TRAFO_ID",
                 "CODIGO_TRAFO",
                 "S_NOM",
+                "Fonte",
             ),
         )
 
@@ -177,6 +178,9 @@ class CircuitsWindowTests(unittest.TestCase):
                 "3",
                 "53244TRAFO_032",
                 "25",
+                # Sem proveniência informada, a coluna "Fonte" mostra travessão,
+                # como qualquer outra origem não resolvida.
+                "—",
             ],
         )
 
@@ -189,7 +193,7 @@ class CircuitsWindowTests(unittest.TestCase):
             model.data(model.index(0, column))
             for column in range(model.HEADERS.index("CODIGO_SE"), len(model.HEADERS))
         ]
-        self.assertEqual(origin, ["—"] * 5)
+        self.assertEqual(origin, ["—"] * 6)
 
     # --------------------------------------- duplo clique na barra inicial
 
@@ -369,7 +373,7 @@ class CircuitsWindowTests(unittest.TestCase):
         self.assertFalse(window.circuits_window.isModal())
         table_model = window.circuit_table_model
         self.assertEqual(table_model.rowCount(), 1)
-        self.assertEqual(table_model.columnCount(), 11)
+        self.assertEqual(table_model.columnCount(), 12)
         self.assertEqual(
             table_model.data(table_model.index(0, 0), Qt.ItemDataRole.CheckStateRole),
             Qt.CheckState.Checked,

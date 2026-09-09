@@ -1080,13 +1080,16 @@ class PowerFlowDiagnosticsTests(unittest.TestCase):
 
 
 class MultipleCircuitTests(unittest.TestCase):
-    """Rede sobreposta: o primeiro circuito processado é o dono do resultado."""
+    """Redes independentes podem ser resolvidas separadamente."""
 
     def setUp(self) -> None:
         self._temp = tempfile.TemporaryDirectory()
         self.workspace = Path(self._temp.name)
         self.addCleanup(self._temp.cleanup)
-        self.network = make_network(make_bars())
+        bars = CircuitModel(["B0", "B1", "B2", "B3"], ["A", "B", "C", "D"],
+                            [500000., 500100., 501000., 501100.], [8000000.] * 4, UtmCrs(21, northern=False))
+        self.network = LineNetworkModel(bars, ["T0", "T1"], ["TR-1", "TR-2"], ["13", "13"],
+                                        [0, 2], [1, 3], ["", ""], ["CB1", "CB1"], ["", ""], [250., 400.])
         self.catalog = CircuitCatalogModel.build(
             self.network,
             None,
@@ -1147,26 +1150,15 @@ class MultipleCircuitTests(unittest.TestCase):
         self.assertEqual(engine.commands, [])
         self.assertEqual(engine.solves, [])
 
-    def test_the_first_circuit_owns_a_shared_segment(self) -> None:
-        # O motor falso soma 10.000 A por Compile: se o segundo circuito
-        # sobrescrevesse o primeiro, o patamar 0 viria 10.010 em vez de 10.
+    def test_coupled_circuits_are_rejected_before_compile(self) -> None:
         engine = FakeEngine()
-
-        result = run_power_flow(
-            engine,
-            self.catalog,
-            make_cables(),
-            PHASES,
-            [0, 1],
-            workspace=self.workspace,
-        )
-
-        self.assertEqual(result.segment_currents[0].magnitudes[0], (10.0, 20.0, 30.0))
+        catalog = CircuitCatalogModel.build(make_network(make_bars()), None, self.catalog.definitions)
+        with self.assertRaisesRegex(ValueError, "multifonte"):
+            run_power_flow(engine, catalog, make_cables(), PHASES, [0, 1], workspace=self.workspace)
+        self.assertEqual(engine.commands, [])
 
     def test_the_second_circuit_still_contributes_its_own_elements(self) -> None:
-        # Só o circuito 2 alcança o trecho 1 a partir da raiz B2? Não — a rede
-        # é compartilhada. O que este teste garante é que processar o segundo
-        # circuito não apaga nem duplica nada do primeiro.
+        # Cada circuito contribui somente com seus próprios trechos.
         engine = FakeEngine()
 
         result = run_power_flow(

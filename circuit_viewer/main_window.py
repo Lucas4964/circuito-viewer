@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from PyQt6.QtCore import QSettings, QSignalBlocker, QThread, QTimer, Qt
 from PyQt6.QtGui import (
@@ -38,6 +39,7 @@ from PyQt6.QtWidgets import (
     QTableView,
     QToolBar,
     QVBoxLayout,
+    QHBoxLayout,
     QWidget,
 )
 
@@ -129,19 +131,28 @@ from .load_import import LoadCsvResult
 from .load_pattern_import import LoadPatternCsvResult
 from .load_pattern_table import LoadPatternTableModel
 from .mdb_engine import (
-    MdbEngineError,
-    MdbPasswordError,
     mdb_import_error,
-    open_database,
 )
-from .mdb_import import MdbImportResult
-from .mdb_import_dialog import MdbImportDialog, MdbPasswordDialog
+from .circuit_colors import generate_circuit_palette
+from .mdb_import import (
+    MdbImportResult,
+    MdbSourceLoad,
+    dataset_from_result,
+)
+from .mdb_import_dialog import MdbImportDialog
+from .sources_window import SourceTableModel, SourcesWindow
+from .source_composition import (
+    ComposedModels,
+    ComposedProvenance,
+    CompositionError,
+    SourceWorkspace,
+    compose,
+)
 from .mdb_import_report import MdbImportReportWindow
 from .mdb_mapping import (
     ENTITY_ORDER,
     MdbMappingError,
     load_table_mapping,
-    resolve_mapping,
 )
 from .mapa_tiles import (
     PROVEDORES,
@@ -751,6 +762,15 @@ class MainWindow(QMainWindow):
             self._settings
         )
 
+        # O espaço de trabalho e a cadeia composta que saiu dele. Com uma fonte
+        # só, a composição devolve os próprios modelos da fonte, sem cópia — é
+        # por isso que abrir um banco continua sendo exatamente o que era.
+        self._workspace = SourceWorkspace()
+        from .project_state import ProjectState
+        self._project = ProjectState(self._workspace)
+        self._project_topology = None
+        self._dispatch_source = None
+        self._composition: ComposedModels | None = None
         self._model: CircuitModel | None = None
         self._line_model: LineNetworkModel | None = None
         self._line_item: LineNetworkItem | None = None
@@ -825,6 +845,7 @@ class MainWindow(QMainWindow):
         self._mdb_table_mapping = None
         self._mdb_mapping_error: str | None = None
         self._mdb_report_window: MdbImportReportWindow | None = None
+        self._composition_report_box: QMessageBox | None = None
         try:
             self._mdb_table_mapping = load_table_mapping()
         except MdbMappingError as exc:
@@ -962,6 +983,16 @@ class MainWindow(QMainWindow):
 
         self.circuit_table_model = CircuitTableModel(self)
         self.circuits_window = CircuitsWindow(self.circuit_table_model, self)
+        self.sources_table_model = SourceTableModel(self)
+        self.sources_window = SourcesWindow(self.sources_table_model, self)
+        self.sources_window.removeRequested.connect(self._remove_source)
+        self.sources_window.detachRequested.connect(self._detach_source)
+        self.sources_window.provenanceRequested.connect(self._show_project_provenance)
+        self.sources_window.fitRequested.connect(self._fit_source)
+        self.sources_window.addRequested.connect(
+            lambda: self._choose_mdb_import(replace=False)
+        )
+        self.sources_table_model.nameChanged.connect(self._rename_source)
         self.overlap_table_model = OverlapReportTableModel(self)
         self.overlap_report_window = CircuitOverlapReportWindow(
             self.overlap_table_model,
@@ -1079,6 +1110,10 @@ class MainWindow(QMainWindow):
         self._update_status_counts(0)
         self._sync_export_availability()
         self._sync_power_flow_availability()
+        # Já na abertura, para que "Adicionar banco de dados…" nasça com o
+        # motivo de estar desabilitada na dica, e não em branco.
+        self._sync_mdb_actions()
+        self._sync_import_availability()
         if self._phase_configuration_error is not None:
             QTimer.singleShot(0, self._show_phase_configuration_error)
         if self._switch_types_error is not None:
@@ -1110,8 +1145,46 @@ class MainWindow(QMainWindow):
     def _is_current_signal_source(self, expected: object | None) -> bool:
         """Aceita chamadas diretas e sinais apenas da operação ainda vigente."""
 
-        source = self.sender()
+        source = self._dispatch_source
         return source is None or source is expected
+
+    def _connect_operation_signal(self, signal, source, callback):
+        """Captura a operação sem consultar QObject.sender após o teardown nativo."""
+        from PyQt6 import sip
+        owner = next((name for name, value in self.__dict__.items()
+                      if value is source and name.endswith(("_worker", "_thread"))), None)
+        input_revision = self._project.project_id, self._project.revision
+        if owner and owner.endswith("_worker") and hasattr(source, "__dict__"):
+            from uuid import uuid4
+            if not hasattr(source, "operation_id"):
+                source.operation_id = str(uuid4())
+                source.project_revision = input_revision
+            if owner == "_export_worker" and not hasattr(source, "input_revision"):
+                source.input_revision = self._study_input_revision()
+
+        def dispatch(*args):
+            if sip.isdeleted(self) or (owner and getattr(self, owner) is not source):
+                return
+            if callback.__name__.endswith("_finished") and not callback.__name__.endswith("_thread_finished"):
+                if owner != "_import_worker" and input_revision != (self._project.project_id, self._project.revision):
+                    return
+                cancel_event = getattr(source, "_cancel_event", None)
+                if owner != "_import_worker" and cancel_event is not None and cancel_event.is_set():
+                    return
+                if owner == "_export_worker":
+                    if source.input_revision != self._study_input_revision():
+                        self.statusBar().showMessage("As entradas mudaram; exportação descartada antes de gravar.", 5000)
+                        return
+                    if args and hasattr(args[0], "input_revision"):
+                        args = (replace(args[0], input_revision=source.input_revision), *args[1:])
+            previous = self._dispatch_source
+            self._dispatch_source = source
+            try:
+                callback(*args)
+            finally:
+                self._dispatch_source = previous
+
+        signal.connect(dispatch)
 
     def _create_actions(self) -> None:
         # A importação por CSV está **suspensa**, não removida: a ação existe,
@@ -1142,7 +1215,21 @@ class MainWindow(QMainWindow):
         if self._mdb_error is not None:
             self.mdb_import_action.setEnabled(False)
             self.mdb_import_action.setToolTip(self._mdb_error)
-        self.mdb_import_action.triggered.connect(self._choose_mdb_import)
+        self.mdb_import_action.triggered.connect(
+            lambda: self._choose_mdb_import(replace=True)
+        )
+
+        self.mdb_add_action = QAction("Adicionar banco de dados…", self)
+        self.new_project_action = QAction("Novo projeto", self)
+        self.new_project_action.triggered.connect(self._new_project)
+        self.undo_project_action = QAction("Desfazer última alteração do projeto", self)
+        self.undo_project_action.setShortcut("Ctrl+Z")
+        self.undo_project_action.setEnabled(False)
+        self.undo_project_action.triggered.connect(self._undo_project)
+        self.mdb_add_action.setEnabled(False)
+        self.mdb_add_action.triggered.connect(
+            lambda: self._choose_mdb_import(replace=False)
+        )
 
         self.fit_action = QAction("Enquadrar tudo", self)
         self.fit_action.setShortcut(QKeySequence("F"))
@@ -1275,6 +1362,14 @@ class MainWindow(QMainWindow):
         self.circuits_action = QAction("Circuitos…", self)
         self.circuits_action.setEnabled(False)
         self.circuits_action.triggered.connect(self._show_circuits_window)
+
+        self.sources_action = QAction("Fontes…", self)
+        self.sources_action.setEnabled(False)
+        self.sources_action.setToolTip(
+            "Bancos carregados no mapa: quantos circuitos cada um trouxe, e de "
+            "onde"
+        )
+        self.sources_action.triggered.connect(self._show_sources_window)
 
         self.overlaps_action = QAction("Sobreposições…", self)
         self.overlaps_action.setEnabled(False)
@@ -1431,6 +1526,8 @@ class MainWindow(QMainWindow):
         self.file_menu = self.menuBar().addMenu("Arquivo")
         # self.file_menu.addAction(self.import_action)  # CSV suspenso
         self.file_menu.addAction(self.mdb_import_action)
+        self.file_menu.addAction(self.new_project_action)
+        self.file_menu.addAction(self.undo_project_action)
         self.file_menu.addSeparator()
         self.file_menu.addAction(self.exit_action)
 
@@ -1452,6 +1549,7 @@ class MainWindow(QMainWindow):
             theme_menu.addAction(self.theme_actions[theme])
         view_menu.addSeparator()
         view_menu.addAction(self.circuits_action)
+        view_menu.addAction(self.sources_action)
         view_menu.addAction(self.overlaps_action)
         view_menu.addSeparator()
         view_menu.addAction(self.fit_action)
@@ -2066,6 +2164,12 @@ class MainWindow(QMainWindow):
             with_companion=True,
         )
         switch_layout.addWidget(self.switch_details_table)
+        switch_actions = QHBoxLayout()
+        for caption, state in (("Abrir no estudo", "0"), ("Fechar no estudo", "1")):
+            button = QPushButton(caption)
+            button.clicked.connect(lambda checked=False, state=state: self._set_project_switch_state(state))
+            switch_actions.addWidget(button)
+        switch_layout.addLayout(switch_actions)
         self.switch_details_section.setVisible(False)
         segment_layout.addWidget(self.switch_details_section)
 
@@ -2190,7 +2294,14 @@ class MainWindow(QMainWindow):
 
         # Mantém o nome usado pela primeira versão para integrações existentes.
         self.detail_labels = self.bar_detail_labels
-        self.details_dock.setWidget(self.details_stack)
+        details_container = QWidget(self.details_dock)
+        details_layout = QVBoxLayout(details_container)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.addWidget(self.details_stack, 1)
+        provenance_button = QPushButton("Origem e histórico…", details_container)
+        provenance_button.clicked.connect(self._show_project_provenance)
+        details_layout.addWidget(provenance_button)
+        self.details_dock.setWidget(details_container)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.details_dock)
 
     def _create_status_bar(self) -> None:
@@ -2311,8 +2422,41 @@ class MainWindow(QMainWindow):
         )
         self.cables_window.importRequested.connect(self._choose_cables_csv)
 
+    #: Por que a importação por CSV não convive com várias fontes.
+    MULTI_SOURCE_CSV_REASON = (
+        "A importação por CSV substitui uma entidade inteira e não sabe de que "
+        "fonte ela veio; use um só banco para editar por CSV."
+    )
+
+    def _multi_source(self) -> bool:
+        return len(self._workspace) > 1
+
+    def _sync_import_availability(self) -> None:
+        """Desabilita o CSV com várias fontes, com o motivo na dica.
+
+        A ação de menu está suspensa hoje, mas os pontos de entrada continuam
+        ligados: reabilitá-la sem esta guarda injetaria linhas sem proveniência,
+        que a próxima composição descartaria sem explicar nada.
+        """
+
+        blocked = self._multi_source()
+        self.import_action.setEnabled(not blocked and not self._busy())
+        self.import_action.setToolTip(
+            self.MULTI_SOURCE_CSV_REASON
+            if blocked
+            else "Importar barras, trechos, cargas, geradores, chaves ou "
+            "circuitos de arquivos CSV"
+        )
+
     def _choose_import(self) -> None:
         if self._busy():
+            return
+        if self._multi_source():
+            QMessageBox.information(
+                self,
+                "Importação por CSV indisponível",
+                self.MULTI_SOURCE_CSV_REASON,
+            )
             return
         dialog = ImportChoiceDialog(
             self._model is not None,
@@ -2543,94 +2687,39 @@ class MainWindow(QMainWindow):
             or self._generator_update_thread is not None
         )
 
-    def _open_mdb(self, path: str):  # noqa: ANN201
-        """Abre o banco pedindo a senha quando o driver reclamar dela.
+    def _choose_mdb_import(self, *, replace: bool = True) -> None:
+        """Abre um banco, para substituir o mapa ou para acrescentar a ele.
 
-        Devolve ``(gerenciador, senha)`` ou ``None`` se o usuário desistir. O
-        contexto volta aberto de propósito: o diálogo precisa consultar tabelas
-        e amostrar coordenadas antes de a importação começar.
+        Os dois caminhos são o mesmo até o fim: a diferença é só se o espaço de
+        trabalho candidato substitui as fontes atuais ou entra ao lado delas.
         """
 
-        password: str | None = None
-        retry = False
-        while True:
-            manager = open_database(path, password)
-            try:
-                database = manager.__enter__()
-            except MdbPasswordError:
-                dialog = MdbPasswordDialog(Path(path).name, self, retry=retry)
-                if dialog.exec() != QDialog.DialogCode.Accepted:
-                    return None
-                password = dialog.password()
-                retry = True
-                continue
-            return manager, database, password
-
-    def _choose_mdb_import(self) -> None:
         if self._busy() or self._mdb_error is not None:
             return
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Importar banco de dados",
-            "",
-            "Bancos Access (*.mdb *.accdb);;Todos os arquivos (*)",
-        )
-        if not path:
-            return
-
-        try:
-            opened = self._open_mdb(path)
-        except MdbEngineError as exc:
-            QMessageBox.critical(self, "Falha ao abrir o banco", str(exc))
-            return
-        if opened is None:
-            return
-        manager, database, password = opened
-
-        try:
-            plan = resolve_mapping(database, self._mdb_table_mapping)
-            table_names = database.tables()
-            row_counts: dict[str, int] = {}
-            for entity in plan.resolved:
-                try:
-                    row_counts[entity.table] = database.row_count(entity.table)
-                except Exception:  # noqa: BLE001 — a contagem é informativa
-                    continue
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Falha ao ler o banco", str(exc))
-            return
-        finally:
-            # A conexão de inspeção é fechada antes de o worker começar: ele
-            # abre a sua própria, porque uma conexão ODBC não é segura para
-            # atravessar threads.
-            manager.__exit__(None, None, None)
-
-        if not plan.has_mandatory:
-            QMessageBox.critical(
-                self,
-                "Banco incompatível",
-                "A tabela de barras não foi encontrada no banco.\n\n"
-                + (plan.reason_for("barras") or ""),
-            )
-            return
-
+        if not replace and self._model is None:
+            return  # Entrada legada; o menu unificado usa a entrada principal.
         dialog = MdbImportDialog(
-            path,
-            plan,
-            table_names,
-            self,
-            row_counts=row_counts,
+            parent=self,
+            workspace=self._workspace,
+            table_mapping=self._mdb_table_mapping,
+            title="Importar banco de dados no projeto",
         )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        selection = dialog.selection()
-        # Toda importação MDB substitui as barras e, por consequência, o
-        # catálogo de circuitos e suas agendas de sessão atuais.
-        if not self.patamares_window.confirm_pending_changes():
-            return
-        self._start_mdb_import(path, selection, password)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            selection = dialog.selection()
+            if not self.patamares_window.confirm_pending_changes():
+                return
+            self._start_mdb_import(
+                dialog.path_input.text(), selection, dialog.password(), replace=False
+            )
+        finally:
+            dialog.clear_password()
+            dialog.deleteLater()
 
-    def _start_mdb_import(self, path: str, selection, password) -> None:  # noqa: ANN001
+    def _start_mdb_import(  # noqa: ANN001
+        self, path: str, selection, password, *, replace: bool = True
+    ) -> None:
         thread = QThread(self)
         worker = MdbImportWorker(
             path,
@@ -2641,6 +2730,12 @@ class MainWindow(QMainWindow):
             scale=selection.scale,
             phase_configuration=self._phase_configuration,
             switch_types=self._switch_types,
+            circuit_ids=selection.import_circuit_ids(),
+            workspace=self._workspace,
+            replace_workspace=False,
+            project=self._project,
+            target_tag=selection.target_tag,
+            correspondences=selection.correspondences,
         )
         worker.moveToThread(thread)
 
@@ -2658,82 +2753,339 @@ class MainWindow(QMainWindow):
         self._progress_entity = "registros"
         self.import_action.setEnabled(False)
         self.mdb_import_action.setEnabled(False)
+        self.mdb_add_action.setEnabled(False)
         self.branches_action.setEnabled(False)
         self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_mdb_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_mdb_import_finished)
+        worker.review_required.connect(lambda conflicts: self._review_network_import(worker, conflicts))
+        worker.project_review_required.connect(lambda proposal: self._review_project_import(worker, proposal))
+        worker.field_review_required.connect(lambda conflicts: self._review_project_fields(worker, conflicts))
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
-    def _on_mdb_import_finished(self, result: MdbImportResult) -> None:
-        """Instala os dez modelos pelos setters existentes, na mesma ordem.
+    def _review_network_import(self, worker, conflicts) -> None:
+        from .network_registry_dialog import NetworkConflictDialog
 
-        Não há cascata nova aqui: reusar ``_set_*_model`` é o que mantém as
-        invalidações exatamente como estão documentadas na seção 6 da
-        arquitetura. A ordem importa — as chaves precisam entrar antes do
-        catálogo de circuitos, que é reconstruído por ``_set_switch_model``.
+        if self._import_worker is not worker or worker._cancel_event.is_set():
+            worker.resolve_review(None)
+            return
+        if self._progress_dialog is not None:
+            self._progress_dialog.hide()
+        dialog = NetworkConflictDialog(conflicts, self)
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            worker.resolve_review(dialog.model.decisions if accepted else None)
+        finally:
+            dialog.deleteLater()
+        if accepted and self._progress_dialog is not None:
+            self._progress_dialog.setLabelText("Atualizando o cadastro da rede…")
+            self._progress_dialog.show()
+
+    def _review_project_import(self, worker, proposal):
+        from .project_dialogs import ImportProposalDialog
+        self._project_review_dialog(worker, proposal, ImportProposalDialog)
+
+    def _review_project_fields(self, worker, conflicts):
+        from .project_dialogs import FieldConflictDialog
+        self._project_review_dialog(worker, conflicts, FieldConflictDialog)
+
+    def _project_review_dialog(self, worker, payload, dialog_type):
+        if self._import_worker is not worker or worker._cancel_event.is_set() or self._close_after_import:
+            worker.resolve_review(None)
+            return
+        if self._progress_dialog:
+            self._progress_dialog.hide()
+        dialog = dialog_type(payload, self)
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            worker.resolve_review(dialog.decisions() if accepted else None)
+        finally:
+            dialog.deleteLater()
+        if accepted and self._progress_dialog:
+            self._progress_dialog.show()
+
+    def _on_mdb_import_finished(self, payload) -> None:  # noqa: ANN001
+        """Recebe o worker e instala a cadeia composta.
+
+        Aceita também um ``MdbImportResult`` cru, que é o que os testes injetam
+        neste ponto: nesse caso a fonte única é embrulhada e composta, e compor
+        uma fonte devolve os **próprios** modelos dela, sem cópia.
         """
 
+        if not self._is_current_signal_source(self._import_worker):
+            return
+        if self._close_after_import or (self._import_worker is not None and self._import_worker._cancel_event.is_set()):
+            self._on_import_cancelled()
+            return
         _close_progress_dialog(self._progress_dialog)
+        load = (
+            payload
+            if isinstance(payload, MdbSourceLoad)
+            else self._single_source_load(payload)
+        )
+        try:
+            if load.project_change is not None:
+                self._commit_project_change(load.project_change)
+            else:
+                self._install_composed_chain(load.composed, load.workspace)
+        except Exception as exc:
+            self._on_import_failed(str(exc))
+            return
+        if load.composed is not None and load.composed.catalog is not None:
+            self._show_circuits_window()
+        if load.result is not None:
+            self._show_mdb_import_report(load.result)
+        if load.composed is not None:
+            self._show_composition_report(load.composed.report)
+        # O disparo real espera o teardown da thread de importação: enquanto
+        # ela existe, _busy() recusa qualquer operação pesada.
+        self._pending_generator_update = True
 
+    def _single_source_load(self, result: MdbImportResult) -> MdbSourceLoad:
+        """Um ``MdbImportResult`` cru como espaço de trabalho de uma fonte só."""
+
+        workspace = SourceWorkspace()
+        dataset = dataset_from_result(result, tag=workspace.next_tag())
+        workspace = workspace.added(dataset)
+        return MdbSourceLoad(
+            dataset=dataset,
+            workspace=workspace,
+            composed=compose(workspace.datasets),
+            result=result,
+        )
+
+    def _install_composed_chain(
+        self,
+        composed: ComposedModels,
+        workspace: SourceWorkspace,
+        *, adopt_project: bool = True,
+    ) -> None:
+        """O **único** caminho de instalação da cadeia.
+
+        Substituir e acrescentar passam os dois por aqui, e não há cascata nova:
+        reusar ``_set_*_model`` na mesma ordem é o que mantém as invalidações
+        exatamente como a seção 6 da arquitetura as descreve. A ordem importa —
+        as chaves entram antes do catálogo, que ``_set_switch_model``
+        reconstrói.
+        """
+
+        previous = self._composition, self._workspace, self._project, self._project_topology
+        display = self._circuit_display_state()
+        try:
+            self._install_composed_models(composed, workspace)
+        except Exception:
+            old_composed, old_workspace, old_project, old_topology = previous
+            try:
+                if old_composed is not None:
+                    self._install_composed_models(old_composed, old_workspace)
+                    if old_composed.catalog is not None:
+                        checked, colors = self._circuit_display_for(old_composed.catalog, old_composed.provenance, display)
+                        self._set_circuit_catalog(old_composed.catalog, checked, colors)
+                else:
+                    self._clear_workspace()
+            finally:
+                self._project, self._project_topology = old_project, old_topology
+                self._workspace, self._composition = old_workspace, old_composed
+            raise
+        if adopt_project:
+            from .project_state import ProjectState
+            self._project = ProjectState.from_workspace(workspace)
+
+    def _install_composed_models(self, composed, workspace):
+        bars = composed.bars
+        # O que o usuário escolheu para cada circuito é capturado ANTES de a
+        # cascata derrubar o catálogo, e reaplicado depois por (fonte, id).
+        display_state = self._circuit_display_state()
         # As barras substituem tudo: trechos e cargas antigos referenciam o
         # modelo anterior e precisam sair antes.
         self._set_capacitor_model(None)
         self._set_load_model(None)
         self._set_line_model(None)
-        self._model = result.bars.model
-        self.search_index.set_bars(result.bars.model, build_fields=False)
-        self.search_palette.schedule_field_index("bar", result.bars.model)
+        self._workspace = workspace
+        self._composition = composed
+        self._model = bars
+        self.search_index.set_bars(bars, build_fields=False)
+        self.search_palette.schedule_field_index("bar", bars)
         self._selected_feature = None
-        self.view.set_model(result.bars.model)
-        self.virtualizer.reset_model(result.bars.model)
+        self.view.set_model(bars)
+        self.virtualizer.reset_model(bars)
         self._set_selection(None)
-        self.total_status.setText(f"Barras: {len(result.bars.model):n}")
+        self.total_status.setText(f"Barras: {len(bars):n}")
         self.show_bars_action.setEnabled(True)
         self.fit_action.setEnabled(True)
 
-        if result.cables is not None:
-            self._set_cable_model(result.cables.model)
-        if result.segments is not None:
-            self._set_line_model(result.segments.model)
-        if result.loads is not None:
-            self._set_load_model(result.loads.model)
-        if result.capacitors is not None:
-            self._set_capacitor_model(result.capacitors.model)
-        if result.allocations is not None:
-            self._set_allocation_model(result.allocations)
-        if result.generators is not None:
-            self._set_generator_model(result.generators.model)
-        if result.patterns is not None:
-            self._set_load_pattern_model(result.patterns.model)
-        if result.switches is not None:
-            self._set_switch_model(result.switches.model)
-        if result.regulators is not None:
-            self._set_regulator_source_model(result.regulators.model)
-        if result.circuits is not None:
-            self._set_circuit_catalog(result.circuits.model)
-        if result.circuit_levels is not None:
-            self._set_circuit_level_model(result.circuit_levels.model)
+        self._set_cable_model(composed.cables)
+        if composed.segments is not None:
+            self._set_line_model(composed.segments)
+        if composed.loads is not None:
+            self._set_load_model(composed.loads)
+        if composed.capacitors is not None:
+            self._set_capacitor_model(composed.capacitors)
+        if composed.allocations is not None:
+            self._set_allocation_model(composed.allocations)
+        if composed.generators is not None:
+            self._set_generator_model(composed.generators)
+        if composed.patterns is not None:
+            self._set_load_pattern_model(composed.patterns)
+        if composed.switches is not None:
+            self._set_switch_model(composed.switches)
+        if composed.regulators is not None:
+            self._set_regulator_source_model(composed.regulators)
+        if composed.catalog is not None:
+            checked, colors = self._circuit_display_for(
+                composed.catalog, composed.provenance, display_state
+            )
+            self._set_circuit_catalog(composed.catalog, checked, colors)
+        if composed.circuit_levels is not None:
+            self._set_circuit_level_model(composed.circuit_levels)
 
+        self.sources_table_model.set_workspace(workspace)
+        self.sources_action.setEnabled(len(workspace) > 0)
+        self._sync_import_availability()
         self._sync_search_availability()
         self._sync_export_availability()
+        self._sync_mdb_actions()
         self._fit_all()
-        if result.circuits is not None:
-            self._show_circuits_window()
-        self._show_mdb_import_report(result)
-        # O disparo real espera o teardown da thread de importação: enquanto
-        # ela existe, _busy() recusa qualquer operação pesada.
-        self._pending_generator_update = True
+
+    def _commit_project_change(self, change):
+        change.validate(self._project)
+        selected = self._selected_feature
+        if change.composed is None:
+            previous = self._composition, self._workspace
+            try:
+                self._clear_workspace()
+            except Exception:
+                if previous[0] is not None:
+                    self._install_composed_models(*previous)
+                raise
+        else:
+            self._install_composed_chain(change.composed, change.state.workspace, adopt_project=False)
+        self._project = change.state
+        self._workspace = change.state.workspace
+        self._project_topology = change.topology
+        self.undo_project_action.setEnabled(change.state.previous is not None)
+        if selected is not None and change.state.history[-1].operation == "edit":
+            self._set_selection(selected)
+        self.statusBar().showMessage(
+            f"Projeto atualizado — revisão {change.state.revision}; {len(change.state.pending)} conexão(ões) pendente(s).", 8000)
+
+    def _new_project(self):
+        if self._busy() or not self.patamares_window.confirm_pending_changes():
+            return
+        if len(self._workspace) and QMessageBox.question(
+            self, "Novo projeto", "Descartar o projeto em memória e começar um novo?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self._clear_workspace()
+        from .project_state import ProjectState
+        self._project = ProjectState(self._workspace)
+        self._project_topology = None
+        self.undo_project_action.setEnabled(False)
+
+    def _undo_project(self):
+        if self._busy() or self._project.previous is None:
+            return
+        from .project_state import undo
+        project = self._project
+        self._start_project_operation(lambda cancel: undo(project, cancel_check=cancel))
+
+    def _start_project_operation(self, operation):
+        if self._busy():
+            return
+        from .workers import ProjectOperationWorker
+        thread = QThread(self)
+        worker = ProjectOperationWorker(operation)
+        worker.moveToThread(thread)
+        progress = QProgressDialog("Atualizando projeto e topologia…", "Cancelar", 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        self._import_thread, self._import_worker, self._progress_dialog = thread, worker, progress
+        self.mdb_import_action.setEnabled(False)
+        self.undo_project_action.setEnabled(False)
+        thread.started.connect(worker.run)
+        self._connect_operation_signal(worker.finished, worker, self._on_project_operation_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(worker.cancel)
+        thread.finished.connect(worker.deleteLater)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_project_operation_finished(self, change):
+        if not self._is_current_signal_source(self._import_worker):
+            return
+        cancelled = self._import_worker is not None and self._import_worker._cancel_event.is_set()
+        try:
+            change.validate(self._project, cancelled=cancelled or self._close_after_import)
+            self._commit_project_change(change)
+        except InterruptedError:
+            self._on_import_cancelled()
+        except Exception as exc:
+            self._on_import_failed(str(exc))
+        finally:
+            _close_progress_dialog(self._progress_dialog)
+
+    def _project_equipment_at(self, entity, index):
+        if self._composition is None:
+            return None
+        key = self._composition.provenance.equipment_key(entity, int(index))
+        return self._project.records.get(key) if key else None
+
+    def _show_project_provenance(self):
+        from .project_dialogs import ProjectProvenanceDialog
+        selection = self._selected_feature
+        records = []
+        if selection:
+            entity = {"bar": "bars", "segment": "segments", "load": "loads", "generator": "generators",
+                      "capacitor": "capacitors"}.get(selection.kind)
+            record = self._project_equipment_at(entity, selection.index) if entity else None
+            if record:
+                records.append(record)
+            if selection.kind == "segment":
+                for entity, model in (("switches", self._switch_model), ("regulators", self._regulator_model)):
+                    if model is not None:
+                        index = int(model.record_indices_by_segment[selection.index])
+                        record = self._project_equipment_at(entity, index) if index >= 0 else None
+                        if record:
+                            records.append(record)
+        dialog = ProjectProvenanceDialog(self._project, records, self)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def _detach_source(self, tag):
+        if self._busy():
+            return
+        from .project_state import detach_origins
+        project = self._project
+        self._start_project_operation(lambda cancel: detach_origins(project, tag, cancel_check=cancel))
+
+    def _set_project_switch_state(self, state):
+        selected = self._selected_feature
+        if self._busy() or selected is None or selected.kind != "segment" or self._switch_model is None:
+            return
+        index = int(self._switch_model.record_indices_by_segment[selected.index])
+        record = self._project_equipment_at("switches", index) if index >= 0 else None
+        if record:
+            from .project_state import edit_equipment
+            project = self._project
+            self._start_project_operation(lambda cancel: edit_equipment(project, record.equipment_id,
+                                                                        {"states": state}, cancel_check=cancel))
 
     def _show_mdb_import_report(self, result: MdbImportResult) -> None:
         imported = len(result.imported_entities)
@@ -2774,16 +3126,16 @@ class MainWindow(QMainWindow):
         self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_import_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -2811,16 +3163,16 @@ class MainWindow(QMainWindow):
         self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_segment_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_segment_import_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -2848,16 +3200,16 @@ class MainWindow(QMainWindow):
         self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_switch_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_switch_import_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -2884,16 +3236,16 @@ class MainWindow(QMainWindow):
         self.branches_action.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_regulator_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_regulator_import_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -2918,16 +3270,16 @@ class MainWindow(QMainWindow):
         self.branches_action.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_cable_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_cable_import_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -2954,16 +3306,16 @@ class MainWindow(QMainWindow):
         self.branches_action.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_load_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_load_import_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -2996,16 +3348,16 @@ class MainWindow(QMainWindow):
         self.branches_action.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_load_pattern_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_load_pattern_import_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -3038,17 +3390,17 @@ class MainWindow(QMainWindow):
         self.branches_action.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.stageChanged.connect(self._on_generator_stage_changed)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_generator_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.stageChanged, worker, self._on_generator_stage_changed)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_generator_import_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(worker.cancel)
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -3089,16 +3441,16 @@ class MainWindow(QMainWindow):
         self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_circuit_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_circuit_import_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -3128,16 +3480,16 @@ class MainWindow(QMainWindow):
         self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_circuit_level_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_circuit_level_import_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(worker.cancel)
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -3166,16 +3518,16 @@ class MainWindow(QMainWindow):
         self.patamares_window.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_import_progress)
-        worker.finished.connect(self._on_allocation_measurement_import_finished)
-        worker.failed.connect(self._on_import_failed)
-        worker.cancelled.connect(self._on_import_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_import_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_allocation_measurement_import_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_import_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_import_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(worker.cancel)
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_import_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_import_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -3376,6 +3728,7 @@ class MainWindow(QMainWindow):
     def _set_line_model(self, model: LineNetworkModel | None) -> None:
         self._invalidate_power_flow()
         self._invalidate_branch_analysis()
+        self._invalidate_blocks()
         if self._search_focus_active:
             self._set_selection(None)
         self._set_circuit_catalog(None)
@@ -3422,6 +3775,7 @@ class MainWindow(QMainWindow):
     def _set_load_model(self, model: LoadModel | None) -> None:
         self._invalidate_power_flow()
         self._invalidate_branch_analysis()
+        self._invalidate_blocks()
         if model is not None and model.bars is not self._model:
             raise ValueError("As cargas devem referenciar as barras exibidas.")
         if model is not self._load_model:
@@ -3579,21 +3933,13 @@ class MainWindow(QMainWindow):
     def _set_switch_model(self, model: SwitchModel | None) -> None:
         self._invalidate_power_flow()
         self._invalidate_branch_analysis()
+        self._invalidate_blocks()
         if self._search_focus_active:
             self._set_selection(None)
         if model is not None and model.segments is not self._line_model:
             raise ValueError("As chaves devem referenciar os trechos exibidos.")
         previous_catalog = self._circuit_catalog
-        previous_checked = (
-            None
-            if self._circuit_visibility is None
-            else self._circuit_visibility.checked_states
-        )
-        previous_colors = (
-            None
-            if self._circuit_visibility is None
-            else self._circuit_visibility.colors
-        )
+        display_state = self._circuit_display_state()
         if self._switch_item is not None:
             self.scene.removeItem(self._switch_item)
             self._switch_item = None
@@ -3615,17 +3961,14 @@ class MainWindow(QMainWindow):
                 previous_catalog.definitions,
                 source_path=previous_catalog.source_path,
             )
-            display_by_id = {
-                definition.circuit_id: (previous_checked[index], previous_colors[index])
-                for index, definition in enumerate(previous_catalog.definitions)
-            }
-            rebuilt_checked = tuple(
-                display_by_id[definition.circuit_id][0]
-                for definition in rebuilt_catalog.definitions
-            )
-            rebuilt_colors = tuple(
-                display_by_id[definition.circuit_id][1]
-                for definition in rebuilt_catalog.definitions
+            # As definições são as mesmas, então a proveniência anterior ainda
+            # se alinha com elas — e ``_circuit_display_for`` tolera divergir.
+            rebuilt_checked, rebuilt_colors = self._circuit_display_for(
+                rebuilt_catalog,
+                None
+                if self._composition is None
+                else self._composition.provenance,
+                display_state,
             )
             self._set_circuit_catalog(
                 rebuilt_catalog,
@@ -3703,30 +4046,30 @@ class MainWindow(QMainWindow):
                 if index is None
                 else getattr(source, f"{field}_values")[index]
             )
+            project_record = self._project_equipment_at("regulators", index) if index is not None else None
+            if project_record:
+                snapshots = [dict(values) for (_, key), values in self._project.baselines.items() if key == project_record.key]
+                if snapshots:
+                    original = str(snapshots[-1].get(f"{field}_values", original))
             edited = index is not None and value.strip() != original.strip()
             edited_any = edited_any or edited
             font = editor.font()
             font.setBold(edited)
             editor.setFont(font)
             editor.setToolTip(
-                f"Editado nesta sessão; o banco mantém "
-                f"{original.strip() or '<vazio>'}. A alteração não é gravada e "
-                "some ao recarregar o circuito."
+                f"Editado no projeto; último valor importado: {original.strip() or '<vazio>'}. "
+                "Atualizações preservam esta edição até uma decisão explícita."
                 if edited
-                else f"{REGULATOR_FIELD_LABELS[field]} como está no banco. "
-                "Editar aqui vale só para esta sessão."
+                else f"{REGULATOR_FIELD_LABELS[field]} no projeto em memória."
             )
         self.regulator_restore_button.setVisible(edited_any)
 
     def _set_regulator_source_model(self, model: RegulatorModel | None) -> None:
-        """Instala o retrato do banco e descarta as edições da sessão.
+        """Instala a projeção canônica e limpa sobreposições do adaptador legado.
 
-        Chamado sempre que os reguladores vêm do MDB — importação isolada,
-        importação completa ou troca de trechos. É aqui que a garantia do
-        usuário se cumpre: recarregar o circuito devolve exatamente o que está
-        gravado no banco, porque as sobreposições morrem junto com o retrato
-        anterior. Fechar o aplicativo não precisa de nada, já que nada disso
-        chega ao disco.
+        No fluxo do projeto, o modelo já contém as edições confirmadas no
+        cadastro. A limpeza serve apenas às sobreposições do importador CSV
+        legado. Nada é restaurado do Access durante a instalação.
         """
 
         self._regulator_source_model = model
@@ -3747,6 +4090,13 @@ class MainWindow(QMainWindow):
         index = source.index_for_id(str(regulator_id))
         if index is None:
             return
+        record = self._project_equipment_at("regulators", index)
+        if record is not None:
+            from .project_state import edit_equipment
+            project = self._project
+            values = {f"{field}_values": str(text).strip()}
+            self._start_project_operation(lambda cancel: edit_equipment(project, record.equipment_id, values, cancel_check=cancel))
+            return
         original = getattr(source, f"{field}_values")[index]
         value = str(text).strip()
         # Voltar ao valor do banco é o mesmo que nunca ter editado: sem isso, a
@@ -3765,6 +4115,17 @@ class MainWindow(QMainWindow):
         """Descarta as edições de um regulador, voltando ao valor do banco."""
 
         source = self._regulator_source_model
+        if source is not None:
+            index = source.index_for_id(regulator_id)
+            record = self._project_equipment_at("regulators", index) if index is not None else None
+            if record:
+                from .project_state import edit_equipment
+                baselines = [dict(values) for (path, key), values in self._project.baselines.items() if key == record.key]
+                if baselines:
+                    values = {name: baselines[-1][name] for name in ("snom_values", "vnom_values") if name in baselines[-1]}
+                    project = self._project
+                    self._start_project_operation(lambda cancel: edit_equipment(project, record.equipment_id, values, cancel_check=cancel))
+                return
         if source is None or not self._regulator_overrides.clear(regulator_id):
             return
         self._set_regulator_model(
@@ -3809,6 +4170,67 @@ class MainWindow(QMainWindow):
         self._apply_circuit_visibility()
         self.view.viewport().update()
 
+    def _circuit_display_state(self) -> dict[tuple[str, str], tuple[bool, str]]:
+        """Visibilidade e cor por ``(etiqueta da fonte, CIRC_ID nativo)``.
+
+        A chave **não** é o CIRC_ID composto: ele é valor derivado e muda
+        quando uma colisão entre fontes aparece ou desaparece. O par
+        ``(fonte, id nativo)`` não muda nunca, e é o que faz a escolha do
+        usuário sobreviver a acrescentar e a remover uma fonte.
+        """
+
+        catalog = self._circuit_catalog
+        controller = self._circuit_visibility
+        if catalog is None or controller is None:
+            return {}
+        provenance = (
+            None if self._composition is None else self._composition.provenance
+        )
+        checked = controller.checked_states
+        colors = controller.colors
+        state: dict[tuple[str, str], tuple[bool, str]] = {}
+        for index, definition in enumerate(catalog.definitions):
+            key = (
+                ("", definition.circuit_id)
+                if provenance is None
+                else provenance.key("circuits", index)
+            )
+            state[key] = (checked[index], colors[index])
+        return state
+
+    def _circuit_display_for(
+        self,
+        catalog: CircuitCatalogModel,
+        provenance: ComposedProvenance | None,
+        state: Mapping[tuple[str, str], tuple[bool, str]],
+    ) -> tuple[tuple[bool, ...], tuple[str, ...]]:
+        """Remapeia o estado visual, tolerando circuito que entrou e que saiu.
+
+        Um circuito **novo** nasce visível com a próxima cor livre da paleta, de
+        modo que acrescentar uma fonte nunca recolore as que já estavam; um
+        circuito que **sumiu** é simplesmente descartado.
+        """
+
+        palette = generate_circuit_palette(len(catalog))
+        taken = {color for _, color in state.values()}
+        spare = [color for color in palette if color not in taken]
+        checked: list[bool] = []
+        colors: list[str] = []
+        for index, definition in enumerate(catalog.definitions):
+            key = (
+                ("", definition.circuit_id)
+                if provenance is None
+                else provenance.key("circuits", index)
+            )
+            previous = state.get(key)
+            if previous is None:
+                checked.append(True)
+                colors.append(spare.pop(0) if spare else palette[index])
+                continue
+            checked.append(previous[0])
+            colors.append(previous[1])
+        return tuple(checked), tuple(colors)
+
     def _set_circuit_catalog(
         self,
         catalog: CircuitCatalogModel | None,
@@ -3817,6 +4239,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         self._invalidate_power_flow()
         self._invalidate_branch_analysis()
+        self._invalidate_blocks()
         if self._search_focus_active:
             self._set_selection(None)
         if catalog is not None:
@@ -3841,6 +4264,7 @@ class MainWindow(QMainWindow):
         self.circuit_table_model.set_source(
             self._circuit_catalog,
             self._circuit_visibility,
+            None if self._composition is None else self._composition.provenance,
         )
         self.circuits_action.setEnabled(catalog is not None)
         # A geometria dos anéis deriva do catálogo, então o item nasce e morre
@@ -4115,6 +4539,21 @@ class MainWindow(QMainWindow):
     def _on_circuit_calculation_levels_saved(
         self, _circuit_id: str, _schedule: CalculationLevelSchedule
     ) -> None:
+        if self._circuit_catalog is not None:
+            index = self._circuit_catalog.index_for_id(_circuit_id)
+            circuit = self._project_equipment_at("circuits", index) if index is not None else None
+            if circuit is not None:
+                from .network_registry import EquipmentKey
+                from .project_state import edit_equipment
+                key = EquipmentKey(circuit.key.network_id, "circuit_levels", circuit.key.native_id)
+                record = self._project.records.get(key)
+                if record is not None:
+                    # O controlador é uma projeção; restaura-o até o commit.
+                    self._set_circuit_level_model(self._circuit_level_model)
+                    project = self._project
+                    self._start_project_operation(lambda cancel: edit_equipment(
+                        project, record.equipment_id, {"schedule": _schedule}, cancel_check=cancel))
+                    return
         self._invalidate_generator_update()
         self.statusBar().showMessage(
             "Patamares do circuito salvos; atualize os geradores novamente.",
@@ -4547,6 +4986,7 @@ class MainWindow(QMainWindow):
         self._generator_update_progress_dialog = progress
         self.import_action.setEnabled(False)
         self.mdb_import_action.setEnabled(False)
+        self.mdb_add_action.setEnabled(False)
         self.cables_window.setEnabled(False)
         self.curves_window.setEnabled(False)
         self.patamares_window.setEnabled(False)
@@ -4555,16 +4995,16 @@ class MainWindow(QMainWindow):
         self._sync_power_flow_availability()
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_generator_update_progress)
-        worker.finished.connect(self._on_generator_update_finished)
-        worker.failed.connect(self._on_generator_update_failed)
-        worker.cancelled.connect(self._on_generator_update_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_generator_update_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_generator_update_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_generator_update_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_generator_update_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(worker.cancel)
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_generator_update_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_generator_update_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -4623,8 +5063,8 @@ class MainWindow(QMainWindow):
         self.cables_window.setEnabled(True)
         self.curves_window.setEnabled(True)
         self.patamares_window.setEnabled(True)
-        self.import_action.setEnabled(True)
-        self.mdb_import_action.setEnabled(self._mdb_error is None)
+        self._sync_import_availability()
+        self._sync_mdb_actions()
         self._sync_branches_availability()
         self._sync_export_availability()
         self._sync_power_flow_availability()
@@ -4679,6 +5119,16 @@ class MainWindow(QMainWindow):
 
         if self._uses_opendss_library_parameters():
             self._invalidate_power_flow()
+
+    def _study_input_revision(self):
+        from .study_inputs import StudyInputRevision
+        library = self._uses_opendss_library_parameters()
+        return StudyInputRevision.capture(self._project, phases=self._phase_configuration,
+                   load_settings=self._opendss_load_settings, max_iterations=self._max_power_flow_iterations,
+                   line_mode=self._opendss_line_parameter_mode,
+                   library=self.opendss_library_session.saved_catalog() if library else None,
+                   mappings=self.opendss_mapping_session.mappings if library else None,
+                   curves=self._saved_curves, schedule=self.calculation_level_schedule)
 
     def _invalidate_power_flow(self) -> None:
         """Descarta o resultado: ele deriva de todos os modelos importados."""
@@ -4985,16 +5435,16 @@ class MainWindow(QMainWindow):
         self._sync_export_availability()
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_export_progress)
-        worker.finished.connect(self._on_opendss_allocation_export_finished)
-        worker.failed.connect(self._on_export_failed)
-        worker.cancelled.connect(self._on_export_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_export_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_opendss_allocation_export_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_export_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_export_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(worker.cancel)
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_export_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_export_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -5239,16 +5689,16 @@ class MainWindow(QMainWindow):
         self._sync_export_availability()
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_export_progress)
-        worker.finished.connect(self._on_simplified_opendss_export_finished)
-        worker.failed.connect(self._on_export_failed)
-        worker.cancelled.connect(self._on_export_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_export_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_simplified_opendss_export_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_export_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_export_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(worker.cancel)
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_export_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_export_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -5392,16 +5842,16 @@ class MainWindow(QMainWindow):
         self._sync_export_availability()
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_export_progress)
-        worker.finished.connect(self._on_opendss_export_finished)
-        worker.failed.connect(self._on_export_failed)
-        worker.cancelled.connect(self._on_export_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_export_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_opendss_export_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_export_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_export_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_export_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_export_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -5627,6 +6077,14 @@ class MainWindow(QMainWindow):
         ):
             return
         circuit_indices = self._visible_circuit_indices()
+        if self._project_topology is not None:
+            self._project_topology.assert_current(self._project)
+            coupled = [group for group in self._project_topology.coupled_circuits if set(group).intersection(circuit_indices)]
+            if coupled:
+                QMessageBox.warning(self, "Estudo acoplado necessário",
+                                    "Há alimentadores unidos por conexões condutoras. O fluxo individual não representa "
+                                    "esse estado do projeto. A solução elétrica multifonte ainda não é suportada.")
+                return
         if not circuit_indices:
             self.statusBar().showMessage(
                 "Marque ao menos um circuito para executar o fluxo de potência.",
@@ -5705,6 +6163,7 @@ class MainWindow(QMainWindow):
 
         self._power_flow_thread = thread
         self._power_flow_worker = worker
+        worker.input_revision = self._study_input_revision()
         self._power_flow_progress_dialog = progress
         self._power_flow_snapshot = (
             catalog,
@@ -5720,16 +6179,16 @@ class MainWindow(QMainWindow):
         self._sync_branches_availability()
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_power_flow_progress)
-        worker.finished.connect(self._on_power_flow_finished)
-        worker.failed.connect(self._on_power_flow_failed)
-        worker.cancelled.connect(self._on_power_flow_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_power_flow_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_power_flow_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_power_flow_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_power_flow_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_power_flow_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_power_flow_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -5750,6 +6209,12 @@ class MainWindow(QMainWindow):
 
     def _on_power_flow_finished(self, result: PowerFlowResult) -> None:
         self._close_power_flow_progress()
+        revision = getattr(self._power_flow_worker, "input_revision", None)
+        if revision is not None:
+            if revision != self._study_input_revision():
+                self.statusBar().showMessage("As entradas do estudo mudaram; resultado descartado.", 5000)
+                return
+            result = replace(result, input_revision=revision)
         # Revalidação por identidade, como nas demais análises: uma reimportação
         # durante a execução torna o resultado um retrato de dados que já não
         # estão na tela.
@@ -5812,7 +6277,7 @@ class MainWindow(QMainWindow):
         self._power_flow_worker = None
         self._power_flow_progress_dialog = None
         _close_progress_dialog(progress)
-        self.import_action.setEnabled(True)
+        self._sync_import_availability()
         self._sync_power_flow_availability()
         self._sync_branches_availability()
         # A flag cai em todos os desfechos: falha e cancelamento não podem
@@ -6126,16 +6591,16 @@ class MainWindow(QMainWindow):
         self.simplified_network_action.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_branch_analysis_progress)
-        worker.finished.connect(self._on_branch_analysis_finished)
-        worker.failed.connect(self._on_branch_analysis_failed)
-        worker.cancelled.connect(self._on_branch_analysis_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_branch_analysis_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_branch_analysis_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_branch_analysis_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_branch_analysis_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_branch_analysis_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_branch_analysis_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -6210,7 +6675,7 @@ class MainWindow(QMainWindow):
         self._branch_progress_dialog = None
         self._branch_analysis_snapshot = None
         _close_progress_dialog(progress)
-        self.import_action.setEnabled(True)
+        self._sync_import_availability()
         self._sync_branches_availability()
         self._sync_power_flow_availability()
         if (
@@ -6400,16 +6865,16 @@ class MainWindow(QMainWindow):
         self.simplified_network_action.setEnabled(False)
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_equivalent_progress)
-        worker.finished.connect(self._on_equivalent_finished)
-        worker.failed.connect(self._on_equivalent_failed)
-        worker.cancelled.connect(self._on_equivalent_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_equivalent_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_equivalent_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_equivalent_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_equivalent_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(worker.cancel)
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_equivalent_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_equivalent_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -6507,7 +6972,7 @@ class MainWindow(QMainWindow):
         self.branches_window.set_equivalent_pending(
             restart and self._pending_branch_metrics
         )
-        self.import_action.setEnabled(True)
+        self._sync_import_availability()
         self._sync_branches_availability()
         self._sync_power_flow_availability()
         pending_export = self._pending_simplified_export
@@ -6643,21 +7108,22 @@ class MainWindow(QMainWindow):
         self.branches_window.set_csv_export_pending(True)
         self.import_action.setEnabled(False)
         self.mdb_import_action.setEnabled(False)
+        self.mdb_add_action.setEnabled(False)
         self._sync_branches_availability()
         self._sync_export_availability()
         self._sync_power_flow_availability()
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_branch_csv_progress)
-        worker.finished.connect(self._on_branch_csv_finished)
-        worker.failed.connect(self._on_branch_csv_failed)
-        worker.cancelled.connect(self._on_branch_csv_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_branch_csv_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_branch_csv_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_branch_csv_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_branch_csv_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(worker.cancel)
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_branch_csv_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_branch_csv_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -6708,8 +7174,8 @@ class MainWindow(QMainWindow):
         self._branch_csv_progress_dialog = None
         _close_progress_dialog(progress)
         self.branches_window.set_csv_export_pending(False)
-        self.import_action.setEnabled(True)
-        self.mdb_import_action.setEnabled(self._mdb_error is None)
+        self._sync_import_availability()
+        self._sync_mdb_actions()
         self._sync_branches_availability()
         self._sync_export_availability()
         self._sync_power_flow_availability()
@@ -6800,21 +7266,22 @@ class MainWindow(QMainWindow):
         self.branches_window.set_json_export_pending(True)
         self.import_action.setEnabled(False)
         self.mdb_import_action.setEnabled(False)
+        self.mdb_add_action.setEnabled(False)
         self._sync_branches_availability()
         self._sync_export_availability()
         self._sync_power_flow_availability()
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_branch_json_progress)
-        worker.finished.connect(self._on_branch_json_finished)
-        worker.failed.connect(self._on_branch_json_failed)
-        worker.cancelled.connect(self._on_branch_json_cancelled)
+        self._connect_operation_signal(worker.progress, worker, self._on_branch_json_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_branch_json_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_branch_json_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_branch_json_cancelled)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         progress.canceled.connect(worker.cancel)
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_branch_json_thread_finished)
+        self._connect_operation_signal(thread.finished, thread, self._on_branch_json_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -6878,8 +7345,8 @@ class MainWindow(QMainWindow):
         self._branch_json_progress_dialog = None
         _close_progress_dialog(progress)
         self.branches_window.set_json_export_pending(False)
-        self.import_action.setEnabled(True)
-        self.mdb_import_action.setEnabled(self._mdb_error is None)
+        self._sync_import_availability()
+        self._sync_mdb_actions()
         self._sync_branches_availability()
         self._sync_export_availability()
         self._sync_power_flow_availability()
@@ -6984,6 +7451,25 @@ class MainWindow(QMainWindow):
         self.blocks_window.activateWindow()
         self.blocks_window.select_block(int(block_id))
 
+    def _blocks_match_current_network(self, result: BlockAnalysisResult) -> bool:
+        """A mesma Regra de identidade da seção 5, aplicada a um resultado.
+
+        ``BlockAnalysisResult`` guarda os três modelos de que nasceu justamente
+        para poder responder isto — e ``block_graph`` lê ``source_segments`` e
+        ``source_switches`` para desenhar, então um resultado de outra rede não
+        erra só a contagem de blocos: desenha o grafo com os modelos antigos.
+
+        A cascata já descarta o resultado quando a rede muda; esta guarda é a
+        rede de segurança, e é ela que responde por qualquer caminho novo que
+        troque um modelo sem passar pelos setters.
+        """
+
+        return (
+            result.source_segments is self._line_model
+            and result.source_switches is self._switch_model
+            and result.source_loads is self._load_model
+        )
+
     def _ensure_blocks_result(self) -> BlockAnalysisResult | None:
         """Calcula uma vez e compartilha o mesmo resultado entre as duas janelas.
 
@@ -6993,11 +7479,14 @@ class MainWindow(QMainWindow):
         """
 
         current = self.block_table_model.result
-        if current is not None:
+        if current is not None and self._blocks_match_current_network(current):
             if self.block_graph_window.result is not current:
                 self.block_graph_window.set_result(current)
                 self._sync_block_graph_styles()
             return current
+        if current is not None:
+            # Rede de outra época: recalcular é o certo, e é barato.
+            self._invalidate_blocks()
 
         catalog = self._circuit_catalog
         if catalog is None or self._line_model is None or self._busy():
@@ -7198,7 +7687,13 @@ class MainWindow(QMainWindow):
         )
 
     def _invalidate_blocks(self) -> None:
-        """Descarta os blocos quando a rede que os originou deixa de valer."""
+        """Descarta os blocos quando a rede que os originou deixa de valer.
+
+        Chamado pela mesma cascata que descarta o fluxo de potência e a análise
+        de ramais: trechos, cargas, chaves e catálogo são exatamente o que os
+        blocos derivam, e um resultado que sobrevive a eles descreve uma rede
+        que não existe mais.
+        """
 
         self._clear_block_highlight()
         self.block_table_model.set_result(None)
@@ -7206,6 +7701,12 @@ class MainWindow(QMainWindow):
         self.block_graph_window.set_result(None)
         self.block_graph_window.set_circuit_styles({}, (), (), {})
         self._block_display_identities = {}
+        # O memo de estilo guarda o par (resultado, catálogo) que originou as
+        # identidades; deixá-lo para trás faria a próxima sincronização achar
+        # que já está em dia.
+        self._block_graph_style_result = None
+        self._block_graph_style_catalog = None
+        self._block_graph_circuit_indices = {}
 
     def _highlighted_record(self):  # noqa: ANN202
         """O bloco ou o ramal em destaque, ou ``None``.
@@ -7737,8 +8238,8 @@ class MainWindow(QMainWindow):
         self._import_worker = None
         self._progress_dialog = None
         _close_progress_dialog(progress)
-        self.import_action.setEnabled(True)
-        self.mdb_import_action.setEnabled(self._mdb_error is None)
+        self._sync_import_availability()
+        self._sync_mdb_actions()
         self.patamares_window.setEnabled(True)
         self._sync_branches_availability()
         self._sync_export_availability()
@@ -8097,6 +8598,199 @@ class MainWindow(QMainWindow):
 
     def _show_zoom_limit_reached(self) -> None:
         self.statusBar().showMessage("Limite máximo de zoom atingido.", 3_000)
+
+    def _show_sources_window(self) -> None:
+        self.sources_window.show()
+        self.sources_window.raise_()
+        self.sources_window.activateWindow()
+
+    def _rename_source(self, tag: str, name: str) -> None:
+        """Renomear é só rótulo: nada é recomposto, nada é relido."""
+
+        self._workspace = self._workspace.renamed(tag, name)
+        from dataclasses import replace
+        self._project = replace(self._project, workspace=self._workspace)
+        self.sources_table_model.set_workspace(self._workspace)
+
+    def _fit_source(self, tag: str) -> None:
+        """Enquadra o retângulo de uma fonte, útil quando elas ficam distantes."""
+
+        composition = self._composition
+        if composition is None or self._model is None:
+            return
+        tags = [item.tag for item in self._workspace.datasets]
+        if tag not in tags:
+            return
+        sources = composition.provenance.sources.get("bars")
+        if sources is None:
+            self.view.fit_model()
+        else:
+            self.view.fit_visible_features(sources == tags.index(tag), None)
+        self.virtualizer.refresh(force=True)
+        self.load_virtualizer.refresh(force=True)
+
+    def _remove_source(self, tag: str) -> None:
+        """Tira uma fonte do mapa recompondo o que sobrou.
+
+        Recompor é o mesmo caminho de acrescentar, ao contrário: os retratos das
+        outras fontes estão guardados e não precisam ser relidos do disco.
+        """
+
+        if self._busy():
+            return
+        dataset = self._workspace.dataset_for(tag)
+        if dataset is None:
+            return
+        message = (
+            f"Remover a fonte {dataset.name} ({tag}) tira "
+            f"{dataset.circuit_count:n} circuito(s) e "
+            f"{dataset.count('bars'):n} barra(s) do mapa."
+        )
+        confirmed = QMessageBox.question(
+            self,
+            "Excluir rede do projeto",
+            message + "\n\nContinuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+        if not self.patamares_window.confirm_pending_changes():
+            return
+
+        if dataset.registry is not None:
+            from .project_state import remove_network
+            project = self._project
+            self._start_project_operation(lambda cancel: remove_network(project, tag, cancel_check=cancel))
+            return
+        remaining = self._workspace.without(tag)
+        if not len(remaining):
+            self._clear_workspace()
+            return
+        # Recompor cinco fontes de 100 mil barras leva ~3 s de numpy. É pouco
+        # para uma thread própria e muito para a janela parecer travada.
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            composed = compose(remaining.datasets)
+        except CompositionError as exc:
+            QMessageBox.critical(self, "Falha ao recompor as fontes", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._install_composed_chain(composed, remaining)
+        self._show_composition_report(composed.report)
+        self.statusBar().showMessage(f"Fonte {dataset.name} removida.", 5_000)
+
+    def _clear_workspace(self) -> None:
+        """A metade de teardown da instalação: o mapa volta a estar vazio."""
+
+        self._set_circuit_level_model(None)
+        self._set_circuit_catalog(None)
+        self._set_regulator_source_model(None)
+        self._set_switch_model(None)
+        self._set_load_pattern_model(None)
+        self._set_generator_model(None)
+        self._set_allocation_model(None)
+        self._set_capacitor_model(None)
+        self._set_load_model(None)
+        self._set_line_model(None)
+        self._set_cable_model(None)
+        self._workspace = self._workspace.cleared()
+        self._composition = None
+        self._model = None
+        self._selected_feature = None
+        self.search_index.set_bars(None, build_fields=False)
+        self.view.set_model(None)
+        self.virtualizer.reset_model(None)
+        self._set_selection(None)
+        self.total_status.setText("Barras: 0")
+        self.show_bars_action.setEnabled(False)
+        self.fit_action.setEnabled(False)
+        self.sources_table_model.set_workspace(self._workspace)
+        self.sources_action.setEnabled(False)
+        self._sync_import_availability()
+        self._sync_search_availability()
+        self._sync_export_availability()
+        self._sync_mdb_actions()
+
+    def _show_composition_report(self, report) -> None:  # noqa: ANN001
+        """Colisão, reprojeção e cabo fundido nunca passam em silêncio."""
+
+        if not report.has_warnings:
+            return
+        lines: list[str] = []
+        if report.collisions:
+            lines.append(
+                f"{len(report.collisions):n} identificador(es) repetido(s) entre "
+                "fontes foram qualificados:"
+            )
+            lines.extend(f"  • {item.description}" for item in report.collisions[:20])
+            if len(report.collisions) > 20:
+                lines.append(f"  … e mais {len(report.collisions) - 20:n}.")
+        if report.code_collisions:
+            lines.append("")
+            lines.append(
+                f"{len(report.code_collisions):n} CODIGO(s) repetido(s) entre "
+                "fontes. O cadastro não foi alterado; a exportação desambigua:"
+            )
+            lines.extend(
+                f"  • {item.description}" for item in report.code_collisions[:10]
+            )
+        for item in report.reprojections:
+            lines.append("")
+            lines.append(item.description)
+        if report.merged_cables:
+            lines.append("")
+            lines.append(
+                f"{len(report.merged_cables):n} cabo(s) idêntico(s) em fontes "
+                "diferentes foram reaproveitados."
+            )
+        for note in report.notes:
+            lines.append("")
+            lines.append(note)
+        if report.crs_warning:
+            lines.append("")
+            lines.append(report.crs_warning)
+        # Modeless, como o relatório de importação: um diálogo modal aqui
+        # travaria a instalação da cadeia no meio, e o usuário ainda precisa
+        # olhar o mapa para entender o que o relatório está dizendo.
+        if self._composition_report_box is not None:
+            self._composition_report_box.close()
+        box = QMessageBox(self)
+        box.setWindowTitle("Composição das fontes")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("A composição precisou ajustar o que segue.")
+        box.setDetailedText("\n".join(lines))
+        box.setModal(False)
+        self._composition_report_box = box
+        box.show()
+        box.raise_()
+
+    def _sync_mdb_actions(self) -> None:
+        """Habilita as duas ações de banco, cada uma com o seu motivo na dica.
+
+        Acrescentar exige um mapa a que acrescentar: sem barras carregadas a
+        ação fica desabilitada dizendo por quê, em vez de sumir — a mesma
+        disciplina de ``mdb_import_action`` sem driver ODBC.
+        """
+
+        self.undo_project_action.setEnabled(not self._busy() and self._project.previous is not None)
+        self.new_project_action.setEnabled(not self._busy())
+        available = self._mdb_error is None
+        self.mdb_import_action.setEnabled(available)
+        if not available:
+            self.mdb_add_action.setEnabled(False)
+            self.mdb_add_action.setToolTip(self._mdb_error or "")
+            return
+        has_model = self._model is not None
+        self.mdb_add_action.setEnabled(has_model)
+        self.mdb_add_action.setToolTip(
+            "Acrescenta os circuitos escolhidos de outro banco ao mapa atual, "
+            "mantendo as fontes já carregadas"
+            if has_model
+            else "Não há nada a que acrescentar; use "
+            "“Importar banco de dados…” primeiro"
+        )
 
     def _sync_search_availability(self) -> None:
         available = self.search_index.entity_count > 0

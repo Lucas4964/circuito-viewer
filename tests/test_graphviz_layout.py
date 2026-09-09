@@ -86,6 +86,7 @@ class GraphvizSerializationTests(unittest.TestCase):
                 rank_separation_px=56.0,
                 edge_routing=GraphvizEdgeRouting.SPLINE,
                 equal_rank_spacing=False,
+                switches_as_nodes=False,
                 tree_edge_weight=8,
                 tree_edge_minlen=1,
                 crossing_minimization=1.0,
@@ -100,6 +101,7 @@ class GraphvizSerializationTests(unittest.TestCase):
                 "rank_separation_px": 120,
                 "edge_routing": "ortho",
                 "equal_rank_spacing": "sim",
+                "switches_as_nodes": "sim",
                 "tree_edge_weight": 101,
                 "tree_edge_minlen": 3,
                 "crossing_minimization": float("nan"),
@@ -111,6 +113,7 @@ class GraphvizSerializationTests(unittest.TestCase):
         self.assertEqual(settings.rank_separation_px, 120.0)
         self.assertEqual(settings.edge_routing, GraphvizEdgeRouting.SPLINE)
         self.assertTrue(settings.equal_rank_spacing)
+        self.assertTrue(settings.switches_as_nodes)
         self.assertEqual(settings.tree_edge_weight, 8)
         self.assertEqual(settings.tree_edge_minlen, 3)
         self.assertEqual(settings.crossing_minimization, 1.0)
@@ -133,6 +136,8 @@ class GraphvizSerializationTests(unittest.TestCase):
             GraphvizLayoutSettings(crossing_minimization=4.1)
         with self.assertRaises(ValueError):
             GraphvizLayoutSettings(equal_rank_spacing="false")
+        with self.assertRaises(ValueError):
+            GraphvizLayoutSettings(switches_as_nodes="true")
 
     def test_forest_is_shared_and_ignores_parallel_and_self_edges(self) -> None:
         graph = BlockGraph(
@@ -251,6 +256,67 @@ class GraphvizSerializationTests(unittest.TestCase):
             graphviz_layout_cache_key(original, GRAPHVIZ_VERSION),
             graphviz_layout_cache_key(customized, GRAPHVIZ_VERSION),
         )
+
+    def test_switches_as_nodes_reserve_label_boxes_and_explicit_layers(self) -> None:
+        graph = BlockGraph(
+            (_record(1, source=True), _record(2), _record(3)),
+            (
+                _edge(10, 1, 2, label="CHAVE PRINCIPAL"),
+                _edge(11, 1, 2),
+                _edge(12, 2, 3),
+                _edge(13, 3, 3),
+            ),
+        )
+        envelopes = {
+            block_id: BlockNodeEnvelope() for block_id in graph.node_ids
+        }
+        label_sizes = {
+            10: (80.0, 20.0),
+            11: (60.0, 20.0),
+            12: (60.0, 20.0),
+            13: (60.0, 20.0),
+        }
+
+        direct = serialize_graphviz_dot(graph, node_envelopes=envelopes)
+        auxiliary = serialize_graphviz_dot(
+            graph,
+            node_envelopes=envelopes,
+            edge_label_sizes=label_sizes,
+            settings=GraphvizLayoutSettings(switches_as_nodes=True),
+        )
+
+        self.assertTrue(auxiliary.switches_as_nodes)
+        self.assertIn('"s_10" [id="switch_node_10"', auxiliary.source)
+        self.assertIn("width=1.222222222", auxiliary.source)
+        self.assertIn("height=0.388888889", auxiliary.source)
+        self.assertIn('id="switch_10_a", weight=8, minlen=1', auxiliary.source)
+        self.assertIn('id="switch_10_b", weight=8, minlen=1', auxiliary.source)
+        self.assertIn('id="switch_11_a", constraint=false', auxiliary.source)
+        self.assertIn('id="switch_13_b", constraint=false', auxiliary.source)
+        self.assertIn("subgraph rank_layer_1", auxiliary.source)
+        self.assertIn('"n_1" -> "s_10"', auxiliary.source)
+        self.assertIn('"s_10" -> "n_2"', auxiliary.source)
+        self.assertNotIn('label="CHAVE PRINCIPAL"', auxiliary.source)
+        self.assertNotEqual(
+            graphviz_layout_cache_key(direct, GRAPHVIZ_VERSION),
+            graphviz_layout_cache_key(auxiliary, GRAPHVIZ_VERSION),
+        )
+
+    def test_switches_as_nodes_require_every_label_envelope(self) -> None:
+        graph = BlockGraph(
+            (_record(1, source=True), _record(2)),
+            (_edge(10, 1, 2),),
+        )
+        envelopes = {
+            block_id: BlockNodeEnvelope() for block_id in graph.node_ids
+        }
+
+        with self.assertRaisesRegex(GraphvizLayoutError, "etiquetas"):
+            serialize_graphviz_dot(
+                graph,
+                node_envelopes=envelopes,
+                settings=GraphvizLayoutSettings(switches_as_nodes=True),
+            )
 
     def test_circuit_separation_changes_cache_without_changing_dot(self) -> None:
         graph = BlockGraph((_record(1), _record(2)), ())
@@ -540,6 +606,117 @@ class GraphvizParserTests(unittest.TestCase):
                 self.envelopes,
             )
 
+    def test_auxiliary_switch_node_becomes_label_anchor_and_one_route(self) -> None:
+        dot_input = GraphvizDotInput(
+            "digraph G {}",
+            {1: 0, 2: 1},
+            (1,),
+            frozenset({0}),
+            switches_as_nodes=True,
+        )
+        payload = {
+            "bb": "0,0,100,200",
+            "objects": [
+                {"_gvid": 0, "name": "n_1", "pos": "50,180"},
+                {"_gvid": 1, "name": "s_7", "pos": "50,100"},
+                {"_gvid": 2, "name": "n_2", "pos": "50,20"},
+            ],
+            "edges": [
+                {
+                    "id": "switch_7_a",
+                    "tail": 0,
+                    "head": 1,
+                    "_draw_": [{
+                        "op": "b",
+                        "points": [[50, 150], [50, 140], [50, 120], [50, 114]],
+                    }],
+                },
+                {
+                    "id": "switch_7_b",
+                    "tail": 1,
+                    "head": 2,
+                    "_draw_": [{
+                        "op": "b",
+                        "points": [[50, 86], [50, 70], [50, 50], [50, 48]],
+                    }],
+                },
+            ],
+        }
+
+        layout = parse_graphviz_json(
+            payload,
+            self.graph,
+            dot_input,
+            self.envelopes,
+        )
+
+        self.assertEqual(layout.edge_label_positions[7], (0.0, 0.0))
+        self.assertEqual(set(layout.edge_routes), {7})
+        self.assertTrue(layout.edge_routes[7].cubic)
+        self.assertEqual(len(layout.edge_routes[7].points), 13)
+        self.assertEqual(layout.edge_routes[7].points[6], (0.0, 0.0))
+
+        payload["edges"] = payload["edges"][:1]
+        with self.assertRaisesRegex(GraphvizLayoutError, "duas metades"):
+            parse_graphviz_json(
+                payload,
+                self.graph,
+                dot_input,
+                self.envelopes,
+            )
+
+    def test_auxiliary_route_follows_the_original_application_orientation(self) -> None:
+        graph = BlockGraph(
+            (_record(1, source=True), _record(2)),
+            (_edge(7, 2, 1),),
+        )
+        dot_input = GraphvizDotInput(
+            "digraph G {}",
+            {1: 0, 2: 1},
+            (1,),
+            frozenset({0}),
+            switches_as_nodes=True,
+        )
+        payload = {
+            "bb": "0,0,100,200",
+            "objects": [
+                {"_gvid": 0, "name": "n_1", "pos": "50,180"},
+                {"_gvid": 1, "name": "s_7", "pos": "50,100"},
+                {"_gvid": 2, "name": "n_2", "pos": "50,20"},
+            ],
+            "edges": [
+                {
+                    "id": "switch_7_a",
+                    "tail": 0,
+                    "head": 1,
+                    "_draw_": [{
+                        "op": "b",
+                        "points": [[50, 150], [50, 140], [50, 120], [50, 114]],
+                    }],
+                },
+                {
+                    "id": "switch_7_b",
+                    "tail": 1,
+                    "head": 2,
+                    "_draw_": [{
+                        "op": "b",
+                        "points": [[50, 86], [50, 70], [50, 50], [50, 48]],
+                    }],
+                },
+            ],
+        }
+
+        layout = parse_graphviz_json(
+            payload,
+            graph,
+            dot_input,
+            self.envelopes,
+        )
+
+        route = layout.edge_routes[7]
+        self.assertGreater(route.points[0][1], route.points[-1][1])
+        self.assertEqual(layout.edge_label_positions[7], (0.0, 0.0))
+
 
 class GraphvizProcessTests(unittest.TestCase):
     def test_nonzero_exit_reports_stderr(self) -> None:
@@ -732,6 +909,171 @@ class BundledGraphvizSmokeTests(unittest.TestCase):
                     set(layout.edge_label_positions),
                     {0, 1, 2, 3},
                 )
+
+    def test_bundled_dot_supports_auxiliary_switch_nodes(self) -> None:
+        status = probe_graphviz_runtime()
+        if not status.available:
+            self.skipTest(status.reason)
+        graph = BlockGraph(
+            (_record(1, source=True), _record(2), _record(3)),
+            (
+                _edge(0, 1, 2),
+                _edge(1, 1, 2),
+                _edge(2, 2, 3),
+                _edge(3, 3, 3),
+            ),
+        )
+        envelopes = {
+            block_id: BlockNodeEnvelope(138.0, 110.0, 56.0)
+            for block_id in graph.node_ids
+        }
+        label_sizes = {edge.switch_index: (70.0, 22.0) for edge in graph.edges}
+        dot_input = serialize_graphviz_dot(
+            graph,
+            node_envelopes=envelopes,
+            edge_label_sizes=label_sizes,
+            settings=GraphvizLayoutSettings(switches_as_nodes=True),
+        )
+
+        layout = calculate_graphviz_layout(
+            status.executable,
+            dot_input,
+            graph,
+            envelopes,
+            edge_label_sizes=label_sizes,
+        )
+
+        self.assertEqual(set(layout.positions), set(graph.node_ids))
+        self.assertEqual(set(layout.edge_routes), {0, 1, 2, 3})
+        self.assertEqual(set(layout.edge_label_positions), {0, 1, 2, 3})
+        for switch_index, route in layout.edge_routes.items():
+            self.assertIn(layout.edge_label_positions[switch_index], route.points)
+            self.assertTrue(
+                all(math.isfinite(value) for point in route.points for value in point)
+            )
+        self.assertLess(
+            layout.positions[1][1],
+            layout.edge_label_positions[0][1],
+        )
+        self.assertLess(
+            layout.edge_label_positions[0][1],
+            layout.positions[2][1],
+        )
+        self.assertLess(
+            layout.positions[1][1],
+            layout.edge_label_positions[1][1],
+        )
+        self.assertLess(
+            layout.edge_label_positions[1][1],
+            layout.positions[2][1],
+        )
+        self.assertGreater(
+            layout.edge_label_positions[3][1],
+            layout.positions[3][1],
+        )
+
+    def test_auxiliary_switch_nodes_support_every_routing_mode(self) -> None:
+        status = probe_graphviz_runtime()
+        if not status.available:
+            self.skipTest(status.reason)
+        graph = BlockGraph(
+            (_record(1, source=True), _record(2)),
+            (_edge(0, 1, 2),),
+        )
+        envelopes = {
+            block_id: BlockNodeEnvelope(100.0, 90.0, 56.0)
+            for block_id in graph.node_ids
+        }
+        label_sizes = {0: (70.0, 22.0)}
+
+        for routing in GraphvizEdgeRouting:
+            with self.subTest(routing=routing.value):
+                dot_input = serialize_graphviz_dot(
+                    graph,
+                    node_envelopes=envelopes,
+                    edge_label_sizes=label_sizes,
+                    settings=GraphvizLayoutSettings(
+                        switches_as_nodes=True,
+                        edge_routing=routing,
+                    ),
+                )
+                layout = calculate_graphviz_layout(
+                    status.executable,
+                    dot_input,
+                    graph,
+                    envelopes,
+                    edge_label_sizes=label_sizes,
+                )
+
+                route = layout.edge_routes[0]
+                self.assertIn(layout.edge_label_positions[0], route.points)
+                self.assertGreaterEqual(len(route.points), 3)
+
+    def test_auxiliary_nodes_keep_four_circuits_separated(self) -> None:
+        status = probe_graphviz_runtime()
+        if not status.available:
+            self.skipTest(status.reason)
+        graph = BlockGraph(
+            tuple(
+                _record(block_id, source=block_id % 2 == 1)
+                for block_id in range(1, 9)
+            ),
+            (
+                _edge(0, 1, 2),
+                _edge(1, 3, 4),
+                _edge(2, 5, 6),
+                _edge(3, 7, 8),
+                _edge(4, 2, 3),
+                _edge(5, 4, 5),
+                _edge(6, 6, 7),
+            ),
+        )
+        block_circuits = {
+            block_id: (block_id - 1) // 2 for block_id in graph.node_ids
+        }
+        envelopes = {
+            block_id: BlockNodeEnvelope(72.0, 90.0, 56.0)
+            for block_id in graph.node_ids
+        }
+        label_sizes = {edge.switch_index: (70.0, 22.0) for edge in graph.edges}
+        dot_input = serialize_graphviz_dot(
+            graph,
+            node_envelopes=envelopes,
+            edge_label_sizes=label_sizes,
+            block_circuit_indices=block_circuits,
+            selected_circuit_indices={0, 1, 2, 3},
+            settings=GraphvizLayoutSettings(
+                switches_as_nodes=True,
+                circuit_separation_px=120.0,
+            ),
+        )
+
+        layout = calculate_graphviz_layout(
+            status.executable,
+            dot_input,
+            graph,
+            envelopes,
+            edge_label_sizes=label_sizes,
+        )
+
+        bounds = []
+        for circuit_index in range(4):
+            node_ids = tuple(
+                block_id
+                for block_id, owner in block_circuits.items()
+                if owner == circuit_index
+            )
+            left = min(layout.positions[block_id][0] - 36.0 for block_id in node_ids)
+            right = max(layout.positions[block_id][0] + 36.0 for block_id in node_ids)
+            bounds.append((left, right))
+        bounds.sort()
+        for previous, current in zip(bounds, bounds[1:]):
+            self.assertGreaterEqual(current[0] - previous[1], 120.0 - 1.0e-6)
+        for switch_index in (4, 5, 6):
+            self.assertIn(
+                layout.edge_label_positions[switch_index],
+                layout.edge_routes[switch_index].points,
+            )
 
     def test_bundled_dot_respects_the_visual_gap_between_circuits(self) -> None:
         status = probe_graphviz_runtime()
