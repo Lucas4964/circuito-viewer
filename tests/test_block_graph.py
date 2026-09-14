@@ -737,17 +737,17 @@ class BlockGraphFilterTests(unittest.TestCase):
         )
         self.circuits = {1: 0, 2: 0, 3: 1, 4: 2, 5: None}
 
-    def test_filter_is_induced_and_preserves_parallel_edges_and_indices(self) -> None:
+    def test_multiple_circuits_keep_neighbors_parallel_edges_and_indices(self) -> None:
         filtered = filter_block_graph(
             self.graph,
             self.circuits,
             frozenset({0, 1}),
         )
 
-        self.assertEqual(filtered.node_ids, (1, 2, 3))
+        self.assertEqual(filtered.node_ids, (1, 2, 3, 4))
         self.assertEqual(
             tuple(edge.switch_index for edge in filtered.edges),
-            (0, 1, 4),
+            (0, 1, 2, 4),
         )
 
     def test_single_circuit_adds_only_direct_external_blocks_and_edges(self) -> None:

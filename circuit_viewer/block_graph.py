@@ -161,6 +161,49 @@ class BlockGraphLayout:
     )
 
 
+def external_block_hosts(
+    graph: BlockGraph,
+    block_circuit_indices: Mapping[int, int | None],
+    selected_circuit_indices: Sequence[int] | frozenset[int] | set[int],
+) -> dict[int, int]:
+    """Blocos externos diretos e seu anfitrião visual, sem mudar o dono elétrico.
+
+    Um bloco compartilhado fica junto ao menor índice selecionado ao qual se
+    conecta. Apenas circuitos selecionados originam a busca: não há recursão.
+    """
+    selected = frozenset(int(value) for value in selected_circuit_indices)
+    hosts: dict[int, int] = {}
+    for edge in graph.edges:
+        start = block_circuit_indices.get(edge.start_block_id)
+        end = block_circuit_indices.get(edge.end_block_id)
+        if start in selected and end is not None and end not in selected:
+            hosts[edge.end_block_id] = min(start, hosts.get(edge.end_block_id, start))
+        elif end in selected and start is not None and start not in selected:
+            hosts[edge.start_block_id] = min(end, hosts.get(edge.start_block_id, end))
+    return hosts
+
+
+def block_layout_groups(
+    graph: BlockGraph,
+    block_circuit_indices: Mapping[int, int | None] | None,
+    selected_circuit_indices: Sequence[int] | frozenset[int] | set[int] = (),
+) -> dict[int, tuple[str, int]]:
+    """Agrupamento geométrico comum aos layouts interno, espacial e Graphviz."""
+    if block_circuit_indices is None:
+        return {block_id: ("all", 0) for block_id in graph.node_ids}
+    external = external_block_hosts(graph, block_circuit_indices, selected_circuit_indices)
+    groups = {}
+    for block_id in graph.node_ids:
+        circuit = block_circuit_indices.get(block_id)
+        if block_id in external:
+            groups[block_id] = ("circuit", external[block_id])
+        elif circuit is None:
+            groups[block_id] = ("unresolved", 0)
+        else:
+            groups[block_id] = ("circuit", int(circuit))
+    return groups
+
+
 def filter_block_graph(
     graph: BlockGraph,
     block_circuit_indices: dict[int, int | None],
@@ -174,10 +217,9 @@ def filter_block_graph(
     ``BlockGraphEdge.switch_index`` continua apontando para o registro original
     da chave, o que permite à interface navegar até o trecho correspondente.
 
-    Com exatamente um circuito selecionado, acrescenta os blocos válidos dos
-    outros circuitos diretamente ligados a ele e somente as arestas dessa
-    ligação. O circuito vizinho não é expandido e seus demais enlaces não
-    aparecem. Com zero ou vários circuitos, o recorte continua sendo induzido.
+    Acrescenta os blocos externos diretamente ligados a qualquer circuito
+    selecionado e todas as chaves dessas ligações. Não expande os vizinhos
+    externos nem acrescenta ligações exclusivamente entre eles.
     """
 
     selected = frozenset(int(value) for value in selected_circuit_indices)
@@ -190,38 +232,22 @@ def filter_block_graph(
         elif circuit_index in selected:
             base_visible_ids.add(record.block_id)
 
-    visible_ids = set(base_visible_ids)
-    direct_edge_indices: set[int] = set()
-    if len(selected) == 1:
-        selected_circuit = next(iter(selected))
-        for edge_index, edge in enumerate(graph.edges):
-            start_circuit = block_circuit_indices.get(edge.start_block_id)
-            end_circuit = block_circuit_indices.get(edge.end_block_id)
-            if (
-                start_circuit == selected_circuit
-                and end_circuit is not None
-                and end_circuit != selected_circuit
-            ):
-                visible_ids.add(edge.end_block_id)
-                direct_edge_indices.add(edge_index)
-            elif (
-                end_circuit == selected_circuit
-                and start_circuit is not None
-                and start_circuit != selected_circuit
-            ):
-                visible_ids.add(edge.start_block_id)
-                direct_edge_indices.add(edge_index)
+    external = external_block_hosts(graph, block_circuit_indices, selected)
+    visible_ids = base_visible_ids | external.keys()
     nodes = tuple(
         record for record in graph.nodes if record.block_id in visible_ids
     )
     edges = tuple(
         edge
-        for edge_index, edge in enumerate(graph.edges)
+        for edge in graph.edges
         if (
             edge.start_block_id in base_visible_ids
             and edge.end_block_id in base_visible_ids
         )
-        or edge_index in direct_edge_indices
+        or (block_circuit_indices.get(edge.start_block_id) in selected
+            and edge.end_block_id in external)
+        or (block_circuit_indices.get(edge.end_block_id) in selected
+            and edge.start_block_id in external)
     )
     return BlockGraph(nodes, edges)
 
@@ -1761,8 +1787,8 @@ def layout_block_graph(
 
     A API antiga sem argumentos nomeados continua válida. Quando o mapa de
     circuitos é fornecido, cada circuito ganha uma árvore local e as caixas são
-    aproximadas por um metagrafo de interligações. Com um único circuito
-    selecionado, seus blocos externos aparecem como folhas da mesma árvore.
+    aproximadas por um metagrafo de interligações. Blocos externos diretos
+    acompanham a árvore do seu anfitrião selecionado, sem duplicação.
     """
 
     node_ids = tuple(sorted(graph.node_ids))
@@ -1778,32 +1804,7 @@ def layout_block_graph(
         for block_id in node_ids
     }
     selected = frozenset(int(value) for value in selected_circuit_indices)
-    single_selected = next(iter(selected)) if len(selected) == 1 else None
-
-    external_for_selected: set[int] = set()
-    if single_selected is not None and block_circuit_indices is not None:
-        for edge in graph.edges:
-            start_circuit = circuits[edge.start_block_id]
-            end_circuit = circuits[edge.end_block_id]
-            if start_circuit == single_selected and end_circuit not in (None, single_selected):
-                external_for_selected.add(edge.end_block_id)
-            elif end_circuit == single_selected and start_circuit not in (None, single_selected):
-                external_for_selected.add(edge.start_block_id)
-
-    cluster_for_node: dict[int, tuple[str, int]] = {}
-    for block_id in node_ids:
-        circuit = circuits[block_id]
-        if block_circuit_indices is None:
-            key = ("all", 0)
-        elif single_selected is not None and (
-            circuit == single_selected or block_id in external_for_selected
-        ):
-            key = ("circuit", single_selected)
-        elif circuit is None:
-            key = ("unresolved", 0)
-        else:
-            key = ("circuit", int(circuit))
-        cluster_for_node[block_id] = key
+    cluster_for_node = block_layout_groups(graph, block_circuit_indices, selected)
 
     cluster_nodes: dict[tuple[str, int], list[int]] = defaultdict(list)
     for block_id, key in cluster_for_node.items():
@@ -1822,11 +1823,11 @@ def layout_block_graph(
     for key in sorted(cluster_nodes, key=_cluster_sort_key):
         values = tuple(sorted(cluster_nodes[key]))
         root_eligible = None
-        if single_selected is not None and key == ("circuit", single_selected):
+        if key[0] == "circuit" and key[1] in selected:
             root_eligible = {
                 block_id
                 for block_id in values
-                if circuits[block_id] == single_selected
+                if circuits[block_id] == key[1]
             }
         positions, local_depths, local_roots, local_tree_edges = _layout_tree_cluster(
             graph,
@@ -2118,7 +2119,7 @@ def _component_coordinate_layout(
     anchors: Mapping[int, Point],
     envelopes: Mapping[int, BlockNodeEnvelope],
     circuits: Mapping[int, int | None],
-    single_selected: int | None,
+    host_circuit: int | None,
 ) -> dict[int, Point]:
     raw_center = (
         median(anchors[block_id][0] for block_id in component),
@@ -2188,9 +2189,9 @@ def _component_coordinate_layout(
             max(raw_length, 1.0e-9) / max(typical_raw, 1.0e-9)
         )
         desired = min(MAX_COORDINATE_EDGE_LENGTH, max(MIN_COORDINATE_EDGE_LENGTH, desired))
-        if single_selected is not None and (
-            (circuits[edge.start_block_id] == single_selected)
-            != (circuits[edge.end_block_id] == single_selected)
+        if host_circuit is not None and (
+            (circuits[edge.start_block_id] == host_circuit)
+            != (circuits[edge.end_block_id] == host_circuit)
         ):
             desired = min(desired, 240.0)
         desired_lengths[edge_index] = desired
@@ -2242,9 +2243,9 @@ def _component_coordinate_layout(
             dy = positions[end][1] - positions[start][1]
             distance = math.hypot(dx, dy)
             maximum = MAX_COORDINATE_EDGE_LENGTH
-            if single_selected is not None and (
-                (circuits[start] == single_selected)
-                != (circuits[end] == single_selected)
+            if host_circuit is not None and (
+                (circuits[start] == host_circuit)
+                != (circuits[end] == host_circuit)
             ):
                 maximum = 240.0
             target = min(maximum, max(MIN_COORDINATE_EDGE_LENGTH, distance))
@@ -2285,7 +2286,7 @@ def _layout_coordinate_cluster(
     anchors: Mapping[int, Point],
     envelopes: Mapping[int, BlockNodeEnvelope],
     circuits: Mapping[int, int | None],
-    single_selected: int | None,
+    host_circuit: int | None,
     target_aspect_ratio: float,
 ) -> dict[int, Point]:
     """Normaliza componentes elétricos dentro de uma mesma caixa espacial."""
@@ -2317,7 +2318,7 @@ def _layout_coordinate_cluster(
             anchors,
             envelopes,
             circuits,
-            single_selected,
+            host_circuit,
         )
         relative[component_index] = positions
         bounds = _layout_bounds(positions, envelopes)
@@ -2388,37 +2389,7 @@ def layout_block_graph_by_coordinates(
         for block_id in node_ids
     }
     selected = frozenset(int(value) for value in selected_circuit_indices)
-    single_selected = next(iter(selected)) if len(selected) == 1 else None
-    external_for_selected: set[int] = set()
-    if single_selected is not None and block_circuit_indices is not None:
-        for edge in graph.edges:
-            start_circuit = circuits[edge.start_block_id]
-            end_circuit = circuits[edge.end_block_id]
-            if (
-                start_circuit == single_selected
-                and end_circuit not in (None, single_selected)
-            ):
-                external_for_selected.add(edge.end_block_id)
-            elif (
-                end_circuit == single_selected
-                and start_circuit not in (None, single_selected)
-            ):
-                external_for_selected.add(edge.start_block_id)
-
-    cluster_for_node: dict[int, tuple[str, int]] = {}
-    for block_id in node_ids:
-        circuit = circuits[block_id]
-        if block_circuit_indices is None:
-            key = ("all", 0)
-        elif single_selected is not None and (
-            circuit == single_selected or block_id in external_for_selected
-        ):
-            key = ("circuit", single_selected)
-        elif circuit is None:
-            key = ("unresolved", 0)
-        else:
-            key = ("circuit", int(circuit))
-        cluster_for_node[block_id] = key
+    cluster_for_node = block_layout_groups(graph, block_circuit_indices, selected)
 
     cluster_nodes: dict[tuple[str, int], list[int]] = defaultdict(list)
     for block_id, key in cluster_for_node.items():
@@ -2440,7 +2411,7 @@ def layout_block_graph_by_coordinates(
             anchors,
             envelopes,
             circuits,
-            single_selected,
+            key[1] if key[0] == "circuit" and key[1] in selected else None,
             aspect,
         )
         local_positions[key] = local

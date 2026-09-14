@@ -529,6 +529,8 @@ class GraphvizParserTests(unittest.TestCase):
     def _payload(self, *, include_label: bool = True) -> dict[str, object]:
         edge: dict[str, object] = {
             "id": "switch_7",
+            "tail": 0,
+            "head": 1,
             "_draw_": [
                 {
                     "op": "b",
@@ -541,8 +543,8 @@ class GraphvizParserTests(unittest.TestCase):
         return {
             "bb": "0,0,100,100",
             "objects": [
-                {"name": "n_1", "pos": "20,80"},
-                {"name": "n_2", "pos": "80,20"},
+                {"_gvid": 0, "name": "n_1", "pos": "20,80"},
+                {"_gvid": 1, "name": "n_2", "pos": "80,20"},
             ],
             "edges": [edge],
         }

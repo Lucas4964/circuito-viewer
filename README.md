@@ -1895,7 +1895,10 @@ navegar pelo resultado.
 posições dos blocos, splines das chaves e âncoras de etiquetas. Cores, símbolos,
 nível de detalhe, seleção, hit-test e toda a pintura continuam no Qt; o
 aplicativo não usa imagens SVG ou PNG do Graphviz. O cálculo ocorre em segundo
-plano, tem limite de 30 segundos e é cancelado quando uma seleção mais recente
+plano. As curvas mantêm a geometria do Graphviz mesmo quando ele orienta uma
+ligação no sentido oposto ao cadastro: os pontos de controle acompanham a
+inversão antes do desenho, evitando retornos artificiais. O cálculo
+tem limite de 30 segundos e é cancelado quando uma seleção mais recente
 o substitui. Os oito últimos resultados ficam em cache, portanto alterações de
 cor não repetem o layout. Se o runtime faltar, estiver em plataforma diferente
 de Windows 64 bits ou devolver geometria inválida, a opção fica indisponível ou
@@ -1961,13 +1964,21 @@ vazia. Blocos sem associação inequívoca podem ser incluídos separadamente po
 **Sem circuito definido**. A escolha dura enquanto a rede atual estiver
 carregada e não altera a visibilidade dos circuitos no mapa principal.
 
-Quando exatamente um circuito é marcado, o grafo acrescenta automaticamente
-cada bloco de outro circuito ligado diretamente por uma chave magenta. Somente
-o bloco externo e as chaves que cruzam essa fronteira aparecem: o restante do
-circuito vizinho e seus outros enlaces ficam ocultos. Isso expõe pontos de
-manobra sem poluir o desenho. Com vários circuitos, permanece o subgrafo
-induzido normal; **Incluir vizinhos diretos** continua selecionando por inteiro
-os circuitos adjacentes de um único salto.
+Para qualquer quantidade de circuitos marcados, o grafo acrescenta os blocos
+externos diretamente ligados a cada um deles e todas as chaves dessas ligações
+em magenta. A expansão automática tem um salto: não mostra os demais blocos dos
+vizinhos nem conexões exclusivamente entre blocos externos. Selecionar um vizinho
+mostra sua estrutura completa e seus próprios vizinhos; desmarcá-lo conserva
+apenas os blocos que ainda fazem fronteira com os circuitos selecionados.
+
+Cada bloco real aparece uma vez, mesmo quando se liga a vários circuitos
+selecionados. Blocos distintos de um mesmo vizinho permanecem distintos e as
+chaves paralelas são preservadas. Nos três layouts, cada bloco externo acompanha
+o circuito selecionado ao qual se liga; havendo vários, o menor índice de
+circuito desempata seu anfitrião visual. Esse agrupamento não muda sua identidade,
+cor, potência, UC ou circuito de origem. **Incluir vizinhos diretos** seleciona
+por inteiro os circuitos adjacentes de um salto e revela sua nova fronteira.
+Os vizinhos precisam existir no projeto: o filtro não consulta nem importa MDBs.
 
 Clique em um nó para selecionar a linha correspondente na tabela de blocos e
 destacar a região na visualização principal. Clique em uma aresta ou em seu

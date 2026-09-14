@@ -28,6 +28,7 @@ from .block_graph import (
     BlockGraphLayout,
     BlockNodeEnvelope,
     build_block_graph_forest,
+    block_layout_groups,
 )
 
 
@@ -364,39 +365,10 @@ def _layout_groups(
     block_circuit_indices: Mapping[int, int | None] | None,
     selected_circuit_indices: Sequence[int] | frozenset[int] | set[int],
 ) -> dict[tuple[str, int], tuple[int, ...]]:
-    selected = frozenset(int(value) for value in selected_circuit_indices)
-    single_selected = next(iter(selected)) if len(selected) == 1 else None
-    circuits = {
-        block_id: (
-            None
-            if block_circuit_indices is None
-            else block_circuit_indices.get(block_id)
-        )
-        for block_id in graph.node_ids
-    }
-    external: set[int] = set()
-    if single_selected is not None:
-        for edge in graph.edges:
-            start = circuits[edge.start_block_id]
-            end = circuits[edge.end_block_id]
-            if start == single_selected and end not in (None, single_selected):
-                external.add(edge.end_block_id)
-            elif end == single_selected and start not in (None, single_selected):
-                external.add(edge.start_block_id)
+    groups = block_layout_groups(graph, block_circuit_indices, selected_circuit_indices)
     grouped: dict[tuple[str, int], list[int]] = defaultdict(list)
     for block_id in sorted(graph.node_ids):
-        circuit = circuits[block_id]
-        if block_circuit_indices is None:
-            key = ("all", 0)
-        elif single_selected is not None and (
-            circuit == single_selected or block_id in external
-        ):
-            key = ("circuit", single_selected)
-        elif circuit is None:
-            key = ("unresolved", 0)
-        else:
-            key = ("circuit", int(circuit))
-        grouped[key].append(block_id)
+        grouped[groups[block_id]].append(block_id)
     return {key: tuple(values) for key, values in grouped.items()}
 
 
@@ -418,7 +390,6 @@ def serialize_graphviz_dot(
         raise GraphvizLayoutError("Os índices técnicos das chaves devem ser únicos.")
 
     selected = frozenset(int(value) for value in selected_circuit_indices)
-    single_selected = next(iter(selected)) if len(selected) == 1 else None
     groups = _layout_groups(
         graph,
         block_circuit_indices,
@@ -440,12 +411,12 @@ def serialize_graphviz_dot(
     for key in sorted(groups, key=lambda value: (value[0], value[1])):
         values = groups[key]
         root_eligible = None
-        if single_selected is not None and key == ("circuit", single_selected):
+        if key[0] == "circuit" and key[1] in selected:
             root_eligible = {
                 block_id
                 for block_id in values
                 if block_circuit_indices is not None
-                and block_circuit_indices.get(block_id) == single_selected
+                and block_circuit_indices.get(block_id) == key[1]
             }
         forest = build_block_graph_forest(
             graph,
@@ -635,9 +606,19 @@ def serialize_graphviz_dot(
                 f"{separator}{common}];"
             )
         else:
+            label = _dot_quote(edge.label)
+            size = None if edge_label_sizes is None else edge_label_sizes.get(edge.switch_index)
+            if size is not None:
+                if len(size) < 2 or any(not math.isfinite(float(v)) or float(v) <= 0 for v in size[:2]):
+                    raise GraphvizLayoutError("Dimensões da etiqueta da chave inválidas.")
+                # O texto é desenhado pelo Qt. Reservar sua caixa real evita
+                # sobreposição entre etiquetas paralelas com fontes diferentes.
+                width, height = (math.ceil(float(v) + 8.0) for v in size[:2])
+                label = (f'<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="0">'
+                         f'<TR><TD FIXEDSIZE="TRUE" WIDTH="{width}" HEIGHT="{height}"> </TD></TR></TABLE>>')
             attributes[:0] = [
                 f'id={_dot_quote(f"switch_{edge.switch_index}")}',
-                f'label={_dot_quote(edge.label)}',
+                f'label={label}',
             ]
             lines.append(
                 f'  "n_{tail}" -> "n_{head}" [{", ".join(attributes)}];'
@@ -857,7 +838,7 @@ def parse_graphviz_json(
                 if object_index in object_names:
                     raise ValueError("_gvid duplicado")
                 object_names[object_index] = name
-            elif dot_input.switches_as_nodes:
+            else:
                 raise KeyError("_gvid")
             if name.startswith("n_"):
                 block_id = int(name[2:])
@@ -940,14 +921,14 @@ def parse_graphviz_json(
             and spline_operations[0].get("op") in {"b", "B"}
             and (len(points) - 1) % 3 == 0
         )
+        try:
+            tail_name = object_names[int(raw["tail"])]
+            head_name = object_names[int(raw["head"])]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GraphvizLayoutError(
+                "Extremidades de chave Graphviz inválidas."
+            ) from exc
         if dot_input.switches_as_nodes:
-            try:
-                tail_name = object_names[int(raw["tail"])]
-                head_name = object_names[int(raw["head"])]
-            except (KeyError, TypeError, ValueError) as exc:
-                raise GraphvizLayoutError(
-                    "Extremidades de chave Graphviz inválidas."
-                ) from exc
             route_parts[switch_index][half] = _GraphvizRoutePart(
                 tail_name,
                 head_name,
@@ -957,6 +938,16 @@ def parse_graphviz_json(
             continue
 
         edge = edge_by_switch[switch_index]
+        expected = (f"n_{edge.start_block_id}", f"n_{edge.end_block_id}")
+        if (tail_name, head_name) == expected:
+            pass  # Inclui autoenlaces: não há inversão inferida entre nós iguais.
+        elif (head_name, tail_name) == expected:
+            # O dot orienta arestas de árvore do pai para o filho. O modelo
+            # elétrico pode ter o sentido oposto: inverter toda a spline antes
+            # de recortar as pontas conserva os controles e evita retornos.
+            points.reverse()
+        else:
+            raise GraphvizLayoutError("A chave Graphviz não liga os blocos esperados.")
         start_center = positions[edge.start_block_id]
         end_center = positions[edge.end_block_id]
         points[0] = _circle_endpoint(

@@ -2596,7 +2596,12 @@ continuam visíveis com `constraint=false`. Os envelopes completos viram
 `width`/`height` fixos e os códigos das chaves viram labels. O processo chama
 somente `bin/dot.exe -Kdot -Tjson` por stdin/stdout; o parser inverte Y,
 centraliza o canvas e converte posições, splines cúbicas e `lp` para
-`BlockGraphLayout`. Um nó, rota, âncora ou valor finito ausente invalida o
+`BlockGraphLayout`. Os campos `tail`/`head` e `_gvid` validam as extremidades:
+se a direção emitida pelo dot for oposta à chave, toda a sequência de pontos
+(incluindo os controles Bézier) é invertida antes de ajustar as pontas aos
+círculos. Autoenlaces conservam a ordem original. Essa normalização preserva
+a geometria da curva e evita retornos artificiais; também precede a separação
+visual entre circuitos. Um nó, rota, âncora ou valor finito ausente invalida o
 resultado inteiro, nunca apenas um item.
 
 Opcionalmente, `switches_as_nodes` troca somente a representação enviada ao
@@ -2662,16 +2667,19 @@ mapa um pequeno conector até a aresta.
 `QGraphicsObject` clicáveis e arestas são `QGraphicsPathItem`; o canvas branco
 oferece zoom sob o cursor, pan no fundo e reenquadramento. O cabeçalho abre um
 `CircuitSelectionPopup` com uma lista marcável sem reservar espaço permanente.
-`filter_block_graph()` produz o subgrafo induzido pelos circuitos escolhidos e
-`direct_circuit_neighbors()` expande somente um salto pelas arestas
-intercircuito. Quando há exatamente um circuito escolhido, o filtro acrescenta
-os blocos externos diretamente ligados e somente as arestas que cruzam essa
-fronteira; não inclui outros enlaces desses blocos nem prossegue pelo
-alimentador vizinho. Com várias escolhas o recorte permanece induzido. Um
+`filter_block_graph()` conserva os circuitos escolhidos e acrescenta seus
+blocos externos diretamente ligados, para qualquer quantidade de escolhas.
+Todas as chaves dessa fronteira permanecem visíveis, sem expansão recursiva
+nem enlaces exclusivamente entre blocos externos. `external_block_hosts()`
+deduplica os blocos e escolhe como anfitrião visual o menor índice selecionado
+adjacente; `block_layout_groups()` compartilha essa regra entre os três layouts,
+sem alterar a associação elétrica original. Circuitos selecionados permanecem
+completos em seus próprios grupos, e seus blocos têm prioridade como raízes.
+`direct_circuit_neighbors()` permite selecionar os vizinhos completos de um salto. Um
 circuito é marcado automaticamente; catálogos com dois ou
 mais começam vazios, e a associação neutra é uma opção separada. O grafo
 completo permanece imutável na janela e cada mudança de filtro recalcula a
-geometria somente do subgrafo visível nos dois modos. O resultado é
+geometria somente do subgrafo visível nos três modos. O resultado é
 determinístico para a mesma seleção, embora posições possam mudar entre filtros
 para eliminar os vazios deixados por circuitos ocultos.
 
