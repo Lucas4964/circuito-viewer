@@ -151,7 +151,13 @@ def branch_equivalent_totals(
     }
 
 
-def _format_pt_br(value: object) -> str:
+def format_pt_br(value: object) -> str:
+    """Valor de célula CSV em pt-BR: vírgula decimal, vazio para ``None``.
+
+    Público porque a seleção a jusante exporta com a mesma regra; uma segunda
+    vírgula decimal divergiria desta em silêncio.
+    """
+
     if value is None:
         return ""
     if isinstance(value, Decimal):
@@ -200,7 +206,7 @@ def build_branches_csv_bytes(
         record = branches.records[branch_index]
         demand, current = totals.get(record.branch_id, (None, None))
         writer.writerow(
-            _format_pt_br(value)
+            format_pt_br(value)
             for value in branch_table_values(record, demand, current)
         )
         if progress is not None:

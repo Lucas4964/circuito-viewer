@@ -171,5 +171,25 @@ class PhaseConfigurationTests(unittest.TestCase):
                     load_phase_configuration(self.write_json(payload))
 
 
+
+class PhaseNameForValueTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.configuration = load_phase_configuration()
+
+    def test_the_code_resolves_to_its_name(self) -> None:
+        self.assertEqual(self.configuration.name_for_value("13"), "DEF")
+        self.assertEqual(self.configuration.name_for_value("7"), "DE")
+        self.assertEqual(self.configuration.name_for_value("2"), "E")
+
+    def test_the_lookup_uses_the_class_normalization(self) -> None:
+        self.assertEqual(self.configuration.name_for_value(" 13 "), "DEF")
+        self.assertEqual(self.configuration.name_for_value(13), "DEF")
+
+    def test_an_unknown_or_empty_code_has_no_name(self) -> None:
+        self.assertIsNone(self.configuration.name_for_value("99"))
+        self.assertIsNone(self.configuration.name_for_value(""))
+        self.assertIsNone(self.configuration.name_for_value(None))
+
+
 if __name__ == "__main__":
     unittest.main()

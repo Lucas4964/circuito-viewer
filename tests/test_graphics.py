@@ -14,6 +14,8 @@ try:
     from PyQt6.QtWidgets import QApplication, QGraphicsScene
 
     from circuit_viewer.graphics import (
+        BarraItem,
+        BarsOverviewItem,
         BranchHighlightOverlayItem,
         MAX_ACTIVE_ITEMS,
         DiagramView,
@@ -25,6 +27,7 @@ try:
         LoadLodCoordinator,
         LoadVirtualizer,
         NORMAL_SEGMENT_WIDTH_PX,
+        POINT_COLOR,
         REGULATOR_COLOR,
         REGULATOR_DIAMETER_PX,
         ROOT_BAR_DIAMETER_PX,
@@ -32,6 +35,7 @@ try:
         RegulatorNetworkItem,
         RootBarNetworkItem,
         SEGMENT_SELECTION_WIDTH_PX,
+        SELECTED_COLOR,
         SegmentSelectionOverlayItem,
         SWITCH_COLOR,
         SWITCH_SEGMENT_WIDTH_PX,
@@ -1279,6 +1283,163 @@ class GraphicsTests(unittest.TestCase):
         switch_item.paint(painter, None)
         painter.end()
         self.assertEqual(QColor(switch_image.pixel(50, 80)).name(), "#ff0000")
+
+    # -- níveis de tensão: as barras coloridas por faixa ------------------
+
+    def voltage_bars(self) -> CircuitModel:
+        """Quatro barras em coluna, uma por categoria do teste."""
+
+        return CircuitModel(
+            [f"B{index}" for index in range(4)],
+            [""] * 4,
+            [50.0] * 4,
+            [20.0, 40.0, 60.0, 80.0],
+            UtmCrs(21, northern=False),
+        )
+
+    def paint_bars(self, item: BarsOverviewItem) -> QImage:
+        image = QImage(100, 100, QImage.Format.Format_RGB32)
+        image.fill(Qt.GlobalColor.white)
+        painter = QPainter(image)
+        painter.translate(0.0, 100.0)
+        item.paint(painter, None)
+        painter.end()
+        return image
+
+    def test_bars_without_bands_stay_a_single_black_polygon(self) -> None:
+        item = BarsOverviewItem(self.voltage_bars())
+        self.assertEqual(item.category_point_count, 1)
+        self.assertEqual(item.visible_point_count, 4)
+        image = self.paint_bars(item)
+        self.assertEqual(QColor(image.pixel(50, 20)).name(), POINT_COLOR.name())
+
+    def test_voltage_rendering_paints_one_color_per_band(self) -> None:
+        item = BarsOverviewItem(self.voltage_bars())
+        colors = ("#2E7D32", "#C62828", "#6A1B9A", "#000000")
+        item.set_voltage_rendering(
+            None,
+            np.array([0, 1, 2, 3], dtype=np.intp),
+            colors,
+        )
+        self.assertEqual(item.category_point_count, 4)
+        self.assertEqual(item.visible_point_count, 4)
+        image = self.paint_bars(item)
+        # As barras estão em y = 20, 40, 60 e 80 do modelo, e a cena inverte Y.
+        for y, color in zip((80, 60, 40, 20), colors, strict=True):
+            self.assertEqual(QColor(image.pixel(50, y)).name(), color.lower())
+
+    def test_undervoltage_and_overvoltage_do_not_share_a_pixel_color(self) -> None:
+        """O ponto do pedido: as duas pontas críticas têm de se distinguir."""
+
+        item = BarsOverviewItem(self.voltage_bars())
+        item.set_voltage_rendering(
+            None,
+            np.array([0, 1, 0, 1], dtype=np.intp),
+            ("#C62828", "#6A1B9A"),
+        )
+        image = self.paint_bars(item)
+        self.assertNotEqual(
+            QColor(image.pixel(50, 80)).name(),
+            QColor(image.pixel(50, 60)).name(),
+        )
+
+    def test_a_palette_change_does_not_rebuild_the_geometry(self) -> None:
+        item = BarsOverviewItem(self.voltage_bars())
+        styles = np.array([0, 0, 1, 1], dtype=np.intp)
+        item.set_voltage_rendering(None, styles, ("#2E7D32", "#C62828"))
+        revision = item.geometry_revision
+        item.set_voltage_rendering(None, styles, ("#2E7D32", "#6A1B9A"))
+        self.assertEqual(item.geometry_revision, revision)
+        image = self.paint_bars(item)
+        self.assertEqual(QColor(image.pixel(50, 40)).name(), "#6a1b9a")
+
+    def test_repeating_the_same_rendering_changes_nothing(self) -> None:
+        item = BarsOverviewItem(self.voltage_bars())
+        styles = np.array([0, 0, 1, 1], dtype=np.intp)
+        item.set_voltage_rendering(None, styles, ("#2E7D32", "#C62828"))
+        revision = item.geometry_revision
+        item.set_voltage_rendering(None, styles, ("#2E7D32", "#C62828"))
+        self.assertEqual(item.geometry_revision, revision)
+
+    def test_the_visibility_mask_preserves_the_bands(self) -> None:
+        item = BarsOverviewItem(self.voltage_bars())
+        item.set_voltage_rendering(
+            None,
+            np.array([0, 0, 1, 1], dtype=np.intp),
+            ("#2E7D32", "#C62828"),
+        )
+        item.set_visibility_mask(np.array([True, False, True, False], dtype=np.bool_))
+        self.assertEqual(item.visible_point_count, 2)
+        self.assertEqual(item.category_point_count, 2)
+        image = self.paint_bars(item)
+        self.assertEqual(QColor(image.pixel(50, 80)).name(), "#2e7d32")
+        self.assertEqual(QColor(image.pixel(50, 40)).name(), "#c62828")
+        self.assertEqual(QColor(image.pixel(50, 60)).name(), "#ffffff")
+
+    def test_turning_the_mode_off_restores_the_default_color(self) -> None:
+        item = BarsOverviewItem(self.voltage_bars())
+        item.set_voltage_rendering(
+            None,
+            np.array([0, 1, 0, 1], dtype=np.intp),
+            ("#2E7D32", "#C62828"),
+        )
+        item.set_voltage_rendering(None, None, ())
+        self.assertEqual(item.category_point_count, 1)
+        self.assertEqual(item.visible_point_count, 4)
+        image = self.paint_bars(item)
+        self.assertEqual(QColor(image.pixel(50, 20)).name(), POINT_COLOR.name())
+
+    def test_a_band_without_a_color_is_refused(self) -> None:
+        item = BarsOverviewItem(self.voltage_bars())
+        with self.assertRaises(ValueError):
+            item.set_voltage_rendering(
+                None,
+                np.array([0, 1, 2, 3], dtype=np.intp),
+                ("#2E7D32",),
+            )
+
+    def test_a_style_vector_of_the_wrong_size_names_the_bars(self) -> None:
+        item = BarsOverviewItem(self.voltage_bars())
+        with self.assertRaises(ValueError) as error:
+            item.set_voltage_rendering(None, np.zeros(3, dtype=np.intp), ("#2E7D32",))
+        self.assertIn("barras", str(error.exception))
+
+    def paint_bar_item(self, item: BarraItem) -> QColor:
+        image = QImage(20, 20, QImage.Format.Format_RGB32)
+        image.fill(Qt.GlobalColor.white)
+        painter = QPainter(image)
+        painter.translate(10.0, 10.0)
+        item.paint(painter, None)
+        painter.end()
+        return QColor(image.pixel(10, 10))
+
+    def test_a_bar_item_paints_the_band_color(self) -> None:
+        item = BarraItem()
+        item.bind(self.voltage_bars(), 0)
+        self.assertEqual(self.paint_bar_item(item).name(), POINT_COLOR.name())
+        item.set_fill_color(QColor("#6A1B9A"))
+        self.assertEqual(self.paint_bar_item(item).name(), "#6a1b9a")
+
+    def test_selection_wins_over_the_band(self) -> None:
+        item = BarraItem()
+        item.bind(self.voltage_bars(), 0)
+        item.set_fill_color(QColor("#6A1B9A"))
+        item.setSelected(True)
+        self.assertEqual(self.paint_bar_item(item).name(), SELECTED_COLOR.name())
+
+    def test_unbinding_drops_the_band_so_the_pool_cannot_leak_it(self) -> None:
+        item = BarraItem()
+        model = self.voltage_bars()
+        item.bind(model, 0)
+        item.set_fill_color(QColor("#6A1B9A"))
+        item.unbind()
+        item.bind(model, 1)
+        self.assertEqual(self.paint_bar_item(item).name(), POINT_COLOR.name())
+
+    def test_an_invalid_band_color_is_refused(self) -> None:
+        item = BarraItem()
+        with self.assertRaises(ValueError):
+            item.set_fill_color(QColor("não é cor"))
 
 
 if __name__ == "__main__":

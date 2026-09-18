@@ -84,7 +84,11 @@ _CANCEL_CHECK_INTERVAL = 4_096
 
 # Abaixo disto o nó não está energizado — é o neutro, a terra, ou uma barra que
 # ficou fora por chave aberta. Não é uma tensão baixa; é a ausência de tensão.
-_DEAD_NODE_PU = 1e-9
+#
+# Público porque a distinção não é só deste módulo: quem colore as barras por
+# faixa de tensão precisa do mesmo corte, e uma segunda constante com o mesmo
+# propósito divergiria em silêncio.
+DEAD_NODE_PU = 1e-9
 
 # O que o OpenDSS usa quando ninguém configura ``Vminpu`` na ``Load``. Precisa
 # ser conhecido aqui porque o corte relatado tem de ser o que **valeu**, não o
@@ -770,7 +774,7 @@ def _harvest_bus_voltages(
     # Nó com tensão nula é neutro/terra ou barra desenergizada; nenhum dos dois
     # é uma tensão que afundou, e deixá-los entrar fixaria o mínimo em zero.
     energized = tuple(
-        float(value) for value in pu_values if float(value) > _DEAD_NODE_PU
+        float(value) for value in pu_values if float(value) > DEAD_NODE_PU
     )
     if not energized:
         return None

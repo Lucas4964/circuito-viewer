@@ -349,7 +349,7 @@ def analyze_blocks(
         for load_index in range(len(loads)):
             block = int(component[int(loads.bar_indices[load_index])])
             loads_by_block[block].append(load_index)
-            power = _parse_power(loads.snom_values[load_index])
+            power = parse_power(loads.snom_values[load_index])
             if power is not None:
                 power_by_block[block].append(power)
 
@@ -414,8 +414,12 @@ def analyze_blocks(
     )
 
 
-def _parse_power(value: str) -> float | None:
-    """Converte o ``SNOM`` textual da carga, tolerando vírgula decimal."""
+def parse_power(value: str) -> float | None:
+    """Converte o ``SNOM`` textual da carga, tolerando vírgula decimal.
+
+    Pública porque a seleção a jusante soma o mesmo ``SNOM`` — e uma segunda
+    regra de conversão divergiria desta em silêncio.
+    """
 
     text = str(value).strip().replace(",", ".")
     if not text:
@@ -435,4 +439,5 @@ __all__ = [
     "SWITCHABLE",
     "analyze_blocks",
     "boundary_segment_mask",
+    "parse_power",
 ]

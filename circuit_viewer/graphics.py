@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import traceback
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 import numpy as np
 from PyQt6.QtCore import (
@@ -169,12 +169,13 @@ def _visibility_mask(mask: BoolArray | None, size: int, label: str) -> BoolArray
 def _style_indices(
     styles: Sequence[int] | None,
     size: int,
+    label: str = "trechos",
 ) -> np.ndarray:
     if styles is None:
         return np.full(size, -1, dtype=np.intp)
     values = np.asarray(styles, dtype=np.intp)
     if values.ndim != 1 or values.size != size:
-        raise ValueError(f"Os estilos de trechos devem possuir {size:n} valores.")
+        raise ValueError(f"Os estilos de {label} devem possuir {size:n} valores.")
     return np.ascontiguousarray(values)
 
 
@@ -300,13 +301,22 @@ def _draw_capacitor_plates(painter: QPainter, rect: QRectF) -> None:
 
 
 class BarsOverviewItem(QGraphicsItem):
-    """Representação de todas as barras em uma única operação de pintura."""
+    """Representação de todas as barras em poucas operações de pintura.
+
+    Um ``QPolygonF`` por categoria de cor, como o :class:`LineNetworkItem` faz
+    com os caminhos: sem faixas de tensão as barras caem todas na categoria
+    ``-1`` e sobra um polígono só, que é o desenho de sempre.
+    """
 
     def __init__(self, model: CircuitModel) -> None:
         super().__init__()
         self._model = model
         self._visibility_mask = np.ones(len(model), dtype=np.bool_)
-        self._points = QPolygonF()
+        self._style_indices = np.full(len(model), -1, dtype=np.intp)
+        self._colors: tuple[str, ...] = ()
+        self._points: dict[int, QPolygonF] = {}
+        self._visible_point_count = 0
+        self._geometry_revision = 0
         self._rebuild_points()
         bounds = model.bounds
         width = max(bounds.width, 1.0)
@@ -328,25 +338,77 @@ class BarsOverviewItem(QGraphicsItem):
 
     @property
     def visible_point_count(self) -> int:
-        return self._points.size()
+        return self._visible_point_count
+
+    @property
+    def category_point_count(self) -> int:
+        return len(self._points)
+
+    @property
+    def geometry_revision(self) -> int:
+        return self._geometry_revision
 
     def set_visibility_mask(self, mask: BoolArray | None) -> None:
-        values = _visibility_mask(mask, len(self._model), "barras")
-        if np.array_equal(values, self._visibility_mask):
+        # Delega para preservar as faixas: trocar de circuito visível não pode
+        # apagar a cor de tensão, e vice-versa.
+        self._set_rendering(mask, self._style_indices, self._colors)
+
+    def set_voltage_rendering(
+        self,
+        mask: BoolArray | None,
+        style_indices: Sequence[int] | None,
+        colors: Sequence[str],
+    ) -> None:
+        self._set_rendering(mask, style_indices, colors)
+
+    def _set_rendering(
+        self,
+        mask: BoolArray | None,
+        style_indices: Sequence[int] | None,
+        colors: Sequence[str],
+    ) -> None:
+        visibility = _visibility_mask(mask, len(self._model), "barras")
+        styles = _style_indices(style_indices, len(self._model), "barras")
+        palette = _render_colors(colors)
+        if styles.size:
+            highest_style = int(styles.max(initial=-1))
+            if highest_style >= len(palette):
+                raise ValueError("Uma faixa de tensão não possui cor correspondente.")
+        geometry_changed = not np.array_equal(
+            visibility, self._visibility_mask
+        ) or not np.array_equal(styles, self._style_indices)
+        color_changed = palette != self._colors
+        if not geometry_changed and not color_changed:
             return
-        self._visibility_mask = values.copy()
-        self._rebuild_points()
+        self._visibility_mask = visibility.copy()
+        self._style_indices = styles.copy()
+        self._colors = palette
+        if geometry_changed:
+            self._rebuild_points()
         self.update()
 
     def _rebuild_points(self) -> None:
-        indices = np.flatnonzero(self._visibility_mask)
         model = self._model
-        self._points = QPolygonF(
-            [
-                QPointF(float(model.x[index]), -float(model.y[index]))
-                for index in indices
-            ]
-        )
+        categories = np.maximum(self._style_indices, -1)
+        points: dict[int, QPolygonF] = {}
+        total = 0
+        for category in range(-1, len(self._colors)):
+            selected = np.flatnonzero(
+                self._visibility_mask & (categories == category)
+            )
+            if selected.size == 0:
+                continue
+            # ``tolist`` devolve floats do Python de uma vez: extrair um escalar
+            # numpy por ponto é o que dominava o custo desta função.
+            xs = model.x[selected].tolist()
+            ys = np.negative(model.y[selected]).tolist()
+            points[category] = QPolygonF(
+                [QPointF(x, y) for x, y in zip(xs, ys, strict=True)]
+            )
+            total += int(selected.size)
+        self._points = points
+        self._visible_point_count = total
+        self._geometry_revision += 1
 
     def boundingRect(self) -> QRectF:  # noqa: N802 - API do Qt
         return self._bounds
@@ -359,8 +421,13 @@ class BarsOverviewItem(QGraphicsItem):
         pen.setWidthF(POINT_DIAMETER_PX)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setCosmetic(True)
-        painter.setPen(pen)
-        painter.drawPoints(self._points)
+        # Ordem determinística, com a categoria sem faixa embaixo.
+        for category in sorted(self._points):
+            pen.setColor(
+                POINT_COLOR if category < 0 else QColor(self._colors[category])
+            )
+            painter.setPen(pen)
+            painter.drawPoints(self._points[category])
         painter.restore()
 
 
@@ -1211,6 +1278,9 @@ class BarraItem(QGraphicsObject):
     def __init__(self) -> None:
         super().__init__()
         self.index = -1
+        # A cor de faixa vem de fora: o item é reciclado por um pool e não
+        # guarda o modelo, então não teria como resolvê-la sozinho.
+        self._fill_color: QColor | None = None
         self.setZValue(10.0)
         flags = (
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
@@ -1218,6 +1288,22 @@ class BarraItem(QGraphicsObject):
         )
         self.setFlags(flags)
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+
+    def set_fill_color(self, color: QColor | None) -> None:
+        """Cor da faixa; ``None`` devolve a barra à cor padrão."""
+
+        if color is None:
+            if self._fill_color is None:
+                return
+            self._fill_color = None
+        else:
+            value = QColor(color)
+            if not value.isValid():
+                raise ValueError(f"Cor inválida: {color}")
+            if value == self._fill_color:
+                return
+            self._fill_color = value
+        self.update()
 
     def bind(self, model: CircuitModel, index: int) -> None:
         self.index = int(index)
@@ -1231,6 +1317,8 @@ class BarraItem(QGraphicsObject):
         self.setSelected(False)
         self.setVisible(False)
         self.setToolTip("")
+        # Sem isto o item volta do pool carregando a faixa da barra anterior.
+        self._fill_color = None
         self.index = -1
 
     def boundingRect(self) -> QRectF:  # noqa: N802 - API do Qt
@@ -1246,12 +1334,19 @@ class BarraItem(QGraphicsObject):
     def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
         del option, widget
         selected = self.isSelected()
+        # ``QColor`` não define ``__bool__``; um ``or`` aqui nunca cairia no
+        # padrão e deixaria passar uma cor inválida.
+        fill = POINT_COLOR if self._fill_color is None else self._fill_color
         diameter = SELECTED_DIAMETER_PX if selected else POINT_DIAMETER_PX
         radius = diameter / 2.0
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, selected)
-        painter.setPen(QPen(SELECTED_OUTLINE if selected else POINT_COLOR, 1.0))
-        painter.setBrush(QBrush(SELECTED_COLOR if selected else POINT_COLOR))
+        # A seleção vence a faixa: é o único retorno de que o clique acertou, e
+        # o SelectionOverlayItem — que desenha a seleção da barra ainda não
+        # materializada — não conhece paleta nenhuma. Se a faixa vencesse, a
+        # mesma barra mudaria de cor conforme o zoom.
+        painter.setPen(QPen(SELECTED_OUTLINE if selected else fill, 1.0))
+        painter.setBrush(QBrush(SELECTED_COLOR if selected else fill))
         painter.drawEllipse(QPointF(0.0, 0.0), radius, radius)
         painter.restore()
 
@@ -2463,6 +2558,13 @@ class ItemVirtualizer(QObject):
         self.overview_item: BarsOverviewItem | None = None
         self._bars_visible = True
         self._visibility_mask: BoolArray | None = None
+        # Canal separado da máscara: cada um guarda a sua metade e faz
+        # early-return, e set_visibility_mask faz muito mais que repassar.
+        self._bar_style_indices: np.ndarray | None = None
+        self._bar_colors: tuple[str, ...] = ()
+        # Função, e não um vetor de textos: a dica é pedida de uma barra por
+        # vez, e guardar cem mil frases para mostrar uma seria desperdício.
+        self._bar_describe: Callable[[int], str] | None = None
         self.selection_overlay = SelectionOverlayItem()
         self.scene.addItem(self.selection_overlay)
 
@@ -2510,6 +2612,11 @@ class ItemVirtualizer(QObject):
         self._visibility_mask = (
             None if model is None else np.ones(len(model), dtype=np.bool_)
         )
+        # Antes de criar o agregado novo: faixas de um modelo maior indexariam
+        # fora do vetor no primeiro bind do modelo seguinte.
+        self._bar_style_indices = None
+        self._bar_colors = ()
+        self._bar_describe = None
         self._loaded_rect = None
         self._last_view_rect = None
         self._selected_index = None
@@ -2599,6 +2706,9 @@ class ItemVirtualizer(QObject):
             for index in batch:
                 item = self._acquire_item()
                 item.bind(self.model, index)
+                item.set_fill_color(self._bar_color(index))
+                if self._bar_describe is not None:
+                    item.setToolTip(self._bar_tooltip(index))
                 self._active[index] = item
         finally:
             del blocker
@@ -2610,6 +2720,62 @@ class ItemVirtualizer(QObject):
         elif self.overview_item is not None:
             self.overview_item.setVisible(False)
             self.view.viewport().update()
+
+    def set_voltage_rendering(
+        self,
+        style_indices: Sequence[int] | None,
+        colors: Sequence[str],
+        describe: Callable[[int], str] | None = None,
+    ) -> None:
+        """Faixas de tensão das barras, ou ``None`` para desligar o modo."""
+
+        if self.model is None:
+            if style_indices is not None:
+                raise ValueError("Não há modelo de barras para receber as faixas.")
+            self._bar_style_indices = None
+            self._bar_colors = ()
+            self._bar_describe = None
+            return
+        styles = _style_indices(style_indices, len(self.model), "barras")
+        palette = _render_colors(colors)
+        if styles.size:
+            highest_style = int(styles.max(initial=-1))
+            if highest_style >= len(palette):
+                raise ValueError("Uma faixa de tensão não possui cor correspondente.")
+        if (
+            self._bar_style_indices is not None
+            and np.array_equal(styles, self._bar_style_indices)
+            and palette == self._bar_colors
+            and describe is self._bar_describe
+        ):
+            return
+        self._bar_style_indices = styles.copy()
+        self._bar_colors = palette
+        self._bar_describe = describe
+        if self.overview_item is not None:
+            self.overview_item.set_voltage_rendering(
+                self._visibility_mask,
+                styles,
+                palette,
+            )
+        for index, item in self._active.items():
+            item.set_fill_color(self._bar_color(index))
+            item.setToolTip(self._bar_tooltip(index))
+
+    def _bar_tooltip(self, index: int) -> str:
+        bar_id = self.model.bar_ids[index]
+        if self._bar_describe is None:
+            return bar_id
+        return f"{bar_id}\n{self._bar_describe(index)}"
+
+    def _bar_color(self, index: int) -> QColor | None:
+        styles = self._bar_style_indices
+        if styles is None:
+            return None
+        category = int(styles[index])
+        if category < 0:
+            return None
+        return QColor(self._bar_colors[category])
 
     def _acquire_item(self) -> BarraItem:
         if self._pool:

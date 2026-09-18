@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "faixas": [
+    {
+      "nome": "Adequada",
+      "cor": "#2E7D32",
+      "minimo_pu": 0.93,
+      "maximo_pu": 1.05,
+      "gravidade": 0
+    },
+    {
+      "nome": "Precária (subtensão)",
+      "cor": "#F9A825",
+      "minimo_pu": 0.9,
+      "maximo_pu": 0.93,
+      "gravidade": 1
+    },
+    {
+      "nome": "Crítica (subtensão)",
+      "cor": "#C62828",
+      "minimo_pu": 0.0,
+      "maximo_pu": 0.9,
+      "gravidade": 2
+    },
+    {
+      "nome": "Crítica (sobretensão)",
+      "cor": "#6A1B9A",
+      "minimo_pu": 1.05,
+      "maximo_pu": null,
+      "gravidade": 2
+    }
+  ],
+  "reservadas": {
+    "sem_tensao_de_linha": "#000000",
+    "sem_tensao": "#9E9E9E",
+    "sem_resultado": "#E0E0E0"
+  }
+}

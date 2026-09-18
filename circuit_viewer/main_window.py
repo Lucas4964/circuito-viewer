@@ -70,6 +70,26 @@ from .graphviz_settings_dialog import (
     save_graphviz_layout_settings,
 )
 from .blocks_window import BlocksWindow, BlockTableModel
+from .downstream_selection import (
+    DownstreamOrigin,
+    DownstreamSelection,
+    select_downstream,
+)
+from .downstream_table import (
+    BARRA,
+    CAPACITOR,
+    CARGA,
+    CHAVE,
+    GERADOR,
+    REGULADOR,
+    TRECHO,
+    DownstreamRow,
+    export_downstream_csv,
+    highlight_segment_indices,
+    suggested_downstream_csv_filename,
+)
+from .downstream_window import DownstreamWindow
+from .network_orientation import NetworkOrientation, build_orientation
 from .branch_window import BranchesWindow, BranchTableModel
 from .display_identity import (
     BlockDisplayIdentity,
@@ -162,6 +182,7 @@ from .mapa_tiles import (
     GerenciadorTiles,
     Provedor,
 )
+from .model import NetworkTopology
 from .model import (
     CableModel,
     CircuitCatalogModel,
@@ -259,6 +280,14 @@ from .phase_config import (
     load_phase_configuration,
 )
 from .phase_legend import PhaseLegend
+from .voltage_bands import (
+    VoltageBandTable,
+    VoltageClassification,
+    VoltageQuantity,
+)
+from .voltage_bands_dialog import VoltageBandsDialog
+from .voltage_bands_store import load_voltage_bands
+from .voltage_legend import VoltageLegend
 from .regulator_import import RegulatorLoadResult
 from .regulator_overrides import (
     EDITABLE_FIELDS as REGULATOR_EDITABLE_FIELDS,
@@ -806,6 +835,14 @@ class MainWindow(QMainWindow):
         self._block_display_identities: dict[int, BlockDisplayIdentity] = {}
         self._selected_branch: BranchRecord | None = None
         self._selected_block: BlockRecord | None = None
+        # Seleção a jusante. A topologia e a orientação são memoizadas e
+        # validadas pela identidade dos modelos que as originaram; a região
+        # guarda a própria origem e é recalculada quando os elementos
+        # pendurados na rede mudam.
+        self._network_topology: NetworkTopology | None = None
+        self._network_orientation: NetworkOrientation | None = None
+        self._downstream_selection: DownstreamSelection | None = None
+        self._downstream_highlighted = False
         self._selected_feature: FeatureSelection | None = None
         self._effective_bar_mask = None
         self._effective_segment_mask = None
@@ -825,6 +862,14 @@ class MainWindow(QMainWindow):
         self._phase_configuration: PhaseConfiguration | None = None
         self._phase_configuration_error: str | None = None
         self._phase_classification: PhaseClassification | None = None
+        # As faixas de níveis de tensão são dado do usuário: arquivo ruim volta
+        # aos padrões do PRODIST e avisa, nunca impede a abertura.
+        self._voltage_bands_load = load_voltage_bands()
+        self._voltage_band_table: VoltageBandTable = self._voltage_bands_load.table
+        # Filha do resultado do fluxo de potência: morre junto com ele.
+        self._voltage_classification: VoltageClassification | None = None
+        self._voltage_quantity = VoltageQuantity.PHASE
+        self._voltage_step = 0
         try:
             self._phase_configuration = load_phase_configuration(
                 self.phase_configuration_path
@@ -967,6 +1012,10 @@ class MainWindow(QMainWindow):
         # fica explicita em _select_block/_select_branch.
         self.block_highlight_overlay = BranchHighlightOverlayItem()
         self.scene.addItem(self.block_highlight_overlay)
+        # Terceira instância, no mesmo amarelo e na mesma exclusão mútua: só
+        # um conjunto em destaque por vez.
+        self.downstream_highlight_overlay = BranchHighlightOverlayItem()
+        self.scene.addItem(self.downstream_highlight_overlay)
         self.search_index = GlobalSearchIndex()
         self.search_palette = SearchPalette(
             self.search_index,
@@ -974,6 +1023,10 @@ class MainWindow(QMainWindow):
             self,
         )
         self.phase_legend = PhaseLegend(self.view.viewport())
+        # Os nomes dos patamares chegam depois, com a grade carregada.
+        self.voltage_legend = VoltageLegend(self.view.viewport())
+        self.voltage_legend.quantityChanged.connect(self._set_voltage_quantity)
+        self.voltage_legend.stepChanged.connect(self._set_voltage_step)
         self._overlay_position_timer = QTimer(self)
         self._overlay_position_timer.setSingleShot(True)
         self._overlay_position_timer.setInterval(0)
@@ -1002,6 +1055,9 @@ class MainWindow(QMainWindow):
         self.branches_window = BranchesWindow(self.branch_table_model, self)
         self.block_table_model = BlockTableModel(self)
         self.blocks_window = BlocksWindow(self.block_table_model, self)
+        self.downstream_window = DownstreamWindow(
+            self, phase_configuration=self._phase_configuration
+        )
         self.block_graph_window = BlockGraphWindow(
             scale_nodes_by_power=self._scale_block_graph_nodes_by_power,
             graphviz_layout_settings=self._graphviz_layout_settings,
@@ -1079,6 +1135,7 @@ class MainWindow(QMainWindow):
         self._patamares_path = patamares_path
         self._calculation_levels_load = load_calculation_levels(patamares_path)
         self.calculation_level_schedule = self._calculation_levels_load.schedule
+        self._sync_voltage_step_names()
         self.patamares_window = PatamaresWindow(
             self.calculation_level_schedule,
             storage_path=patamares_path,
@@ -1122,6 +1179,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._show_curves_load_warning)
         if self._calculation_levels_load.issue is not None:
             QTimer.singleShot(0, self._show_calculation_levels_load_warning)
+        if self._voltage_bands_load.issue is not None:
+            QTimer.singleShot(0, self._show_voltage_bands_load_warning)
 
     def _apply_default_visibility(self) -> None:
         """Empurra o estado inicial das ações para a cena.
@@ -1302,6 +1361,19 @@ class MainWindow(QMainWindow):
             self._set_phase_coloring_enabled
         )
 
+        self.voltage_coloring_action = QAction(
+            "Colorir barras por níveis de tensão",
+            self,
+        )
+        self.voltage_coloring_action.setCheckable(True)
+        self.voltage_coloring_action.setEnabled(False)
+        self.voltage_coloring_action.setToolTip(
+            "Pintar cada barra conforme a faixa de tensão do fluxo de potência"
+        )
+        self.voltage_coloring_action.toggled.connect(
+            self._set_voltage_coloring_enabled
+        )
+
         self.satellite_action = QAction("Exibir imagem de satélite", self)
         self.satellite_action.setCheckable(True)
         self.satellite_action.setChecked(False)
@@ -1453,6 +1525,12 @@ class MainWindow(QMainWindow):
         )
         self.patamares_action.triggered.connect(self._show_patamares_window)
 
+        self.voltage_bands_action = QAction("Faixas de níveis de tensão…", self)
+        self.voltage_bands_action.setToolTip(
+            "Definir os limites em pu, as cores e a gravidade de cada faixa"
+        )
+        self.voltage_bands_action.triggered.connect(self._show_voltage_bands_dialog)
+
         self.update_generators_action = QAction("Atualizar Geradores…", self)
         self.update_generators_action.setEnabled(False)
         self.update_generators_action.setToolTip(
@@ -1498,6 +1576,13 @@ class MainWindow(QMainWindow):
         )
         self.block_graph_action.triggered.connect(self._show_block_graph)
 
+        self.downstream_action = QAction("Seleção a jusante…", self)
+        self.downstream_action.setEnabled(False)
+        self.downstream_action.setToolTip(
+            "Selecionar tudo o que está a jusante de uma barra ou de um trecho"
+        )
+        self.downstream_action.triggered.connect(self._show_downstream_window)
+
         self.select_action = QAction("Selecionar", self)
         self.select_action.setCheckable(True)
         self.select_action.setChecked(True)
@@ -1538,6 +1623,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.show_capacitors_action)
         view_menu.addAction(self.root_bar_action)
         view_menu.addAction(self.phase_coloring_action)
+        view_menu.addAction(self.voltage_coloring_action)
         view_menu.addAction(self.simplified_network_action)
         view_menu.addSeparator()
         view_menu.addAction(self.satellite_action)
@@ -1570,6 +1656,7 @@ class MainWindow(QMainWindow):
         self.tools_menu.addAction(self.branches_action)
         self.tools_menu.addAction(self.blocks_action)
         self.tools_menu.addAction(self.block_graph_action)
+        self.tools_menu.addAction(self.downstream_action)
         self.tools_menu.addSeparator()
         self.tools_menu.addAction(self.update_generators_action)
         self.tools_menu.addAction(self.power_flow_action)
@@ -1579,6 +1666,7 @@ class MainWindow(QMainWindow):
         self.settings_menu = self.menuBar().addMenu("Configurações")
         self.settings_menu.addAction(self.opendss_settings_action)
         self.settings_menu.addAction(self.patamares_action)
+        self.settings_menu.addAction(self.voltage_bands_action)
         self.settings_menu.addAction(self.curves_action)
 
         toolbar = QToolBar("Ferramentas principais", self)
@@ -2384,6 +2472,22 @@ class MainWindow(QMainWindow):
         )
         self.blocks_window.closed.connect(self._clear_block_highlight)
         self.blocks_window.graphRequested.connect(self._show_block_graph)
+        self.downstream_window.useMapSelectionRequested.connect(
+            self._downstream_from_map_selection
+        )
+        self.downstream_window.beyondOpenSwitchesChanged.connect(
+            self._downstream_beyond_changed
+        )
+        self.downstream_window.kindsChanged.connect(self._downstream_kinds_changed)
+        self.downstream_window.highlightRequested.connect(
+            self._show_downstream_highlight
+        )
+        self.downstream_window.frameRequested.connect(self._frame_downstream)
+        self.downstream_window.exportCsvRequested.connect(
+            self._export_downstream_csv
+        )
+        self.downstream_window.rowActivated.connect(self._activate_downstream_row)
+        self.downstream_window.closed.connect(self._clear_downstream_highlight)
         self.block_graph_window.blockRequested.connect(
             self._select_block_from_graph
         )
@@ -3729,6 +3833,9 @@ class MainWindow(QMainWindow):
         self._invalidate_power_flow()
         self._invalidate_branch_analysis()
         self._invalidate_blocks()
+        if model is not self._line_model:
+            # Índices de outra rede: a origem não quer dizer mais nada.
+            self._invalidate_downstream()
         if self._search_focus_active:
             self._set_selection(None)
         self._set_circuit_catalog(None)
@@ -3799,6 +3906,7 @@ class MainWindow(QMainWindow):
         self._apply_circuit_visibility()
         if model is not None and self.show_loads_action.isChecked():
             self.load_virtualizer.refresh(force=True)
+        self._refresh_downstream_selection()
         self.view.viewport().update()
 
     def _set_allocation_model(
@@ -3846,6 +3954,7 @@ class MainWindow(QMainWindow):
         self._apply_circuit_visibility()
         if model is not None and self.show_generators_action.isChecked():
             self.generator_virtualizer.refresh(force=True)
+        self._refresh_downstream_selection()
         self.view.viewport().update()
 
     def _set_capacitor_model(self, model: CapacitorModel | None) -> None:
@@ -3877,6 +3986,7 @@ class MainWindow(QMainWindow):
         self._apply_circuit_visibility()
         if model is not None and self.show_capacitors_action.isChecked():
             self.capacitor_virtualizer.refresh(force=True)
+        self._refresh_downstream_selection()
         self.view.viewport().update()
 
     def _set_load_pattern_model(self, model: LoadPatternModel | None) -> None:
@@ -3934,6 +4044,8 @@ class MainWindow(QMainWindow):
         self._invalidate_power_flow()
         self._invalidate_branch_analysis()
         self._invalidate_blocks()
+        if model is not self._switch_model:
+            self._invalidate_downstream()
         if self._search_focus_active:
             self._set_selection(None)
         if model is not None and model.segments is not self._line_model:
@@ -4168,6 +4280,7 @@ class MainWindow(QMainWindow):
         # um repaint — nenhum dos dois existia enquanto reguladores não eram
         # desenhados.
         self._apply_circuit_visibility()
+        self._refresh_downstream_selection()
         self.view.viewport().update()
 
     def _circuit_display_state(self) -> dict[tuple[str, str], tuple[bool, str]]:
@@ -4240,6 +4353,8 @@ class MainWindow(QMainWindow):
         self._invalidate_power_flow()
         self._invalidate_branch_analysis()
         self._invalidate_blocks()
+        if catalog is not self._circuit_catalog:
+            self._invalidate_downstream()
         if self._search_focus_active:
             self._set_selection(None)
         if catalog is not None:
@@ -4421,10 +4536,22 @@ class MainWindow(QMainWindow):
             self.phase_coloring_action.isChecked()
             and self._phase_classification is not None
         )
+        voltage_mode = (
+            self.voltage_coloring_action.isChecked()
+            and self._voltage_classification is not None
+        )
         self.view.set_feature_visibility_masks(bar_mask, segment_mask)
         self._effective_bar_mask = bar_mask
         self._effective_segment_mask = segment_mask
         self._effective_load_mask = load_mask
+        # Antes da máscara: é ela que dispara a materialização, e os lotes novos
+        # precisam nascer já com a paleta corrente.
+        self.virtualizer.set_voltage_rendering(
+            self._voltage_classification.style_indices if voltage_mode else None,
+            self._voltage_classification.colors if voltage_mode else (),
+            # A dica é onde a barra preta diz por que está preta.
+            self._voltage_classification.describe if voltage_mode else None,
+        )
         self.virtualizer.set_visibility_mask(bar_mask)
         self.load_virtualizer.set_visibility_mask(load_mask)
         self.generator_virtualizer.set_visibility_mask(generator_mask)
@@ -4472,8 +4599,15 @@ class MainWindow(QMainWindow):
             )
             self._root_bar_item.setVisible(self.root_bar_action.isChecked())
         self.phase_legend.setVisible(phase_mode and self._line_item is not None)
-        if self.phase_legend.isVisible():
-            self._position_phase_legend()
+        self.voltage_legend.setVisible(voltage_mode)
+        if voltage_mode:
+            classification = self._voltage_classification
+            self.voltage_legend.set_entries(
+                classification.labels,
+                classification.colors,
+                classification.counts,
+            )
+        self._position_viewport_overlays()
 
         selection = self._selected_feature
         if selection is not None and controller is not None:
@@ -4527,6 +4661,7 @@ class MainWindow(QMainWindow):
         # consumidores futuros consultarão.
         self._invalidate_generator_update()
         self.calculation_level_schedule = schedule
+        self._sync_voltage_step_names()
         self.statusBar().showMessage("4 patamares salvos.", 6_000)
 
     def _on_calculation_levels_reloaded(
@@ -4535,6 +4670,7 @@ class MainWindow(QMainWindow):
         if schedule != self.calculation_level_schedule:
             self._invalidate_generator_update()
         self.calculation_level_schedule = schedule
+        self._sync_voltage_step_names()
 
     def _on_circuit_calculation_levels_saved(
         self, _circuit_id: str, _schedule: CalculationLevelSchedule
@@ -4722,6 +4858,13 @@ class MainWindow(QMainWindow):
             self._circuit_catalog is not None
             and self._line_model is not None
             and self._switch_model is not None
+            and not self._busy()
+        )
+        # A seleção a jusante só precisa da orientação — trechos e circuitos.
+        # Sem chaves a rede inteira conduz, e a resposta continua valendo.
+        self.downstream_action.setEnabled(
+            self._circuit_catalog is not None
+            and self._line_model is not None
             and not self._busy()
         )
         self.block_graph_action.setEnabled(self.blocks_action.isEnabled())
@@ -5146,6 +5289,9 @@ class MainWindow(QMainWindow):
         self._segment_power_flow_currents = None
         self._segment_power_flow_powers = None
         self._bar_power_flow_voltages = None
+        # As faixas descrevem o resultado que acabou de ser descartado; mantê-las
+        # deixaria o canvas colorido por uma rede que já não existe.
+        self._refresh_voltage_classification()
         self.segment_power_flow_model.clear()
         self.bar_power_flow_model.clear()
         self.segment_power_flow_section.setVisible(False)
@@ -6248,6 +6394,8 @@ class MainWindow(QMainWindow):
             )
             return
         self._power_flow_result = result
+        self._refresh_voltage_classification()
+        self._apply_circuit_visibility()
         # A seleção corrente precisa ser reaplicada para o painel refletir o
         # resultado que acabou de chegar.
         if self._selected_feature is not None:
@@ -7354,6 +7502,307 @@ class MainWindow(QMainWindow):
             self._close_after_branch_json_export = False
             self.close()
 
+    # -- seleção a jusante --------------------------------------------------
+
+    def _ensure_network_topology(self) -> NetworkTopology | None:
+        """A adjacência da rede, memoizada pela identidade de trechos e chaves.
+
+        A guarda lê os modelos, não um sinalizador sujo: um caminho novo que
+        troque um modelo sem passar pelos setters se cura sozinho.
+        """
+
+        if self._line_model is None:
+            self._network_topology = None
+            return None
+        current = self._network_topology
+        if (
+            current is not None
+            and current.segments is self._line_model
+            and current.switches is self._switch_model
+        ):
+            return current
+        self._network_topology = NetworkTopology(self._line_model, self._switch_model)
+        return self._network_topology
+
+    def _ensure_network_orientation(self) -> NetworkOrientation | None:
+        """A orientação da rede, construída no primeiro uso e reaproveitada."""
+
+        catalog = self._circuit_catalog
+        topology = self._ensure_network_topology()
+        if catalog is None or topology is None:
+            self._network_orientation = None
+            return None
+        current = self._network_orientation
+        if (
+            current is not None
+            and current.topology is topology
+            and current.catalog is catalog
+        ):
+            return current
+        self._network_orientation = build_orientation(topology, catalog)
+        return self._network_orientation
+
+    def _invalidate_downstream(self) -> None:
+        """Descarta a região: a topologia de onde ela saiu deixou de valer."""
+
+        self._clear_downstream_highlight()
+        self._downstream_selection = None
+        self._network_topology = None
+        self._network_orientation = None
+        self.downstream_window.set_selection(None)
+
+    def _compute_downstream(
+        self,
+        origin: DownstreamOrigin,
+        beyond_open_switches: bool,
+    ) -> DownstreamSelection | None:
+        orientation = self._ensure_network_orientation()
+        if orientation is None:
+            return None
+        return select_downstream(
+            orientation,
+            origin,
+            beyond_open_switches=beyond_open_switches,
+            loads=self._load_model,
+            capacitors=self._capacitor_model,
+            generators=self._generator_model,
+            regulators=self._regulator_model,
+        )
+
+    def _select_downstream_from(self, kind: str, index: int) -> None:
+        """Calcula a região a jusante do ponto e a mostra na janela e no mapa."""
+
+        try:
+            selection = self._compute_downstream(
+                DownstreamOrigin(kind, int(index)),
+                self.downstream_window.beyond_open_switches,
+            )
+        except (IndexError, ValueError):
+            self._invalidate_downstream()
+            self.statusBar().showMessage(
+                "A seleção a jusante não vale mais para a rede exibida.",
+                5_000,
+            )
+            return
+        if selection is None:
+            self.statusBar().showMessage(
+                "Importe os trechos e os circuitos para selecionar a jusante.",
+                5_000,
+            )
+            return
+        self._downstream_selection = selection
+        self.downstream_window.set_selection(selection)
+        self.downstream_window.show()
+        self.downstream_window.raise_()
+        self._show_downstream_highlight()
+        self.statusBar().showMessage(
+            f"{selection.segment_indices.size:n} trecho(s) e "
+            f"{selection.bar_indices.size:n} barra(s) a jusante.",
+            5_000,
+        )
+
+    def _refresh_downstream_selection(self) -> None:
+        """Recalcula a região da mesma origem com os modelos atuais.
+
+        Chamado quando mudam os elementos pendurados na rede — cargas,
+        capacitores, geradores, reguladores. A região não muda, o conteúdo sim:
+        guardar os índices antigos destacaria e exportaria o que já não existe.
+        """
+
+        current = self._downstream_selection
+        if current is None:
+            return
+        try:
+            selection = self._compute_downstream(
+                current.origin,
+                current.beyond_open_switches,
+            )
+        except (IndexError, ValueError):
+            selection = None
+        if selection is None:
+            self._invalidate_downstream()
+            return
+        self._downstream_selection = selection
+        self.downstream_window.set_selection(selection)
+        if self._downstream_highlighted:
+            self._bind_downstream_overlay()
+
+    def _show_downstream_window(self) -> None:
+        """Abre a janela; sem região ainda, parte do que está selecionado."""
+
+        feature = self._selected_feature
+        if (
+            self._downstream_selection is None
+            and feature is not None
+            and feature.kind in {"bar", "segment"}
+        ):
+            self._select_downstream_from(feature.kind, feature.index)
+        self.downstream_window.show()
+        self.downstream_window.raise_()
+        self.downstream_window.activateWindow()
+
+    def _add_downstream_action(self, menu, feature) -> None:  # noqa: ANN001
+        if (
+            self._circuit_catalog is None
+            or self._line_model is None
+            or self._busy()
+        ):
+            return
+        if not menu.isEmpty():
+            menu.addSeparator()
+        action = menu.addAction("Selecionar a jusante daqui")
+        action.triggered.connect(
+            lambda _checked=False, kind=feature.kind, index=int(feature.index): (
+                self._select_downstream_from(kind, index)
+            )
+        )
+
+    def _downstream_from_map_selection(self) -> None:
+        feature = self._selected_feature
+        if feature is None or feature.kind not in {"bar", "segment"}:
+            self.statusBar().showMessage(
+                "Selecione uma barra ou um trecho no mapa para usar como origem.",
+                5_000,
+            )
+            return
+        self._select_downstream_from(feature.kind, feature.index)
+
+    def _downstream_beyond_changed(self, enabled: bool) -> None:
+        # A opção muda quais barras existem na região: é travessia, e recalcula.
+        del enabled
+        current = self._downstream_selection
+        if current is not None:
+            self._select_downstream_from(current.origin.kind, current.origin.index)
+
+    def _downstream_kinds_changed(self) -> None:
+        # Os filtros são só apresentação: nada é recalculado, só o destaque.
+        if self._downstream_highlighted:
+            self._bind_downstream_overlay()
+
+    def _bind_downstream_overlay(self) -> None:
+        selection = self._downstream_selection
+        if selection is None or self._line_model is None:
+            self.downstream_highlight_overlay.clear()
+            return
+        segments = highlight_segment_indices(
+            selection,
+            self.downstream_window.highlighted_kinds(),
+        )
+        if segments.size:
+            self.downstream_highlight_overlay.bind(self._line_model, segments.tolist())
+        else:
+            self.downstream_highlight_overlay.clear()
+        self.view.viewport().update()
+
+    def _show_downstream_highlight(self) -> None:
+        """Pinta a região no mapa, em exclusão mútua com bloco e ramal."""
+
+        if self._downstream_selection is None or self._line_model is None:
+            return
+        self._clear_block_highlight(clear_table=True)
+        self._clear_branch_highlight(clear_table=True)
+        self._downstream_highlighted = True
+        self._bind_downstream_overlay()
+
+    def _clear_downstream_highlight(self, *, clear_table: bool = False) -> None:
+        """Apaga o destaque; a região continua na janela para ser reativada."""
+
+        self._downstream_highlighted = False
+        self.downstream_highlight_overlay.clear()
+        if clear_table:
+            self.downstream_window.clear_selection()
+        self.view.viewport().update()
+
+    def _frame_downstream(self) -> None:
+        selection = self._downstream_selection
+        if selection is None or not selection.segment_indices.size:
+            return
+        self._show_downstream_highlight()
+        try:
+            self.view.focus_segments(selection.segment_indices)
+        except (IndexError, ValueError):
+            self._invalidate_downstream()
+            return
+        self.virtualizer.refresh(force=True)
+        self.load_virtualizer.refresh(force=True)
+
+    def _activate_downstream_row(self, row: DownstreamRow) -> None:
+        """Seleciona no mapa o elemento da linha, sem perder o destaque."""
+
+        selection = self._downstream_selection
+        if selection is None:
+            return
+        segment: int | None = None
+        bar: int | None = None
+        if row.kind == TRECHO:
+            feature = FeatureSelection("segment", row.index)
+            segment = row.index
+        elif row.kind == CHAVE and selection.switches is not None:
+            segment = int(selection.switches.segment_indices[row.index])
+            feature = FeatureSelection("segment", segment)
+        elif row.kind == REGULADOR and selection.regulators is not None:
+            segment = int(selection.regulators.segment_indices[row.index])
+            feature = FeatureSelection("segment", segment)
+        elif row.kind == BARRA:
+            feature = FeatureSelection("bar", row.index)
+            bar = row.index
+        elif row.kind == CARGA:
+            feature = FeatureSelection("load", row.index)
+        elif row.kind == CAPACITOR and selection.capacitors is not None:
+            feature = FeatureSelection("capacitor", row.index)
+            bar = int(selection.capacitors.bar_indices[row.index])
+        elif row.kind == GERADOR and selection.generators is not None:
+            feature = FeatureSelection("generator", row.index)
+            bar = int(selection.generators.bar_indices[row.index])
+        else:
+            return
+        if not self._downstream_highlighted:
+            self._show_downstream_highlight()
+        self._set_selection(feature, preserve_highlight=True)
+        try:
+            if segment is not None:
+                self.view.focus_segments([segment])
+            elif bar is not None:
+                self.view.focus_bar(bar)
+            elif row.kind == CARGA:
+                self.view.focus_load(row.index)
+        except (IndexError, ValueError):
+            return
+        self.virtualizer.refresh(force=True)
+        self.load_virtualizer.refresh(force=True)
+
+    def _export_downstream_csv(self) -> None:
+        selection = self._downstream_selection
+        if selection is None:
+            return
+        rows = self.downstream_window.visible_rows_in_display_order()
+        if not rows:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self.downstream_window,
+            "Exportar seleção a jusante para CSV",
+            str(Path.cwd() / suggested_downstream_csv_filename(selection)),
+            "Arquivos CSV (*.csv);;Todos os arquivos (*)",
+        )
+        if not path:
+            return
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(".csv")
+        try:
+            result = export_downstream_csv(target, rows)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(
+                self,
+                "Falha na exportação CSV",
+                str(exc) or type(exc).__name__,
+            )
+            return
+        self.statusBar().showMessage(
+            f"{result.row_count:n} elemento(s) exportado(s) para {result.path}.",
+            8_000,
+        )
+
     def _show_map_context_menu(self, feature, global_position) -> None:  # noqa: ANN001
         """Monta o menu do mapa conforme o que está sob o cursor.
 
@@ -7367,6 +7816,8 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         if feature is not None and feature.kind == "segment":
             self._add_block_actions(menu, int(feature.index))
+        if feature is not None and feature.kind in {"bar", "segment"}:
+            self._add_downstream_action(menu, feature)
         if menu.isEmpty():
             return
         menu.exec(global_position)
@@ -7709,13 +8160,20 @@ class MainWindow(QMainWindow):
         self._block_graph_circuit_indices = {}
 
     def _highlighted_record(self):  # noqa: ANN202
-        """O bloco ou o ramal em destaque, ou ``None``.
+        """O bloco, o ramal ou a região a jusante em destaque, ou ``None``.
 
-        Um de cada vez: a exclusão mútua entre os dois já garante isso, e é o
-        que permite uma regra só para os dois.
+        Um de cada vez: a exclusão mútua entre os três já garante isso, e é o
+        que permite uma regra só para eles. A região a jusante expõe os mesmos
+        ``segment_indices`` e ``bar_indices`` que os outros dois registros.
         """
 
-        return self._selected_block or self._selected_branch
+        if self._selected_block is not None:
+            return self._selected_block
+        if self._selected_branch is not None:
+            return self._selected_branch
+        if self._downstream_highlighted:
+            return self._downstream_selection
+        return None
 
     def _selection_inside_highlight(self, selection) -> bool:  # noqa: ANN001
         """A seleção cai dentro do conjunto em destaque?
@@ -7742,7 +8200,7 @@ class MainWindow(QMainWindow):
         return bar_index in set(record.bar_indices.tolist())
 
     def _clear_highlights(self, *, clear_table: bool = False) -> bool:
-        """Apaga os dois destaques. Devolve se havia algum a apagar.
+        """Apaga os destaques. Devolve se havia algum a apagar.
 
         A resposta é o que o Esc usa para saber se já fez alguma coisa neste
         nível, antes de descer para o seguinte.
@@ -7751,6 +8209,7 @@ class MainWindow(QMainWindow):
         had = self._highlighted_record() is not None
         self._clear_block_highlight(clear_table=clear_table)
         self._clear_branch_highlight(clear_table=clear_table)
+        self._clear_downstream_highlight(clear_table=clear_table)
         return had
 
     def _escape_pressed(self) -> None:
@@ -7789,6 +8248,7 @@ class MainWindow(QMainWindow):
         if self._line_model is None:
             return
         self._clear_branch_highlight(clear_table=True)
+        self._clear_downstream_highlight(clear_table=True)
         self._selected_block = record
         if record.segment_count == 0:
             self.block_highlight_overlay.clear()
@@ -7859,6 +8319,7 @@ class MainWindow(QMainWindow):
             self._circuit_visibility_timer.stop()
             self._apply_circuit_visibility()
         self._clear_block_highlight(clear_table=True)
+        self._clear_downstream_highlight(clear_table=True)
         self._selected_branch = record
         self.branch_highlight_overlay.bind(
             self._line_model,
@@ -8296,6 +8757,93 @@ class MainWindow(QMainWindow):
             4_000,
         )
 
+    # -- níveis de tensão --------------------------------------------------
+
+    def _sync_voltage_step_names(self) -> None:
+        self.voltage_legend.set_step_names(
+            [item.name for item in self.calculation_level_schedule.levels]
+        )
+
+    def _refresh_voltage_classification(self) -> None:
+        """Recalcula as faixas a partir do resultado corrente do fluxo.
+
+        Chamado sempre pela mesma razão: uma das três entradas mudou — o
+        resultado, a grandeza/patamar escolhidos, ou a tabela de faixas. Sem
+        resultado não há classificação, e a ação some junto.
+        """
+
+        result = self._power_flow_result
+        bars = None if self._line_model is None else self._line_model.bars
+        if result is None or bars is None or not result.bar_voltages:
+            self._voltage_classification = None
+            self.voltage_coloring_action.setEnabled(False)
+            if self.voltage_coloring_action.isChecked():
+                # Desmarcar dispara o slot, que reaplica a visibilidade.
+                self.voltage_coloring_action.setChecked(False)
+            return
+        self._voltage_classification = self._voltage_band_table.classify(
+            len(bars),
+            result.bar_voltages,
+            self._voltage_quantity,
+            self._voltage_step,
+        )
+        self.voltage_coloring_action.setEnabled(True)
+
+    def _set_voltage_quantity(self, quantity: VoltageQuantity) -> None:
+        if quantity is self._voltage_quantity:
+            return
+        self._voltage_quantity = quantity
+        self._refresh_voltage_classification()
+        self._apply_circuit_visibility()
+
+    def _set_voltage_step(self, step: int) -> None:
+        step = max(0, int(step))
+        if step == self._voltage_step:
+            return
+        self._voltage_step = step
+        self._refresh_voltage_classification()
+        self._apply_circuit_visibility()
+
+    def _set_voltage_coloring_enabled(self, enabled: bool) -> None:
+        if enabled and self._voltage_classification is None:
+            self.voltage_coloring_action.setChecked(False)
+            return
+        self._apply_circuit_visibility()
+        if not enabled or self._voltage_classification is None:
+            self.statusBar().showMessage(
+                "Coloração das barras por circuito restaurada.",
+                4_000,
+            )
+            return
+        classification = self._voltage_classification
+        missing = classification.counts[self._voltage_band_table.no_data_index]
+        suffix = f" {missing:n} barras sem resultado." if missing else ""
+        self.statusBar().showMessage(
+            f"Níveis de tensão por {classification.quantity.label.lower()}, "
+            f"patamar {self.voltage_legend.step}.{suffix}",
+            8_000,
+        )
+
+    def _show_voltage_bands_dialog(self) -> None:
+        dialog = VoltageBandsDialog(self._voltage_band_table, parent=self)
+        dialog.tableSaved.connect(self._on_voltage_bands_saved)
+        dialog.exec()
+
+    def _on_voltage_bands_saved(self, table: VoltageBandTable) -> None:
+        if table == self._voltage_band_table:
+            return
+        self._voltage_band_table = table
+        # A classificação carrega a paleta consigo; sem recalcular, o canvas
+        # continuaria com as cores antigas até o próximo fluxo de potência.
+        self._refresh_voltage_classification()
+        self._apply_circuit_visibility()
+        self.statusBar().showMessage("Faixas de níveis de tensão salvas.", 6_000)
+
+    def _show_voltage_bands_load_warning(self) -> None:
+        issue = self._voltage_bands_load.issue
+        if issue is not None:
+            QMessageBox.warning(self, "Faixas de níveis de tensão", issue)
+
     def _set_phase_coloring_enabled(self, enabled: bool) -> None:
         if enabled and self._phase_classification is None:
             self.phase_coloring_action.setChecked(False)
@@ -8579,22 +9127,27 @@ class MainWindow(QMainWindow):
         self.view.set_satellite_enabled(enabled)
         self.statusBar().showMessage(message, 4_000)
 
-    def _position_phase_legend(self) -> None:
-        if not self.phase_legend.isVisible():
-            return
-        self.phase_legend.adjustSize()
-        viewport = self.view.viewport()
-        self.phase_legend.move(
-            12,
-            max(12, viewport.height() - self.phase_legend.height() - 12),
-        )
-        self.phase_legend.raise_()
-
     def _schedule_viewport_overlay_update(self) -> None:
         self._overlay_position_timer.start()
 
     def _position_viewport_overlays(self) -> None:
-        self._position_phase_legend()
+        """Empilha os overlays visíveis no canto inferior esquerdo.
+
+        Os dois modos são independentes — um colore trechos, o outro barras —,
+        então podem estar ligados ao mesmo tempo e não podem ocupar o mesmo
+        lugar. O canto direito é do rótulo do satélite, que se ergue a cada
+        rolagem e passaria por cima.
+        """
+
+        viewport = self.view.viewport()
+        bottom = viewport.height() - 12
+        for overlay in (self.voltage_legend, self.phase_legend):
+            if not overlay.isVisible():
+                continue
+            overlay.adjustSize()
+            overlay.move(12, max(12, bottom - overlay.height()))
+            overlay.raise_()
+            bottom -= overlay.height() + 8
 
     def _show_zoom_limit_reached(self) -> None:
         self.statusBar().showMessage("Limite máximo de zoom atingido.", 3_000)

@@ -100,6 +100,16 @@ class PhaseConfiguration:
             unknown_values,
         )
 
+    def name_for_value(self, value: object) -> str | None:
+        """O ``NOME`` do FASES2 — ``13`` vira ``DEF`` —, ou ``None`` sem relação."""
+
+        try:
+            key = normalize_phase_value(value)
+        except ValueError:
+            return None
+        entry = next((item for item in self.entries if item.fases2 == key), None)
+        return None if entry is None else entry.name
+
     def phase_letters_for_value(self, value: object) -> tuple[str, ...] | None:
         """Resolve as fases elétricas em ordem canônica dos terminais DSS.
 
