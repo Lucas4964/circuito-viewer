@@ -247,7 +247,7 @@ arquivo**: é o seam que a importação por banco consome (seção 6).
 | `switch_import.py` | Chave | `LineNetworkModel` | `CHAVE_ID, TIPOCHV_ID, CIRC_ID, TRECHO_ID, CODIGO, ESTADO, ESTADO_NORMAL, CORN, ELO, ELO_TIPO` |
 | `regulator_import.py` | Regulador de tensão | `LineNetworkModel` | `REGU_ID, TRECHO_ID, EXTERN_ID, CODIGO, LIGACAO, SNOM, FAIXA, NPASSOS, TAP, INOM, VNOM` |
 | `load_import.py` | Carga | `CircuitModel` | `CARGA_ID, BARRA_ID, EXTERN_ID, CODIGO, SNOM, SADM, VLINHASEC, FASES2, TIPO_LIG` |
-| `generator_import.py` | Gerador | `LoadModel` | `MT_GERADOR_CONS` associado a `MT_CONS` por `CODIGO`; barra resolvida por `CARGA_ID` |
+| `generator_import.py` | Gerador | `LoadModel` | `MT_GERADOR_CONS` associado a `MT_CONS` por `MT_CONS_ID` → `ID` (o `CODIGO` é reserva); barra resolvida por `CARGA_ID`; `P1..P4`/`Q1..Q4` opcionais |
 | `load_pattern_import.py` | Patamar | `LoadModel` | `CARGA_ID, NPAT, PD, PE, PF, QD, QE, QF` |
 | `circuit_import.py` | Circuito | `LineNetworkModel` + `SwitchModel?` | `CIRC_ID, BARRA_ID, CODIGO, VNOM` |
 | `cable_import.py` | Cabo | — (catálogo raiz) | `CABO_ID, TIPO, CODIGO, IADM, GMR, R, X, QCAP, R0, X0, R1, X1, NOME, EXTERN_ID` |
@@ -1891,13 +1891,18 @@ divergência de `VNOM` entre donos vira aviso sem descartar o trecho.
 | nome da `Line` | **`CODIGO` da chave** (não o do trecho); `CHAVE_ID` como fallback |
 | `Bus1`/`Bus2` + sufixo de nós | mesmas regras dos trechos, lidas do trecho onde a chave está |
 | `Phases` | `NUMERO_FASES` do `FASES2` do trecho |
-| `Switch=Yes` | sempre a **última** propriedade |
+| `Switch=Yes` | seguido de `SWITCH_IMPEDANCE_DIRECTIVE` (1 µΩ) |
 | `Open Line.<nome> 1` | emitido no fim do arquivo quando `ESTADO != "1"` |
 
-**`Switch=Yes` é a última propriedade por obrigação, não por estilo.** O
+**A impedância vem depois do `Switch=Yes` por obrigação, não por estilo.** O
 `DSSHelp` documenta o efeito colateral: ele redefine `r1`, `x1`, `r0`, `x0`,
-`c1`, `c0` e `length=0.001`. Emitir qualquer parâmetro elétrico depois dele o
-apagaria — por isso a chave não recebe `R1`, `Length` nem `units`.
+`c1`, `c0` e `length=0.001` no momento em que é lido, o que deixa 1 mΩ + j1 mΩ
+em cada chave. O Interplan trata a chave fechada como ideal, e ao longo de um
+tronco com várias chaves esse miliohm vira perda e queda de tensão que o
+relatório dele não tem (0,86 kW e −0,011% em |V| no 010012). As propriedades
+escritas depois do `Switch=Yes` prevalecem — conferido contra a DLL 10.2: a
+linha continua marcada como chave e o `Open` funciona —, então a chave sai com
+`r1=1e-6 x1=1e-6 r0=1e-6 x0=1e-6 c1=0 c0=0 Length=1 units=km`.
 
 `Open` é comando executivo e exige o elemento já definido, então todas as
 definições vêm antes de todos os `Open` no mesmo arquivo. O critério de abertura
@@ -1918,8 +1923,8 @@ espaços de nomes distintos de `Line.*`.
 | nome da `Load` | `<CODIGO>-<N>F-<FASE>`; `CARGA_ID` como fallback do `CODIGO` |
 | `phases` | sempre `1` — a carga multifásica é decomposta, não declarada |
 | `bus1` | **`CODIGO`** da barra + nó da fase (ver abaixo) |
-| `conn` | fixo em `wye` |
-| `kV` | `VNOM` do circuito dono **dividida por `√3`** |
+| `conn` | `wye`; `delta` na trifásica de `TIPO_LIG` 2 |
+| `kV` | `VNOM` do circuito dono **dividida por `√3`**; a própria `VNOM` em `delta` |
 | `kW`/`kvar` | fixos em `1` |
 | `daily` | `PERFIL-<nome da Load>` |
 | `class` | a contagem de fases: `1`, `2` ou `3` |
@@ -1936,6 +1941,18 @@ módulo: uma única `Load` de `phases=2` ou `3` distribuiria a potência
 igualmente entre as fases, apagando exatamente o desequilíbrio que os patamares
 por fase (`PD`/`PE`/`PF`) descrevem. A monofásica segue a mesma forma com uma
 fase só, por uniformidade.
+
+**ET e EP trifásicos são ligados entre fases.** O Interplan modela a carga
+trifásica de `TIPO_LIG` 2 no primário em delta do transformador: os `PD`/`PE`/`PF`
+do `MODELO_CARGA` são as potências dos pares `DE`/`EF`/`FD`. A prova está nas
+correntes do relatório — 2,809/2,809/0,069 kW nos pares dão 0,22/0,37/0,22 A nas
+linhas, que só a ligação em delta reproduz (em estrela seriam 0,37/0,37/0,01 A).
+Para essas cargas cada letra vai para o par que começa nela
+(`_DELTA_PAIR_BY_PHASE`), com os nós vindos dos mesmos terminais das
+monofásicas, `conn=delta` e o `kV` de linha. Nome e perfil não mudam, então
+nenhum leitor de resultado precisa saber da diferença. Monofásicas e bifásicas
+seguem fase-neutro: as monofásicas são assim no Interplan, e as bifásicas ainda
+não têm um caso conferido.
 
 **A nomenclatura carrega a contagem de fases.** `<CODIGO>-<N>F-<FASE>` deixa o
 arquivo legível sem consultar o `fases2.json` e, de quebra, torna impossível que
@@ -2002,7 +2019,10 @@ parameterizado por `phase_count`, como o builder de cargas. O retrato já traz o
 circuito resolvido, as letras de fase e quatro `GeneratorPhasePowerRecord` por
 equipamento; uma posição omitida na atualização nunca chega ao arquivo. Cada
 fase vira uma `Load` monofásica e um `LoadShape`, com `kW=1`, `kvar=1`,
-`model=1`, `conn=wye` e `qmult` zerado.
+`model=1`, `conn=wye` e `qmult` zerado — salvo quando o cadastro informa
+`Q1..Q4`, que chegam negativos como a potência ativa. O consumidor de `FASES2`
+vazio ou `0` (os sintéticos que o Interplan cria para gerador sem consumidor
+próprio) usa a entrada trifásica `DEF`, a mesma regra da atualização.
 
 O sinal não é transformado no exportador. `generator_update.py` armazena
 `PD`/`PE`/`PF = -(DEMANDA/N)`, e esses valores seguem diretamente para `mult`.
@@ -2022,7 +2042,9 @@ carga, fixando a mesma ordem nos `Redirect` do master.
 
 `build_capacitor_export()` emite **um arquivo só**, sem divisão por contagem de
 fases: bancos são poucos e não justificam três arquivos. Cada banco vira uma
-`Load` monofásica por fase, com `kW=0`, `kvar=1`, `model=1`, `conn=wye` e o
+`Load` monofásica por fase, com `kW=0`, `kvar=1`, `model=2` (impedância
+constante: o reativo cai com o quadrado da tensão, como no banco real e no
+Interplan), `conn=wye` e o
 `LoadShape` do sempre presente par `mult`/`qmult` — `mult` zerado e `qmult`
 negativo. É a modelagem de compensação reativa como carga, no mesmo dialeto do
 resto do exportador; nenhum mecanismo novo foi necessário, porque a `LoadShape`
@@ -2085,6 +2107,16 @@ arquivos de elementos saem mesclados e uma fonte só deixaria os outros
 alimentadores ilhados, com carga não atendida. O caminho futuro é somar um
 `New Vsource.<CODIGO>` na barra raiz de cada alimentador adicional; enquanto
 isso, `build_master_export()` devolve `text` vazio com o motivo nos `issues`.
+
+**A tensão da saída por patamar é um `LoadShape` do `Vsource`.** `VSE1..VSE4`
+do `CIRCUITO` (colunas opcionais, guardadas em `CircuitDefinition.vse1..vse4`)
+viram `New LoadShape.VSE-<CODIGO>` logo depois do `New Circuit` — o perfil só
+existe dentro do circuito e precisa existir antes do `Edit Vsource.source
+daily=…` que o referencia. No modo diário o OpenDSS multiplica a tensão da fonte
+pelo perfil, um ponto por patamar como nas cargas (conferido contra a DLL). Com
+a fonte nominal nos quatro patamares o bloco não sai e o master fica byte a byte
+igual; um valor ilegível descarta o perfil inteiro, com aviso, porque meio
+perfil deixaria um patamar com a tensão errada em silêncio.
 
 **`text` vazio em vez de exceção.** O master é o único builder que pode
 legitimamente não produzir arquivo (seleção múltipla, `VNOM` inválida). Devolver
@@ -2165,16 +2197,28 @@ de gerador (`GER-*`), de capacitor (`CAP-*`) e de ramal equivalente. Para os
 limites de tensão isso é aceitável e é o comportamento histórico; para o modelo
 não é, porque um banco de capacitores ou uma injeção de GD não têm a
 sensibilidade à tensão de um consumo. Por isso o modelo é emitido **por
-elemento**, em `build_load_export`, onde o `model=1` já era literal. Nenhuma
-outra emissão muda: `build_generator_export`, `build_capacitor_export`,
-`build_branch_export` e as três da alocação seguem com `model=1` fixo.
+elemento**, em `build_load_export`, onde o `model=1` já era literal.
+`build_generator_export` e as três da alocação seguem com `model=1` fixo;
+`build_capacitor_export` sai sempre em `model=2`, impedância constante, que é o
+comportamento físico do banco e o do Interplan.
 
-O ramal equivalente merece nota própria: ele é o *líquido* de carga menos
-geração, pode ser negativo em todos os patamares e ainda absorve capacitores
-internos — não existe um ZIPV correto para o agregado. E a carga de energia da
-alocação vive dentro do laço de convergência do `AllocateLoads`, que ajusta o
-`CFactor` comparando corrente com o `PeakCurrent` do medidor; trocar o modelo ali
-mudaria o que o alocador enxerga a cada iteração.
+O ramal equivalente (`build_branch_export`) segue a origem da potência. **Por
+tabela**, ele é a soma dos patamares nominais das cargas do ramal — os mesmos
+valores a 1 pu que cada carga levaria no modo completo, inclusive os ETs de
+saldo negativo, que o próprio Interplan modela com o ZIP —, então recebe a mesma
+diretiva das cargas de consumo. Em potência constante o agregado consumia mais
+do que as cargas que substitui, e o modo simplificado divergia do completo:
++8,6 kW na saída do 010012 com o preset Interplan, contra ±0,2 kW depois. **Medido
+pelo fluxo**, o valor já foi tomado na tensão real da conexão, com as perdas do
+ramal, e fica em `model=1`: é o que reproduz o fluxo completo, e um modelo
+dependente de tensão aplicaria a tensão duas vezes. Ficam como aproximação do
+modo por tabela o gerador de MT somado ao agregado, que passa a seguir o modelo
+das cargas, e o capacitor interno ao ramal, que continua sem representação.
+
+A carga de energia da alocação vive dentro do laço de convergência do
+`AllocateLoads`, que ajusta o `CFactor` comparando corrente com o `PeakCurrent`
+do medidor; trocar o modelo ali mudaria o que o alocador enxerga a cada
+iteração.
 
 **A ordem do vetor é a do OpenDSS**, e está travada por teste: três pesos Z/I/P
 da ativa, três da reativa, e a tensão de corte por último. O corte é aplicado por
@@ -2214,7 +2258,11 @@ linhas, chaves, reguladores e coordenadas; `reduced_load_indices` e
 `reduced_generator_indices` retiram as fontes internas dos seis arquivos
 normais. Os equivalentes válidos e não zerados são emitidos em
 `ramalmonofasico.dss` e `ramalbifasico.dss`, como `Load` monofásicas por fase,
-com `LoadShape` de quatro NPAT e potência líquida sem inversão adicional.
+com `LoadShape` de quatro NPAT e potência líquida sem inversão adicional. As
+cargas externas aos ramais — todas as trifásicas, que ficam no tronco — passam
+pelo mesmo `build_load_export` do modo completo, inclusive a ligação em delta de
+`TIPO_LIG` 2, e o equivalente recebe o `model` das cargas quando a potência vem
+das tabelas (ver *Modelo de carga*): os dois modos falam a mesma língua.
 
 O namespace `Load.*` é reservado na ordem cargas externas, geradores externos e
 ramais. Qualquer equivalência incompleta, colisão ou erro de fase bloqueia o
@@ -3254,6 +3302,17 @@ O cálculo usa `parse_number(GERACAO_KWH) / 720` e multiplica pela curva na
 número e 0 consulta o ponto visual 24. Não há arredondamento no núcleo; quatro
 casas são apenas apresentação no painel.
 
+**A potência cadastrada tem precedência sobre a energia.** Quando o gerador traz
+`P1..P4`/`Q1..Q4` (colunas opcionais do `MT_GERADOR_CONS`) com algum valor
+diferente de zero, cada `NPAT` usa o valor do cadastro — `P1` é o `NPAT` 0 —, e a
+curva fica de fora; o `Q` cadastrado também é geração e sai negativo. É o que o
+Interplan injeta: no 010012 um gerador de `GERACAO_KWH` zerada entrega 50 kW de
+manhã e à tarde, e era descartado quando só a energia contava. Valor preenchido
+que não seja número descarta o gerador com o motivo. O consumidor de `FASES2`
+vazio ou `0` torna o gerador trifásico equilibrado, com ocorrência informativa
+que não o invalida. A energia pela curva continua sem reproduzir o Interplan
+exatamente: ele aplica um fator por gerador que não está no banco.
+
 O resultado vive somente na `MainWindow`. O worker recebe todos os retratos
 antes de começar e o novo valor só é instalado no sinal de sucesso. Cancelar,
 falhar ou terminar sem geradores válidos mantém o anterior. Trocar geradores,
@@ -3295,7 +3354,7 @@ lido por uma build anterior.
 | `test_opendss_generator_export.py` | três arquivos de geradores, perfis ativos negativos sem dupla inversão, classes negativas, terminais e tensão de fase, seleção por circuito, fallback, descarte integral, namespace `Load.*` compartilhado e ordem dos `Redirect` |
 | `test_opendss_settings.py` | invariante da faixa (`0 < vminpu <= 1 <= vmaxpu`), comandos `BatchEdit` exatos e sem vírgula decimal, desabilitado não emite nada, ida e volta pelo mapeamento, recuperação de preferência corrompida e o teto de iterações do fluxo caindo no padrão fora da faixa |
 | `test_opendss_load_model.py` | ordem do vetor `ZIPV`, números de `model` do OpenDSS, soma dos pesos verificada fora da invariante, padrão de fábrica equivalente a potência constante e descarte de preferência incoerente |
-| `test_opendss_zipv_export.py` | potência constante byte a byte igual ao comportamento anterior, `model=8` com o vetor só nas cargas de consumo, e geradores, capacitores e ramais intactos |
+| `test_opendss_zipv_export.py` | potência constante byte a byte igual ao comportamento anterior, `model=8` com o vetor só nas cargas de consumo, e geradores e capacitores intactos |
 | `test_opendss_engine.py` | detecção da biblioteca opcional, memoização do erro de import, reuso do motor único, diretório corrente restaurado (inclusive após falha) e escolha da pasta ASCII |
 | `test_opendss_powerflow.py` | com um **motor falso**: arquivos gravados iguais aos da exportação, inclusão e identidade do retrato de geradores, ordem `Clear`/`Compile`/`Set …`, um `Solve` por patamar, corrente no trecho certo (inclusive em chaves), só o terminal 1, tensões e pu por nó, neutro descartado, `IADM` ausente, patamar não convergido, colisão de caixa em nome de linha e de barra, circuito sem master, sobreposição resolvida pelo primeiro circuito, progresso e cancelamento |
 | `test_mdb_engine.py` | `cell_to_text` exaustivo (o inteiro sem `.0`, o decimal íntegro, Sim/Não, nulo, binário), sniff de formato por versão do Access, detecção de senha, cadeia de conexão somente leitura **sem chaves em `DBQ` nem em `PWD`** e comparada com a forma comprovadamente funcional, recuo do `SQL_MODE_READ_ONLY`, senha fora das mensagens, e a garantia de que só `SELECT` é emitido |

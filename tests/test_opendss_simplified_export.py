@@ -26,6 +26,7 @@ from circuit_viewer.model import (
     UtmCrs,
 )
 from circuit_viewer.opendss_powerflow import PowerFlowResult, SegmentPowers
+from circuit_viewer.opendss_settings import INTERPLAN_LOAD_SETTINGS
 from circuit_viewer.branch_json_export import build_branch_json_payload
 from circuit_viewer.opendss_simplified_export import (
     SINGLE_PHASE_BRANCHES_FILENAME,
@@ -153,7 +154,7 @@ def make_system(
     return catalog, loads, patterns, updates, equivalent
 
 
-def build_system_export(**kwargs):
+def build_system_export(*, load_settings=None, **kwargs):  # noqa: ANN001
     catalog, loads, patterns, updates, equivalent = make_system(**kwargs)
     result = build_simplified_export(
         catalog,
@@ -164,11 +165,12 @@ def build_system_export(**kwargs):
         loads=loads,
         patterns=patterns,
         generator_updates=updates,
+        load_settings=load_settings,
     )
     return catalog, equivalent, result
 
 
-def build_measured_system_export(active: float, **kwargs):
+def build_measured_system_export(active: float, *, load_settings=None, **kwargs):  # noqa: ANN001
     """Refaz o mesmo sistema com a potência do ramal medida no primeiro trecho."""
 
     catalog, loads, patterns, updates, aggregated = make_system(**kwargs)
@@ -209,8 +211,51 @@ def build_measured_system_export(active: float, **kwargs):
         loads=loads,
         patterns=patterns,
         generator_updates=updates,
+        load_settings=load_settings,
     )
     return catalog, equivalent, result
+
+
+def branch_load_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("New Load.RAMAL-")]
+
+
+class BranchLoadModelTests(unittest.TestCase):
+    """O equivalente de ramal fala a mesma língua das cargas do modo completo."""
+
+    def test_table_branch_follows_the_consumer_load_model(self) -> None:
+        # A soma das tabelas é nominal (1 pu), como a de qualquer carga: com o
+        # ZIP do Interplan, o equivalente precisa do mesmo modelo das cargas
+        # que ele substitui, senão consome mais que elas no modo completo.
+        _, _, result = build_system_export(load_settings=INTERPLAN_LOAD_SETTINGS)
+
+        directive = INTERPLAN_LOAD_SETTINGS.load_model_directive()
+        lines = branch_load_lines(result.single_phase_branches.text)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(f" {directive} kW=1 kvar=1 ", lines[0])
+        self.assertIn("conn=wye", lines[0])
+        self.assertIn(directive, result.single_phase_loads.text)
+        self.assertIn("mesmo modelo das cargas", result.single_phase_branches.text)
+
+    def test_measured_branch_stays_in_constant_power(self) -> None:
+        # Medida pelo fluxo, a potência já está na tensão real da conexão:
+        # um modelo dependente de tensão a aplicaria duas vezes.
+        _, _, result = build_measured_system_export(
+            4.0, load_settings=INTERPLAN_LOAD_SETTINGS
+        )
+
+        lines = branch_load_lines(result.single_phase_branches.text)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(" model=1 kW=1 kvar=1 ", lines[0])
+        self.assertNotIn("ZIPV", result.single_phase_branches.text)
+        self.assertIn("potencia constante", result.single_phase_branches.text)
+
+    def test_without_settings_the_branch_stays_in_constant_power(self) -> None:
+        _, _, result = build_system_export()
+
+        lines = branch_load_lines(result.single_phase_branches.text)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(" model=1 kW=1 kvar=1 ", lines[0])
 
 
 class SimplifiedOpenDssExportTests(unittest.TestCase):

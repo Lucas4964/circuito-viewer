@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
 from .branch_analysis import BranchType
+from .branch_power_source import BranchPowerSource
 from .equivalent_network import PHASE_COLUMNS, EquivalentNetworkResult
 from .model import (
     CableModel,
@@ -257,11 +258,33 @@ def build_branch_export(
     *,
     phase_count: int,
     reserved_names: frozenset[str] = frozenset(),
+    load_settings: OpenDssLoadSettings | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> OpenDssBranchExportResult:
+    """Emite as cargas equivalentes dos ramais de ``phase_count`` fases.
+
+    Cada fase do ramal é uma ``Load`` fase-neutro na barra de conexão. O
+    ``model`` depende de onde veio a potência:
+
+    - **por tabela**, o equivalente é a soma dos patamares das cargas do ramal,
+      valores nominais (1 pu) como os de qualquer carga — então segue o mesmo
+      modelo das cargas de consumo de ``load_settings``. Sem isso, com o ZIP do
+      Interplan as cargas do ramal consumiriam no modo completo menos do que o
+      equivalente no simplificado (+8,6 kW na saída do 010012);
+    - **medida pelo fluxo**, a potência já foi tomada na tensão real da conexão,
+      com as perdas do ramal: potência constante (``model=1``) a reproduz
+      exatamente, e um modelo dependente de tensão a aplicaria duas vezes.
+    """
+
     if phase_count not in _BRANCH_FILES:
         raise ValueError(f"Contagem de fases sem arquivo de ramal: {phase_count}")
     model = equivalent.model
+    measured = model.power_source is BranchPowerSource.POWER_FLOW
+    model_directive = (
+        "model=1"
+        if measured or load_settings is None
+        else load_settings.load_model_directive()
+    )
     entries = _entries_by_value(phase_configuration)
     terminals = _terminals_by_phase_letter(phase_configuration)
     bus_name = bus_namer(catalog)
@@ -377,7 +400,7 @@ def build_branch_export(
             )
             loads.append(
                 f"New Load.{name} phases=1 bus1={bus}.{node} conn=wye"
-                f" kV={voltage} model=1 kW=1 kvar=1 daily={shape_name}"
+                f" kV={voltage} {model_directive} kW=1 kvar=1 daily={shape_name}"
                 f" class={phase_count}"
             )
             used.add(name)
@@ -389,6 +412,11 @@ def build_branch_export(
         f"! Cargas equivalentes de ramais {label}",
         "! Potencias liquidas: consumo positivo e geracao negativa",
         "! Cada fase usa um LoadShape de quatro patamares",
+        (
+            "! Potencia medida pelo fluxo na conexao do ramal: potencia constante"
+            if measured
+            else "! Potencia somada das tabelas: mesmo modelo das cargas de consumo"
+        ),
         "",
     )
     body = (*shapes, *(('',) if shapes and loads else ()), *loads)
@@ -592,6 +620,7 @@ def build_simplified_export(
             circuit_index,
             phase_count=count,
             reserved_names=reserved,
+            load_settings=load_settings,
             cancel_check=cancel_check,
         )
         if result.discarded_count:

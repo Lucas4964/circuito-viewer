@@ -841,6 +841,21 @@ NPAT, `kW=1`, `kvar=1`, `conn=wye`, `class=1` ou `class=2` e nomes
 `Load.*`. Esta opção não altera **Exportar > OpenDSS…** nem o fluxo de potência
 interno da aplicação.
 
+As cargas que ficam fora dos ramais — entre elas todas as trifásicas, que
+estão no tronco — saem exatamente como no modo completo, inclusive a ligação
+entre fases das de `TIPO_LIG` 2. O `model` do equivalente depende de onde veio a
+potência do ramal:
+
+- **Por tabela**, o equivalente é a soma dos patamares nominais das cargas do
+  ramal e segue o **mesmo modelo das cargas de consumo** (o ZIPV do preset
+  Interplan, quando escolhido). Em potência constante ele consumiria mais do que
+  as cargas que substitui: no 010012 eram +8,6 kW na saída contra o Interplan,
+  e passam a ±0,2 kW, como no modo completo.
+- **Pelo fluxo de potência**, a potência já foi medida na tensão real da
+  conexão, com as perdas do ramal, e fica em **potência constante**
+  (`model=1`): é ela que reproduz o fluxo completo, e um modelo dependente de
+  tensão a aplicaria duas vezes.
+
 ### `trechos.dss` no modo original
 
 Um elemento `Line` por trecho que **não** representa chave. No modo original,
@@ -1299,13 +1314,14 @@ potência: `(0.95, 0, 0.05, 1, 0, 0, 0)` — ativa 95% impedância e 5% potênci
 constante, reativa 100% impedância — com os limites de tensão ligados em 0,5 e
 1,5 pu. Como o "Restaurar padrões", ele só preenche os campos: quem salva é o OK.
 
-**O modelo vale só para as cargas de consumo.** Geradores, ramais equivalentes
-da rede simplificada e as cargas de energia da alocação continuam em `model=1`:
-eles saem como `Load` por dialeto do exportador, não por natureza. Uma injeção de
-geração distribuída não tem a sensibilidade à tensão de um consumo, e o ramal
-equivalente é o *líquido* de carga menos geração, que pode ser negativo em todos
-os patamares. Os bancos de capacitores saem sempre em impedância constante
-(`model=2`), que é o comportamento físico deles.
+**O modelo vale para as cargas de consumo.** Geradores e as cargas de energia
+da alocação continuam em `model=1`: eles saem como `Load` por dialeto do
+exportador, não por natureza, e uma injeção de geração distribuída não tem a
+sensibilidade à tensão de um consumo. Os bancos de capacitores saem sempre em
+impedância constante (`model=2`), que é o comportamento físico deles. Os ramais
+equivalentes da rede simplificada seguem o modelo das cargas quando a potência
+vem das tabelas, e ficam em `model=1` quando é medida pelo fluxo de potência —
+ver [Exportação da rede simplificada por ramais](#exportação-da-rede-simplificada-por-ramais).
 
 ### Faixa de tensão
 
