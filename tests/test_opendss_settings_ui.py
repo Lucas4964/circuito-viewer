@@ -46,6 +46,7 @@ try:
         DEFAULT_OPENDSS_LOAD_SETTINGS,
         DEFAULT_VMAXPU,
         DEFAULT_VMINPU,
+        INTERPLAN_LOAD_SETTINGS,
         OpenDssLoadSettings,
     )
     from circuit_viewer.opendss_settings_dialog import (
@@ -620,6 +621,26 @@ class DialogTests(unittest.TestCase):
 
         self.assertTrue(ok.isEnabled())
         self.assertIsNone(dialog.zipv_validation_error())
+
+    def test_the_interplan_preset_fills_the_load_tab(self) -> None:
+        dialog = self._dialog()
+        ok = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+
+        dialog.interplan_preset_button.click()
+
+        self.assertEqual(dialog.settings(), INTERPLAN_LOAD_SETTINGS)
+        self.assertTrue(dialog.zipv_radio.isChecked())
+        self.assertTrue(ok.isEnabled())
+
+    def test_restore_defaults_undoes_the_interplan_preset(self) -> None:
+        dialog = self._dialog()
+        dialog.interplan_preset_button.click()
+
+        dialog.buttons.button(
+            QDialogButtonBox.StandardButton.RestoreDefaults
+        ).click()
+
+        self.assertEqual(dialog.settings(), DEFAULT_OPENDSS_LOAD_SETTINGS)
 
     def test_restore_defaults_also_resets_the_model(self) -> None:
         dialog = self._dialog()

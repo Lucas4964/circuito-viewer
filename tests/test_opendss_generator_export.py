@@ -201,6 +201,32 @@ class GeneratorOpenDssExportTests(unittest.TestCase):
             all("class=-3" in line for line in data_lines(three.text, "New Load."))
         )
 
+    def test_unspecified_phases_are_exported_as_balanced_three_phase(self) -> None:
+        """FASES2 0 do consumidor sintético: trifásico, como no Interplan."""
+
+        catalog = make_catalog()
+        updates = make_updates(catalog, phases=("0",), codes=("81144859",))
+
+        three = build_generator_export(catalog, updates, (0,), phase_count=3)
+        mono = build_generator_export(catalog, updates, (0,), phase_count=1)
+
+        self.assertEqual((three.exported_count, three.discarded_count), (1, 0))
+        self.assertEqual(three.issues, ())
+        self.assertEqual(
+            [
+                line.split(" bus1=")[1].split(" ")[0]
+                for line in data_lines(three.text, "New Load.")
+            ],
+            ["BARRA-1.1", "BARRA-1.2", "BARRA-1.3"],
+        )
+        self.assertTrue(
+            all(
+                "mult=[-0.666667" in line
+                for line in data_lines(three.text, "New LoadShape.")
+            )
+        )
+        self.assertEqual(mono.skipped_other_phase_count, 1)
+
     def test_selected_circuit_filters_generators(self) -> None:
         catalog = make_catalog()
         updates = make_updates(

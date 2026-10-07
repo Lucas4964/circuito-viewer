@@ -22,7 +22,10 @@ linha:
   fase — e o circuito informa ``VNOM`` como tensão de **linha**.
 
 O ``kV`` das cargas e dos geradores é a mesma tensão de fase, pela mesma razão:
-cada ``Load`` é ligada entre fase e neutro (``conn=wye``).
+cada ``Load`` é ligada entre fase e neutro (``conn=wye``). A exceção são as
+cargas trifásicas de ``TIPO_LIG`` 2 (ET e EP), que o Interplan liga **entre
+fases**: elas saem com ``conn=delta`` e a tensão de linha, ver
+:data:`DELTA_CONNECTION_TYPE`.
 """
 
 from __future__ import annotations
@@ -126,6 +129,43 @@ _PATTERN_COLUMNS_BY_PHASE = {
     "E": ("pe", "qe"),
     "F": ("pf", "qf"),
 }
+
+# TIPO_LIG da carga trifásica de ET e EP. O Interplan a liga **entre fases**: o
+# primário do transformador é em delta, e PD/PE/PF do MODELO_CARGA são as
+# potências dos pares DE/EF/FD, não de fase-neutro. Conferido contra as
+# correntes do relatório: 2,809/2,809/0,069 kW nos três pares dão 0,22/0,37/0,22 A
+# nas linhas, que em estrela seriam 0,37/0,37/0,01 A.
+DELTA_CONNECTION_TYPE = "2"
+# Par fase-fase de cada coluna de patamar: PD vai para DE, PE para EF, PF para FD.
+_DELTA_PAIR_BY_PHASE = {
+    "D": ("D", "E"),
+    "E": ("E", "F"),
+    "F": ("F", "D"),
+}
+
+# Impedância residual da chave fechada, escrita **depois** do ``Switch=Yes``.
+# Sozinho, o ``Switch=Yes`` deixa 1 mΩ + j1 mΩ em cada chave (r1=1 por unidade
+# com length=0,001), e ao longo de um tronco com várias chaves isso vira perda
+# e queda de tensão que o Interplan não tem — lá a chave é ideal. O
+# ``Switch=Yes`` só redefine os parâmetros no momento em que é lido, então as
+# propriedades seguintes prevalecem e a linha continua marcada como chave.
+SWITCH_IMPEDANCE_DIRECTIVE = (
+    "r1=1e-6 x1=1e-6 r0=1e-6 x0=1e-6 c1=0 c0=0 Length=1 units=km"
+)
+
+# FASES2 do consumidor que não descreve fase alguma. O Interplan cria um
+# consumidor sintético para o gerador de MT sem consumidor próprio ("Cons.
+# 11185_AUX", FASES2 0) e trata o gerador como trifásico equilibrado — o
+# relatório o lista como "Aterrado". A regra vale só para geradores: carga ou
+# trecho sem fase continua sendo erro de cadastro.
+UNSPECIFIED_GENERATOR_PHASES = frozenset({"", "0"})
+
+# Perfil diário da tensão da fonte (VSE1..VSE4 do CIRCUITO, em pu), um ponto por
+# patamar como os das cargas.
+SOURCE_VOLTAGE_SHAPE_PREFIX = "VSE-"
+# Desvio abaixo do qual a tensão da fonte é tratada como nominal e o master sai
+# sem o perfil, idêntico ao de antes.
+_SOURCE_VOLTAGE_TOLERANCE = 1e-9
 
 # --- Regulador de tensão -----------------------------------------------------
 # Um regulador trifásico vira três transformadores monofásicos, um por fase, e
@@ -635,6 +675,21 @@ class _ExportReport:
 
 def _entries_by_value(configuration: PhaseConfiguration) -> dict[str, object]:
     return {entry.fases2: entry for entry in configuration.entries}
+
+
+def _balanced_three_phase_entry(configuration: PhaseConfiguration):  # noqa: ANN202
+    """A entrada trifásica D/E/F, para o gerador de FASES2 não informada."""
+
+    return next(
+        (
+            entry
+            for entry in configuration.entries
+            if entry.phase_count == 3
+            and entry.dss
+            and _phase_letters(entry.name, 3) == ("D", "E", "F")
+        ),
+        None,
+    )
 
 
 def _phase_letter(name: str | None) -> str:
@@ -1487,7 +1542,8 @@ def build_switch_export(
     ``common_segment_indices`` usado por :func:`build_line_export`.
 
     A chave não consome cabo, ``COMPR`` nem ``VNOM``: ``Switch=Yes`` sobrescreve
-    todos os parâmetros elétricos da linha.
+    todos os parâmetros elétricos da linha, e :data:`SWITCH_IMPEDANCE_DIRECTIVE`
+    os reduz em seguida a uma impedância residual — a chave fechada é ideal.
     """
 
     selected = _selected_indices(catalog, circuit_indices)
@@ -1596,15 +1652,16 @@ def build_switch_export(
 
             bus1 = bus_name(int(segments.start_indices[segment_index]))
             bus2 = bus_name(int(segments.end_indices[segment_index]))
-            # Switch=Yes é a ÚLTIMA propriedade de propósito: ele redefine
-            # r1/x1/r0/x0/c1/c0/length, então qualquer parâmetro elétrico
-            # escrito depois dele seria apagado pelo OpenDSS.
+            # A impedância vem DEPOIS do Switch=Yes de propósito: ele redefine
+            # r1/x1/r0/x0/c1/c0/length no momento em que é lido, então qualquer
+            # parâmetro elétrico escrito antes dele seria apagado.
             lines.append(
                 f"New Line.{name}"
                 f" Bus1={bus1}.{entry.dss}"
                 f" Bus2={bus2}.{entry.dss}"
                 f" Phases={entry.phase_count}"
                 " Switch=Yes"
+                f" {SWITCH_IMPEDANCE_DIRECTIVE}"
             )
             used_names[name] = switch.switch_id
             used_names_casefold.add(name.casefold())
@@ -1628,7 +1685,8 @@ def build_switch_export(
 
     header = (
         "! Chaves exportadas pelo Visualizador de Circuitos Eletricos",
-        "! Switch=Yes define r1/x1/r0/x0/c1/c0 e length no OpenDSS",
+        "! Switch=Yes define r1/x1/r0/x0/c1/c0 e length no OpenDSS (1 mohm);",
+        "! a impedancia escrita depois dele torna a chave fechada ideal",
         "! Os comandos Open no fim exigem o circuito ja definido",
         "! Circuitos: "
         + ", ".join(
@@ -2033,6 +2091,11 @@ def build_load_export(
     o prefixo ``PERFIL-``. ``kW=1 kvar=1`` são fixos: a potência real de cada
     patamar vive no perfil.
 
+    A trifásica de ``TIPO_LIG`` :data:`DELTA_CONNECTION_TYPE` (ET e EP) é ligada
+    entre fases, como no Interplan: a ``Load`` de cada letra vai para o par
+    seguinte (``-D`` em DE, ``-E`` em EF, ``-F`` em FD), com ``conn=delta`` e o
+    ``kV`` de linha. Nome e perfil não mudam — o ``-D`` continua levando PD/QD.
+
     ``CircuitMembership`` não associa cargas, apenas barras, então a carga é
     atribuída ao circuito pela barra em que está pendurada.
 
@@ -2043,9 +2106,9 @@ def build_load_export(
     if phase_count not in _LOAD_FILES:
         raise ValueError(f"Contagem de fases sem arquivo: {phase_count}")
 
-    # O modelo vale só para as cargas de consumo. Geradores, capacitores e
-    # ramais equivalentes são Load por dialeto do exportador, não por
-    # natureza, e continuam em potência constante.
+    # O modelo vale só para as cargas de consumo. Geradores e ramais
+    # equivalentes são Load por dialeto do exportador, não por natureza, e
+    # continuam em potência constante; capacitores, em impedância constante.
     model_directive = (
         "model=1"
         if load_settings is None
@@ -2068,6 +2131,7 @@ def build_load_export(
     # seria descartada inteira mais abaixo, por nome já usado.
     load_suffixes = loads.name_suffixes
     exported = 0
+    exported_delta = 0
     skipped_other_phase = 0
 
     for load_index in range(total):
@@ -2207,7 +2271,22 @@ def build_load_export(
             )
 
         bus = bus_name(bar_index)
-        voltage = _format(phase_voltage_kv(nominal_voltage))
+        delta = (
+            phase_count == 3
+            and loads.connection_types[load_index].strip() == DELTA_CONNECTION_TYPE
+        )
+        if delta:
+            # Os terminais das três fases já foram exigidos por _phase_nodes,
+            # então o par de cada letra sempre resolve.
+            nodes = tuple(
+                ".".join(terminals[phase] for phase in _DELTA_PAIR_BY_PHASE[letter])
+                for letter in letters
+            )
+            connection = "delta"
+            voltage = _format(nominal_voltage)
+        else:
+            connection = "wye"
+            voltage = _format(phase_voltage_kv(nominal_voltage))
         for name, node, (active, reactive) in zip(phase_names, nodes, series):
             shape_name = f"{LOAD_SHAPE_PREFIX}{name}"
             shapes.append(
@@ -2221,7 +2300,7 @@ def build_load_export(
                 f"New Load.{name}"
                 " phases=1"
                 f" bus1={bus}.{node}"
-                " conn=wye"
+                f" conn={connection}"
                 f" kV={voltage}"
                 f" {model_directive} kW=1 kvar=1"
                 f" daily={shape_name}"
@@ -2229,6 +2308,8 @@ def build_load_export(
             )
             used_names[name] = load_id
         exported += 1
+        if delta:
+            exported_delta += 1
 
     if cancel_check is not None and cancel_check():
         raise InterruptedError("Exportação cancelada.")
@@ -2247,7 +2328,24 @@ def build_load_export(
             else ()
         ),
         "! kW=1 e kvar=1 sao fixos: a potencia de cada patamar vem do LoadShape",
-        "! kV e a tensao de fase do circuito (VNOM de linha dividida por raiz de 3)",
+        *(
+            (
+                "! kV e a tensao de fase do circuito (VNOM de linha dividida por "
+                "raiz de 3)",
+            )
+            if exported_delta == 0 or exported_delta < exported
+            else ()
+        ),
+        *(
+            (
+                "! TIPO_LIG 2 (ET e EP) e ligada entre fases, como no Interplan: "
+                "conn=delta e kV de linha (VNOM)",
+                "! -D, -E e -F ocupam os pares DE, EF e FD, com PD, PE e PF do "
+                "patamar",
+            )
+            if exported_delta
+            else ()
+        ),
         *(
             (
                 "! ZIPV: pesos Z/I/P da ativa, depois da reativa, e a tensao "
@@ -2308,6 +2406,7 @@ def build_generator_export(
     generators = updates.generators
     configuration = updates.phase_configuration
     entries_by_value = _entries_by_value(configuration)
+    balanced_entry = _balanced_three_phase_entry(configuration)
     terminals = _terminals_by_phase_letter(configuration)
     report = _ExportReport()
     bus_name = bus_namer(catalog)
@@ -2342,6 +2441,10 @@ def build_generator_export(
         record = generators.record(generator_index)
         raw_phases = record.phases
         entry = entries_by_value.get(raw_phases.strip().casefold())
+        if entry is None and raw_phases.strip() in UNSPECIFIED_GENERATOR_PHASES:
+            # Mesma regra de calculate_generator_demands, que já repartiu a
+            # potência pelas três fases.
+            entry = balanced_entry
         if entry is None:
             report.add(
                 record.generator_id,
@@ -2468,7 +2571,9 @@ def build_generator_export(
             if phase_count > 1
             else ()
         ),
-        "! Potencia ativa negativa representa geracao; qmult permanece zerado",
+        "! Potencia negativa representa geracao; qmult so nao e zero quando o "
+        "cadastro informa Q1..Q4",
+        "! model=1: potencia constante, como os geradores do Interplan",
         "! kW=1 e kvar=1 sao fixos: a potencia de cada patamar vem do LoadShape",
         "! kV e a tensao de fase do circuito (VNOM de linha dividida por raiz de 3)",
         "! Circuitos: "
@@ -2500,6 +2605,34 @@ def _master_base_name(definition) -> str:  # noqa: ANN001
     )
 
 
+def _source_voltage_profile(
+    definition,  # noqa: ANN001
+) -> tuple[tuple[float, ...] | None, str | None]:
+    """VSE1..VSE4 em pu, ou ``None`` quando a fonte fica em 1 pu o dia todo.
+
+    Vazio vale 1 pu, como na ausência da coluna. Um valor ilegível descarta o
+    perfil inteiro — meio perfil deixaria um patamar com a tensão errada sem
+    aviso — e devolve o motivo para o relatório.
+    """
+
+    values: list[float] = []
+    for position, raw in enumerate(definition.source_voltages, start=1):
+        text = str(raw).strip()
+        if not text:
+            values.append(1.0)
+            continue
+        parsed = parse_number(text)
+        if parsed is None or parsed <= 0.0:
+            return None, (
+                f"VSE{position} '{text}' inválida; a fonte ficou em 1 pu em "
+                "todos os patamares"
+            )
+        values.append(parsed)
+    if all(abs(value - 1.0) <= _SOURCE_VOLTAGE_TOLERANCE for value in values):
+        return None, None
+    return tuple(values), None
+
+
 def build_capacitor_export(
     catalog: CircuitCatalogModel,
     capacitors: CapacitorModel,
@@ -2517,6 +2650,11 @@ def build_capacitor_export(
     uma ``Load`` por fase, tensão de fase, potência no ``LoadShape``. A
     compensação entra por ``qmult`` negativo — ``kW=0`` com ``mult`` zerado anula
     a potência ativa, e ``kvar=1`` deixa o perfil entregar o valor absoluto.
+
+    ``model=2`` (impedância constante) porque é o que um banco de capacitores é:
+    o reativo entregue cai com o quadrado da tensão, como no Interplan. Em
+    potência constante o banco compensaria a mais justamente nas barras de
+    tensão baixa. O ``qmult`` continua escalando o kvar nominal de cada patamar.
 
     ``Q1..Q4`` do cadastro é a potência do **banco inteiro**, e não por fase como
     o ``QD``/``QE``/``QF`` das cargas, então é dividida pelo número de fases: sem
@@ -2678,7 +2816,7 @@ def build_capacitor_export(
                 f" bus1={bus}.{node}"
                 " conn=wye"
                 f" kV={voltage}"
-                " model=1 kW=0 kvar=1"
+                " model=2 kW=0 kvar=1"
                 f" daily={shape_name}"
                 f" class={phase_count}"
             )
@@ -2691,6 +2829,7 @@ def build_capacitor_export(
     header = (
         "! Bancos de capacitores exportados pelo Visualizador de Circuitos Eletricos",
         "! Cada banco vira uma Load monofasica por fase, com reativo negativo",
+        "! model=2: impedancia constante, o reativo varia com o quadrado da tensao",
         "! kW=0 e mult zerado: o banco nao consome potencia ativa",
         "! kvar=1 e fixo: a compensacao de cada patamar vem do qmult do LoadShape",
         "! Q do cadastro e do banco inteiro, entao e dividido pelo numero de fases",
@@ -2784,6 +2923,10 @@ def build_master_export(
     ``Vsource`` por alimentador adicional — fica para quando a exportação
     múltipla for tratada.
 
+    A tensão da saída por patamar (``VSE1``..``VSE4``) vira um ``LoadShape``
+    diário no ``Vsource``. Só sai quando algum patamar difere de 1 pu: com a
+    fonte nominal o master continua idêntico ao de sempre.
+
     ``max_power_flow_iterations`` vira o ``Set MaxIter``. Sem ele o OpenDSS usa
     o próprio padrão, 15, que é baixo demais para alimentador longo e carregado:
     a solução é abandonada antes de terminar a primeira passada, e nem o laço de
@@ -2861,6 +3004,24 @@ def build_master_export(
         f"~ MVAsc3={SOURCE_SHORT_CIRCUIT_MVA} MVAsc1={SOURCE_SHORT_CIRCUIT_MVA}",
         "",
     ]
+    source_profile, source_issue = _source_voltage_profile(definition)
+    if source_issue is not None:
+        report.add(definition.circuit_id, source_issue, discarded=False)
+    if source_profile is not None:
+        # O LoadShape só existe depois do New Circuit, e o daily= do Vsource
+        # precisa dele já definido. No modo diário o OpenDSS multiplica a
+        # tensão da fonte pelo perfil, um ponto por patamar como nas cargas.
+        shape_name = f"{SOURCE_VOLTAGE_SHAPE_PREFIX}{base}"
+        lines.extend(
+            [
+                f"New LoadShape.{shape_name}"
+                f" npts={LOAD_PATTERN_COUNT}"
+                " interval=1"
+                f" mult=[{' '.join(_format_pattern(value) for value in source_profile)}]",
+                f"Edit Vsource.source daily={shape_name}",
+                "",
+            ]
+        )
     lines.extend(f"Redirect {name}" for name in redirects)
     if redirects:
         lines.append("")

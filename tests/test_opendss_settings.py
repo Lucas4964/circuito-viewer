@@ -6,8 +6,11 @@ from circuit_viewer.opendss_settings import (
     DEFAULT_OPENDSS_LOAD_SETTINGS,
     DEFAULT_VMAXPU,
     DEFAULT_VMINPU,
+    INTERPLAN_LOAD_SETTINGS,
+    OpenDssLoadModel,
     OpenDssLoadSettings,
     settings_from_mapping,
+    zipv_sum_error,
 )
 from circuit_viewer.opendss_solution import (
     DEFAULT_MAX_POWER_FLOW_ITER,
@@ -131,6 +134,34 @@ class MappingTests(unittest.TestCase):
             settings_from_mapping(DEFAULT_OPENDSS_LOAD_SETTINGS.as_mapping()),
             DEFAULT_OPENDSS_LOAD_SETTINGS,
         )
+
+    def test_round_trip_of_the_interplan_preset(self) -> None:
+        self.assertEqual(
+            settings_from_mapping(INTERPLAN_LOAD_SETTINGS.as_mapping()),
+            INTERPLAN_LOAD_SETTINGS,
+        )
+
+
+class InterplanPresetTests(unittest.TestCase):
+    """Ativa 95% Z + 5% P, reativa 100% Z: o que o Interplan faz."""
+
+    def test_directive_and_band(self) -> None:
+        settings = INTERPLAN_LOAD_SETTINGS
+
+        self.assertIs(settings.load_model, OpenDssLoadModel.ZIPV)
+        self.assertIsNone(zipv_sum_error(settings.zipv))
+        self.assertEqual(
+            settings.load_model_directive(), "model=8 ZIPV=[0.95, 0, 0.05, 1, 0, 0, 0]"
+        )
+        # Faixa larga: o ZIPV do OpenDSS só vale entre vminpu e vmaxpu.
+        self.assertEqual(
+            settings.batch_edit_commands(),
+            ("BatchEdit Load..* vminpu=0.5", "BatchEdit Load..* vmaxpu=1.5"),
+        )
+
+    def test_is_not_the_default(self) -> None:
+        self.assertNotEqual(INTERPLAN_LOAD_SETTINGS, DEFAULT_OPENDSS_LOAD_SETTINGS)
+        self.assertTrue(DEFAULT_OPENDSS_LOAD_SETTINGS.is_default)
 
     def test_missing_keys_fall_back_to_the_default(self) -> None:
         self.assertEqual(settings_from_mapping({}), DEFAULT_OPENDSS_LOAD_SETTINGS)

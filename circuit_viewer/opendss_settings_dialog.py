@@ -50,6 +50,7 @@ from .opendss_solution import (
 from .opendss_settings import (
     DEFAULT_OPENDSS_LOAD_SETTINGS,
     DEFAULT_ZIPV_COEFFICIENTS,
+    INTERPLAN_LOAD_SETTINGS,
     OpenDssLoadModel,
     OpenDssLoadSettings,
     VMAXPU_RANGE,
@@ -665,6 +666,20 @@ class OpenDssSettingsDialog(QDialog):
         tab.setObjectName("opendss_loads_tab")
         layout = QVBoxLayout(tab)
 
+        self.interplan_preset_button = QPushButton("Preset Interplan", tab)
+        self.interplan_preset_button.setObjectName("opendss_interplan_preset")
+        self.interplan_preset_button.setToolTip(
+            "Preenche o modelo de carga do Interplan: ZIPV com a ativa 95% "
+            "impedância e 5% potência constantes e a reativa 100% impedância, "
+            "e limites de 0,5 a 1,5 pu para o modelo valer em todas as barras. "
+            "Só é salvo com OK."
+        )
+        self.interplan_preset_button.clicked.connect(self.apply_interplan_preset)
+        layout.addWidget(
+            self.interplan_preset_button,
+            alignment=Qt.AlignmentFlag.AlignLeft,
+        )
+
         self.load_model_group = QButtonGroup(tab)
         self.load_model_group.setObjectName("opendss_load_model_group")
         self.load_model_group.setExclusive(True)
@@ -898,21 +913,36 @@ class OpenDssSettingsDialog(QDialog):
         if ok is not None:
             ok.setEnabled(valid)
 
+    def _apply_load_settings(self, settings: OpenDssLoadSettings) -> None:
+        """Leva uma configuração de cargas aos campos, sem salvá-la."""
+
+        self.apply_limits_check.setChecked(settings.voltage_limits_enabled)
+        self.vminpu_input.setValue(settings.vminpu)
+        self.vmaxpu_input.setValue(settings.vmaxpu)
+        if settings.load_model is OpenDssLoadModel.ZIPV:
+            self.zipv_radio.setChecked(True)
+        else:
+            self.constant_power_radio.setChecked(True)
+        for name, value in zip(
+            ("z_p", "i_p", "p_p", "z_q", "i_q", "p_q", "cutoff"),
+            settings.zipv.as_tuple(),
+            strict=True,
+        ):
+            self.zipv_inputs[name].setValue(value)
+
+    def apply_interplan_preset(self) -> None:
+        """Preenche a aba de cargas com o modelo do Interplan.
+
+        Como o "Restaurar padrões", só mexe nos campos: quem decide salvar é o OK.
+        """
+
+        self._apply_load_settings(INTERPLAN_LOAD_SETTINGS)
+        self._sync_accept_enabled()
+
     def restore_defaults(self) -> None:
         current_tab = self.tabs.currentWidget()
         if current_tab is self.voltage_tab:
-            self.apply_limits_check.setChecked(
-                DEFAULT_OPENDSS_LOAD_SETTINGS.voltage_limits_enabled
-            )
-            self.vminpu_input.setValue(DEFAULT_OPENDSS_LOAD_SETTINGS.vminpu)
-            self.vmaxpu_input.setValue(DEFAULT_OPENDSS_LOAD_SETTINGS.vmaxpu)
-            self.constant_power_radio.setChecked(True)
-            for name, value in zip(
-                ("z_p", "i_p", "p_p", "z_q", "i_q", "p_q", "cutoff"),
-                DEFAULT_ZIPV_COEFFICIENTS.as_tuple(),
-                strict=True,
-            ):
-                self.zipv_inputs[name].setValue(value)
+            self._apply_load_settings(DEFAULT_OPENDSS_LOAD_SETTINGS)
         elif current_tab is self.branches_tab:
             self.branch_power_table_radio.setChecked(True)
         elif current_tab is self.line_parameters_tab:

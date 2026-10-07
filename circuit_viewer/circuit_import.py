@@ -27,6 +27,9 @@ from .model import (
 
 
 EXPECTED_CIRCUIT_HEADER = ("CIRC_ID", "BARRA_ID", "CODIGO", "VNOM")
+# Tensão da saída por patamar, em pu. Opcional: uma fonte sem ela continua
+# importando, com a fonte em 1 pu como sempre foi.
+OPTIONAL_CIRCUIT_HEADER = ("VSE1", "VSE2", "VSE3", "VSE4")
 MAX_REPORTED_ISSUES = 200
 ProgressCallback = Callable[[int, int, int], None]
 
@@ -141,6 +144,10 @@ def parse_circuit_rows(
     header = normalize_header(raw_header)
     positions = _column_positions(header)
     last_required_position = max(positions.values())
+    # A primeira ocorrência vence; coluna opcional ausente fica vazia.
+    optional_positions = {
+        name: header.index(name) for name in OPTIONAL_CIRCUIT_HEADER if name in header
+    }
 
     for line_number, row in enumerate(rows, start=first_line_number):
         if cancel_event is not None and cancel_event.is_set():
@@ -155,6 +162,8 @@ def parse_circuit_rows(
             continue
 
         values = {name: row[index].strip() for name, index in positions.items()}
+        for name, index in optional_positions.items():
+            values[name] = row[index].strip() if index < len(row) else ""
         circuit_id = values["CIRC_ID"]
         if not circuit_id:
             add_issue(line_number, "CIRC_ID vazio")
@@ -189,6 +198,10 @@ def parse_circuit_rows(
                 transformer_id="" if link is None else link.transformer_id,
                 transformer_code="" if link is None else link.transformer_code,
                 transformer_power="" if link is None else link.transformer_power,
+                vse1=values.get("VSE1", ""),
+                vse2=values.get("VSE2", ""),
+                vse3=values.get("VSE3", ""),
+                vse4=values.get("VSE4", ""),
             )
         )
 

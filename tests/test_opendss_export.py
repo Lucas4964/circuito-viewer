@@ -23,6 +23,8 @@ from circuit_viewer.opendss_export import (
     MAX_REPORTED_ISSUES,
     REGULATORS_FILENAME,
     SINGLE_PHASE_LOADS_FILENAME,
+    SOURCE_VOLTAGE_SHAPE_PREFIX,
+    SWITCH_IMPEDANCE_DIRECTIVE,
     SWITCHES_FILENAME,
     THREE_PHASE_LOADS_FILENAME,
     TWO_PHASE_LOADS_FILENAME,
@@ -223,6 +225,7 @@ def make_loads(
     bar_indices: tuple[int, ...] = (1,),
     codes: tuple[str, ...] = ("CARGA-1",),
     phases: tuple[str, ...] = ("1",),
+    connection_types: tuple[str, ...] | None = None,
 ) -> LoadModel:
     size = len(load_ids)
     return LoadModel(
@@ -235,7 +238,7 @@ def make_loads(
         ["12"] * size,
         ["220"] * size,
         list(phases),
-        ["Y"] * size,
+        ["Y"] * size if connection_types is None else list(connection_types),
     )
 
 
@@ -595,10 +598,13 @@ class SwitchExportTests(unittest.TestCase):
         self.assertEqual(
             data_lines(result.text)[0],
             "New Line.CHV-001 Bus1=BARRA_B.1.2.3 Bus2=BARRA_C.1.2.3 Phases=3 "
-            "Switch=Yes",
+            "Switch=Yes r1=1e-6 x1=1e-6 r0=1e-6 x0=1e-6 c1=0 c0=0 Length=1 units=km",
         )
-        # Switch=Yes redefine r1/x1/r0/x0/c1/c0/length: nada elétrico depois dele.
-        self.assertTrue(data_lines(result.text)[0].endswith("Switch=Yes"))
+        # Switch=Yes redefine r1/x1/r0/x0/c1/c0/length quando é lido: a
+        # impedância residual precisa vir DEPOIS dele para prevalecer.
+        line = data_lines(result.text)[0]
+        self.assertLess(line.index("Switch=Yes"), line.index("r1="))
+        self.assertTrue(line.endswith(SWITCH_IMPEDANCE_DIRECTIVE))
         self.assertEqual(open_commands(result.text), [])
 
     def test_open_switch_gets_an_open_command(self) -> None:
@@ -710,7 +716,7 @@ class SwitchExportTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "Bus1=BARRA_B.1.2 Bus2=BARRA_C.1.2 Phases=2 Switch=Yes",
+            "Bus1=BARRA_B.1.2 Bus2=BARRA_C.1.2 Phases=2 Switch=Yes ",
             result.text,
         )
 
@@ -1880,6 +1886,84 @@ class ThreePhaseLoadExportTests(unittest.TestCase):
             ],
         )
 
+    def test_tipo_lig_2_is_connected_between_phases_like_the_interplan(self) -> None:
+        """ET/EP trifásicos: PD/PE/PF são os pares DE/EF/FD, não fase-neutro."""
+
+        bars = make_bars()
+        loads = make_loads(bars, phases=("13",), connection_types=("2",))
+
+        result = self._export(loads, make_patterns(loads))
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertFalse(result.has_warnings)
+        self.assertEqual(
+            load_entries(result.text),
+            [
+                "New Load.CARGA-1-3F-D phases=1 bus1=BARRA_B.1.2 conn=delta"
+                " kV=13.8 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-D class=3",
+                "New Load.CARGA-1-3F-E phases=1 bus1=BARRA_B.2.3 conn=delta"
+                " kV=13.8 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-E class=3",
+                "New Load.CARGA-1-3F-F phases=1 bus1=BARRA_B.3.1 conn=delta"
+                " kV=13.8 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-F class=3",
+            ],
+        )
+        # O perfil não muda: o "-D" continua com PD/QD, agora no par DE.
+        self.assertIn(
+            "New LoadShape.PERFIL-CARGA-1-3F-D npts=4 interval=1"
+            " mult=[1.500000 2.500000 3.500000 4.500000]",
+            result.text,
+        )
+        self.assertIn("conn=delta e kV de linha", result.text)
+        self.assertNotIn("kV e a tensao de fase", result.text)
+
+    def test_delta_and_wye_loads_share_the_three_phase_file(self) -> None:
+        bars = make_bars()
+        loads = make_loads(
+            bars,
+            load_ids=("CG1", "CG2"),
+            bar_indices=(1, 2),
+            codes=("ET", "OUTRA"),
+            phases=("14", "13"),
+            connection_types=(" 2 ", "Y"),
+        )
+
+        result = self._export(loads, make_patterns(loads))
+
+        buses = [
+            line.split(" bus1=")[1].split(" conn=")
+            for line in load_entries(result.text)
+        ]
+        self.assertEqual(
+            [(bus, conn.split(" ")[0]) for bus, conn in buses],
+            [
+                ("BARRA_B.1.2", "delta"),
+                ("BARRA_B.2.3", "delta"),
+                ("BARRA_B.3.1", "delta"),
+                ("BARRA_C.1", "wye"),
+                ("BARRA_C.2", "wye"),
+                ("BARRA_C.3", "wye"),
+            ],
+        )
+        # Com as duas ligações no arquivo, os dois avisos de kV aparecem.
+        self.assertIn("kV e a tensao de fase", result.text)
+        self.assertIn("conn=delta e kV de linha", result.text)
+
+    def test_tipo_lig_2_does_not_touch_single_phase_loads(self) -> None:
+        bars = make_bars()
+        loads = make_loads(bars, phases=("1",), connection_types=("2",))
+
+        result = export_loads(loads, make_patterns(loads), 1)
+
+        kv = phase_voltage_kv(13.8)
+        self.assertEqual(
+            load_entries(result.text),
+            [
+                f"New Load.CARGA-1-1F-D phases=1 bus1=BARRA_B.1 conn=wye"
+                f" kV={kv:.6g} model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-1F-D"
+                " class=1",
+            ],
+        )
+
     def test_neutral_in_the_name_is_ignored(self) -> None:
         # "DEFN" resolve as mesmas três fases de "DEF": o N não é fase.
         bars = make_bars()
@@ -2058,6 +2142,60 @@ class MasterExportTests(unittest.TestCase):
                 "",
                 "Buscoords ALIMENTADOR_Buscoords.csv",
             ],
+        )
+
+    def _catalog_with_source_voltages(self, *vse: str) -> CircuitCatalogModel:
+        values = dict(zip(("vse1", "vse2", "vse3", "vse4"), vse))
+        return CircuitCatalogModel.build(
+            make_network(make_bars()),
+            None,
+            [CircuitDefinition("C1", "B0", "ALIMENTADOR", "13,8", **values)],
+        )
+
+    def test_source_voltage_per_level_becomes_a_daily_vsource_shape(self) -> None:
+        result = build_master_export(
+            self._catalog_with_source_voltages("1,02", "1", "0.98", ""),
+            [0],
+            redirects=[LINES_FILENAME],
+        )
+        lines = result.text.splitlines()
+        shape = f"{SOURCE_VOLTAGE_SHAPE_PREFIX}ALIMENTADOR"
+
+        self.assertFalse(result.has_warnings)
+        # Vazio vale 1 pu, como a ausência da coluna.
+        self.assertIn(
+            f"New LoadShape.{shape} npts=4 interval=1"
+            " mult=[1.020000 1.000000 0.980000 1.000000]",
+            lines,
+        )
+        self.assertIn(f"Edit Vsource.source daily={shape}", lines)
+        # O LoadShape só existe dentro do circuito, e precisa existir antes do
+        # Edit que o referencia; os elementos vêm depois.
+        self.assertLess(lines.index("New Circuit.ALIMENTADOR"), lines.index(
+            f"Edit Vsource.source daily={shape}"
+        ))
+        self.assertLess(
+            lines.index(f"Edit Vsource.source daily={shape}"),
+            lines.index("Redirect trechos.dss"),
+        )
+
+    def test_nominal_source_voltage_keeps_the_master_unchanged(self) -> None:
+        nominal = build_master_export(
+            self._catalog_with_source_voltages("1", "1.0", "1,000", "1"), [0]
+        )
+
+        self.assertEqual(nominal.text, build_master_export(self._catalog(), [0]).text)
+
+    def test_invalid_source_voltage_is_reported_and_left_nominal(self) -> None:
+        result = build_master_export(
+            self._catalog_with_source_voltages("1,02", "x", "1", "1"), [0]
+        )
+
+        self.assertNotIn("Vsource", result.text)
+        self.assertEqual(result.discarded_count, 0)
+        self.assertIn(
+            "VSE2 'x' inválida; a fonte ficou em 1 pu em todos os patamares",
+            [issue.reason for issue in result.issues],
         )
 
     def test_max_iter_uses_the_configured_ceiling(self) -> None:

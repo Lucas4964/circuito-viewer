@@ -69,17 +69,19 @@ class CapacitorExportTests(unittest.TestCase):
         self.assertEqual(result.discarded_count, 0)
         self.assertEqual(result.issues, ())
         kv = phase_voltage_kv(13.8)
+        # model=2: o banco é impedância constante, como no Interplan — o
+        # reativo entregue cai com o quadrado da tensão.
         self.assertEqual(
             load_entries(result.text),
             [
                 f"New Load.CAP-CAP-1-3F-D phases=1 bus1=BARRA_B.1 conn=wye"
-                f" kV={kv:.6g} model=1 kW=0 kvar=1"
+                f" kV={kv:.6g} model=2 kW=0 kvar=1"
                 " daily=PERFIL-CAP-CAP-1-3F-D class=3",
                 f"New Load.CAP-CAP-1-3F-E phases=1 bus1=BARRA_B.2 conn=wye"
-                f" kV={kv:.6g} model=1 kW=0 kvar=1"
+                f" kV={kv:.6g} model=2 kW=0 kvar=1"
                 " daily=PERFIL-CAP-CAP-1-3F-E class=3",
                 f"New Load.CAP-CAP-1-3F-F phases=1 bus1=BARRA_B.3 conn=wye"
-                f" kV={kv:.6g} model=1 kW=0 kvar=1"
+                f" kV={kv:.6g} model=2 kW=0 kvar=1"
                 " daily=PERFIL-CAP-CAP-1-3F-F class=3",
             ],
         )

@@ -71,6 +71,62 @@ class GeneratorImportTests(unittest.TestCase):
         self.assertEqual(record.bar_id, "B2")
         self.assertEqual(record.generation_kwh, "1000,5")
 
+    def test_associates_by_mt_cons_id_when_the_codes_differ(self) -> None:
+        """O gerador 81144859 do Interplan pende de "Cons. 11185_AUX"."""
+
+        generators = self.write(
+            "MT_GERADOR_CONS.csv",
+            ";".join(GENERATOR_HEADER)
+            + ";P1;P2;P3;P4;Q1;Q2;Q3;Q4\n"
+            + "87;276;81144859;13,8;50;2;0;0;0;50;50;0;0;1,5;0;0\n",
+        )
+        consumers = self.write(
+            "MT_CONS.csv",
+            ";".join(CONSUMER_HEADER)
+            + "\n276;L1;Cons. 11185_AUX;;;0\n",
+        )
+
+        result = load_generators_csv(generators, consumers, self.loads)
+
+        self.assertEqual(result.valid_rows, 1)
+        record = result.model.record(0)
+        self.assertEqual(record.generator_code, "81144859")
+        self.assertEqual(record.consumer_code, "Cons. 11185_AUX")
+        self.assertEqual(record.load_id, "L1")
+        self.assertEqual(record.phases, "0")
+        self.assertEqual(record.level_active_powers, ("0", "50", "50", "0"))
+        self.assertEqual(record.level_reactive_powers, ("0", "1,5", "0", "0"))
+
+    def test_mt_cons_id_wins_over_a_code_that_points_elsewhere(self) -> None:
+        generators = self.write(
+            "geradores.csv",
+            ";".join(GENERATOR_HEADER) + "\nG1;MC2;COD-1;;;;;\n",
+        )
+        consumers = self.write(
+            "consumidores.csv",
+            ";".join(CONSUMER_HEADER) + "\nMC1;L1;COD-1;;;\nMC2;L2;OUTRO;;;\n",
+        )
+
+        result = load_generators_csv(generators, consumers, self.loads)
+
+        self.assertEqual(result.model.record(0).consumer_id, "MC2")
+        self.assertEqual(result.model.bar_indices.tolist(), [1])
+
+    def test_without_optional_columns_the_level_powers_are_empty(self) -> None:
+        generators = self.write(
+            "geradores.csv",
+            ";".join(GENERATOR_HEADER) + "\nG1;MC1;COD;13.8;75;Y;CUR;1000\n",
+        )
+        consumers = self.write(
+            "cons.csv",
+            ";".join(CONSUMER_HEADER) + "\nMC1;L2;COD;EXT;Usina;ABC\n",
+        )
+
+        record = load_generators_csv(generators, consumers, self.loads).model.record(0)
+
+        self.assertEqual(record.level_active_powers, ("", "", "", ""))
+        self.assertEqual(record.level_reactive_powers, ("", "", "", ""))
+
     def test_skips_duplicate_ids_ambiguous_codes_and_unknown_loads(self) -> None:
         generators = self.write(
             "geradores.csv",

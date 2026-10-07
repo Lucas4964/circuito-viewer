@@ -343,6 +343,10 @@ class GeneratorRecord:
     name: str
     phases: str
     bar_id: str
+    # P1..P4 (kW) e Q1..Q4 (kvar) do cadastro, na ordem dos patamares NPAT
+    # 0..3; vazios quando a fonte não os tem.
+    level_active_powers: tuple[str, str, str, str] = ("", "", "", "")
+    level_reactive_powers: tuple[str, str, str, str] = ("", "", "", "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,6 +402,10 @@ class CircuitDefinition:
     sendo um circuito, e o catálogo continua desenhável. Perder o alimentador
     por causa de uma coluna de referência seria trocar o essencial pelo
     acessório.
+
+    ``vse1``..``vse4`` são a tensão da saída do alimentador em cada patamar
+    (``VSE1``..``VSE4`` do ``CIRCUITO``, em pu), com a mesma regra: vazio
+    significa a tensão nominal, 1 pu.
     """
 
     circuit_id: str
@@ -409,6 +417,16 @@ class CircuitDefinition:
     transformer_id: str = ""
     transformer_code: str = ""
     transformer_power: str = ""
+    vse1: str = ""
+    vse2: str = ""
+    vse3: str = ""
+    vse4: str = ""
+
+    @property
+    def source_voltages(self) -> tuple[str, str, str, str]:
+        """VSE1..VSE4 na ordem dos patamares NPAT 0..3."""
+
+        return (self.vse1, self.vse2, self.vse3, self.vse4)
 
 
 @dataclass(frozen=True, slots=True)
@@ -952,6 +970,12 @@ class LoadModel:
         return self._phases
 
     @property
+    def connection_types(self) -> tuple[str, ...]:
+        """``TIPO_LIG`` de cada carga, como texto do cadastro."""
+
+        return self._connection_types
+
+    @property
     def spatial_index(self) -> StaticPointIndex:
         return self._spatial_index
 
@@ -1144,6 +1168,8 @@ class GeneratorModel:
         "_external_ids",
         "_names",
         "_phases",
+        "_level_active_powers",
+        "_level_reactive_powers",
         "_by_id",
         "_spatial_index",
         "source_paths",
@@ -1167,6 +1193,8 @@ class GeneratorModel:
         names: Iterable[str],
         phases: Iterable[str],
         *,
+        level_active_powers: Iterable[Iterable[str]] | None = None,
+        level_reactive_powers: Iterable[Iterable[str]] | None = None,
         source_paths: tuple[str, str] | None = None,
     ) -> None:
         ids = tuple(str(value) for value in generator_ids)
@@ -1197,6 +1225,13 @@ class GeneratorModel:
             raise ValueError("Os índices de cargas devem formar um vetor compatível.")
         if (associated_loads < 0).any() or (associated_loads >= len(loads)).any():
             raise ValueError("Um gerador referencia uma carga inexistente.")
+        level_powers = tuple(
+            _level_power_column(values, size, label)
+            for values, label in (
+                (level_active_powers, "P1..P4"),
+                (level_reactive_powers, "Q1..Q4"),
+            )
+        )
 
         by_id: dict[str, int] = {}
         for index, generator_id in enumerate(ids):
@@ -1230,6 +1265,7 @@ class GeneratorModel:
             self._names,
             self._phases,
         ) = text_columns
+        self._level_active_powers, self._level_reactive_powers = level_powers
         self._by_id = by_id
         self._spatial_index = StaticPointIndex(
             self.bars.x[bar_indices], self.bars.y[bar_indices]
@@ -1283,7 +1319,30 @@ class GeneratorModel:
             name=self._names[index],
             phases=self._phases[index],
             bar_id=self.bars.bar_ids[int(self._bar_indices[index])],
+            level_active_powers=self._level_active_powers[index],
+            level_reactive_powers=self._level_reactive_powers[index],
         )
+
+
+def _level_power_column(
+    values: Iterable[Iterable[str]] | None,
+    size: int,
+    label: str,
+) -> tuple[tuple[str, str, str, str], ...]:
+    """Coluna de potências por patamar, quatro textos por gerador.
+
+    Ausente vira vazio — o caso de toda fonte anterior a estas colunas, inclusive
+    projetos compostos antes delas existirem.
+    """
+
+    if values is None:
+        return (("", "", "", ""),) * size
+    column = tuple(tuple(str(value) for value in row) for row in values)
+    if len(column) != size:
+        raise ValueError(f"{label} deve ter uma linha por gerador.")
+    if any(len(row) != 4 for row in column):
+        raise ValueError(f"{label} deve ter um valor por patamar (NPAT 0 a 3).")
+    return column  # type: ignore[return-value]
 
 
 class CableModel:

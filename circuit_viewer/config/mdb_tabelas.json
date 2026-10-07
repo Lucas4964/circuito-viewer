@@ -44,7 +44,9 @@
     "tabelas": ["MT_GERADOR_CONS"],
     "colunas": {
       "GERADOR_ID": [], "MT_CONS_ID": [], "CODIGO": [], "VNOM": [],
-      "SNOM": [], "LIGACAO": [], "CURVA_ID": [], "GERACAO_KWH": []
+      "SNOM": [], "LIGACAO": [], "CURVA_ID": [], "GERACAO_KWH": [],
+      "P1": [], "P2": [], "P3": [], "P4": [],
+      "Q1": [], "Q2": [], "Q3": [], "Q4": []
     }
   },
   {
@@ -84,7 +86,10 @@
   {
     "entidade": "circuitos",
     "tabelas": ["CIRCUITO"],
-    "colunas": {"CIRC_ID": [], "BARRA_ID": [], "CODIGO": [], "VNOM": []}
+    "colunas": {
+      "CIRC_ID": [], "BARRA_ID": [], "CODIGO": [], "VNOM": [],
+      "VSE1": [], "VSE2": [], "VSE3": [], "VSE4": []
+    }
   },
   {
     "entidade": "patamares_circuitos",

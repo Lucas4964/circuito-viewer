@@ -878,18 +878,21 @@ Um elemento `Line` com `Switch=Yes` por trecho que **representa** chave — o
 complemento exato de `trechos.dss`:
 
 ```
-New Line.CHV-001 Bus1=COD-B.1.2.3 Bus2=COD-C.1.2.3 Phases=3 Switch=Yes
+New Line.CHV-001 Bus1=COD-B.1.2.3 Bus2=COD-C.1.2.3 Phases=3 Switch=Yes r1=1e-6 x1=1e-6 r0=1e-6 x0=1e-6 c1=0 c0=0 Length=1 units=km
 ```
 
 - **Nome** — `CODIGO` da **chave** (de `chaves.csv`), não o do trecho; quando
   vazio, cai no `CHAVE_ID` com aviso.
 - **`Bus1`/`Bus2`, `Phases` e o sufixo de nós** — mesmas regras de
   `trechos.dss`, lidos do trecho onde a chave está.
-- **Sem `R1`, `Length` ou `units`**: `Switch=Yes` tem efeito colateral
-  documentado no OpenDSS — define `r1`, `x1`, `r0`, `x0`, `c1`, `c0` e
-  `length=0.001` por conta própria. Por isso ele é sempre a **última**
-  propriedade da linha; qualquer parâmetro elétrico escrito depois dele seria
-  sobrescrito.
+- **Chave ideal**: `Switch=Yes` tem efeito colateral documentado no OpenDSS —
+  define `r1`, `x1`, `r0`, `x0`, `c1`, `c0` e `length=0.001` por conta própria,
+  o que deixa **1 mΩ + j1 mΩ** em cada chave. Ao longo de um tronco com várias
+  chaves isso vira perda e queda de tensão que o Interplan não tem (lá a chave
+  é ideal): no alimentador 010012 foram 0,86 kW de perda e −0,011% de viés nas
+  tensões. Por isso a impedância residual de 1 µΩ vem **depois** do
+  `Switch=Yes` — ele só redefine os parâmetros no momento em que é lido, então
+  as propriedades seguintes prevalecem e a linha continua marcada como chave.
 
 Chaves abertas recebem, **no fim do arquivo**, depois de todas as definições:
 
@@ -917,6 +920,9 @@ fase**, com reativo negativo — a compensação modelada como carga, no mesmo
 dialeto do resto da exportação. Todos os bancos ficam num arquivo só, sem divisão
 por número de fases.
 
+- **`model=2`** (impedância constante): o reativo entregue cai com o quadrado da
+  tensão, como num banco de capacitores de verdade e como no Interplan. Em
+  potência constante o banco compensaria a mais justamente onde a tensão é baixa.
 - **`kW=0`** e o `mult` do `LoadShape` zerado: o banco não consome potência ativa.
 - **`kvar=1`** fixo, com a compensação de cada patamar vindo do **`qmult`**, que
   é negativo porque o banco injeta reativo.
@@ -1030,6 +1036,45 @@ coeficientes, e o resto da linha permanece igual:
 New Load.CARGA-1-3F-D phases=1 bus1=COD-B.1 conn=wye kV=7.96743 model=8 ZIPV=[0.5, 0.2, 0.3, 0.4, 0.3, 0.3, 0.7] kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-D class=3
 ```
 
+#### ET e EP trifásicos (`TIPO_LIG` 2): ligação entre fases
+
+O Interplan liga a carga trifásica de ET e EP **entre fases** — o primário do
+transformador é em delta —, e os `PD`/`PE`/`PF` do `MODELO_CARGA` são as
+potências dos **pares `DE`/`EF`/`FD`**, não de fase-neutro. A carga de
+`TIPO_LIG` 2 sai assim, com o mesmo nome e o mesmo perfil, mas cada letra no par
+que começa nela, `conn=delta` e a **tensão de linha**:
+
+```
+New Load.CARGA-1-3F-D phases=1 bus1=COD-B.1.2 conn=delta kV=13.8 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-D class=3
+New Load.CARGA-1-3F-E phases=1 bus1=COD-B.2.3 conn=delta kV=13.8 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-E class=3
+New Load.CARGA-1-3F-F phases=1 bus1=COD-B.3.1 conn=delta kV=13.8 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-F class=3
+```
+
+A evidência está nas correntes do relatório do Interplan: um ET com 2,809 /
+2,809 / 0,069 kW nos três pares tem 0,22 / 0,37 / 0,22 A nas linhas, o que só a
+ligação em delta reproduz (em estrela seriam 0,37 / 0,37 / 0,01 A). Monofásicas
+(`TIPO_LIG` 0) continuam fase-neutro; os demais códigos e as bifásicas mantêm a
+ligação em estrela, por falta de um caso conferido contra o Interplan.
+
+#### Modelo do Interplan (botão "Preset Interplan")
+
+Em **Configurações do OpenDSS → Cargas**, o botão **Preset Interplan** preenche
+o ZIPV que o Interplan usa — **ativa 95% impedância + 5% potência constante,
+reativa 100% impedância** — e limites de tensão de 0,5 a 1,5 pu, para o ZIPV
+do OpenDSS (que só vale entre `vminpu` e `vmaxpu`) não trocar de modelo em
+barra nenhuma. Só é salvo com OK; o padrão continua sendo potência constante.
+
+```
+New Load.CARGA-1-3F-D phases=1 bus1=COD-B.1.2 conn=delta kV=13.8 model=8 ZIPV=[0.95, 0, 0.05, 1, 0, 0, 0] kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-D class=3
+```
+
+Com as duas peças, o capacitor em impedância constante, as chaves ideais e os
+geradores de MT pela potência cadastrada (abaixo), o alimentador 010012 bate com
+o relatório de fluxo do Interplan no limite de precisão do próprio relatório:
+saída a ±0,2 kW e ±0,1 kvar, |V| a ±0,05% e ângulo a ±0,05° em todas as barras,
+perdas a ±0,1 kW. `benchmarks/validate_interplan_powerflow.py` refaz essa
+comparação para qualquer export e qualquer pasta de relatórios do Interplan.
+
 #### Nome
 
 Toda carga exportada segue `<CODIGO>-<N>F-<FASE>`, onde `N` é a contagem de
@@ -1054,7 +1099,8 @@ que faz `DN` valer como `D` e `DEFN` como `DEF`.
   nó de neutro explícito: `DN` gera `bus.1.0`.
 - **`kV`** — a **tensão de fase** do circuito: como `VNOM` é a tensão de linha,
   ela é dividida por `√3`. É a mesma conversão usada em `C1`, pela mesma razão —
-  a carga é ligada entre fase e neutro (`conn=wye`).
+  a carga é ligada entre fase e neutro (`conn=wye`). A exceção é a trifásica de
+  `TIPO_LIG` 2, ligada entre fases com a própria `VNOM` (seção acima).
 - **`kW=1 kvar=1`** — fixos de propósito. A potência real de cada patamar vive
   no `LoadShape`, e o OpenDSS multiplica os dois.
 - **`mult` e `qmult`** — os quatro patamares na ordem `NPAT` 0, 1, 2 e 3, com
@@ -1111,7 +1157,29 @@ New Load.GER-SOLAR-1-2F-E phases=1 bus1=COD-B.2 conn=wye kV=7.96743 model=1 kW=1
 esses valores diretamente no `mult`, sem uma segunda inversão; `QD`, `QE` e
 `QF` permanecem zero. Assim o elemento `Load` representa geração no OpenDSS.
 Uma curva negativa conserva sua demanda total negativa e produz potência ativa
-por fase positiva, conforme a mesma convenção algébrica.
+por fase positiva, conforme a mesma convenção algébrica. Os geradores ficam em
+potência constante (`model=1`), como no Interplan, mesmo com o preset ZIPV.
+
+**Potência cadastrada.** Quando o gerador traz `P1..P4` (kW) ou `Q1..Q4` (kvar)
+diferentes de zero no `MT_GERADOR_CONS`, é essa a potência de cada patamar —
+`P1` é o `NPAT` 0 —, e não a energia pela curva; vale mesmo com `GERACAO_KWH`
+zerada. É o caso de um gerador que o Interplan injeta com 50 kW de manhã e à
+tarde sem energia mensal cadastrada. O `Q` cadastrado também é geração e chega
+negativo ao `qmult`. As colunas são opcionais: num banco sem elas tudo segue
+pela curva.
+
+**Vínculo com o consumidor.** O gerador é ligado ao seu `MT_CONS` pela chave
+`MT_CONS_ID` → `ID`, com o `CODIGO` como reserva para fontes cujo ID não case.
+O código do gerador costuma repetir o do consumidor, mas não sempre: o Interplan
+cria consumidores sintéticos (`Cons. 11185_AUX`) para geradores sem consumidor
+próprio, e esses só são achados pelo ID. Um consumidor com `FASES2` vazio ou `0`
+— o caso desses sintéticos — torna o gerador **trifásico equilibrado**, como o
+Interplan o trata, e o caso entra no relatório da atualização.
+
+A curva por energia não reproduz exatamente o Interplan: ele aplica um fator por
+gerador que não está no banco (no 010012, 1,23 kW contra 0,96 kW num gerador de
+214 kWh/mês). A diferença é pequena no fluxo da MT, porque a geração de BT já
+chega descontada no `MODELO_CARGA` de cada ET.
 
 O nome é `GER-<CODIGO>-<N>F-<FASE>`, com `GERADOR_ID` como reserva quando o
 código não gera um nome válido. `class=-1`, `-2` ou `-3` identifica a contagem
@@ -1174,6 +1242,17 @@ A ordem das seções não é estética:
   exatamente os quatro patamares.
 - `MVAsc3`/`MVAsc1` altíssimos dão a barra infinita usual de um estudo de
   alimentador: a rede a montante da subestação não é modelada.
+- A tensão da saída por patamar (`VSE1`..`VSE4` do `CIRCUITO`, em pu) entra,
+  quando algum valor difere de 1, como um `LoadShape` diário no `Vsource`, logo
+  depois do `New Circuit`:
+
+  ```
+  New LoadShape.VSE-ALIMENTADOR npts=4 interval=1 mult=[1.020000 1.000000 0.980000 1.000000]
+  Edit Vsource.source daily=VSE-ALIMENTADOR
+  ```
+
+  Com a fonte nominal nos quatro patamares — ou sem as colunas — o master sai
+  idêntico ao de sempre. Um valor ilegível descarta o perfil inteiro e vira aviso.
 
 O `<CODIGO>_Buscoords.csv` tem uma linha por barra do circuito, com o **mesmo
 nome** usado nos `Bus1`/`Bus2` dos trechos — é isso que faz o OpenDSS casar cada
@@ -1215,12 +1294,18 @@ mecanismo, que só é aplicado quando o valor é maior que zero.
 O padrão de fábrica é `(0, 0, 1, 0, 0, 1, 0)` — potência constante pura. Trocar
 para ZIPV sem editar nada não muda o resultado.
 
-**O modelo vale só para as cargas de consumo.** Geradores, capacitores, ramais
-equivalentes da rede simplificada e as cargas de energia da alocação continuam em
-`model=1`: eles saem como `Load` por dialeto do exportador, não por natureza. Um
-banco de capacitores ou uma injeção de geração distribuída não têm a
-sensibilidade à tensão de um consumo, e o ramal equivalente é o *líquido* de
-carga menos geração, que pode ser negativo em todos os patamares.
+O botão **Preset Interplan** preenche o modelo que o Interplan usa no fluxo de
+potência: `(0.95, 0, 0.05, 1, 0, 0, 0)` — ativa 95% impedância e 5% potência
+constante, reativa 100% impedância — com os limites de tensão ligados em 0,5 e
+1,5 pu. Como o "Restaurar padrões", ele só preenche os campos: quem salva é o OK.
+
+**O modelo vale só para as cargas de consumo.** Geradores, ramais equivalentes
+da rede simplificada e as cargas de energia da alocação continuam em `model=1`:
+eles saem como `Load` por dialeto do exportador, não por natureza. Uma injeção de
+geração distribuída não tem a sensibilidade à tensão de um consumo, e o ramal
+equivalente é o *líquido* de carga menos geração, que pode ser negativo em todos
+os patamares. Os bancos de capacitores saem sempre em impedância constante
+(`model=2`), que é o comportamento físico deles.
 
 ### Faixa de tensão
 

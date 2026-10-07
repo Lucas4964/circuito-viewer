@@ -22,10 +22,14 @@ from typing import Mapping, Protocol, Sequence
 
 from .cable_import import EXPECTED_CABLE_HEADER
 from .capacitor_import import EXPECTED_CAPACITOR_HEADER
-from .circuit_import import EXPECTED_CIRCUIT_HEADER
+from .circuit_import import EXPECTED_CIRCUIT_HEADER, OPTIONAL_CIRCUIT_HEADER
 from .circuit_level_import import EXPECTED_CIRCUIT_LEVEL_HEADER
 from .csv_import import EXPECTED_HEADER as EXPECTED_BAR_HEADER
-from .generator_import import CONSUMER_HEADER, GENERATOR_HEADER
+from .generator_import import (
+    CONSUMER_HEADER,
+    GENERATOR_HEADER,
+    OPTIONAL_GENERATOR_HEADER,
+)
 from .load_import import EXPECTED_LOAD_HEADER
 from .load_pattern_import import EXPECTED_LOAD_PATTERN_HEADER
 from .regulator_import import EXPECTED_REGULATOR_HEADER
@@ -76,6 +80,16 @@ REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "reguladores": EXPECTED_REGULATOR_HEADER,
     "circuitos": EXPECTED_CIRCUIT_HEADER,
     "patamares_circuitos": EXPECTED_CIRCUIT_LEVEL_HEADER,
+}
+
+# Colunas lidas quando existem. A ausência não deixa a entidade indisponível —
+# o importador as trata como vazias —, porque são complementos de modelagem
+# (potência cadastrada do gerador, tensão da saída por patamar) e não deveriam
+# custar a importação de um banco que não as tenha. Vêm depois das obrigatórias
+# em ``ResolvedEntity.columns``/``header``.
+OPTIONAL_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "geradores": OPTIONAL_GENERATOR_HEADER,
+    "circuitos": OPTIONAL_CIRCUIT_HEADER,
 }
 
 # Rótulos para relatórios e para o diálogo.
@@ -135,8 +149,9 @@ class ResolvedEntity:
 
     entity: str
     table: str
-    # Na ordem de ``REQUIRED_COLUMNS[entity]``: ``columns[i]`` é o nome real da
-    # coluna no banco e ``header[i]`` é o nome canônico que o importador espera.
+    # Na ordem de ``REQUIRED_COLUMNS[entity]``, seguida das opcionais que o
+    # banco tem: ``columns[i]`` é o nome real da coluna no banco e
+    # ``header[i]`` é o nome canônico que o importador espera.
     columns: tuple[str, ...]
     header: tuple[str, ...]
 
@@ -259,11 +274,11 @@ def load_table_mapping(path: str | Path | None = None) -> tuple[EntityMapping, .
             raise MdbMappingError(
                 f"Entrada {row_number}: 'colunas' deve ser um objeto JSON."
             )
-        required = REQUIRED_COLUMNS[entity]
+        accepted = (*REQUIRED_COLUMNS[entity], *OPTIONAL_COLUMNS.get(entity, ()))
         aliases: dict[str, tuple[str, ...]] = {}
         for column, raw_alias in raw_columns.items():
-            if column not in required:
-                expected = ", ".join(required)
+            if column not in accepted:
+                expected = ", ".join(accepted)
                 raise MdbMappingError(
                     f"Entrada {row_number}: a coluna '{column}' não pertence a "
                     f"'{entity}'. Esperadas: {expected}."
@@ -389,8 +404,16 @@ def resolve_mapping(
                     f"{table}: colunas ausentes: " + ", ".join(missing)
                 )
                 continue
+            header = list(required)
+            for column in OPTIONAL_COLUMNS.get(entity, ()):
+                for candidate in entry.candidates_for(column):
+                    real = columns_by_key.get(candidate.strip().casefold())
+                    if real is not None:
+                        selected.append(real)
+                        header.append(column)
+                        break
             resolved.append(
-                ResolvedEntity(entity, table, tuple(selected), tuple(required))
+                ResolvedEntity(entity, table, tuple(selected), tuple(header))
             )
             break
         else:

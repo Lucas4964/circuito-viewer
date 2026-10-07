@@ -52,6 +52,8 @@ def make_system(
     phases: tuple[str, ...] = ("13",),
     load_bar_indices: tuple[int, ...] | None = None,
     circuit_bars: tuple[tuple[int, ...], ...] = ((0, 1), (2, 3)),
+    level_active_powers: tuple[tuple[str, str, str, str], ...] | None = None,
+    level_reactive_powers: tuple[tuple[str, str, str, str], ...] | None = None,
 ) -> tuple[GeneratorModel, CircuitCatalogModel]:
     bar_count = 6
     bars = CircuitModel(
@@ -124,6 +126,8 @@ def make_system(
         [""] * generator_count,
         [f"Gerador {index}" for index in range(generator_count)],
         phases,
+        level_active_powers=level_active_powers,
+        level_reactive_powers=level_reactive_powers,
     )
     return generators, circuits
 
@@ -283,6 +287,77 @@ class GeneratorDemandCalculationTests(unittest.TestCase):
         self.assertIn("não pertence", reasons["G4"])
         for index in range(1, 5):
             self.assertEqual(result.model.demand_records_for_generator(index), ())
+
+    def test_registered_level_powers_take_precedence_over_the_energy(self) -> None:
+        """P1..P4/Q1..Q4 do cadastro valem mesmo com GERACAO_KWH zerada."""
+
+        generators, circuits = make_system(
+            energies=("0",),
+            phases=("13",),
+            level_active_powers=(("0", "50", "50,0", ""),),
+            level_reactive_powers=(("0", "3", "0", "0"),),
+        )
+
+        result = calculate(generators, circuits)
+
+        self.assertEqual(result.valid_generators, 1)
+        self.assertEqual(
+            [item.demand for item in result.model.demand_records_for_generator(0)],
+            [0.0, 50.0, 50.0, 0.0],
+        )
+        morning = result.model.phase_power_records_for_generator(0)[1]
+        for value in (morning.pd, morning.pe, morning.pf):
+            self.assertAlmostEqual(value, -50.0 / 3.0)
+        # Q injetado também é geração: sinal negativo, repartido pelas fases.
+        for value in (morning.qd, morning.qe, morning.qf):
+            self.assertAlmostEqual(value, -1.0)
+        self.assertEqual(result.model.mean_demands, (25.0,))
+
+    def test_zeroed_registered_powers_fall_back_to_the_energy(self) -> None:
+        generators, circuits = make_system(
+            energies=("720",),
+            phases=("1",),
+            level_active_powers=(("0", "0", "0", "0"),),
+            level_reactive_powers=(("", "", "", ""),),
+        )
+
+        result = calculate(generators, circuits)
+
+        self.assertEqual(
+            [item.demand for item in result.model.demand_records_for_generator(0)],
+            [23.0, 11.0, 12.0, 22.0],
+        )
+
+    def test_invalid_registered_power_discards_the_generator(self) -> None:
+        generators, circuits = make_system(
+            energies=("720", "720"),
+            phases=("1", "1"),
+            level_active_powers=(("0", "x", "0", "0"), ("", "", "", "")),
+        )
+
+        result = calculate(generators, circuits)
+
+        self.assertEqual((result.valid_generators, result.invalid_generators), (1, 1))
+        self.assertEqual(
+            [(item.generator_id, item.reason) for item in result.issues],
+            [("G0", "P2 não é um número válido: x")],
+        )
+
+    def test_unspecified_phases_become_a_balanced_three_phase_generator(self) -> None:
+        """Como o Interplan trata o consumidor sintético de FASES2 0."""
+
+        generators, circuits = make_system(energies=("720", "720"), phases=("0", ""))
+
+        result = calculate(generators, circuits)
+
+        self.assertEqual((result.valid_generators, result.invalid_generators), (2, 0))
+        for index in range(2):
+            first = result.model.phase_power_records_for_generator(index)[0]
+            for value in (first.pd, first.pe, first.pf):
+                self.assertAlmostEqual(value, -(23.0 / 3.0))
+        reasons = [item.reason for item in result.issues]
+        self.assertEqual(len(reasons), 2)
+        self.assertTrue(all("trifásico equilibrado (DEF)" in reason for reason in reasons))
 
     def test_bar_owned_by_multiple_circuits_is_omitted(self) -> None:
         generators, circuits = make_system(

@@ -348,6 +348,23 @@ class SubstationLinkTests(unittest.TestCase):
         self.assertEqual(result.model.definition(0).substation_code, "")
         self.assertEqual(result.issues, ())
 
+    def test_source_voltages_are_optional_columns(self) -> None:
+        # VSE1..VSE4 do CIRCUITO; a ausência vale 1 pu, como antes delas.
+        self.assertEqual(self._parse().model.definition(0).source_voltages, ("",) * 4)
+
+        result = parse_circuit_rows(
+            (*self.HEADER, "VSE2", "VSE1", "VSE4"),
+            [("C1", "B0", "Circuito 1", "13.8", " 0,98 ", "1.02", "1")],
+            self.network,
+            None,
+            source_label="teste",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            result.model.definition(0).source_voltages, ("1.02", "0,98", "", "1")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

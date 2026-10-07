@@ -10,6 +10,7 @@ from circuit_viewer.mdb_mapping import (
     GENERATOR_CONSUMER_ENTITY,
     MAPPING_ORDER,
     MANDATORY_ENTITIES,
+    OPTIONAL_COLUMNS,
     REQUIRED_COLUMNS,
     EntityMapping,
     MdbMappingError,
@@ -114,6 +115,19 @@ class LoadTableMappingTests(unittest.TestCase):
         entry = load_table_mapping(path)[0]
         self.assertEqual(entry.candidates_for("X"), ("X", "COORD_X", "LESTE"))
 
+    def test_optional_columns_accept_aliases(self) -> None:
+        path = self.write(
+            [
+                {
+                    "entidade": "circuitos",
+                    "tabelas": ["CIRCUITO"],
+                    "colunas": {"VSE1": ["V_PAT1"]},
+                }
+            ]
+        )
+        entry = load_table_mapping(path)[0]
+        self.assertEqual(entry.candidates_for("VSE1"), ("VSE1", "V_PAT1"))
+
     def test_unknown_entity_is_refused(self) -> None:
         path = self.write([{"entidade": "postes", "tabelas": ["POSTE"]}])
         with self.assertRaises(MdbMappingError) as caught:
@@ -185,6 +199,38 @@ class ResolveMappingTests(unittest.TestCase):
         self.assertIsNotNone(entity)
         self.assertEqual(entity.columns, REQUIRED_COLUMNS["cargas"])
         self.assertNotIn("FATDEM", entity.columns)
+
+    def test_optional_columns_follow_the_required_when_present(self) -> None:
+        # P1..P4/Q1..Q4 do gerador e VSE1..VSE4 do circuito, como no Interplan.
+        database = full_database(
+            MT_GERADOR_CONS=[
+                *REQUIRED_COLUMNS["geradores"],
+                *OPTIONAL_COLUMNS["geradores"],
+                "OBS",
+            ],
+            CIRCUITO=[*REQUIRED_COLUMNS["circuitos"], "vse1", "VSE3", "SE_ID"],
+        )
+
+        result = resolve_mapping(database)
+        generators = result.get("geradores")
+        circuits = result.get("circuitos")
+
+        self.assertEqual(
+            generators.header,
+            (*REQUIRED_COLUMNS["geradores"], *OPTIONAL_COLUMNS["geradores"]),
+        )
+        self.assertEqual(
+            circuits.header, (*REQUIRED_COLUMNS["circuitos"], "VSE1", "VSE3")
+        )
+        # O nome real do banco segue para a leitura; o canônico, para o parser.
+        self.assertEqual(circuits.columns[-2:], ("vse1", "VSE3"))
+
+    def test_missing_optional_columns_keep_the_entity_available(self) -> None:
+        result = resolve_mapping(full_database())
+
+        self.assertEqual(result.get("geradores").header, REQUIRED_COLUMNS["geradores"])
+        self.assertEqual(result.get("circuitos").header, REQUIRED_COLUMNS["circuitos"])
+        self.assertEqual(result.unavailable, ())
 
     def test_ignores_the_extra_scenario_column_of_the_patterns_table(self) -> None:
         entity = resolve_mapping(full_database()).get("patamares")

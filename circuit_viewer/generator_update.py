@@ -9,13 +9,16 @@ from typing import Callable, Sequence
 from .calculation_levels import CalculationLevelSchedule
 from .curvas import Curve
 from .model import CircuitCatalogModel, GeneratorModel
-from .opendss_export import parse_number
+from .opendss_export import UNSPECIFIED_GENERATOR_PHASES, parse_number
 from .phase_config import PhaseConfiguration
 
 
 MAX_REPORTED_ISSUES = 200
 ProgressCallback = Callable[[int, int], None]
 CancelCheck = Callable[[], bool]
+# Fases do gerador cujo consumidor não informa FASES2; ver
+# opendss_export.UNSPECIFIED_GENERATOR_PHASES.
+BALANCED_GENERATOR_LETTERS = ("D", "E", "F")
 
 
 class GeneratorUpdateError(ValueError):
@@ -152,6 +155,29 @@ def curve_value_at_reference(curve: Curve, reference_hour: int) -> float:
     return curve.values[visual_hour - 1]
 
 
+def _level_powers(
+    values: Sequence[str],
+    label: str,
+) -> tuple[tuple[float, ...], str | None]:
+    """P1..P4 ou Q1..Q4 do cadastro em números; vazio vale zero.
+
+    Devolve o motivo quando um valor preenchido não é número: o gerador fica de
+    fora, em vez de ter um patamar zerado em silêncio.
+    """
+
+    parsed: list[float] = []
+    for position, raw in enumerate(values, start=1):
+        text = str(raw).strip()
+        if not text:
+            parsed.append(0.0)
+            continue
+        number = parse_number(text)
+        if number is None:
+            return (), f"{label}{position} não é um número válido: {text}"
+        parsed.append(number)
+    return tuple(parsed), None
+
+
 def calculate_generator_demands(
     generators: GeneratorModel,
     circuits: CircuitCatalogModel,
@@ -163,7 +189,20 @@ def calculate_generator_demands(
     cancel_check: CancelCheck | None = None,
     progress: ProgressCallback | None = None,
 ) -> GeneratorUpdateResult:
-    """Calcula demandas totais e potências ativas por fase para quatro NPAT."""
+    """Calcula demandas totais e potências por fase para quatro NPAT.
+
+    Duas origens, nesta ordem:
+
+    - **Potência cadastrada** (``P1..P4``/``Q1..Q4`` do gerador), quando algum
+      valor difere de zero: é o que o Interplan injeta no patamar, e vale mesmo
+      com ``GERACAO_KWH`` zerada — caso do gerador que só tem a potência.
+    - **Energia mensal** (``GERACAO_KWH``) distribuída pela curva na hora de
+      referência de cada patamar, como sempre.
+
+    Um consumidor sem FASES2 (vazia ou ``0``) torna o gerador trifásico
+    equilibrado, que é como o Interplan o trata; o caso entra no relatório, mas
+    o gerador é calculado.
+    """
 
     if circuits.segments.bars is not generators.bars:
         raise GeneratorUpdateError(
@@ -214,10 +253,20 @@ def calculate_generator_demands(
         if cancel_check is not None and cancel_check():
             raise InterruptedError("Atualização cancelada.")
         record = generators.record(generator_index)
+        level_active, active_error = _level_powers(record.level_active_powers, "P")
+        level_reactive, reactive_error = _level_powers(
+            record.level_reactive_powers, "Q"
+        )
+        level_error = active_error or reactive_error
+        registered = level_error is None and any(
+            value != 0.0 for value in (*level_active, *level_reactive)
+        )
         energy = parse_number(record.generation_kwh)
-        if energy is None:
+        if level_error is not None:
+            report(record.generator_id, level_error)
+        elif not registered and energy is None:
             report(record.generator_id, "GERACAO_KWH não é um número válido")
-        elif energy < 0.0:
+        elif not registered and energy < 0.0:
             report(record.generator_id, "GERACAO_KWH não pode ser negativo")
         else:
             owners = owners_by_bar[int(generators.bar_indices[generator_index])]
@@ -233,6 +282,17 @@ def calculate_generator_demands(
                 )
             else:
                 letters = phase_configuration.phase_letters_for_value(record.phases)
+                if (
+                    letters is None
+                    and record.phases.strip() in UNSPECIFIED_GENERATOR_PHASES
+                ):
+                    letters = BALANCED_GENERATOR_LETTERS
+                    report(
+                        record.generator_id,
+                        f"FASES2 '{record.phases.strip() or '<vazio>'}' não "
+                        "informa as fases; o gerador foi tratado como trifásico "
+                        "equilibrado (DEF), como no Interplan",
+                    )
                 if letters is None:
                     report(
                         record.generator_id,
@@ -241,24 +301,42 @@ def calculate_generator_demands(
                 else:
                     circuit_index = owners[0]
                     schedule = schedules[circuit_index]
-                    mean_demand = energy / (30.0 * 24.0)
+                    mean_demand = (
+                        sum(level_active) / len(level_active)
+                        if registered
+                        else energy / (30.0 * 24.0)
+                    )
                     demands: list[GeneratorDemandRecord] = []
                     powers: list[GeneratorPhasePowerRecord] = []
                     for level in schedule.levels:
-                        demand = mean_demand * curve_value_at_reference(
-                            curve, level.reference_hour
-                        )
+                        if registered:
+                            # P1 é o NPAT 0, como Q1..Q4 dos capacitores.
+                            demand = level_active[level.npat]
+                            reactive_demand = level_reactive[level.npat]
+                        else:
+                            demand = mean_demand * curve_value_at_reference(
+                                curve, level.reference_hour
+                            )
+                            reactive_demand = 0.0
                         # Convenção elétrica da aplicação: consumo é positivo e
                         # geração é negativa. A demanda total permanece sem
-                        # inversão; somente a potência ativa injetada por fase
+                        # inversão; somente a potência injetada por fase
                         # recebe o sinal de geração.
                         per_phase = (
                             0.0 if demand == 0.0 else -(demand / len(letters))
                         )
+                        per_phase_reactive = (
+                            0.0
+                            if reactive_demand == 0.0
+                            else -(reactive_demand / len(letters))
+                        )
                         active = {
-                            "D": per_phase if "D" in letters else 0.0,
-                            "E": per_phase if "E" in letters else 0.0,
-                            "F": per_phase if "F" in letters else 0.0,
+                            letter: per_phase if letter in letters else 0.0
+                            for letter in BALANCED_GENERATOR_LETTERS
+                        }
+                        reactive = {
+                            letter: per_phase_reactive if letter in letters else 0.0
+                            for letter in BALANCED_GENERATOR_LETTERS
                         }
                         demands.append(
                             GeneratorDemandRecord(
@@ -272,6 +350,9 @@ def calculate_generator_demands(
                                 active["D"],
                                 active["E"],
                                 active["F"],
+                                reactive["D"],
+                                reactive["E"],
+                                reactive["F"],
                             )
                         )
                     mean_demands[generator_index] = mean_demand

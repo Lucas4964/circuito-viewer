@@ -172,6 +172,26 @@ class ZipvCoefficients:
 
 DEFAULT_ZIPV_COEFFICIENTS = ZipvCoefficients()
 
+# Modelo de carga do Interplan, medido contra o relatório de fluxo dele: ativa
+# 95% impedância constante e 5% potência constante; reativa 100% impedância
+# constante. Num EP de 3.153 kW com |V|² = 0,94732, o Interplan consome
+# 0,95012·P0 e este modelo dá 0,95·V² + 0,05 = 0,94995; o reativo com a mesma
+# divisão 95/5 erraria a saída do alimentador em +5,5 kvar, e 100% Z em 0,3.
+INTERPLAN_ZIPV_COEFFICIENTS = ZipvCoefficients(
+    z_p=0.95,
+    i_p=0.0,
+    p_p=0.05,
+    z_q=1.0,
+    i_q=0.0,
+    p_q=0.0,
+    cutoff=0.0,
+)
+# Faixa larga de propósito: o ZIPV do OpenDSS só vale entre vminpu e vmaxpu, e
+# fora dela a carga vira impedância interpolada. Com 0,5–1,5 nenhuma barra
+# realista sai do modelo — que é o comportamento a reproduzir.
+INTERPLAN_VMINPU = 0.5
+INTERPLAN_VMAXPU = 1.5
+
 
 def zipv_sum_error(coefficients: ZipvCoefficients) -> str | None:
     """Mensagem quando os pesos não somam 1, ou ``None`` quando somam.
@@ -207,9 +227,10 @@ class OpenDssLoadSettings:
     padrões dele. Os valores continuam guardados enquanto desligados, para o
     usuário não precisar redigitá-los ao reativar.
 
-    O modelo vale **só para as cargas de consumo**. Geradores, capacitores,
-    ramais equivalentes e as cargas de energia da alocação continuam em potência
-    constante — eles são ``Load`` por dialeto do exportador, não por natureza.
+    O modelo vale **só para as cargas de consumo**. Geradores, ramais
+    equivalentes e as cargas de energia da alocação continuam em potência
+    constante — eles são ``Load`` por dialeto do exportador, não por natureza —,
+    e os capacitores saem sempre em impedância constante.
     """
 
     voltage_limits_enabled: bool = False
@@ -308,6 +329,16 @@ _ZIPV_FIELDS = ("z_p", "i_p", "p_p", "z_q", "i_q", "p_q", "cutoff")
 
 DEFAULT_OPENDSS_LOAD_SETTINGS = OpenDssLoadSettings()
 
+# O que o botão "Preset Interplan" do diálogo preenche. Não é o padrão: quem não
+# o escolhe continua com a configuração salva, ou com a potência constante.
+INTERPLAN_LOAD_SETTINGS = OpenDssLoadSettings(
+    voltage_limits_enabled=True,
+    vminpu=INTERPLAN_VMINPU,
+    vmaxpu=INTERPLAN_VMAXPU,
+    load_model=OpenDssLoadModel.ZIPV,
+    zipv=INTERPLAN_ZIPV_COEFFICIENTS,
+)
+
 
 def settings_from_mapping(values: Mapping[str, object]) -> OpenDssLoadSettings:
     """Reconstrói a configuração a partir do mapeamento textual.
@@ -361,6 +392,10 @@ __all__ = [
     "DEFAULT_VMAXPU",
     "DEFAULT_VMINPU",
     "DEFAULT_ZIPV_COEFFICIENTS",
+    "INTERPLAN_LOAD_SETTINGS",
+    "INTERPLAN_VMAXPU",
+    "INTERPLAN_VMINPU",
+    "INTERPLAN_ZIPV_COEFFICIENTS",
     "OpenDssLoadModel",
     "OpenDssLoadSettings",
     "VMAXPU_RANGE",

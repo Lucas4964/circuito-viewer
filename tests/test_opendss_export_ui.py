@@ -49,6 +49,7 @@ try:
         OpenDssLibraryExportResult,
         REGULATORS_FILENAME,
         SINGLE_PHASE_LOADS_FILENAME,
+        SWITCH_IMPEDANCE_DIRECTIVE,
         SWITCHES_FILENAME,
         THREE_PHASE_LOADS_FILENAME,
         TWO_PHASE_LOADS_FILENAME,
@@ -759,7 +760,9 @@ class OpenDssExportUiTests(unittest.TestCase):
         self.assertIn("New Line.TR-1 ", lines)
         self.assertNotIn("TR-2", lines)
         self.assertIn("New Line.CHV-1 Bus1=COD-B", switches)
-        self.assertTrue(switches.rstrip().endswith("Switch=Yes"))
+        self.assertTrue(
+            switches.rstrip().endswith(f"Switch=Yes {SWITCH_IMPEDANCE_DIRECTIVE}")
+        )
         # Uma carga de cada contagem de fases, cada uma no seu arquivo.
         self.assertIn(
             "New LoadShape.PERFIL-CARGA-1-1F-D npts=4", single_phase

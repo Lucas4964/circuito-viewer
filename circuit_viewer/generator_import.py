@@ -30,6 +30,10 @@ GENERATOR_HEADER = (
     "CURVA_ID",
     "GERACAO_KWH",
 )
+# Potência cadastrada no próprio gerador, por patamar: P1..P4 em kW e Q1..Q4 em
+# kvar, NPAT 0..3. Opcional — uma fonte sem ela continua importando, e o gerador
+# segue calculado pela energia (GERACAO_KWH).
+OPTIONAL_GENERATOR_HEADER = ("P1", "P2", "P3", "P4", "Q1", "Q2", "Q3", "Q4")
 CONSUMER_HEADER = ("ID", "CARGA_ID", "CODIGO", "EXTERN_ID", "NOME", "FASES2")
 MAX_REPORTED_ISSUES = 200
 ProgressCallback = Callable[[int, int, int], None]
@@ -72,6 +76,7 @@ class GeneratorCsvResult:
 
 @dataclass(frozen=True, slots=True)
 class _ConsumerSource:
+    rows_by_id: dict[str, tuple[str, str, str, str, str, str]]
     rows_by_code: dict[str, tuple[str, str, str, str, str, str]]
     ambiguous_codes: frozenset[str]
     total_rows: int
@@ -117,6 +122,8 @@ def _parse_consumer_rows(
 ) -> _ConsumerSource:
     positions = _column_positions(raw_header, CONSUMER_HEADER, source_label)
     last_position = max(positions.values())
+    rows_by_id: dict[str, tuple[str, str, str, str, str, str]] = {}
+    repeated_ids: set[str] = set()
     rows_by_code: dict[str, tuple[str, str, str, str, str, str]] = {}
     ambiguous: set[str] = set()
     total_rows = 0
@@ -131,6 +138,14 @@ def _parse_consumer_rows(
         if len(row) <= last_position:
             continue
         values = tuple(row[positions[name]].strip() for name in CONSUMER_HEADER)
+        # Um ID repetido não identifica ninguém: some do índice e o gerador
+        # cai na associação pelo CODIGO, como os códigos ambíguos abaixo.
+        consumer_id = values[0]
+        if consumer_id in rows_by_id:
+            repeated_ids.add(consumer_id)
+            rows_by_id.pop(consumer_id, None)
+        elif consumer_id and consumer_id not in repeated_ids:
+            rows_by_id[consumer_id] = values
         code = values[2]
         if not code:
             continue
@@ -141,7 +156,7 @@ def _parse_consumer_rows(
             rows_by_code[code] = values
     if progress is not None:
         progress(total_rows)
-    return _ConsumerSource(rows_by_code, frozenset(ambiguous), total_rows)
+    return _ConsumerSource(rows_by_id, rows_by_code, frozenset(ambiguous), total_rows)
 
 
 def parse_generator_rows(
@@ -162,7 +177,16 @@ def parse_generator_rows(
     consumer_progress: RowProgress | None = None,
     stage: StageCallback | None = None,
 ) -> GeneratorCsvResult:
-    """Associa as duas fontes por ``CODIGO`` e resolve a barra pela carga.
+    """Associa cada gerador ao seu consumidor e resolve a barra pela carga.
+
+    O vínculo é a chave estrangeira ``MT_CONS_ID`` → ``MT_CONS.ID``. O
+    ``CODIGO`` fica de reserva, para fontes cujo ID não case: o código do
+    gerador costuma repetir o do consumidor, mas não sempre — um gerador
+    ``81144859`` pendurado no consumidor ``Cons. 11185_AUX`` só é achado pelo
+    ID, e era descartado quando o vínculo era só pelo código.
+
+    ``P1..P4``/``Q1..Q4``, quando a fonte as tem, seguem para o modelo como a
+    potência cadastrada de cada patamar.
 
     CSV e MDB entregam apenas cabeçalhos e iteradores de texto. Toda validação,
     diagnóstico e construção do modelo permanece concentrada nesta função.
@@ -181,11 +205,21 @@ def parse_generator_rows(
     if stage is not None:
         stage("MT_GERADOR_CONS")
 
+    generator_header = normalize_header(raw_generator_header)
     positions = _column_positions(
-        raw_generator_header, GENERATOR_HEADER, generator_source_label
+        generator_header, GENERATOR_HEADER, generator_source_label
     )
     last_position = max(positions.values())
+    # A primeira ocorrência vence; coluna opcional ausente fica vazia.
+    optional_positions = {
+        name: generator_header.index(name)
+        for name in OPTIONAL_GENERATOR_HEADER
+        if name in generator_header
+    }
     columns = {name: [] for name in GENERATOR_HEADER}
+    optional_columns: dict[str, list[str]] = {
+        name: [] for name in OPTIONAL_GENERATOR_HEADER
+    }
     consumer_columns = {name: [] for name in CONSUMER_HEADER}
     load_indices: list[int] = []
     seen_ids: set[str] = set()
@@ -229,12 +263,18 @@ def parse_generator_rows(
         if not code:
             add_issue(line_number, "CODIGO vazio")
             continue
-        if code in consumers.ambiguous_codes:
-            add_issue(line_number, f"CODIGO ambíguo em MT_CONS: {code}")
-            continue
-        consumer = consumers.rows_by_code.get(code)
+        consumer = consumers.rows_by_id.get(values["MT_CONS_ID"])
         if consumer is None:
-            add_issue(line_number, f"CODIGO inexistente em MT_CONS: {code}")
+            if code in consumers.ambiguous_codes:
+                add_issue(line_number, f"CODIGO ambíguo em MT_CONS: {code}")
+                continue
+            consumer = consumers.rows_by_code.get(code)
+        if consumer is None:
+            add_issue(
+                line_number,
+                f"CODIGO inexistente em MT_CONS: {code} (MT_CONS_ID "
+                f"{values['MT_CONS_ID'] or '<vazio>'} também não casa com ID)",
+            )
             continue
         load_id = consumer[1]
         load_index = loads.index_for_id(load_id)
@@ -245,6 +285,13 @@ def parse_generator_rows(
         load_indices.append(load_index)
         for name in GENERATOR_HEADER:
             columns[name].append(values[name])
+        for name, target in optional_columns.items():
+            position = optional_positions.get(name)
+            target.append(
+                row[position].strip()
+                if position is not None and position < len(row)
+                else ""
+            )
         for name, value in zip(CONSUMER_HEADER, consumer, strict=True):
             consumer_columns[name].append(value)
     if generator_progress is not None:
@@ -270,6 +317,14 @@ def parse_generator_rows(
         consumer_columns["EXTERN_ID"],
         consumer_columns["NOME"],
         consumer_columns["FASES2"],
+        level_active_powers=zip(
+            *(optional_columns[name] for name in ("P1", "P2", "P3", "P4")),
+            strict=True,
+        ),
+        level_reactive_powers=zip(
+            *(optional_columns[name] for name in ("Q1", "Q2", "Q3", "Q4")),
+            strict=True,
+        ),
         source_paths=(generator_source_label, consumer_source_label),
     )
     return GeneratorCsvResult(
