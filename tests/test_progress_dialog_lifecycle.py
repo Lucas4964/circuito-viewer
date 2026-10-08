@@ -22,6 +22,16 @@ if PYQT_AVAILABLE:
         triggered = pyqtSignal()
 
 
+class CanceledSignalStub:
+    """Registra o desligamento do ``canceled`` antes do fechamento."""
+
+    def __init__(self) -> None:
+        self.disconnected = False
+
+    def disconnect(self) -> None:
+        self.disconnected = True
+
+
 class ReentrantProgressDialog:
     """Dublê que executa a limpeza da operação dentro de ``setValue``."""
 
@@ -29,6 +39,11 @@ class ReentrantProgressDialog:
         self.on_value = on_value
         self.calls: list[tuple[object, ...]] = []
         self.value_was_set = False
+        self.canceled = CanceledSignalStub()
+        self.deleted = False
+
+    def deleteLater(self) -> None:  # noqa: N802
+        self.deleted = True
 
     def setRange(self, minimum: int, maximum: int) -> None:  # noqa: N802
         self._before_value("range", minimum, maximum)
@@ -139,6 +154,9 @@ class ProgressDialogLifecycleTests(unittest.TestCase):
         self.assertIsNone(self.window._export_thread)
         self.assertIn(("close",), dialog.calls)
         self.assertEqual(dialog.calls[-2][0], "value")
+        # Fechar emitiria ``canceled`` para um worker já em destruição.
+        self.assertTrue(dialog.canceled.disconnected)
+        self.assertTrue(dialog.deleted)
 
     def test_stale_worker_progress_does_not_touch_current_dialog(self) -> None:
         cases = (
