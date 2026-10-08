@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
+import shutil
 import threading
 import re
 
@@ -65,7 +67,7 @@ from .source_composition import (
 from .opendss_engine import acquire_engine, ascii_workspace
 from .opendss_allocation_export import build_allocation_export
 from .opendss_allocation_settings import OpenDssAllocationSettings
-from .opendss_export import build_export
+from .opendss_export import build_export, stage_export_directory
 from .opendss_library import OpenDssLibraryCatalog
 from .opendss_line_mode import OpenDssLineParameterMode
 from .opendss_mapping_store import OpenDssLibraryMappings
@@ -823,12 +825,17 @@ class OpenDssExportWorker(QObject):
         ),
         library_catalog: OpenDssLibraryCatalog | None = None,
         library_mappings: OpenDssLibraryMappings | None = None,
+        destination_base: Path | None = None,
     ) -> None:
         super().__init__()
         self.catalog = catalog
         self.cables = cables
         self.phase_configuration = phase_configuration
         self.circuit_indices = tuple(circuit_indices)
+        # Com uma pasta base, os arquivos já saem gravados numa pasta
+        # temporária dentro dela; a janela só faz a troca final, instantânea.
+        self.destination_base = destination_base
+        self.staging_directory: Path | None = None
         self.loads = loads
         self.patterns = patterns
         self.generator_updates = generator_updates
@@ -865,12 +872,34 @@ class OpenDssExportWorker(QObject):
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
             )
+            if self.destination_base is not None:
+                if self._cancel_event.is_set():
+                    raise InterruptedError("Exportação cancelada.")
+                self.progress.emit(0, 0)
+                self.staging_directory = stage_export_directory(
+                    self.destination_base,
+                    result.files,
+                    cancel_check=self._cancel_event.is_set,
+                )
         except InterruptedError:
             self.cancelled.emit()
+        except OSError as exc:
+            self.failed.emit(
+                f"Não foi possível gravar em {self.destination_base}: "
+                f"{exc.strerror or exc}"
+            )
         except Exception as exc:
             self.failed.emit(str(exc))
         else:
             self.finished.emit(result)
+
+    def discard_staging(self) -> None:
+        """Remove a pasta temporária que não chegou a ser instalada."""
+
+        staging = self.staging_directory
+        self.staging_directory = None
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 class OpenDssAllocationExportWorker(QObject):

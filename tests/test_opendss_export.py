@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from circuit_viewer.model import (
     CableModel,
@@ -35,11 +39,14 @@ from circuit_viewer.opendss_export import (
     build_regulator_export,
     build_switch_export,
     bus_namer,
+    commit_export_directory,
     master_filenames,
+    opendss_export_directory_name,
     parse_number,
     phase_voltage_kv,
     positive_sequence_capacitance_nf,
     sanitize_dss_name,
+    stage_export_directory,
 )
 from circuit_viewer.opendss_settings import OpenDssLoadSettings
 from circuit_viewer.opendss_solution import DEFAULT_MAX_POWER_FLOW_ITER
@@ -2772,6 +2779,73 @@ class LineExportControlTests(unittest.TestCase):
                 [0],
                 cancel_check=lambda: True,
             )
+
+
+class ExportDirectoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.base = Path(directory.name)
+
+    def test_directory_name_uses_the_master_base(self) -> None:
+        catalog = make_catalog(make_network(make_bars()))
+
+        self.assertEqual(opendss_export_directory_name(catalog, 0), "ALIMENTADOR_dss")
+        master, _ = master_filenames(catalog, (0,))
+        self.assertTrue(master.startswith("ALIMENTADOR_"))
+
+    def test_stage_writes_every_file_inside_a_hidden_folder(self) -> None:
+        staging = stage_export_directory(
+            self.base,
+            (("a.dss", "um"), ("b.dss", "dois")),
+        )
+
+        self.assertEqual(staging.parent, self.base)
+        self.assertTrue(staging.name.startswith("."))
+        self.assertEqual((staging / "a.dss").read_text(encoding="utf-8"), "um")
+        self.assertEqual((staging / "b.dss").read_text(encoding="utf-8"), "dois")
+
+    def test_stage_removes_its_folder_when_cancelled(self) -> None:
+        with self.assertRaises(InterruptedError):
+            stage_export_directory(
+                self.base,
+                (("a.dss", "um"),),
+                cancel_check=lambda: True,
+            )
+
+        self.assertEqual(list(self.base.iterdir()), [])
+
+    def test_commit_replaces_the_whole_existing_folder(self) -> None:
+        final = self.base / "ALIMENTADOR_dss"
+        final.mkdir()
+        (final / "antigo.dss").write_text("x", encoding="utf-8")
+        staging = stage_export_directory(self.base, (("novo.dss", "y"),))
+
+        commit_export_directory(staging, final)
+
+        self.assertEqual([entry.name for entry in final.iterdir()], ["novo.dss"])
+        self.assertEqual([entry.name for entry in self.base.iterdir()], [final.name])
+
+    def test_commit_restores_the_old_folder_when_the_swap_fails(self) -> None:
+        final = self.base / "ALIMENTADOR_dss"
+        final.mkdir()
+        (final / "antigo.dss").write_text("x", encoding="utf-8")
+        staging = stage_export_directory(self.base, (("novo.dss", "y"),))
+        real_replace = os.replace
+
+        def failing_replace(source, target):  # noqa: ANN001, ANN202
+            if Path(source) == staging:
+                raise PermissionError("pasta em uso")
+            return real_replace(source, target)
+
+        with patch(
+            "circuit_viewer.opendss_export.os.replace",
+            side_effect=failing_replace,
+        ), self.assertRaises(PermissionError):
+            commit_export_directory(staging, final)
+
+        self.assertEqual([entry.name for entry in final.iterdir()], ["antigo.dss"])
+        self.assertEqual([entry.name for entry in self.base.iterdir()], [final.name])
 
 
 if __name__ == "__main__":

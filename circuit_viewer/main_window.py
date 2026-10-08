@@ -212,7 +212,9 @@ from .opendss_export import (
     TWO_PHASE_GENERATORS_FILENAME,
     TWO_PHASE_LOADS_FILENAME,
     OpenDssExportBundle,
+    commit_export_directory,
     master_filenames,
+    opendss_export_directory_name,
     parse_number,
     phase_letters_by_node,
 )
@@ -381,6 +383,31 @@ def _close_progress_dialog(dialog: QProgressDialog | None) -> None:
 
     if dialog is not None:
         dialog.close()
+
+
+def _silence_progress_dialog(dialog: QProgressDialog | None) -> None:
+    """Fecha o progresso sem emitir ``canceled`` para o worker.
+
+    ``QProgressDialog.closeEvent`` emite ``canceled``; com o worker já em
+    ``deleteLater``, esse sinal tardio chamaria um objeto em destruição.
+    """
+
+    if dialog is None:
+        return
+    try:
+        dialog.canceled.disconnect()
+    except TypeError:
+        pass
+    dialog.close()
+
+
+def _dispose_progress_dialog(dialog: QProgressDialog | None) -> None:
+    """Fecha o progresso em silêncio e libera o objeto nativo."""
+
+    if dialog is None:
+        return
+    _silence_progress_dialog(dialog)
+    dialog.deleteLater()
 
 
 # Grandezas do fluxo de potência oferecidas em cada página de detalhes, como
@@ -5344,42 +5371,6 @@ class MainWindow(QMainWindow):
             return None
         return self._power_flow_result
 
-    def _expected_export_filenames(
-        self,
-        circuit_indices: tuple[int, ...],
-    ) -> tuple[str, ...]:
-        """Arquivos que a exportação vai gravar para esta seleção.
-
-        Arquivos de carga exigem cargas e patamares; os de geradores exigem um
-        resultado vigente de sua atualização. Só os grupos que serão gravados
-        podem aparecer na confirmação de substituição. O master e as coordenadas
-        dependem do circuito escolhido, por isso vêm de ``master_filenames``.
-        """
-
-        names = [LINES_FILENAME, SWITCHES_FILENAME]
-        if self._uses_opendss_library_parameters():
-            names[:0] = [
-                CABOS_FILENAME,
-                ARRANGEMENTS_FILENAME,
-                LINE_GEOMETRIES_FILENAME,
-            ]
-        # Aproximação deliberada: só a exportação sabe quantos reguladores são
-        # de fato exportáveis, e um modelo cujos reguladores fossem todos
-        # descartados não geraria o arquivo. Perguntar por um arquivo que não
-        # será tocado é inofensivo; deixar de perguntar por um que será, não.
-        if self._regulator_model is not None:
-            names.append(REGULATORS_FILENAME)
-        if self._exportable_loads() is not None:
-            names.extend(filename for _, filename, _ in _LOAD_EXPORT_FILES)
-        if self._exportable_generators() is not None:
-            names.extend(filename for _, filename, _ in _GENERATOR_EXPORT_FILES)
-        catalog = self._circuit_catalog
-        if catalog is not None:
-            master = master_filenames(catalog, circuit_indices)
-            if master is not None:
-                names.extend(master)
-        return tuple(names)
-
     def _export_opendss(self) -> None:
         catalog = self._circuit_catalog
         cables = self._cable_model
@@ -5414,23 +5405,22 @@ class MainWindow(QMainWindow):
             return
         directory = QFileDialog.getExistingDirectory(
             self,
-            "Escolher a pasta de destino da exportação",
+            "Escolher a pasta base da exportação",
         )
         if not directory:
             return
-        # A pasta é escolhida uma vez só e recebe todos os arquivos gerados.
-        destination = Path(directory)
-        existing = [
-            name
-            for name in self._expected_export_filenames(circuit_indices)
-            if (destination / name).exists()
-        ]
-        if existing:
+        # Como na exportação simplificada, os arquivos vão para uma pasta
+        # própria, <circuito>_dss, criada dentro da pasta escolhida.
+        destination = Path(directory) / opendss_export_directory_name(
+            catalog,
+            circuit_indices[0],
+        )
+        if destination.exists():
             answer = QMessageBox.question(
                 self,
-                "Substituir arquivos",
-                f"Já existem em {destination}: {', '.join(existing)}.\n"
-                "Deseja substituí-los?",
+                "Substituir pasta",
+                f"A pasta {destination} já existe e será substituída inteira "
+                "quando a exportação terminar.\nDeseja continuar?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
@@ -5588,7 +5578,7 @@ class MainWindow(QMainWindow):
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
-        progress.canceled.connect(worker.cancel)
+        progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
         self._connect_operation_signal(thread.finished, thread, self._on_export_thread_finished)
         thread.finished.connect(thread.deleteLater)
@@ -5842,7 +5832,7 @@ class MainWindow(QMainWindow):
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
-        progress.canceled.connect(worker.cancel)
+        progress.canceled.connect(lambda: worker.cancel())
         thread.finished.connect(worker.deleteLater)
         self._connect_operation_signal(thread.finished, thread, self._on_export_thread_finished)
         thread.finished.connect(thread.deleteLater)
@@ -5964,6 +5954,9 @@ class MainWindow(QMainWindow):
             line_parameter_mode=self._opendss_line_parameter_mode,
             library_catalog=library_catalog,
             library_mappings=library_mappings,
+            # A gravação acontece no worker, numa pasta temporária ao lado do
+            # destino: arquivos grandes não congelam mais a interface.
+            destination_base=destination.parent,
         )
         worker.moveToThread(thread)
 
@@ -6017,24 +6010,29 @@ class MainWindow(QMainWindow):
         )
 
     def _close_export_progress(self) -> None:
-        _close_progress_dialog(self._export_progress_dialog)
+        _silence_progress_dialog(self._export_progress_dialog)
 
     def _on_opendss_export_finished(self, result: OpenDssExportBundle) -> None:
         self._close_export_progress()
         destination = self._export_directory
+        worker = self._export_worker
         if destination is None:
             return
-        for filename, text in result.files:
-            target = destination / filename
-            try:
-                target.write_text(text, encoding="utf-8")
-            except OSError as exc:
-                QMessageBox.critical(
-                    self,
-                    "Falha na exportação",
-                    f"Não foi possível gravar {target}: {exc.strerror or exc}",
-                )
-                return
+        staging = getattr(worker, "staging_directory", None)
+        if staging is None:
+            return
+        # Os arquivos já estão gravados pelo worker; aqui só se troca a pasta
+        # temporária pela definitiva, o que é instantâneo no mesmo volume.
+        worker.staging_directory = None
+        try:
+            commit_export_directory(staging, destination)
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Falha na exportação",
+                f"Não foi possível criar {destination}: {exc.strerror or exc}",
+            )
+            return
         self._show_opendss_export_report(result, destination)
 
     def _on_export_failed(self, reason: str) -> None:
@@ -6052,11 +6050,17 @@ class MainWindow(QMainWindow):
         if not self._is_current_signal_source(self._export_thread):
             return
         progress = self._export_progress_dialog
+        worker = self._export_worker
         self._export_thread = None
         self._export_worker = None
         self._export_progress_dialog = None
         self._export_directory = None
-        _close_progress_dialog(progress)
+        # Resultado descartado (entradas mudaram, falha ou cancelamento): a
+        # pasta temporária não pode ficar esquecida ao lado do destino.
+        discard_staging = getattr(worker, "discard_staging", None)
+        if discard_staging is not None:
+            discard_staging()
+        _dispose_progress_dialog(progress)
         self._sync_export_availability()
         if self._close_after_export:
             self._close_after_export = False

@@ -110,6 +110,7 @@ class OpenDssExportUiTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.destination = Path(directory.name)
+        self.export_dir = self.destination / "ALIMENTADOR_dss"
 
     def _window(self, **kwargs) -> MainWindow:  # noqa: ANN003
         window = MainWindow(**kwargs)
@@ -404,51 +405,6 @@ class OpenDssExportUiTests(unittest.TestCase):
             OpenDssLineParameterMode.LIBRARY,
         )
 
-    def test_library_mode_adds_only_its_three_expected_filenames(self) -> None:
-        window = self._window()
-        self._load_everything(window, with_loads=False)
-        library_names = {
-            CABOS_FILENAME,
-            ARRANGEMENTS_FILENAME,
-            LINE_GEOMETRIES_FILENAME,
-        }
-
-        original = set(window._expected_export_filenames((0,)))
-        window._opendss_line_parameter_mode = OpenDssLineParameterMode.LIBRARY
-        library = set(window._expected_export_filenames((0,)))
-
-        self.assertTrue(library_names.isdisjoint(original))
-        self.assertTrue(library_names.issubset(library))
-        self.assertEqual(library - original, library_names)
-
-    def test_library_files_are_named_in_the_overwrite_confirmation(self) -> None:
-        window = self._window()
-        self._load_everything(window, with_loads=False)
-        window._opendss_line_parameter_mode = OpenDssLineParameterMode.LIBRARY
-        for filename in (
-            CABOS_FILENAME,
-            ARRANGEMENTS_FILENAME,
-            LINE_GEOMETRIES_FILENAME,
-        ):
-            (self.destination / filename).write_text("anterior", encoding="utf-8")
-
-        with patch.object(
-            OpenDssExportDialog, "exec", accept_dialog
-        ), patch(
-            "circuit_viewer.main_window.QFileDialog.getExistingDirectory",
-            return_value=str(self.destination),
-        ), patch(
-            "circuit_viewer.main_window.QMessageBox.question",
-            return_value=QMessageBox.StandardButton.Cancel,
-        ) as question:
-            window._export_opendss()
-
-        prompt = question.call_args.args[2]
-        self.assertIn(CABOS_FILENAME, prompt)
-        self.assertIn(ARRANGEMENTS_FILENAME, prompt)
-        self.assertIn(LINE_GEOMETRIES_FILENAME, prompt)
-        self.assertIsNone(window._export_thread)
-
     def test_export_worker_receives_saved_library_snapshots(self) -> None:
         window = self._window()
         self._load_everything(window, with_loads=False)
@@ -689,7 +645,7 @@ class OpenDssExportUiTests(unittest.TestCase):
             window.opendss_export_action.trigger()
             self._wait_for_export(window)
 
-        target = self.destination / REGULATORS_FILENAME
+        target = self.export_dir / REGULATORS_FILENAME
         self.assertTrue(target.is_file())
         emitted = target.read_text(encoding="utf-8")
         self.assertIn("New Transformer.REG-X-D ", emitted)
@@ -697,9 +653,9 @@ class OpenDssExportUiTests(unittest.TestCase):
         # O trecho regulado saiu do arquivo de trechos: ele virou o regulador.
         # Nesta fixture o outro trecho carrega a chave, então trechos.dss fica
         # sem nenhuma Line — e a chave continua intacta no arquivo dela.
-        lines = (self.destination / LINES_FILENAME).read_text(encoding="utf-8")
+        lines = (self.export_dir / LINES_FILENAME).read_text(encoding="utf-8")
         self.assertNotIn("New Line.", lines)
-        switches = (self.destination / SWITCHES_FILENAME).read_text(encoding="utf-8")
+        switches = (self.export_dir / SWITCHES_FILENAME).read_text(encoding="utf-8")
         self.assertIn("New Line.CHV-1 ", switches)
 
     def test_export_writes_every_file_in_the_chosen_folder(self) -> None:
@@ -739,22 +695,22 @@ class OpenDssExportUiTests(unittest.TestCase):
             ],
         )
         for filename, text in expected.files:
-            target = self.destination / filename
+            target = self.export_dir / filename
             self.assertTrue(target.is_file(), filename)
             self.assertEqual(target.read_text(encoding="utf-8"), text)
 
-        lines = (self.destination / LINES_FILENAME).read_text(encoding="utf-8")
-        switches = (self.destination / SWITCHES_FILENAME).read_text(
+        lines = (self.export_dir / LINES_FILENAME).read_text(encoding="utf-8")
+        switches = (self.export_dir / SWITCHES_FILENAME).read_text(
             encoding="utf-8"
         )
         single_phase = (
-            self.destination / SINGLE_PHASE_LOADS_FILENAME
+            self.export_dir / SINGLE_PHASE_LOADS_FILENAME
         ).read_text(encoding="utf-8")
-        two_phase = (self.destination / TWO_PHASE_LOADS_FILENAME).read_text(
+        two_phase = (self.export_dir / TWO_PHASE_LOADS_FILENAME).read_text(
             encoding="utf-8"
         )
         three_phase = (
-            self.destination / THREE_PHASE_LOADS_FILENAME
+            self.export_dir / THREE_PHASE_LOADS_FILENAME
         ).read_text(encoding="utf-8")
         # O trecho T1 é chave: sai de chaves.dss, nunca de trechos.dss.
         self.assertIn("New Line.TR-1 ", lines)
@@ -794,7 +750,7 @@ class OpenDssExportUiTests(unittest.TestCase):
         self.assertNotIn("CARGA-1", three_phase)
         self.assertNotIn("CARGA-2", three_phase)
         # O master chama todos os arquivos de elementos e aponta as coordenadas.
-        master = (self.destination / "ALIMENTADOR_Master.dss").read_text(
+        master = (self.export_dir / "ALIMENTADOR_Master.dss").read_text(
             encoding="utf-8"
         )
         self.assertIn("New Circuit.ALIMENTADOR", master)
@@ -802,7 +758,7 @@ class OpenDssExportUiTests(unittest.TestCase):
         for filename, _ in expected.element_files:
             self.assertIn(f"Redirect {filename}", master)
         self.assertIn("Buscoords ALIMENTADOR_Buscoords.csv", master)
-        buscoords = (self.destination / "ALIMENTADOR_Buscoords.csv").read_text(
+        buscoords = (self.export_dir / "ALIMENTADOR_Buscoords.csv").read_text(
             encoding="utf-8"
         )
         self.assertEqual(
@@ -829,22 +785,18 @@ class OpenDssExportUiTests(unittest.TestCase):
             self._wait_for_export(window)
 
         # O menu não depende de cargas: os dois arquivos de rede saem normalmente.
-        self.assertTrue((self.destination / LINES_FILENAME).is_file())
-        self.assertTrue((self.destination / SWITCHES_FILENAME).is_file())
+        self.assertTrue((self.export_dir / LINES_FILENAME).is_file())
+        self.assertTrue((self.export_dir / SWITCHES_FILENAME).is_file())
         for filename in (
             SINGLE_PHASE_LOADS_FILENAME,
             TWO_PHASE_LOADS_FILENAME,
             THREE_PHASE_LOADS_FILENAME,
         ):
-            self.assertFalse((self.destination / filename).exists(), filename)
+            self.assertFalse((self.export_dir / filename).exists(), filename)
 
-    def test_existing_load_file_is_ignored_when_it_will_not_be_written(self) -> None:
+    def test_export_leaves_nothing_loose_in_the_chosen_folder(self) -> None:
         window = self._window()
         self._load_everything(window, with_loads=False)
-        # Sem cargas o arquivo não será gravado, então não faz sentido pedir
-        # confirmação para substituí-lo.
-        target = self.destination / TWO_PHASE_LOADS_FILENAME
-        target.write_text("conteudo anterior", encoding="utf-8")
 
         with patch.object(
             OpenDssExportDialog, "exec", accept_dialog
@@ -857,15 +809,21 @@ class OpenDssExportUiTests(unittest.TestCase):
             window.opendss_export_action.trigger()
             self._wait_for_export(window)
 
+        # A pasta ainda não existia: nada a confirmar.
         question.assert_not_called()
-        self.assertEqual(target.read_text(encoding="utf-8"), "conteudo anterior")
+        self.assertEqual(
+            [entry.name for entry in self.destination.iterdir()],
+            ["ALIMENTADOR_dss"],
+        )
+        self.assertTrue((self.export_dir / LINES_FILENAME).is_file())
+        self.assertTrue((self.export_dir / "ALIMENTADOR_Master.dss").is_file())
 
-    def test_export_asks_before_replacing_any_existing_file(self) -> None:
+    def test_export_asks_before_replacing_an_existing_folder(self) -> None:
         window = self._window()
         self._load_everything(window)
-        # Basta um dos arquivos existir para a confirmação aparecer.
-        target = self.destination / SWITCHES_FILENAME
-        target.write_text("conteudo anterior", encoding="utf-8")
+        self.export_dir.mkdir()
+        stale = self.export_dir / "antigo.dss"
+        stale.write_text("conteudo anterior", encoding="utf-8")
 
         with patch.object(
             OpenDssExportDialog, "exec", accept_dialog
@@ -879,10 +837,77 @@ class OpenDssExportUiTests(unittest.TestCase):
             window.opendss_export_action.trigger()
 
         question.assert_called_once()
-        self.assertIn(SWITCHES_FILENAME, question.call_args.args[2])
+        self.assertIn(str(self.export_dir), question.call_args.args[2])
         self.assertIsNone(window._export_thread)
-        self.assertEqual(target.read_text(encoding="utf-8"), "conteudo anterior")
-        self.assertFalse((self.destination / LINES_FILENAME).exists())
+        self.assertEqual(stale.read_text(encoding="utf-8"), "conteudo anterior")
+        self.assertFalse((self.export_dir / LINES_FILENAME).exists())
+
+    def test_confirmed_replacement_swaps_the_whole_folder(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        self.export_dir.mkdir()
+        stale = self.export_dir / "antigo.dss"
+        stale.write_text("conteudo anterior", encoding="utf-8")
+
+        with patch.object(
+            OpenDssExportDialog, "exec", accept_dialog
+        ), patch(
+            "circuit_viewer.main_window.QFileDialog.getExistingDirectory",
+            return_value=str(self.destination),
+        ), patch(
+            "circuit_viewer.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            window.opendss_export_action.trigger()
+            self._wait_for_export(window)
+
+        self.assertFalse(stale.exists())
+        self.assertTrue((self.export_dir / LINES_FILENAME).is_file())
+        # Nem a temporária nem o backup da pasta antiga ficam para trás.
+        self.assertEqual(
+            [entry.name for entry in self.destination.iterdir()],
+            ["ALIMENTADOR_dss"],
+        )
+
+    def test_cancelled_export_leaves_no_temporary_folder(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+
+        with patch.object(
+            OpenDssExportDialog, "exec", accept_dialog
+        ), patch(
+            "circuit_viewer.main_window.QFileDialog.getExistingDirectory",
+            return_value=str(self.destination),
+        ), patch(
+            "circuit_viewer.workers.stage_export_directory",
+            side_effect=InterruptedError("Exportação cancelada."),
+        ):
+            window.opendss_export_action.trigger()
+            self._wait_for_export(window)
+
+        self.assertIsNone(window._export_thread)
+        self.assertEqual(list(self.destination.iterdir()), [])
+
+    def test_staging_discarded_by_changed_inputs_is_removed(self) -> None:
+        window = self._window()
+        self._load_everything(window, with_loads=False)
+        staging = self.destination / ".dss-export-teste"
+        staging.mkdir()
+        worker = SimpleNamespace(staging_directory=staging)
+
+        def discard() -> None:
+            import shutil
+
+            shutil.rmtree(worker.staging_directory, ignore_errors=True)
+            worker.staging_directory = None
+
+        worker.discard_staging = discard
+        window._export_worker = worker
+
+        window._on_export_thread_finished()
+
+        self.assertFalse(staging.exists())
+        self.assertIsNone(window._export_worker)
 
     def _wait_for_export(self, window: MainWindow) -> None:
         thread = window._export_thread

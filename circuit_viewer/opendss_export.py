@@ -31,8 +31,13 @@ fases**: elas saem com ``conn=delta`` e a tensão de linha, ver
 from __future__ import annotations
 
 import math
+import os
 import re
+import shutil
+import tempfile
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
 from .dss_names import sanitize_dss_name
@@ -2873,6 +2878,83 @@ def master_filenames(
         f"{base}{MASTER_FILENAME_SUFFIX}",
         f"{base}{BUSCOORDS_FILENAME_SUFFIX}",
     )
+
+
+EXPORT_DIRECTORY_SUFFIX = "_dss"
+_STAGING_PREFIX = ".dss-export-"
+
+
+def opendss_export_directory_name(
+    catalog: CircuitCatalogModel,
+    circuit_index: int,
+) -> str:
+    """Nome sugerido da pasta que recebe a exportação de um circuito.
+
+    Usa a mesma base do master, para a pasta e o ``<base>_Master.dss`` dentro
+    dela terem o mesmo nome.
+    """
+
+    base = _master_base_name(catalog.definition(int(circuit_index)))
+    return f"{base}{EXPORT_DIRECTORY_SUFFIX}"
+
+
+def stage_export_directory(
+    base: str | os.PathLike[str],
+    files: Iterable[tuple[str, str]],
+    cancel_check: Callable[[], bool] | None = None,
+) -> Path:
+    """Grava os arquivos numa pasta temporária dentro de ``base``.
+
+    A pasta temporária fica no mesmo volume do destino para que a troca final
+    em :func:`commit_export_directory` seja um ``os.replace`` instantâneo. Em
+    qualquer falha, ou cancelamento, ela é removida antes de propagar o erro.
+    """
+
+    base_path = Path(base)
+    base_path.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=_STAGING_PREFIX, dir=base_path))
+    try:
+        for filename, text in files:
+            if cancel_check is not None and cancel_check():
+                raise InterruptedError("Exportação cancelada.")
+            (staging / filename).write_text(text, encoding="utf-8")
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return staging
+
+
+def commit_export_directory(
+    staging: str | os.PathLike[str],
+    final: str | os.PathLike[str],
+) -> Path:
+    """Substitui ``final`` inteira pela pasta preparada, com rollback.
+
+    A pasta antiga só é apagada depois que a nova está no lugar; se a troca
+    falhar, ela volta ao nome original e a temporária é descartada.
+    """
+
+    staging_path = Path(staging)
+    final_path = Path(final)
+    backup: Path | None = None
+    try:
+        if final_path.exists():
+            backup = final_path.with_name(
+                f".{final_path.name}.backup-{uuid.uuid4().hex}"
+            )
+            os.replace(final_path, backup)
+        os.replace(staging_path, final_path)
+    except BaseException:
+        if backup is not None and backup.exists() and not final_path.exists():
+            os.replace(backup, final_path)
+        shutil.rmtree(staging_path, ignore_errors=True)
+        raise
+    if backup is not None:
+        if backup.is_dir():
+            shutil.rmtree(backup, ignore_errors=True)
+        else:
+            backup.unlink(missing_ok=True)
+    return final_path
 
 
 def _empty_master(
