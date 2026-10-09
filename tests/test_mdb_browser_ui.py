@@ -48,7 +48,9 @@ def choose_rows(view, *rows):
 
 def test_initial_layout_and_empty_selection(dialog):
     assert [dialog.tabs.tabText(i) for i in range(3)] == ["Alimentadores", "Tabelas", "Coordenadas"]
-    assert dialog.size().width() == 820
+    assert dialog.size().width() == 760
+    assert not dialog.network_row.isVisibleTo(dialog)
+    assert dialog.substation_count.text() == "4"
     assert dialog.path_input.isReadOnly()
     assert not dialog.load_button.isEnabled()
     assert dialog.available_model.rowCount() == 0
@@ -58,20 +60,19 @@ def test_initial_layout_and_empty_selection(dialog):
     assert dialog.coordinate_scale() == 10
 
 
-def test_accumulate_filter_and_transfer_all_four_buttons(dialog):
+def test_accumulate_and_transfer_all_four_buttons(dialog):
     activate(dialog, "1")
-    dialog.circuit_filter.setText("AGUA")
-    assert dialog.available_model.rowCount() == 1
-    dialog.transfer_buttons[">>"].click()
-    assert dialog.selected_circuit_ids() == ("2",)
-    assert dialog.available_model.rowCount() == 0
-    dialog.circuit_filter.clear()
+    assert dialog.available_count.text() == "2"
     choose_rows(dialog.available_view, 0)
     dialog.transfer_buttons[">"].click()
+    assert dialog.selected_circuit_ids() == ("2",)
+    assert dialog.available_model.rowCount() == 1
+    dialog.transfer_buttons[">>"].click()
     activate(dialog, "2")
     dialog.transfer_buttons[">>"].click()
     assert dialog.selected_circuit_ids() == ("2", "3", "4")
-    assert "2 subestações" in dialog.circuit_summary.text()
+    assert dialog.selected_count.text() == "3"
+    assert "2 subestações" in dialog.selected_count.toolTip()
     dialog.tabs.setCurrentIndex(1)
     dialog.tabs.setCurrentIndex(2)
     dialog.tabs.setCurrentIndex(0)
@@ -84,17 +85,33 @@ def test_accumulate_filter_and_transfer_all_four_buttons(dialog):
     assert not dialog.load_button.isEnabled()
 
 
-def test_substation_search_ignores_accents_and_does_not_erase_chosen(dialog):
-    activate(dialog, "1")
-    dialog.transfer_buttons[">>"].click()
-    dialog.substation_filter.setText("sao jose")
-    assert not dialog.substation_view.isRowHidden(0)
-    assert not dialog.substation_view.isRowHidden(1)
-    assert dialog.substation_view.isRowHidden(2)
-    dialog.substation_filter.setText("3")
-    assert dialog._active_substation is None
+def test_several_substations_list_the_union_and_clearing_keeps_chosen(dialog):
+    dialog.substation_view.selectAll()
+    assert dialog.available_model.rowCount() == 5
+    dialog.substation_view.clearSelection()
     assert dialog.available_model.rowCount() == 0
-    assert dialog.selected_circuit_ids() == ("2", "3")
+    keys = [row[0] for row in dialog.substation_model.rows]
+    choose_rows(dialog.substation_view, keys.index("1"), keys.index("2"))
+    assert {row[0] for row in dialog.available_model.rows} == {"2", "3", "4"}
+    dialog.transfer_buttons[">>"].click()
+    dialog.substation_view.clearSelection()
+    assert dialog.available_model.rowCount() == 0
+    assert dialog.selected_circuit_ids() == ("2", "3", "4")
+
+
+def test_column_checkbox_mirrors_and_toggles_highlight(dialog):
+    check = dialog.substation_all
+    assert check.checkState() == Qt.CheckState.Unchecked
+    assert not dialog.available_all.isEnabled()
+    choose_rows(dialog.substation_view, 0)
+    assert check.checkState() == Qt.CheckState.PartiallyChecked
+    check.click()
+    assert check.checkState() == Qt.CheckState.Checked
+    assert dialog.available_model.rowCount() == 5
+    assert dialog.available_all.isEnabled()
+    check.click()
+    assert check.checkState() == Qt.CheckState.Unchecked
+    assert dialog.available_model.rowCount() == 0
 
 
 def test_empty_and_unlinked_substations(dialog):

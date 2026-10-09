@@ -251,14 +251,13 @@ class CircuitChoiceDialogTests(unittest.TestCase):
         dialog.transfer_buttons["<<"].click()
         self.assertFalse(dialog.load_button.isEnabled())
 
-    def test_filter_limits_the_available_list(self) -> None:
+    def test_highlighted_substation_limits_the_available_list(self) -> None:
         dialog = self.dialog()
         self.addCleanup(dialog.close)
         dialog.substation_view.setCurrentIndex(dialog.substation_model.index(0, 0))
-        dialog.circuit_filter.setText("nao-existe")
-        self.assertEqual(dialog.available_model.rowCount(), 0)
-        dialog.circuit_filter.setText("004001")
         self.assertEqual(dialog.available_model.rowCount(), 1)
+        dialog.substation_view.clearSelection()
+        self.assertEqual(dialog.available_model.rowCount(), 0)
 
 
 @unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está disponível")

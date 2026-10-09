@@ -100,10 +100,11 @@ def test_mapping_controls_are_explicit_and_reset_on_target_change(qtbot):
     workspace, _ = register_import(SourceWorkspace(), dataset(), FileIdentity("a.mdb", "a"))
     widget = MdbImportDialog(workspace=workspace)
     qtbot.addWidget(widget)
+    assert widget.network_row.isVisibleTo(widget)
     assert widget.network_combo.currentData() is None
-    assert not widget.mapping_button.isEnabled()
+    assert not widget.mapping_button.isVisibleTo(widget)
     widget.network_combo.setCurrentIndex(1)
-    assert widget.mapping_button.isEnabled()
+    assert widget.mapping_button.isVisibleTo(widget)
     mapping = IdentityMapping("bars", "107", "7")
     editor = NetworkMappingDialog((mapping,))
     qtbot.addWidget(editor)

@@ -13,6 +13,7 @@ from enum import StrEnum
 import unicodedata
 
 from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QThread, Qt
+from PyQt6.QtGui import QPalette
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -22,16 +23,14 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QFileDialog,
     QScrollArea,
-    QSplitter,
     QTabWidget,
-    QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
+    QListView,
     QPushButton,
     QSpinBox,
-    QTableView,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -139,6 +138,23 @@ class MdbPasswordDialog(QDialog):
         return self.password_input.text()
 
 
+def mute(label: QLabel) -> QLabel:
+    """Texto secundário na cor de placeholder do tema, claro ou escuro."""
+    palette = label.palette()
+    palette.setColor(QPalette.ColorRole.WindowText, palette.color(QPalette.ColorRole.PlaceholderText))
+    label.setPalette(palette)
+    return label
+
+
+class CompactDelegate(QStyledItemDelegate):
+    """Linhas justas como no Interplan; o estilo Windows 11 quase dobra a altura."""
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        size.setHeight(option.fontMetrics.height() + 6)
+        return size
+
+
 def search_key(value: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", value.casefold())
                    if not unicodedata.combining(c)).strip()
@@ -193,8 +209,8 @@ class MdbImportDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.resize(820, 700)
-        self.setMinimumSize(640, 540)
+        self.resize(760, 520)
+        self.setMinimumSize(600, 420)
         self._table_mapping = tuple(table_mapping) if table_mapping is not None else load_table_mapping()
         self._mapping = mapping or ResolvedMapping((), ())
         self._automatic_mapping = self._mapping
@@ -204,7 +220,7 @@ class MdbImportDialog(QDialog):
         self._circuits = tuple(circuits)
         self._substations = tuple(substations)
         self._chosen: set[str] = set()
-        self._active_substation = None
+        self._active_substations: set[str] = set()
         self._known_substations = {}
         self._ready = mapping is not None
         self._inspecting = False
@@ -235,22 +251,26 @@ class MdbImportDialog(QDialog):
         layout.addLayout(file_row)
         self._identity_mappings = ()
         self.network_combo = QComboBox()
-        self.network_combo.addItem("Reconhecer banco; arquivos diferentes criam outra rede", None)
+        self.network_combo.addItem("Nova rede (reconhecida automaticamente)", None)
         for source in workspace or ():
             if source.registry is not None:
                 self.network_combo.addItem(f"Vincular à rede {source.tag} — {source.name}", source.tag)
         self.mapping_button = QPushButton("Correspondências…")
         self.mapping_button.setAutoDefault(False)
-        self.mapping_button.setEnabled(False)
+        self.mapping_button.setVisible(False)
         self.mapping_button.clicked.connect(self._edit_identity_mappings)
         self.network_combo.currentIndexChanged.connect(self._network_changed)
         self.network_combo.setToolTip("O mesmo caminho ou uma cópia idêntica reconhece a rede automaticamente. "
                                      "Vincule outro banco somente se ele representar a mesma rede física.")
-        network_row = QHBoxLayout()
+        # Sem rede registrada no projeto só existe uma opção: a linha não diz nada.
+        self.network_row = QWidget()
+        network_row = QHBoxLayout(self.network_row)
+        network_row.setContentsMargins(0, 0, 0, 0)
         network_row.addWidget(QLabel("Rede:"))
         network_row.addWidget(self.network_combo, 1)
         network_row.addWidget(self.mapping_button)
-        layout.addLayout(network_row)
+        self.network_row.setVisible(self.network_combo.count() > 1)
+        layout.addWidget(self.network_row)
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_feeders_tab(), "Alimentadores")
         tables_page = QWidget()
@@ -261,11 +281,11 @@ class MdbImportDialog(QDialog):
         self.table_status.setWordWrap(True)
         self.table_status.setTextFormat(Qt.TextFormat.PlainText)
         self.tables_layout.addWidget(self.table_status)
-        self.auxiliary_label = QLabel("As tabelas auxiliares serão verificadas ao abrir o banco.")
+        self.tables_layout.addStretch()
+        self.auxiliary_label = mute(QLabel("As tabelas auxiliares serão verificadas ao abrir o banco."))
         self.auxiliary_label.setWordWrap(True)
         self.auxiliary_label.setTextFormat(Qt.TextFormat.PlainText)
         self.tables_layout.addWidget(self.auxiliary_label)
-        self.tables_layout.addStretch()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -277,24 +297,19 @@ class MdbImportDialog(QDialog):
         coordinate_layout.addStretch()
         self.tabs.addTab(coordinate_page, "Coordenadas")
         layout.addWidget(self.tabs, 1)
-        self.circuit_summary = QLabel()
-        self.circuit_summary.setWordWrap(True)
-        layout.addWidget(self.circuit_summary)
         self.warning_label = QLabel()
         self.warning_label.setTextFormat(Qt.TextFormat.PlainText)
         self.warning_label.setWordWrap(True)
-        layout.addWidget(self.warning_label)
-        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancelar")
-        self.load_button = QPushButton("Carregar alimentadores na memória")
-        self.load_button.setMinimumHeight(32)
-        self.load_button.setAutoDefault(False)
-        button_row = QHBoxLayout()
-        button_row.addWidget(self.load_button, 1)
-        button_row.addWidget(self.buttons)
-        self.load_button.clicked.connect(self.accept)
+        self.buttons = QDialogButtonBox()
+        self.load_button = self.buttons.addButton("Carregar", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.load_button.setDefault(True)
+        self.buttons.addButton(QDialogButtonBox.StandardButton.Cancel).setText("Cancelar")
+        self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
-        layout.addLayout(button_row)
+        footer = QHBoxLayout()
+        footer.addWidget(self.warning_label, 1)
+        footer.addWidget(self.buttons)
+        layout.addLayout(footer)
         self._building = False
         self._update_entity_validity()
         self._refresh_substations()
@@ -302,7 +317,7 @@ class MdbImportDialog(QDialog):
 
     def _network_changed(self):
         self._identity_mappings = ()
-        self.mapping_button.setEnabled(self.network_combo.currentData() is not None)
+        self.mapping_button.setVisible(self.network_combo.currentData() is not None)
 
     def _edit_identity_mappings(self):
         dialog = NetworkMappingDialog(self._identity_mappings, self)
@@ -310,95 +325,119 @@ class MdbImportDialog(QDialog):
             self._identity_mappings = dialog.mappings()
         dialog.deleteLater()
 
-    def _table(self, model, *, single=False):
-        view = QTableView()
+    def _list(self, model):
+        view = QListView()
         view.setModel(model)
-        view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection if single
-                              else QAbstractItemView.SelectionMode.ExtendedSelection)
+        view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        view.verticalHeader().hide()
-        view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        view.setShowGrid(False)
-        view.setMinimumHeight(90)
+        view.setUniformItemSizes(True)
+        font = view.font()
+        font.setBold(True)
+        view.setFont(font)
+        view.setItemDelegate(CompactDelegate(view))
+        view.setMinimumHeight(120)
         return view
+
+    @staticmethod
+    def _highlighted_rows(view):
+        return {index.row() for index in view.selectionModel().selectedIndexes()}
+
+    def _column(self, title, view):
+        """Checkbox "todos" e contador sobre a lista, como nas colunas do Interplan.
+
+        O checkbox espelha o destaque da lista: marcado com todos, parcial com
+        alguns, vazio com nenhum. O clique destaca todos ou limpa o destaque.
+        """
+        check = QCheckBox(title)
+        check.setToolTip("Destacar todos / limpar destaque")
+
+        def sync(*_args):
+            total = view.model().rowCount()
+            highlighted = len(self._highlighted_rows(view))
+            check.setCheckState(Qt.CheckState.Unchecked if not highlighted else
+                                Qt.CheckState.Checked if highlighted >= total else
+                                Qt.CheckState.PartiallyChecked)
+            check.setEnabled(total > 0)
+
+        def toggle():
+            if len(self._highlighted_rows(view)) >= view.model().rowCount():
+                view.clearSelection()
+            else:
+                view.selectAll()
+            sync()  # o clique já avançou o estado; a lista é quem manda
+
+        check.clicked.connect(toggle)
+        view.selectionModel().selectionChanged.connect(sync)
+        view.model().modelReset.connect(sync)
+        sync()
+        header = QHBoxLayout()
+        header.setSpacing(2)
+        header.addWidget(check)
+        header.addStretch()
+        count = mute(QLabel("0"))
+        count.setMinimumWidth(24)
+        count.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(count)
+        column = QVBoxLayout()
+        column.setSpacing(2)
+        column.addLayout(header)
+        column.addWidget(view, 1)
+        return column, count, check
 
     def _build_feeders_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        self.circuits_group = QWidget()
-        hierarchy = QVBoxLayout(self.circuits_group)
-        hierarchy.setContentsMargins(0, 0, 0, 0)
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        top = QWidget()
-        upper = QVBoxLayout(top)
-        upper.setContentsMargins(0, 0, 0, 0)
-        upper.addWidget(QLabel("1. Selecione a subestação"))
-        self.substation_filter = QLineEdit()
-        self.substation_filter.setPlaceholderText("Buscar subestação por código, nome ou ID…")
-        self.substation_filter.setClearButtonEnabled(True)
-        self.substation_filter.textChanged.connect(self._filter_substations)
-        upper.addWidget(self.substation_filter)
         self.substation_model = ChoiceTableModel(("Código", "Nome", "Alimentadores"), self)
-        self.substation_view = self._table(self.substation_model, single=True)
-        self.substation_view.selectionModel().currentRowChanged.connect(self._substation_changed)
-        upper.addWidget(self.substation_view, 1)
-        splitter.addWidget(top)
-        bottom = QWidget()
-        lower = QVBoxLayout(bottom)
-        lower.setContentsMargins(0, 0, 0, 0)
-        lower.addWidget(QLabel("2. Selecione os alimentadores"))
-        self.circuit_filter = QLineEdit()
-        self.circuit_filter.setPlaceholderText("Buscar alimentador por código, ID ou tensão…")
-        self.circuit_filter.setClearButtonEnabled(True)
-        self.circuit_filter.textChanged.connect(self._refresh_circuits)
-        lower.addWidget(self.circuit_filter)
         self.available_model = ChoiceTableModel(("Código", "ID", "Tensão (kV)"), self)
         self.selected_model = ChoiceTableModel(("Código", "ID", "Tensão (kV)", "Subestação"), self)
-        self.available_view = self._table(self.available_model)
-        self.selected_view = self._table(self.selected_model)
-        self.available_view.setColumnHidden(1, True)
-        self.selected_view.setColumnHidden(1, True)
-        transfer = QHBoxLayout()
-        left, right = QVBoxLayout(), QVBoxLayout()
-        left.addWidget(QLabel("Disponíveis"))
-        left.addWidget(self.available_view, 1)
-        right.addWidget(QLabel("Selecionados"))
-        right.addWidget(self.selected_view, 1)
-        transfer.addLayout(left, 1)
+        self.substation_view = self._list(self.substation_model)
+        self.available_view = self._list(self.available_model)
+        self.selected_view = self._list(self.selected_model)
+        substations, self.substation_count, self.substation_all = self._column("SEs", self.substation_view)
+        available, self.available_count, self.available_all = self._column("Circuitos", self.available_view)
+        selected, self.selected_count, self.selected_all = self._column("Selecionados", self.selected_view)
         arrows = QVBoxLayout()
         arrows.addStretch()
         self.transfer_buttons = {}
-        for text, tip, callback in (
-            (">", "Adicionar os alimentadores destacados", self._add_highlighted),
-            (">>", "Adicionar todos os disponíveis após o filtro", self._add_visible),
-            ("<", "Remover os alimentadores destacados", self._remove_highlighted),
-            ("<<", "Limpar toda a seleção, de todas as subestações", self._clear_chosen),
+        for key, text, tip, callback in (
+            (">", "→", "Adicionar os alimentadores destacados", self._add_highlighted),
+            (">>", "⇒", "Adicionar todos os circuitos da lista", self._add_visible),
+            ("<", "←", "Remover os alimentadores destacados", self._remove_highlighted),
+            ("<<", "⇐", "Limpar toda a seleção, de todas as subestações", self._clear_chosen),
         ):
             button = QPushButton(text)
             button.setFixedWidth(36)
+            font = button.font()
+            font.setPointSizeF(font.pointSizeF() + 3)
+            button.setFont(font)
             button.setAutoDefault(False)
             button.setToolTip(tip)
             button.setAccessibleName(tip)
             button.clicked.connect(callback)
-            self.transfer_buttons[text] = button
+            self.transfer_buttons[key] = button
             arrows.addWidget(button)
         arrows.addStretch()
-        transfer.addLayout(arrows)
-        transfer.addLayout(right, 1)
-        lower.addLayout(transfer, 1)
+        self.circuits_group = QWidget()
+        columns = QHBoxLayout(self.circuits_group)
+        columns.setContentsMargins(0, 0, 0, 0)
+        columns.addLayout(substations, 2)
+        columns.addLayout(available, 3)
+        columns.addLayout(arrows)
+        columns.addLayout(selected, 3)
+        layout.addWidget(self.circuits_group, 1)
+        self.substation_view.selectionModel().selectionChanged.connect(self._substation_changed)
         self.available_view.doubleClicked.connect(self._add_highlighted)
         self.selected_view.doubleClicked.connect(self._remove_highlighted)
         self.available_view.selectionModel().selectionChanged.connect(self._sync_transfer_buttons)
         self.selected_view.selectionModel().selectionChanged.connect(self._sync_transfer_buttons)
-        splitter.addWidget(bottom)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
-        hierarchy.addWidget(splitter)
-        layout.addWidget(self.circuits_group, 1)
-        self.whole_database_check = QCheckBox("Importar banco sem seleção de alimentadores")
+        self.whole_database_check = QCheckBox("Banco inteiro")
+        self.whole_database_check.setToolTip("Importa o banco sem escolher alimentadores; "
+                                             "são lidas as tabelas marcadas na aba Tabelas.")
         self.whole_database_check.toggled.connect(self._sync_ok_enabled)
-        layout.addWidget(self.whole_database_check)
+        options = QHBoxLayout()
+        options.addStretch()
+        options.addWidget(self.whole_database_check)
+        layout.addLayout(options)
         return page
 
     def _substation_key(self, choice):
@@ -411,29 +450,18 @@ class MdbImportDialog(QDialog):
                  f"ID: {item.substation_id}") for item in self._substations]
         rows.sort(key=lambda row: search_key(" ".join(str(value) for value in row[1][:2])))
         if counts[""]:
-            rows.append(("", ("—", "Sem subestação", counts[""]), "Alimentadores sem vínculo válido com SE."))
+            rows.append(("", ("Sem SE", "Sem subestação", counts[""]), "Alimentadores sem vínculo válido com SE."))
         self.substation_model.replace_rows(rows)
-        self._active_substation = None
-        self._filter_substations()
+        self.substation_count.setText(str(len(rows)))
+        self._active_substations = set()
 
-    def _filter_substations(self, *_args):
-        needle = search_key(self.substation_filter.text())
-        for index, (key, cells, _) in enumerate(self.substation_model.rows):
-            hidden = needle not in search_key(" ".join((key, *(str(cell) for cell in cells[:2]))))
-            self.substation_view.setRowHidden(index, hidden)
-            if hidden and self._active_substation == key:
-                self.substation_view.setCurrentIndex(QModelIndex())
-                self._active_substation = None
-                self._refresh_circuits()
-
-    def _substation_changed(self, current, _previous):
-        self._active_substation = current.data(Qt.ItemDataRole.UserRole) if current.isValid() else None
+    def _substation_changed(self, *_args):
+        self._active_substations = self._highlighted(self.substation_view)
         self._refresh_circuits()
 
     def _refresh_circuits(self, *_args):
         if self._building:
             return
-        needle = search_key(self.circuit_filter.text())
         available, selected = [], []
         for choice in self._circuits:
             cells = (choice.code, choice.circuit_id, choice.nominal_voltage)
@@ -442,16 +470,19 @@ class MdbImportDialog(QDialog):
                 label = "Sem subestação" if substation is None else (
                     " · ".join(filter(None, (substation.code, substation.name))) or substation.substation_id)
                 selected.append((choice.circuit_id, (*cells, label), choice.reason))
-            elif self._active_substation == self._substation_key(choice) and needle in search_key(" ".join(cells)):
+            elif self._substation_key(choice) in self._active_substations:
                 available.append((choice.circuit_id, cells, choice.reason))
         self.available_model.replace_rows(available)
         self.selected_model.replace_rows(selected)
+        self.available_count.setText(str(len(available)))
+        self.selected_count.setText(str(len(selected)))
         self._sync_ok_enabled()
         self._sync_transfer_buttons()
 
     @staticmethod
     def _highlighted(view):
-        return {index.data(Qt.ItemDataRole.UserRole) for index in view.selectionModel().selectedRows()}
+        # A lista destaca só a coluna 0; selectedRows() exigiria a linha inteira.
+        return {index.data(Qt.ItemDataRole.UserRole) for index in view.selectionModel().selectedIndexes()}
 
     def _add_highlighted(self, *_args):
         self._chosen.update(self._highlighted(self.available_view))
@@ -536,7 +567,6 @@ class MdbImportDialog(QDialog):
         self.circuits_group.setEnabled(self._ready and not self._inspecting and not whole)
         self.whole_database_check.setEnabled(self._ready and not self._inspecting)
         self.entities_group.setEnabled(self._ready and not self._inspecting)
-        self.load_button.setText("Carregar banco na memória" if whole else "Carregar alimentadores na memória")
         selected = self.selected_entities()
         required = ("barras",) if whole else ("barras", "trechos", "circuitos")
         missing = [ENTITY_LABELS[entity] for entity in required
@@ -548,8 +578,7 @@ class MdbImportDialog(QDialog):
         count = len(self._chosen)
         feeders = "alimentador selecionado" if count == 1 else "alimentadores selecionados"
         stations = "subestação" if len(groups) == 1 else "subestações"
-        self.circuit_summary.setText("Banco sem seleção de alimentadores; serão lidas as tabelas marcadas."
-                                    if whole else f"{count} {feeders} em {len(groups)} {stations}")
+        self.selected_count.setToolTip(f"{count} {feeders} em {len(groups)} {stations}")
         if self._closing:
             message = "Cancelando a inspeção e fechando a conexão…"
         elif self._inspecting:
@@ -566,10 +595,9 @@ class MdbImportDialog(QDialog):
             message = ("Selecione ao menos um alimentador." if self._circuits else
                        "Nenhum alimentador disponível. Verifique Tabelas ou escolha importar o banco sem seleção.")
         else:
-            skipped = [ENTITY_LABELS[entity] for entity in ENTITY_ORDER if entity not in selected]
-            message = "Não serão importadas: " + ", ".join(skipped) if skipped else ""
+            message = ""
         if self._diagnostics and not self._inspecting:
-            message += "\n" + "\n".join(self._diagnostics)
+            message = "\n".join(filter(None, (message, *self._diagnostics)))
         self.warning_label.setText(message)
         self.warning_label.setVisible(bool(message))
 
@@ -599,8 +627,6 @@ class MdbImportDialog(QDialog):
         self._diagnostics = ()
         self._building = True
         self.whole_database_check.setChecked(False)
-        self.substation_filter.clear()
-        self.circuit_filter.clear()
         self.zone_input.setValue(21)
         self.hemisphere_input.setCurrentIndex(0)
         self.unit_input.setCurrentIndex(self.unit_input.findData(DEFAULT_COORDINATE_SCALE))
@@ -766,8 +792,9 @@ class MdbImportDialog(QDialog):
 
 
     def _build_entities_group(self) -> QWidget:
-        group = QGroupBox("Tabelas")
+        group = QWidget()
         form = QFormLayout(group)
+        form.setContentsMargins(0, 0, 0, 0)
         self.entity_checks: dict[str, QCheckBox] = {}
         self.entity_combos: dict[str, QComboBox] = {}
 
@@ -844,8 +871,9 @@ class MdbImportDialog(QDialog):
 
 
     def _build_coordinates_group(self, suggested_scale: float) -> QWidget:
-        group = QGroupBox("Coordenadas")
+        group = QWidget()
         form = QFormLayout(group)
+        form.setContentsMargins(0, 0, 0, 0)
 
         self.zone_input = QSpinBox()
         self.zone_input.setRange(1, 60)
