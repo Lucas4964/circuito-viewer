@@ -31,6 +31,12 @@ EXPECTED_LOAD_PATTERN_HEADER = (
     "QE",
     "QF",
 )
+# O modelo ZIP por carga e patamar. No Interplan é a tabela MODELO_CARGA_SIZ,
+# separada da MODELO_CARGA; num CSV pode vir como colunas opcionais da própria
+# tabela de patamares. Quando o cadastro não o traz, vale o das configurações.
+ZIP_COLUMNS = ("ZCTE", "ICTE", "SCTE")
+LOAD_ZIP_HEADER = ("CARGA_ID", "NPAT", *ZIP_COLUMNS)
+ZIP_TABLE_LABEL = "MODELO_CARGA_SIZ"
 MAX_REPORTED_ISSUES = 200
 ProgressCallback = Callable[[int, int, int], None]
 
@@ -90,11 +96,18 @@ def parse_load_pattern_rows(
     first_line_number: int = 2,
     cancel_event: threading.Event | None = None,
     progress: RowProgress | None = None,
+    zip_header: Iterable[str] | None = None,
+    zip_rows: Iterable[TextRow] | None = None,
 ) -> LoadPatternCsvResult:
     """Valida linhas de patamares já em texto e devolve o modelo.
 
     Toda a validação vive aqui, independente da fonte: o CSV e o banco Access
     apenas entregam cabeçalho e linhas de texto.
+
+    ``zip_header``/``zip_rows`` são a tabela opcional do modelo ZIP
+    (:data:`LOAD_ZIP_HEADER`), casada pelo par ``CARGA_ID``/``NPAT``. Ela
+    complementa os patamares e nunca os invalida: uma linha dela sem par vira
+    ocorrência e é ignorada.
     """
 
     records_by_load: dict[int, dict[int, LoadPatternRecord]] = {}
@@ -113,6 +126,10 @@ def parse_load_pattern_rows(
     header = normalize_header(raw_header)
     positions = _column_positions(header)
     last_required_position = max(positions.values())
+    zip_positions = {
+        name: header.index(name) for name in ZIP_COLUMNS if name in header
+    }
+    zip_by_level = _zip_by_level(zip_header, zip_rows, loads, add_issue, cancel_event)
 
     for line_number, row in enumerate(rows, start=first_line_number):
         if cancel_event is not None and cancel_event.is_set():
@@ -151,6 +168,12 @@ def parse_load_pattern_rows(
                 f"NPAT duplicado para CARGA_ID {load_id}: {npat}",
             )
             continue
+        zip_values = zip_by_level.get((load_id, npat)) or tuple(
+            row[zip_positions[name]].strip()
+            if name in zip_positions and zip_positions[name] < len(row)
+            else ""
+            for name in ZIP_COLUMNS
+        )
         group[npat] = LoadPatternRecord(
             load_id=load_id,
             npat=npat,
@@ -160,6 +183,9 @@ def parse_load_pattern_rows(
             qd=values["QD"],
             qe=values["QE"],
             qf=values["QF"],
+            zcte=zip_values[0],
+            icte=zip_values[1],
+            scte=zip_values[2],
         )
 
     if cancel_event is not None and cancel_event.is_set():
@@ -204,6 +230,54 @@ def parse_load_pattern_rows(
         issues=tuple(issues),
         omitted_issues=max(0, issue_count - len(issues)),
     )
+
+
+def _zip_by_level(
+    raw_header: Iterable[str] | None,
+    rows: Iterable[TextRow] | None,
+    loads: LoadModel,
+    add_issue: Callable[[int, str], None],
+    cancel_event: threading.Event | None,
+) -> dict[tuple[str, int], tuple[str, str, str]]:
+    """ZCTE/ICTE/SCTE da tabela do modelo ZIP, por ``(CARGA_ID, NPAT)``."""
+
+    if raw_header is None or rows is None:
+        return {}
+    header = normalize_header(raw_header)
+    missing = [name for name in LOAD_ZIP_HEADER if name not in header]
+    if missing:
+        add_issue(0, f"{ZIP_TABLE_LABEL}: colunas ausentes: " + ", ".join(missing))
+        return {}
+    positions = {name: header.index(name) for name in LOAD_ZIP_HEADER}
+    last_position = max(positions.values())
+    found: dict[tuple[str, int], tuple[str, str, str]] = {}
+    for line_number, row in enumerate(rows, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CsvImportCancelled("Importação cancelada.")
+        if not row or not any(value.strip() for value in row):
+            continue
+        if len(row) <= last_position:
+            add_issue(line_number, f"{ZIP_TABLE_LABEL}: faltam valores")
+            continue
+        values = {name: row[index].strip() for name, index in positions.items()}
+        load_id = values["CARGA_ID"]
+        if loads.index_for_id(load_id) is None:
+            add_issue(
+                line_number,
+                f"{ZIP_TABLE_LABEL}: carga inexistente: {load_id or '<vazio>'}",
+            )
+            continue
+        if values["NPAT"] not in {"0", "1", "2", "3"}:
+            add_issue(
+                line_number,
+                f"{ZIP_TABLE_LABEL}: NPAT inválido para CARGA_ID {load_id}: "
+                f"{values['NPAT'] or '<vazio>'}",
+            )
+            continue
+        found[(load_id, int(values["NPAT"]))] = tuple(
+            values[name] for name in ZIP_COLUMNS
+        )
+    return found
 
 
 def _parse_file(

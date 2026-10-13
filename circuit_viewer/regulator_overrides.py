@@ -25,13 +25,32 @@ from collections.abc import Iterable, Mapping
 from .model import RegulatorModel
 
 
-# Só os campos que a exportação OpenDSS realmente consome. Editar FAIXA, TAP ou
-# NPASSOS não teria efeito algum no `.dss` gerado, e oferecer isso na interface
-# seria uma armadilha: o usuário mudaria o número e nada aconteceria.
-EDITABLE_FIELDS: tuple[str, ...] = ("vnom", "snom")
+# Só campos que a exportação OpenDSS consome e que fazem sentido mudar num
+# estudo: a tensão, a potência, o VREG de cada patamar e o tap fixo (FIXO e TAP,
+# para simular um regulador travado). FAIXA e NPASSOS também entram no modelo,
+# mas descrevem o equipamento, e continuam só de leitura.
+EDITABLE_FIELDS: tuple[str, ...] = (
+    "vnom",
+    "snom",
+    "vreg_p1",
+    "vreg_p2",
+    "vreg_p3",
+    "vreg_p4",
+    "fixed",
+    "tap",
+)
 
 # Nome do campo -> rótulo da coluna no MDB, para as mensagens da interface.
-FIELD_LABELS: Mapping[str, str] = {"vnom": "VNOM", "snom": "SNOM"}
+FIELD_LABELS: Mapping[str, str] = {
+    "vnom": "VNOM",
+    "snom": "SNOM",
+    "vreg_p1": "VREG_P1",
+    "vreg_p2": "VREG_P2",
+    "vreg_p3": "VREG_P3",
+    "vreg_p4": "VREG_P4",
+    "fixed": "FIXO",
+    "tap": "TAP",
+}
 
 
 class RegulatorOverrides:
@@ -127,9 +146,10 @@ def apply_overrides(
     if model is None or overrides.is_empty:
         return model
 
-    snom_values = list(model.snom_values)
-    vnom_values = list(model.vnom_values)
-    columns = {"snom": snom_values, "vnom": vnom_values}
+    # Cada campo editável é a coluna ``<campo>_values`` do modelo.
+    columns = {
+        field: list(getattr(model, f"{field}_values")) for field in EDITABLE_FIELDS
+    }
     changed = False
     for index, regulator_id in enumerate(model.regulator_ids):
         for field, value in overrides.fields_for(regulator_id).items():
@@ -147,11 +167,16 @@ def apply_overrides(
         model.external_ids,
         model.codes,
         model.connections,
-        snom_values,
+        columns["snom"],
         model.regulation_ranges,
         model.step_counts,
-        model.tap_values,
+        columns["tap"],
         model.inom_values,
-        vnom_values,
+        columns["vnom"],
+        vreg_p1_values=columns["vreg_p1"],
+        vreg_p2_values=columns["vreg_p2"],
+        vreg_p3_values=columns["vreg_p3"],
+        vreg_p4_values=columns["vreg_p4"],
+        fixed_values=columns["fixed"],
         source_path=model.source_path,
     )

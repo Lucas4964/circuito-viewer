@@ -62,10 +62,14 @@ class RegulatorOverridesTests(unittest.TestCase):
     def test_only_fields_consumed_by_the_export_are_editable(self) -> None:
         overrides = RegulatorOverrides()
 
-        self.assertEqual(EDITABLE_FIELDS, ("vnom", "snom"))
+        self.assertEqual(
+            EDITABLE_FIELDS,
+            ("vnom", "snom", "vreg_p1", "vreg_p2", "vreg_p3", "vreg_p4", "fixed", "tap"),
+        )
         for field in EDITABLE_FIELDS:
             self.assertTrue(overrides.set("RG1", field, "1"))
-        for field in ("faixa", "tap", "npassos", "codigo"):
+        # FAIXA e NPASSOS descrevem o equipamento e continuam só de leitura.
+        for field in ("faixa", "regulation_range", "npassos", "codigo"):
             with self.assertRaises(ValueError):
                 overrides.set("RG1", field, "1")
 
@@ -131,6 +135,19 @@ class RegulatorOverridesTests(unittest.TestCase):
         self.assertEqual(effective.record(0).inom, "200")
         self.assertEqual(effective.record(0).code, "REG-01")
         self.assertEqual(effective.segments, model.segments)
+
+    def test_vreg_fixo_and_tap_overrides_reach_the_effective_model(self) -> None:
+        model = make_regulators(make_network())
+        overrides = RegulatorOverrides()
+        overrides.set("RG1", "vreg_p3", "1,01")
+        overrides.set("RG1", "fixed", "1")
+        overrides.set("RG1", "tap", "0.05")
+
+        record = apply_overrides(model, overrides).record(0)
+
+        self.assertEqual(record.vreg_by_level, ("", "", "1,01", ""))
+        self.assertEqual(record.fixed, "1")
+        self.assertEqual(record.tap, "0.05")
 
     def test_the_imported_model_is_never_mutated(self) -> None:
         """O MDB é retrato somente leitura: a edição não pode vazar para ele."""

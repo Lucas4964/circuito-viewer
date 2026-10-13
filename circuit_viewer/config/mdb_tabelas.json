@@ -66,6 +66,13 @@
     }
   },
   {
+    "entidade": "patamares_zip",
+    "tabelas": ["MODELO_CARGA_SIZ"],
+    "colunas": {
+      "CARGA_ID": [], "NPAT": [], "SCTE": [], "ICTE": [], "ZCTE": []
+    }
+  },
+  {
     "entidade": "chaves",
     "tabelas": ["CHAVE"],
     "colunas": {
@@ -80,7 +87,8 @@
     "colunas": {
       "REGU_ID": [], "TRECHO_ID": [], "EXTERN_ID": [], "CODIGO": [],
       "LIGACAO": [], "SNOM": [], "FAIXA": [], "NPASSOS": [], "TAP": [],
-      "INOM": [], "VNOM": []
+      "INOM": [], "VNOM": [],
+      "VREG_P1": [], "VREG_P2": [], "VREG_P3": [], "VREG_P4": [], "FIXO": []
     }
   },
   {

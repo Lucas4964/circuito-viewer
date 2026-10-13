@@ -162,9 +162,16 @@ class RegulatorUiTests(unittest.TestCase):
 
         window._set_selection(FeatureSelection("segment", 0))
 
-        self.assertEqual(set(window.regulator_value_editors), {"vnom", "snom"})
+        self.assertEqual(
+            set(window.regulator_value_editors),
+            {"vnom", "snom", "vreg_p1", "vreg_p2", "vreg_p3", "vreg_p4", "fixed", "tap"},
+        )
         self.assertEqual(window.regulator_value_editors["vnom"].text(), "13800")
         self.assertEqual(window.regulator_value_editors["snom"].text(), "1000")
+        self.assertEqual(window.regulator_value_editors["tap"].text(), "3")
+        # O CSV da fixture não traz as colunas opcionais: os campos ficam vazios.
+        self.assertEqual(window.regulator_value_editors["vreg_p1"].text(), "")
+        self.assertEqual(window.regulator_value_editors["fixed"].text(), "")
         self.assertFalse(window.regulator_restore_button.isVisible())
 
     def test_an_edit_reaches_the_effective_model_without_touching_the_source(
@@ -282,6 +289,11 @@ class RegulatorUiTests(unittest.TestCase):
                 "regulation_range": "10",
                 "step_count": "32",
                 "tap": "3",
+                "fixed": "",
+                "vreg_p1": "",
+                "vreg_p2": "",
+                "vreg_p3": "",
+                "vreg_p4": "",
                 "inom": "100",
                 "vnom": "13800",
             },

@@ -127,6 +127,7 @@ from .generator_update import (
     GeneratorScheduleMode,
     GeneratorUpdateModel,
     GeneratorUpdateResult,
+    preferred_schedule_choices,
 )
 from .generator_update_dialog import UpdateGeneratorsDialog
 from .generator_update_table import (
@@ -217,6 +218,7 @@ from .opendss_export import (
     opendss_export_directory_name,
     parse_number,
     phase_letters_by_node,
+    regulators_without_power,
 )
 from .opendss_export_dialog import OpenDssExportDialog
 from .opendss_allocation_dialog import (
@@ -259,10 +261,12 @@ from .opendss_settings_dialog import (
     load_branch_power_source,
     load_max_power_flow_iterations,
     load_opendss_line_parameter_mode,
+    load_opendss_regulator_settings,
     load_opendss_settings,
     save_branch_power_source,
     save_max_power_flow_iterations,
     save_opendss_line_parameter_mode,
+    save_opendss_regulator_settings,
     save_opendss_settings,
 )
 from .overlap_report import CircuitOverlapReportWindow, OverlapReportTableModel
@@ -801,6 +805,9 @@ class MainWindow(QMainWindow):
         # Preferência de sessão para sessão, como o tema: os limites de tensão
         # das cargas valem para a exportação e para o fluxo de potência.
         self._opendss_load_settings = load_opendss_settings(self._settings)
+        self._opendss_regulator_settings = load_opendss_regulator_settings(
+            self._settings
+        )
         self._opendss_allocation_settings = load_opendss_allocation_settings(
             self._settings
         )
@@ -2298,6 +2305,11 @@ class MainWindow(QMainWindow):
             ("regulation_range", "FAIXA:"),
             ("step_count", "NPASSOS:"),
             ("tap", "TAP:"),
+            ("fixed", "FIXO:"),
+            ("vreg_p1", "VREG_P1 (pu):"),
+            ("vreg_p2", "VREG_P2 (pu):"),
+            ("vreg_p3", "VREG_P3 (pu):"),
+            ("vreg_p4", "VREG_P4 (pu):"),
             ("inom", "INOM:"),
             ("vnom", "VNOM:"),
         )
@@ -4261,7 +4273,11 @@ class MainWindow(QMainWindow):
                 from .project_state import edit_equipment
                 baselines = [dict(values) for (path, key), values in self._project.baselines.items() if key == record.key]
                 if baselines:
-                    values = {name: baselines[-1][name] for name in ("snom_values", "vnom_values") if name in baselines[-1]}
+                    values = {
+                        f"{field}_values": baselines[-1][f"{field}_values"]
+                        for field in REGULATOR_EDITABLE_FIELDS
+                        if f"{field}_values" in baselines[-1]
+                    }
                     project = self._project
                     self._start_project_operation(lambda cancel: edit_equipment(project, record.equipment_id, values, cancel_check=cancel))
                 return
@@ -5086,9 +5102,9 @@ class MainWindow(QMainWindow):
         """Atualiza a potência dos geradores sem passar pelo diálogo.
 
         Roda ao abrir a rede, com as mesmas escolhas que o diálogo oferece
-        pré-selecionadas: a curva padrão e os patamares ``DEFAULT`` para todo
-        circuito. Um circuito com patamares próprios continua exigindo o
-        diálogo — marcá-los sozinho seria decidir pelo usuário.
+        pré-selecionadas: a curva padrão e, em cada circuito, os patamares
+        próprios quando ele os tem e os ``DEFAULT`` quando não tem (ver
+        ``preferred_schedule_choices``).
 
         Silenciosa por construção: ``_show_generator_update_report`` já resume
         na barra de status quando não há ocorrência e só abre o relatório
@@ -5108,8 +5124,16 @@ class MainWindow(QMainWindow):
             or curve is None
         ):
             return
-        modes = (GeneratorScheduleMode.DEFAULT,) * len(circuits)
-        schedules = (self.calculation_level_schedule,) * len(circuits)
+        levels = self._circuit_level_controller
+        if levels is not None and levels.circuits is not circuits:
+            levels = None
+        modes, schedules = preferred_schedule_choices(
+            self.calculation_level_schedule,
+            tuple(
+                None if levels is None else levels.schedule(index)
+                for index in range(len(circuits))
+            ),
+        )
         self.statusBar().showMessage(
             f'Atualizando geradores com a curva "{curve.name}"…', 4_000
         )
@@ -5294,7 +5318,8 @@ class MainWindow(QMainWindow):
         from .study_inputs import StudyInputRevision
         library = self._uses_opendss_library_parameters()
         return StudyInputRevision.capture(self._project, phases=self._phase_configuration,
-                   load_settings=self._opendss_load_settings, max_iterations=self._max_power_flow_iterations,
+                   load_settings=self._opendss_load_settings, regulator_settings=self._opendss_regulator_settings,
+                   max_iterations=self._max_power_flow_iterations,
                    line_mode=self._opendss_line_parameter_mode,
                    library=self.opendss_library_session.saved_catalog() if library else None,
                    mappings=self.opendss_mapping_session.mappings if library else None,
@@ -5403,6 +5428,8 @@ class MainWindow(QMainWindow):
         circuit_indices = dialog.selected_circuit_indices()
         if not circuit_indices:
             return
+        if not self._confirm_regulators_without_power(circuit_indices):
+            return
         directory = QFileDialog.getExistingDirectory(
             self,
             "Escolher a pasta base da exportação",
@@ -5427,6 +5454,47 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
         self._start_opendss_export(destination, circuit_indices)
+
+    def _confirm_regulators_without_power(
+        self,
+        circuit_indices: tuple[int, ...],
+    ) -> bool:
+        """Avisa dos reguladores sem SNOM antes de exportar.
+
+        Eles saem mesmo assim, como reguladores ideais, que não dependem da
+        potência. O aviso existe porque um cadastro sem SNOM costuma ter outros
+        campos incompletos, e o usuário pode preferir revisá-lo no painel antes.
+        """
+
+        catalog = self._circuit_catalog
+        if catalog is None:
+            return True
+        missing = regulators_without_power(
+            catalog, self._regulator_model, circuit_indices
+        )
+        if not missing:
+            return True
+        shown = 10
+        names = "\n".join(
+            f"• {record.code.strip() or record.regulator_id} "
+            f"(SNOM {record.snom.strip() or 'vazia'})"
+            for record in missing[:shown]
+        )
+        if len(missing) > shown:
+            names += f"\n… e mais {len(missing) - shown:n}"
+        answer = QMessageBox.question(
+            self,
+            "Reguladores sem potência",
+            f"{len(missing):n} regulador(es) sem potência (SNOM) cadastrada:\n"
+            f"{names}\n\n"
+            "Eles serão exportados como reguladores ideais e regularão "
+            "normalmente, como no Interplan: o modelo não depende da SNOM. "
+            "Para registrar a potência, edite a SNOM no painel do regulador.\n"
+            "Deseja continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def _export_opendss_allocation(self) -> None:
         catalog = self._circuit_catalog
@@ -5470,6 +5538,8 @@ class MainWindow(QMainWindow):
             settings = dialog.selected_settings()
         except ValueError as exc:
             QMessageBox.warning(self, "Escolhas inválidas", str(exc))
+            return
+        if not self._confirm_regulators_without_power((circuit_index,)):
             return
         directory = QFileDialog.getExistingDirectory(
             self,
@@ -5539,6 +5609,7 @@ class MainWindow(QMainWindow):
             settings,
             regulators=self._regulator_model,
             load_settings=self._opendss_load_settings,
+            regulator_settings=self._opendss_regulator_settings,
             max_power_flow_iterations=self._max_power_flow_iterations,
             line_parameter_mode=self._opendss_line_parameter_mode,
             library_catalog=(
@@ -5743,6 +5814,8 @@ class MainWindow(QMainWindow):
         circuit_indices = dialog.selected_circuit_indices()
         if len(circuit_indices) != 1:
             return
+        if not self._confirm_regulators_without_power(circuit_indices):
+            return
         directory = QFileDialog.getExistingDirectory(
             self,
             "Escolher a pasta base da exportação simplificada",
@@ -5800,6 +5873,7 @@ class MainWindow(QMainWindow):
             regulators=self._regulator_model,
             capacitors=self._capacitor_model,
             load_settings=self._opendss_load_settings,
+            regulator_settings=self._opendss_regulator_settings,
             max_power_flow_iterations=self._max_power_flow_iterations,
         )
         thread = QThread(self)
@@ -5950,6 +6024,7 @@ class MainWindow(QMainWindow):
             regulators=self._regulator_model,
             capacitors=self._capacitor_model,
             load_settings=self._opendss_load_settings,
+            regulator_settings=self._opendss_regulator_settings,
             max_power_flow_iterations=self._max_power_flow_iterations,
             line_parameter_mode=self._opendss_line_parameter_mode,
             library_catalog=library_catalog,
@@ -6290,6 +6365,7 @@ class MainWindow(QMainWindow):
             regulators=self._regulator_model,
             capacitors=self._capacitor_model,
             load_settings=self._opendss_load_settings,
+            regulator_settings=self._opendss_regulator_settings,
             max_power_flow_iterations=self._max_power_flow_iterations,
             line_parameter_mode=self._opendss_line_parameter_mode,
             library_catalog=library_catalog,
@@ -6516,6 +6592,32 @@ class MainWindow(QMainWindow):
             + (f" e mais {remainder:n}." if remainder > 0 else ".")
         )
 
+    def _overloaded_regulator_note(self, result: PowerFlowResult) -> str | None:
+        """Reguladores acima do INOM, por patamar, ou ``None`` se nenhum.
+
+        O fluxo não os tira de operação: em campo o regulador continua
+        regulando, e a sobrecarga é o achado a relatar. É também a explicação
+        de uma diferença conhecida contra o Interplan, que deixa o tap no neutro
+        nesse caso.
+        """
+
+        overloaded = result.overloaded_regulators
+        if not overloaded:
+            return None
+        segment_ids = result.catalog.segments.segment_ids
+        parts = [
+            f"{segment_ids[item.segment_index]} (NPAT {item.step}: "
+            f"{item.current:.0f} A, {item.percent:.0f}% do INOM)"
+            for item in overloaded[:10]
+        ]
+        remainder = len(overloaded) - len(parts)
+        return (
+            "Reguladores acima da corrente nominal (INOM) — continuam "
+            "regulando no modelo, mas operam em sobrecarga: "
+            + ", ".join(parts)
+            + (f" e mais {remainder:n}." if remainder > 0 else ".")
+        )
+
     def _show_power_flow_report(self, result: PowerFlowResult) -> None:
         summary = (
             f"{len(result.solved_circuits):n} circuito(s) resolvido(s): "
@@ -6576,6 +6678,9 @@ class MainWindow(QMainWindow):
         saturated = self._saturated_regulator_note(result)
         if saturated is not None:
             lines.append(saturated)
+        overloaded = self._overloaded_regulator_note(result)
+        if overloaded is not None:
+            lines.append(overloaded)
         message.setInformativeText("\n".join(lines))
         details = [
             f"{issue.element_id}: {issue.reason}" for issue in result.issues
@@ -8950,6 +9055,7 @@ class MainWindow(QMainWindow):
             line_parameter_mode=self._opendss_line_parameter_mode,
             branch_power_source=self._branch_power_source,
             max_power_flow_iterations=self._max_power_flow_iterations,
+            regulator_settings=self._opendss_regulator_settings,
         )
         dialog.cable_map_editor.saveRequested.connect(
             lambda entries: self._save_single_opendss_map(
@@ -8971,8 +9077,10 @@ class MainWindow(QMainWindow):
         chosen_mode = dialog.line_parameter_mode()
         chosen_source = dialog.branch_power_source()
         chosen_iterations = dialog.max_power_flow_iterations()
+        chosen_regulators = dialog.regulator_settings()
         chosen_maps = dialog.mappings()
         load_changed = chosen != self._opendss_load_settings
+        regulators_changed = chosen_regulators != self._opendss_regulator_settings
         mode_changed = chosen_mode is not self._opendss_line_parameter_mode
         source_changed = chosen_source is not self._branch_power_source
         iterations_changed = chosen_iterations != self._max_power_flow_iterations
@@ -8986,6 +9094,7 @@ class MainWindow(QMainWindow):
             and not mode_changed
             and not source_changed
             and not iterations_changed
+            and not regulators_changed
             and not maps_changed
         ):
             return
@@ -9005,7 +9114,10 @@ class MainWindow(QMainWindow):
         if iterations_changed:
             self._max_power_flow_iterations = chosen_iterations
             save_max_power_flow_iterations(self._settings, chosen_iterations)
-        if load_changed or mode_changed or iterations_changed:
+        if regulators_changed:
+            self._opendss_regulator_settings = chosen_regulators
+            save_opendss_regulator_settings(self._settings, chosen_regulators)
+        if load_changed or mode_changed or iterations_changed or regulators_changed:
             self._invalidate_power_flow()
         if source_changed:
             # A troca é do método, não dos dados: o fluxo permanece válido, mas
@@ -9017,6 +9129,11 @@ class MainWindow(QMainWindow):
         messages: list[str] = []
         if load_changed:
             messages.append(self._opendss_settings_summary(chosen))
+        if regulators_changed:
+            messages.append(
+                f"Reguladores: VREG {chosen_regulators.vreg_pu:n} pu e banda "
+                f"{chosen_regulators.band_pu:n} pu."
+            )
         if mode_changed:
             mode_label = (
                 "biblioteca de cabos e arranjos"
@@ -9898,6 +10015,11 @@ class MainWindow(QMainWindow):
                 "regulation_range": regulator_record.regulation_range,
                 "step_count": regulator_record.step_count,
                 "tap": regulator_record.tap,
+                "fixed": regulator_record.fixed,
+                "vreg_p1": regulator_record.vreg_p1,
+                "vreg_p2": regulator_record.vreg_p2,
+                "vreg_p3": regulator_record.vreg_p3,
+                "vreg_p4": regulator_record.vreg_p4,
                 "inom": regulator_record.inom,
                 "vnom": regulator_record.vnom,
             }
@@ -10091,6 +10213,15 @@ class MainWindow(QMainWindow):
                 f". Fase(s) {', '.join(saturated)} no fim do curso: "
                 "o regulador não consegue corrigir mais."
             )
+        overloaded = [
+            item for item in result.overloaded_regulators
+            if item.segment_index == segment_index
+        ]
+        if overloaded:
+            text += ". Acima do INOM em " + ", ".join(
+                f"NPAT {item.step} ({item.percent:.0f}%)" for item in overloaded
+            ) + "."
+
         self.regulator_tap_label.setText(text)
         self.regulator_tap_label.setVisible(True)
 

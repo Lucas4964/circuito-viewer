@@ -48,7 +48,9 @@ from .model import (
     CircuitCatalogModel,
     LoadModel,
     LoadPatternModel,
+    LoadPatternRecord,
     RegulatorModel,
+    RegulatorRecord,
 )
 from .opendss_automatic_assembly import (
     AutomaticAssembly,
@@ -64,6 +66,14 @@ from .opendss_library import (
 )
 from .opendss_line_mode import OpenDssLineParameterMode
 from .opendss_mapping_store import OpenDssLibraryMappings
+from .opendss_regulator_settings import (
+    DEFAULT_OPENDSS_REGULATOR_SETTINGS,
+    DEFAULT_REGULATION_RANGE,
+    DEFAULT_STEP_COUNT,
+    OpenDssRegulatorSettings,
+    effective_band_pu,
+    is_valid_vreg,
+)
 from .opendss_solution import (
     DEFAULT_MAX_POWER_FLOW_ITER,
     parse_max_power_flow_iterations,
@@ -175,7 +185,7 @@ _SOURCE_VOLTAGE_TOLERANCE = 1e-9
 # --- Regulador de tensão -----------------------------------------------------
 # Um regulador trifásico vira três transformadores monofásicos, um por fase, e
 # cada um ganha o seu RegControl. Os valores abaixo são a modelagem adotada; o
-# CSV traz apenas VNOM e SNOM.
+# VREG e a banda vêm de ``opendss_regulator_settings``.
 REGULATOR_NAME_PREFIX = "REG-"
 # Prefixo próprio, no espírito do regulador: torna o arquivo
 # autoexplicativo e afasta a colisão com cargas e geradores, que dividem o
@@ -183,14 +193,19 @@ REGULATOR_NAME_PREFIX = "REG-"
 CAPACITOR_NAME_PREFIX = "CAP-"
 REGULATOR_CONTROL_NAME_PREFIX = "CTRL-"
 # Transformador quase ideal: o regulador injeta tensão em série, não impedância.
+# A potência de cada unidade é fixa e grande, e não a SNOM: a SNOM do cadastro é
+# a potência de regulação (±10 % da passante), e como base dos 0,01 % ela punha
+# no modelo uma queda e perdas que o equipamento não tem — medido no 070004,
+# +10 a +16 kW na saída e +18 a +32 kW de perdas, com a passante a 600 % da
+# SNOM. Com 10 MVA por unidade a impedância fica abaixo de 1 mΩ em 13,8 kV.
+REGULATOR_UNIT_KVA = 10_000.0
 REGULATOR_XHL_PERCENT = 0.01
 REGULATOR_LOAD_LOSS_PERCENT = 0.01
 # Transformador de potencial: 115 V entre fases no secundário, como o primário,
 # de modo que ``ptratio`` fica VNOM*1000/115 — o √3 dos dois lados se cancela.
+# É também a base de vreg e band: o RegControl os lê no secundário do TP, de
+# fase, então 1 pu vale 115/√3 ≈ 66,4 V.
 REGULATOR_PT_SECONDARY_V = 115.0
-# Banda fixa, na mesma base do TP secundário (115 V) que vreg — o mesmo jeito
-# de especificar bandwidth no dial de um regulador real.
-REGULATOR_BAND_V = 3.0
 # O regulador ocupa o lugar do trecho, então a impedância dele sai do modelo.
 # Acima deste comprimento isso deixa de ser desprezível e vira aviso.
 REGULATOR_SEGMENT_LENGTH_WARNING_M = 10.0
@@ -1717,12 +1732,123 @@ def build_switch_export(
     )
 
 
+def _regulation_range(value: str) -> float | None:
+    """``FAIXA`` como fração (0,1 = ±10 %), ou ``None`` se inutilizável.
+
+    O MDB grava fração, mas um cadastro em porcentagem (10) é comum o bastante
+    para ser aceito: acima de 1 só pode ser porcentagem, porque uma faixa de
+    ±100 % ou mais não existe.
+    """
+
+    number = parse_number(value)
+    if number is None or number <= 0.0:
+        return None
+    if number > 1.0:
+        number /= 100.0
+    return number if number < 1.0 else None
+
+
+def _step_count(value: str) -> int | None:
+    """``NPASSOS`` como inteiro de ao menos 2, ou ``None`` se inutilizável."""
+
+    number = parse_number(value)
+    if number is None or number < 2.0 or number != int(number):
+        return None
+    return int(number)
+
+
+def _vreg_levels(
+    record: RegulatorRecord,
+    default_pu: float,
+) -> tuple[tuple[float, ...], tuple[int, ...]]:
+    """VREG de cada patamar e os NPAT em que o cadastro deu lugar ao padrão.
+
+    Mesma regra do Interplan: um ``VREG_Pn`` vazio, não numérico ou fora de
+    [0,5; 1,5] vale o padrão (lá, o ``LR_VREG`` do ``Geral.mdb``; aqui, o das
+    configurações).
+    """
+
+    levels: list[float] = []
+    replaced: list[int] = []
+    for npat, text in enumerate(record.vreg_by_level):
+        value = parse_number(text)
+        if is_valid_vreg(value):
+            levels.append(float(value))
+        else:
+            levels.append(default_pu)
+            replaced.append(npat)
+    return tuple(levels), tuple(replaced)
+
+
+def _single_vreg(levels: Sequence[float]) -> float:
+    """O VREG mais frequente entre os patamares; no empate, o do primeiro.
+
+    O ``RegControl`` tem um ``vreg`` só. Enquanto o master não emitir um
+    comando por patamar, um regulador com VREG diferente entre patamares sai
+    com um valor único, e a exportação avisa.
+    """
+
+    return min(levels, key=lambda value: (-levels.count(value), levels.index(value)))
+
+
+def _is_fixed(value: str) -> bool:
+    """``FIXO`` diferente de zero: o tap não é automático."""
+
+    number = parse_number(value)
+    return number is not None and number != 0.0
+
+
+def _tap_fraction(value: str) -> float | None:
+    """``TAP`` como fração (0,05 = +5 %), aceitando porcentagem como a ``FAIXA``."""
+
+    number = parse_number(value)
+    if number is None:
+        return None
+    if abs(number) >= 1.0:
+        number /= 100.0
+    return number
+
+
+def regulators_without_power(
+    catalog: CircuitCatalogModel,
+    regulators: RegulatorModel | None,
+    circuit_indices: Sequence[int] | Iterable[int],
+) -> tuple[RegulatorRecord, ...]:
+    """Reguladores dos circuitos indicados cuja ``SNOM`` não é positiva.
+
+    Eles são exportados mesmo assim, como reguladores ideais (ver
+    :func:`build_regulator_export`). A lista existe para a interface avisar
+    antes da exportação: um cadastro sem potência costuma denunciar outros
+    campos incompletos, e o usuário pode preferir completá-lo no painel.
+    Considera os mesmos trechos que a exportação: só os comuns, porque o
+    regulador num trecho de chave não é exportado.
+    """
+
+    if regulators is None:
+        return ()
+    by_segment = regulators.record_indices_by_segment
+    seen: set[int] = set()
+    found: list[RegulatorRecord] = []
+    for circuit_index in _selected_indices(catalog, circuit_indices):
+        for raw_index in catalog.membership(circuit_index).common_segment_indices:
+            record_index = int(by_segment[int(raw_index)])
+            if record_index < 0 or record_index in seen:
+                continue
+            seen.add(record_index)
+            record = regulators.record(record_index)
+            power = parse_number(record.snom)
+            if power is None or power <= 0.0:
+                found.append(record)
+    return tuple(found)
+
+
 def build_regulator_export(
     catalog: CircuitCatalogModel,
     regulators: RegulatorModel,
     phase_configuration: PhaseConfiguration,
     circuit_indices: Sequence[int] | Iterable[int],
     *,
+    settings: OpenDssRegulatorSettings | None = None,
     include_segments: frozenset[int] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
@@ -1731,10 +1857,19 @@ def build_regulator_export(
 
     Um regulador vira **uma unidade monofásica por fase do trecho** — três num
     trecho trifásico, duas num bifásico, uma num monofásico —, cada uma um
-    ``Transformer`` com o seu ``RegControl``. As unidades dividem a grandeza do
-    banco: ``kV = VNOM/√3`` (a mesma :func:`phase_voltage_kv` do ``C1`` dos
-    trechos e do ``kV`` das cargas) e ``kVA = SNOM/nº de fases``, o que devolve
-    o ``SNOM`` inteiro quando o banco é uma unidade só.
+    ``Transformer`` com o seu ``RegControl``. Cada unidade usa a tensão de fase
+    do banco, ``kV = VNOM/√3`` (a mesma :func:`phase_voltage_kv` do ``C1`` dos
+    trechos e do ``kV`` das cargas).
+
+    **O regulador é ideal.** A potência da unidade é :data:`REGULATOR_UNIT_KVA`,
+    e não a ``SNOM``, então a ``SNOM`` não entra no modelo: um cadastro sem ela
+    — comum no MDB — exporta o regulador do mesmo jeito, com uma ocorrência que
+    não o descarta. É o que o Interplan faz, e o equipamento existe em campo.
+
+    A faixa e os passos vêm de ``FAIXA`` e ``NPASSOS`` (``MaxTap``, ``MinTap`` e
+    ``NumTaps``); vazios ou nulos, valem ±10 % em 32 passos, como no Interplan.
+    O VREG e a banda vêm de ``settings``, com a banda elevada a um degrau quando
+    for menor (ver :func:`~circuit_viewer.opendss_regulator_settings.effective_band_pu`).
 
     Quem decide o número de fases é o ``FASES2`` do **trecho**, não o cadastro
     do regulador: o MDB traz ``LIGACAO`` e ``FASES`` zerados em todos os
@@ -1756,12 +1891,15 @@ def build_regulator_export(
     """
 
     selected = _selected_indices(catalog, circuit_indices)
+    settings = DEFAULT_OPENDSS_REGULATOR_SETTINGS if settings is None else settings
     segments = catalog.segments
     entries_by_value = _entries_by_value(phase_configuration)
     terminals = _terminals_by_phase_letter(phase_configuration)
     report = _ExportReport()
     bus_name = bus_namer(catalog)
     by_segment = regulators.record_indices_by_segment
+    # Base de vreg e band: a tensão de fase no secundário do TP.
+    pt_phase_volts = REGULATOR_PT_SECONDARY_V / math.sqrt(3.0)
 
     total = sum(
         int(catalog.membership(index).common_segment_indices.size)
@@ -1879,15 +2017,6 @@ def build_regulator_export(
                     discarded=False,
                 )
                 voltage = circuit_voltage
-            power = parse_number(regulator.snom)
-            if power is None or power <= 0.0:
-                report.add(
-                    segment_id,
-                    f"regulador {regulator.regulator_id} sem SNOM numérica "
-                    f"positiva ({regulator.snom.strip() or '<vazio>'}); informe "
-                    "o valor no painel do trecho para exportá-lo",
-                )
-                continue
             # VNOM do regulador e do circuito são a mesma tensão de linha em kV.
             # Divergir muito quase sempre é unidade trocada, e o modelo
             # resultante seria aceito pelo OpenDSS e completamente errado.
@@ -1919,12 +2048,117 @@ def build_regulator_export(
                 )
                 continue
 
+            power = parse_number(regulator.snom)
+            if power is None or power <= 0.0:
+                report.add(
+                    segment_id,
+                    f"regulador {regulator.regulator_id} sem SNOM numérica "
+                    f"positiva ({regulator.snom.strip() or '<vazio>'}); "
+                    "exportado como regulador ideal, que não depende dela",
+                    discarded=False,
+                )
+            regulation_range = _regulation_range(regulator.regulation_range)
+            if regulation_range is None:
+                report.add(
+                    segment_id,
+                    f"regulador {regulator.regulator_id} sem FAIXA utilizável "
+                    f"({regulator.regulation_range.strip() or '<vazio>'}); "
+                    "adotada ±10 %, como no Interplan",
+                    discarded=False,
+                )
+                regulation_range = DEFAULT_REGULATION_RANGE
+            step_count = _step_count(regulator.step_count)
+            if step_count is None:
+                report.add(
+                    segment_id,
+                    f"regulador {regulator.regulator_id} sem NPASSOS "
+                    f"utilizável ({regulator.step_count.strip() or '<vazio>'}); "
+                    f"adotados {DEFAULT_STEP_COUNT} passos, como no Interplan",
+                    discarded=False,
+                )
+                step_count = DEFAULT_STEP_COUNT
+            taps = (
+                f" MaxTap={_format(1.0 + regulation_range)}"
+                f" MinTap={_format(1.0 - regulation_range)}"
+                f" NumTaps={step_count}"
+            )
+            fixed = _is_fixed(regulator.fixed)
+            if fixed:
+                # FIXO: o tap fica onde o cadastro manda e não há RegControl,
+                # o mesmo que o Interplan faz com 1 + TAP.
+                tap = _tap_fraction(regulator.tap)
+                if tap is None:
+                    report.add(
+                        segment_id,
+                        f"regulador {regulator.regulator_id} com FIXO e TAP "
+                        f"não numérico ({regulator.tap.strip() or '<vazio>'}); "
+                        "tap fixo no neutro",
+                        discarded=False,
+                    )
+                    tap = 0.0
+                if abs(tap) > regulation_range:
+                    limited = math.copysign(regulation_range, tap)
+                    report.add(
+                        segment_id,
+                        f"TAP {_format(tap * 100.0)} % do regulador "
+                        f"{regulator.regulator_id} além da FAIXA; limitado a "
+                        f"{_format(limited * 100.0)} %",
+                        discarded=False,
+                    )
+                    tap = limited
+                taps += f" Taps=[1, {_format(1.0 + tap)}]"
+                report.add(
+                    segment_id,
+                    f"regulador {regulator.regulator_id} com FIXO: tap fixo em "
+                    f"{_format(tap * 100.0)} %, sem controle automático",
+                    discarded=False,
+                )
+            else:
+                band_pu = effective_band_pu(
+                    settings.band_pu, regulation_range, step_count
+                )
+                if band_pu > settings.band_pu:
+                    report.add(
+                        segment_id,
+                        f"banda de {_format(settings.band_pu)} pu menor que um "
+                        f"degrau do regulador {regulator.regulator_id}; usada "
+                        f"{_format(band_pu)} pu para o tap não oscilar",
+                        discarded=False,
+                    )
+                levels, replaced = _vreg_levels(regulator, settings.vreg_pu)
+                invalid = [
+                    npat for npat in replaced
+                    if regulator.vreg_by_level[npat].strip()
+                ]
+                if invalid:
+                    report.add(
+                        segment_id,
+                        f"regulador {regulator.regulator_id} com "
+                        + ", ".join(
+                            f"VREG_P{npat + 1} = "
+                            f"{regulator.vreg_by_level[npat].strip()}"
+                            for npat in invalid
+                        )
+                        + f" fora de [0,5; 1,5] pu; usado o padrão "
+                        f"{_format(settings.vreg_pu)} pu, como no Interplan",
+                        discarded=False,
+                    )
+                vreg_pu = _single_vreg(levels)
+                if len(set(levels)) > 1:
+                    report.add(
+                        segment_id,
+                        f"regulador {regulator.regulator_id} com VREG diferente "
+                        "por patamar ("
+                        + "; ".join(_format(value) for value in levels)
+                        + f" pu); o RegControl aceita um só e saiu "
+                        f"{_format(vreg_pu)} pu nos quatro patamares",
+                        discarded=False,
+                    )
+                vreg = vreg_pu * pt_phase_volts
+                band = band_pu * pt_phase_volts
+
             phase_kv = _format(phase_voltage_kv(voltage))
-            # O SNOM descreve o banco; num trecho monofásico o banco é uma
-            # unidade só e ela leva o valor inteiro.
-            phase_kva = _format(power / entry.phase_count)
-            vreg = REGULATOR_PT_SECONDARY_V / math.sqrt(3.0)
-            band = REGULATOR_BAND_V
+            unit_kva = _format(REGULATOR_UNIT_KVA)
             ptratio = voltage * 1_000.0 / REGULATOR_PT_SECONDARY_V
             bus1 = bus_name(int(segments.start_indices[segment_index]))
             bus2 = bus_name(int(segments.end_indices[segment_index]))
@@ -1940,17 +2174,19 @@ def build_regulator_export(
                     f" Buses=[{bus1}.{node}.0, {bus2}.{node}.0]"
                     " conns=[wye, wye]"
                     f" kVs=[{phase_kv}, {phase_kv}]"
-                    f" kVAs=[{phase_kva}, {phase_kva}]"
+                    f" kVAs=[{unit_kva}, {unit_kva}]"
+                    f"{taps}"
                 )
-                controls.append(
-                    f"New RegControl."
-                    f"{REGULATOR_CONTROL_NAME_PREFIX}{name}-{letter}"
-                    f" transformer={unit}"
-                    " winding=2"
-                    f" vreg={_format(vreg)}"
-                    f" band={_format(band)}"
-                    f" ptratio={_format(ptratio)}"
-                )
+                if not fixed:
+                    controls.append(
+                        f"New RegControl."
+                        f"{REGULATOR_CONTROL_NAME_PREFIX}{name}-{letter}"
+                        f" transformer={unit}"
+                        " winding=2"
+                        f" vreg={_format(vreg)}"
+                        f" band={_format(band)}"
+                        f" ptratio={_format(ptratio)}"
+                    )
                 exported_units.append((unit, segment_index, letter))
 
             used_names[name] = regulator.regulator_id
@@ -1978,8 +2214,15 @@ def build_regulator_export(
         "! Reguladores exportados pelo Visualizador de Circuitos Eletricos",
         "! Uma unidade monofasica (Transformer + RegControl) por fase do "
         "trecho: 3, 2 ou 1",
-        "! kV = VNOM/raiz(3) e kVA = SNOM/(numero de fases); o trecho regulado "
+        "! kV = VNOM/raiz(3); o trecho regulado "
         f"nao sai em {LINES_FILENAME}",
+        f"! Regulador ideal: {_format(REGULATOR_UNIT_KVA)} kVA por unidade, "
+        "independente da SNOM; faixa e passos de FAIXA e NPASSOS",
+        "! vreg e band em volts no secundario do TP (1 pu = 115/raiz(3) V)",
+        "! VREG de VREG_P1..P4 do cadastro; vazio ou fora de [0,5; 1,5] pu vale "
+        f"o padrao, {_format(settings.vreg_pu)} pu",
+        f"! Banda de {_format(settings.band_pu)} pu, nunca menor que um degrau; "
+        "FIXO diferente de zero fixa o tap em 1 + TAP, sem RegControl",
         "! Circuitos: "
         + ", ".join(
             sanitize_dss_name(catalog.definition(index).circuit_id)
@@ -2069,6 +2312,100 @@ def _phase_nodes(
     return tuple(terminals[letter] for letter in letters), None
 
 
+# Tolerâncias da soma dos pesos ZIP do cadastro: fração (1) ou porcentagem
+# (100), como o Interplan grava. Mesma precisão do diálogo para a fração.
+_ZIP_FRACTION_TOLERANCE = 1e-4
+_ZIP_PERCENT_TOLERANCE = 1e-2
+
+
+def _format_zip_weight(value: float) -> str:
+    """Quatro casas, como os pesos do diálogo (``opendss_settings``)."""
+
+    return f"{value:.4f}".rstrip("0").rstrip(".") or "0"
+
+
+def _registry_zip(record: LoadPatternRecord) -> tuple[float, float, float] | str | None:
+    """Pesos (Z, I, P) do cadastro em fração, ``None`` sem modelo, ``"inválido"``.
+
+    ``SCTE`` é a parcela de potência constante. Pesos em porcentagem (somando
+    100) viram fração; uma soma que não feche nem em 1 nem em 100 é inválida.
+    """
+
+    texts = (record.zcte, record.icte, record.scte)
+    if not any(text.strip() for text in texts):
+        return None
+    values = [parse_number(text) if text.strip() else 0.0 for text in texts]
+    if any(value is None for value in values):
+        return "inválido"
+    total = math.fsum(values)
+    if abs(total - 100.0) <= _ZIP_PERCENT_TOLERANCE:
+        values = [value / 100.0 for value in values]
+    elif abs(total - 1.0) > _ZIP_FRACTION_TOLERANCE:
+        return "inválido"
+    return (values[0], values[1], values[2])
+
+
+def registry_zip_weights(
+    group: Sequence[LoadPatternRecord],
+) -> tuple[tuple[float, float, float] | None, list[str]]:
+    """Pesos (Z, I, P) do cadastro de uma carga, e as observações.
+
+    Devolve ``None`` quando nenhum patamar traz modelo válido — a carga segue o
+    das configurações. A ``Load`` tem um ``ZIPV`` só: com modelos diferentes
+    entre patamares vale o mais frequente (no empate, o do primeiro), como o
+    VREG dos reguladores.
+    """
+
+    notes: list[str] = []
+    weights: list[tuple[float, float, float]] = []
+    for record in group:
+        parsed = _registry_zip(record)
+        if parsed is None:
+            continue
+        if isinstance(parsed, str):
+            notes.append(
+                f"pesos ZIP do NPAT {record.npat} não somam 1 nem 100 "
+                f"(Z {record.zcte or '0'}, I {record.icte or '0'}, "
+                f"P {record.scte or '0'}); ignorados"
+            )
+            continue
+        weights.append(parsed)
+    if not weights:
+        return None, notes
+    chosen = min(weights, key=lambda value: (-weights.count(value), weights.index(value)))
+    if len(set(weights)) > 1:
+        notes.append(
+            "modelo ZIP diferente entre patamares; a Load aceita um só e saiu "
+            "Z/I/P " + "/".join(_format_zip_weight(value) for value in chosen)
+        )
+    return chosen, notes
+
+
+def zipv_directive(
+    active: Sequence[float],
+    reactive: Sequence[float],
+    cutoff: float,
+) -> str:
+    """``model=8 ZIPV=[…]`` com os pesos (Z, I, P) da ativa e da reativa."""
+
+    vector = ", ".join(
+        _format_zip_weight(value) for value in (*active, *reactive, cutoff)
+    )
+    return f"model=8 ZIPV=[{vector}]"
+
+
+def _registry_zip_directive(
+    group: Sequence[LoadPatternRecord],
+    cutoff: float,
+) -> tuple[str | None, list[str]]:
+    """Diretiva do modelo ZIP do cadastro da carga, ou ``None`` sem ele."""
+
+    chosen, notes = registry_zip_weights(group)
+    if chosen is None:
+        return None, notes
+    return zipv_directive(chosen, chosen, cutoff), notes
+
+
 def build_load_export(
     catalog: CircuitCatalogModel,
     loads: LoadModel,
@@ -2114,11 +2451,15 @@ def build_load_export(
     # O modelo vale só para as cargas de consumo. Geradores e ramais
     # equivalentes são Load por dialeto do exportador, não por natureza, e
     # continuam em potência constante; capacitores, em impedância constante.
+    # A carga com modelo ZIP no cadastro (MODELO_CARGA_SIZ) usa o dela.
     model_directive = (
         "model=1"
         if load_settings is None
         else load_settings.load_model_directive()
     )
+    zip_cutoff = 0.0 if load_settings is None else load_settings.zipv.cutoff
+    registry_zip_count = 0
+    uses_zipv = False
 
     selected = _selected_indices(catalog, circuit_indices)
     entries_by_value = _entries_by_value(phase_configuration)
@@ -2230,6 +2571,11 @@ def build_load_export(
             )
             continue
 
+        registry_directive, zip_notes = _registry_zip_directive(group, zip_cutoff)
+        for note in zip_notes:
+            report.add(load_id, note, discarded=False)
+        load_directive = registry_directive or model_directive
+
         base_name = sanitize_dss_name(loads.codes[load_index])
         if not base_name:
             base_name = sanitize_dss_name(load_id)
@@ -2307,12 +2653,15 @@ def build_load_export(
                 f" bus1={bus}.{node}"
                 f" conn={connection}"
                 f" kV={voltage}"
-                f" {model_directive} kW=1 kvar=1"
+                f" {load_directive} kW=1 kvar=1"
                 f" daily={shape_name}"
                 f" class={phase_count}"
             )
             used_names[name] = load_id
         exported += 1
+        if registry_directive is not None:
+            registry_zip_count += 1
+        uses_zipv = uses_zipv or load_directive.startswith("model=8")
         if delta:
             exported_delta += 1
 
@@ -2320,6 +2669,20 @@ def build_load_export(
         raise InterruptedError("Exportação cancelada.")
     if progress is not None:
         progress(total, total)
+    # O ZIPV só vale entre vminpu e vmaxpu; fora da faixa a carga vira
+    # impedância constante. Sem os limites ativos a faixa é 0,95–1,05, e o
+    # modelo do cadastro seria ignorado justamente nas barras mais baixas.
+    if registry_zip_count and (
+        load_settings is None or not load_settings.voltage_limits_enabled
+    ):
+        report.add(
+            "MODELO_CARGA_SIZ",
+            f"{registry_zip_count:n} carga(s) com o modelo ZIP do cadastro, mas "
+            "os limites de tensão das cargas estão desligados: o OpenDSS só "
+            "aplica o ZIPV entre 0,95 e 1,05 pu. Ative-os nas Configurações "
+            "do OpenDSS (o Preset Interplan usa 0,5 a 1,5)",
+            discarded=False,
+        )
 
     label = _LOAD_FILES[phase_count][1]
     header = (
@@ -2356,7 +2719,15 @@ def build_load_export(
                 "! ZIPV: pesos Z/I/P da ativa, depois da reativa, e a tensao "
                 "de corte em pu",
             )
-            if entries and model_directive.startswith("model=8")
+            if uses_zipv
+            else ()
+        ),
+        *(
+            (
+                "! Cargas com MODELO_CARGA_SIZ no cadastro usam o ZIPV dele, "
+                "igual na ativa e na reativa",
+            )
+            if registry_zip_count
             else ()
         ),
         "! Circuitos: "
@@ -3186,6 +3557,7 @@ def build_export(
     regulators: RegulatorModel | None = None,
     capacitors: CapacitorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
+    regulator_settings: OpenDssRegulatorSettings | None = None,
     max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     line_parameter_mode: OpenDssLineParameterMode = OpenDssLineParameterMode.ORIGINAL,
     library_catalog: OpenDssLibraryCatalog | None = None,
@@ -3250,6 +3622,7 @@ def build_export(
             regulators,
             phase_configuration,
             selected,
+            settings=regulator_settings,
             cancel_check=cancel_check,
             progress=progress,
         )

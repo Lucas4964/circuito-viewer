@@ -67,9 +67,9 @@ def make_cables() -> CableModel:
     )
 
 
-def active_group(load_id: str, value: str):
+def active_group(load_id: str, value: str, zip_weights=("", "", "")):  # noqa: ANN001
     return tuple(
-        LoadPatternRecord(load_id, npat, value, "0", "0", "0", "0", "0")
+        LoadPatternRecord(load_id, npat, value, "0", "0", "0", "0", "0", *zip_weights)
         for npat in range(4)
     )
 
@@ -79,6 +79,7 @@ def make_system(
     branch_consumption: str = "2",
     outside_code: str = "CARGA-EXTERNA",
     incomplete_branch: bool = False,
+    branch_zip: tuple[str, str, str] = ("", "", ""),
 ):
     bars = CircuitModel(
         ["B0", "B1", "B2", "B3", "B4"],
@@ -120,7 +121,7 @@ def make_system(
         loads,
         (
             active_group("L0", "5"),
-            active_group("L1", branch_consumption),
+            active_group("L1", branch_consumption, branch_zip),
             None if incomplete_branch else active_group("L2", "0"),
         ),
     )
@@ -249,6 +250,16 @@ class BranchLoadModelTests(unittest.TestCase):
         self.assertIn(" model=1 kW=1 kvar=1 ", lines[0])
         self.assertNotIn("ZIPV", result.single_phase_branches.text)
         self.assertIn("potencia constante", result.single_phase_branches.text)
+
+    def test_registry_zip_of_the_branch_loads_reaches_the_equivalent(self) -> None:
+        # A carga do ramal tem o modelo do cadastro (0Z/60I/40P). O equivalente
+        # a representa sozinha na ativa; sem potência reativa no ramal, a
+        # reativa fica com o modelo das configurações (potência constante).
+        _, _, result = build_system_export(branch_zip=("0", "60", "40"))
+
+        lines = branch_load_lines(result.single_phase_branches.text)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(" model=8 ZIPV=[0, 0.6, 0.4, 0, 0, 1, 0] ", lines[0])
 
     def test_without_settings_the_branch_stays_in_constant_power(self) -> None:
         _, _, result = build_system_export()

@@ -658,6 +658,70 @@ class OpenDssExportUiTests(unittest.TestCase):
         switches = (self.export_dir / SWITCHES_FILENAME).read_text(encoding="utf-8")
         self.assertIn("New Line.CHV-1 ", switches)
 
+    def test_regulator_without_snom_is_announced_and_exported(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        model = self._load_regulators(window)
+        window._on_regulator_import_finished(
+            RegulatorLoadResult(
+                RegulatorModel(
+                    model.segments, ["RG1"], [0], [""], ["X"], ["Y"], ["0"],
+                    ["10"], ["32"], ["0"], ["100"], ["13,8"],
+                ),
+                "utf-8-sig", 1, 1, 0, (), 0,
+            )
+        )
+        self.app.processEvents()
+
+        with patch.object(
+            OpenDssExportDialog, "exec", accept_dialog
+        ), patch(
+            "circuit_viewer.main_window.QFileDialog.getExistingDirectory",
+            return_value=str(self.destination),
+        ), patch(
+            "circuit_viewer.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ) as question, patch.object(QMessageBox, "exec", return_value=0):
+            window.opendss_export_action.trigger()
+            self._wait_for_export(window)
+
+        warning = next(
+            call for call in question.call_args_list
+            if call.args[1] == "Reguladores sem potência"
+        )
+        self.assertIn("X (SNOM 0)", warning.args[2])
+        self.assertIn("ideais", warning.args[2])
+        emitted = (self.export_dir / REGULATORS_FILENAME).read_text(encoding="utf-8")
+        self.assertIn("New Transformer.REG-X-D ", emitted)
+
+    def test_cancelling_the_snom_warning_cancels_the_export(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        model = self._load_regulators(window)
+        window._on_regulator_import_finished(
+            RegulatorLoadResult(
+                RegulatorModel(
+                    model.segments, ["RG1"], [0], [""], ["X"], ["Y"], [""],
+                    ["10"], ["32"], ["0"], ["100"], ["13,8"],
+                ),
+                "utf-8-sig", 1, 1, 0, (), 0,
+            )
+        )
+        self.app.processEvents()
+
+        with patch.object(
+            OpenDssExportDialog, "exec", accept_dialog
+        ), patch(
+            "circuit_viewer.main_window.QFileDialog.getExistingDirectory",
+        ) as folder_dialog, patch(
+            "circuit_viewer.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ):
+            window.opendss_export_action.trigger()
+
+        folder_dialog.assert_not_called()
+        self.assertIsNone(window._export_thread)
+
     def test_export_writes_every_file_in_the_chosen_folder(self) -> None:
         window = self._window()
         self._load_everything(window)

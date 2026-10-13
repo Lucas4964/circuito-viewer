@@ -56,8 +56,11 @@ from .opendss_export import (
     bus_namer,
     parse_number,
     phase_voltage_kv,
+    registry_zip_weights,
     sanitize_dss_name,
+    zipv_directive,
 )
+from .opendss_regulator_settings import OpenDssRegulatorSettings
 from .opendss_solution import DEFAULT_MAX_POWER_FLOW_ITER
 from .phase_config import PhaseConfiguration
 
@@ -250,6 +253,65 @@ def _format_incomplete_error(records) -> SimplifiedOpenDssExportError:  # noqa: 
     )
 
 
+_CONSTANT_POWER_WEIGHTS = (0.0, 0.0, 1.0)
+
+
+def _configured_zip_weights(
+    load_settings: OpenDssLoadSettings | None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Pesos (Z, I, P) da ativa e da reativa do modelo das configurações."""
+
+    if load_settings is None or load_settings.load_model_directive() == "model=1":
+        return _CONSTANT_POWER_WEIGHTS, _CONSTANT_POWER_WEIGHTS
+    zipv = load_settings.zipv
+    return (zipv.z_p, zipv.i_p, zipv.p_p), (zipv.z_q, zipv.i_q, zipv.p_q)
+
+
+def _blended_zip_weights(
+    source_load_indices: Iterable[int],
+    patterns: LoadPatternModel,
+    configured: tuple[tuple[float, float, float], tuple[float, float, float]],
+) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
+    """ZIP do equivalente de um ramal quando alguma carga dele tem o do cadastro.
+
+    O equivalente soma cargas que podem ter modelos diferentes (o do cadastro,
+    ``MODELO_CARGA_SIZ``, ou o das configurações). A parcela de cada modelo é
+    a fração da potência que ele representa, então os pesos são a média
+    ponderada pela potência — a ativa pela soma de abs(P) dos quatro
+    patamares, a reativa pela de abs(Q). Sem nenhuma carga com o modelo do cadastro,
+    devolve ``None`` e o equivalente segue o das configurações, como sempre.
+    """
+
+    any_registry = False
+    totals = ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+    powers = [0.0, 0.0]
+    for raw_index in source_load_indices:
+        group = patterns.records_for_load(int(raw_index))
+        if len(group) != LOAD_PATTERN_COUNT:
+            continue
+        registry, _ = registry_zip_weights(group)
+        weights = configured if registry is None else (registry, registry)
+        any_registry = any_registry or registry is not None
+        for side, fields in enumerate((("pd", "pe", "pf"), ("qd", "qe", "qf"))):
+            power = sum(
+                abs(parse_number(getattr(item, field)) or 0.0)
+                for item in group
+                for field in fields
+            )
+            powers[side] += power
+            for position in range(3):
+                totals[side][position] += power * weights[side][position]
+    if not any_registry:
+        return None
+    blended = []
+    for side in range(2):
+        if powers[side] > 0.0:
+            blended.append(tuple(value / powers[side] for value in totals[side]))
+        else:
+            blended.append(configured[side])
+    return blended[0], blended[1]
+
+
 def build_branch_export(
     catalog: CircuitCatalogModel,
     equivalent: EquivalentNetworkResult,
@@ -285,6 +347,8 @@ def build_branch_export(
         if measured or load_settings is None
         else load_settings.load_model_directive()
     )
+    configured = _configured_zip_weights(load_settings)
+    zip_cutoff = 0.0 if load_settings is None else load_settings.zipv.cutoff
     entries = _entries_by_value(phase_configuration)
     terminals = _terminals_by_phase_letter(phase_configuration)
     bus_name = bus_namer(catalog)
@@ -386,6 +450,14 @@ def build_branch_export(
             report(record.load_id, f"nome OpenDSS '{collision}' já utilizado")
             continue
 
+        record_directive = model_directive
+        if not measured and model.source_patterns is not None:
+            blended = _blended_zip_weights(
+                record.source_load_indices, model.source_patterns, configured
+            )
+            if blended is not None:
+                record_directive = zipv_directive(*blended, zip_cutoff)
+
         voltage = _format(phase_voltage_kv(nominal_voltage))
         bus = bus_name(record.bar_index)
         for name, node, letter in zip(phase_names, nodes, letters, strict=True):
@@ -400,7 +472,7 @@ def build_branch_export(
             )
             loads.append(
                 f"New Load.{name} phases=1 bus1={bus}.{node} conn=wye"
-                f" kV={voltage} {model_directive} kW=1 kvar=1 daily={shape_name}"
+                f" kV={voltage} {record_directive} kW=1 kvar=1 daily={shape_name}"
                 f" class={phase_count}"
             )
             used.add(name)
@@ -448,6 +520,7 @@ def build_simplified_export(
     regulators: RegulatorModel | None = None,
     capacitors: CapacitorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
+    regulator_settings: OpenDssRegulatorSettings | None = None,
     max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     cancel_check: Callable[[], bool] | None = None,
     progress: Callable[[int, int], None] | None = None,
@@ -516,6 +589,7 @@ def build_simplified_export(
             regulators,
             phase_configuration,
             selected,
+            settings=regulator_settings,
             include_segments=retained_segments,
             cancel_check=cancel_check,
             progress=progress,

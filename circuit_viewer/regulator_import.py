@@ -40,6 +40,15 @@ EXPECTED_REGULATOR_HEADER = (
     "INOM",
     "VNOM",
 )
+# Lidas quando existem; ausentes, ficam vazias e a exportação usa o padrão das
+# configurações (VREG) ou o controle automático (FIXO).
+OPTIONAL_REGULATOR_HEADER = (
+    "VREG_P1",
+    "VREG_P2",
+    "VREG_P3",
+    "VREG_P4",
+    "FIXO",
+)
 MAX_REPORTED_ISSUES = 200
 ProgressCallback = Callable[[int, int, int], None]
 
@@ -132,6 +141,13 @@ def parse_regulator_rows(
     header = normalize_header(raw_header)
     positions = _column_positions(header)
     last_required_position = max(positions.values())
+    # A primeira ocorrência vence; coluna opcional ausente fica vazia.
+    optional_positions = {
+        name: header.index(name) for name in OPTIONAL_REGULATOR_HEADER if name in header
+    }
+    optional_columns: dict[str, list[str]] = {
+        name: [] for name in OPTIONAL_REGULATOR_HEADER
+    }
 
     for line_number, row in enumerate(rows, start=first_line_number):
         if cancel_event is not None and cancel_event.is_set():
@@ -182,6 +198,13 @@ def parse_regulator_rows(
         tap_values.append(values["TAP"])
         inom_values.append(values["INOM"])
         vnom_values.append(values["VNOM"])
+        for name, column in optional_columns.items():
+            position = optional_positions.get(name)
+            column.append(
+                row[position].strip()
+                if position is not None and position < len(row)
+                else ""
+            )
 
     if cancel_event is not None and cancel_event.is_set():
         raise CsvImportCancelled("Importação cancelada.")
@@ -203,6 +226,11 @@ def parse_regulator_rows(
         tap_values,
         inom_values,
         vnom_values,
+        vreg_p1_values=optional_columns["VREG_P1"],
+        vreg_p2_values=optional_columns["VREG_P2"],
+        vreg_p3_values=optional_columns["VREG_P3"],
+        vreg_p4_values=optional_columns["VREG_P4"],
+        fixed_values=optional_columns["FIXO"],
         source_path=source_label,
     )
     return RegulatorLoadResult(

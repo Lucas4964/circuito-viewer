@@ -53,10 +53,38 @@ class CircuitLevelsWindowTests(unittest.TestCase):
         self.addCleanup(self.window.deleteLater)
         self.assertTrue(self.window.set_circuit_levels(self.controller))
 
-    def select_circuit(self, circuit_index: int) -> None:
+    def select_circuit(self, circuit_index: int | None) -> None:
+        """``None`` escolhe a grade DEFAULT."""
+
         position = self.window.schedule_selector.findData(circuit_index)
         self.assertGreaterEqual(position, 0)
         self.window.schedule_selector.setCurrentIndex(position)
+
+    def test_opens_on_the_first_circuit_with_its_own_levels(self) -> None:
+        # São os horários com que o circuito é calculado; DEFAULT continua na
+        # lista para editar a grade global.
+        self.assertEqual(self.window.selected_circuit_index, 0)
+        self.assertEqual(self.window.schedule_selector.currentText(), "2 — 004001")
+        self.assertEqual(
+            self.window.catalog.to_schedule(), self.controller.schedule(0)
+        )
+
+    def test_without_circuit_levels_it_opens_on_default(self) -> None:
+        window = PatamaresWindow(default_calculation_levels(), storage_path=self.path)
+        self.addCleanup(window.deleteLater)
+
+        self.assertTrue(window.set_circuit_levels(None))
+
+        self.assertIsNone(window.selected_circuit_index)
+        self.assertEqual(window.schedule_selector.currentText(), "DEFAULT")
+
+    def test_a_new_source_keeps_the_circuit_chosen_before(self) -> None:
+        self.select_circuit(1)
+        replacement = CircuitCalculationLevelsController(self.controller.model)
+
+        self.assertTrue(self.window.set_circuit_levels(replacement))
+
+        self.assertEqual(self.window.selected_circuit_index, 1)
 
     def test_combo_lists_default_and_only_valid_imported_circuits(self) -> None:
         self.assertEqual(self.window.schedule_selector.count(), 3)
@@ -77,6 +105,7 @@ class CircuitLevelsWindowTests(unittest.TestCase):
         self.assertEqual(self.window.catalog.draft(0).name, "Virtual")
 
     def test_default_still_saves_permanently(self) -> None:
+        self.select_circuit(None)
         self.window.table_model.setData(self.window.table_model.index(0, 1), "Global")
         self.assertTrue(self.window._save())
         self.assertTrue(self.path.exists())
@@ -89,9 +118,9 @@ class CircuitLevelsWindowTests(unittest.TestCase):
             "question",
             return_value=QMessageBox.StandardButton.Cancel,
         ):
-            self.select_circuit(0)
-        self.assertIsNone(self.window.selected_circuit_index)
-        self.assertEqual(self.window.schedule_selector.currentText(), "DEFAULT")
+            self.select_circuit(None)
+        self.assertEqual(self.window.selected_circuit_index, 0)
+        self.assertEqual(self.window.schedule_selector.currentText(), "2 — 004001")
 
     def test_selection_discard_restores_last_session_version(self) -> None:
         self.select_circuit(0)

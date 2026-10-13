@@ -1687,6 +1687,55 @@ class RegulatorTapHarvestTests(unittest.TestCase):
             ((0, 0, ("D",)), (0, 1, ("D",)), (0, 2, ("D",)), (0, 3, ("D",))),
         )
 
+    def test_current_above_inom_is_reported_and_the_regulator_keeps_regulating(
+        self,
+    ) -> None:
+        # INOM da fixture: 200 A. A fase F passa (240 A), as outras não. O
+        # regulador não sai de operação: só a sobrecarga é relatada.
+        engine = FakeEngine(
+            transformer_taps={
+                "REG-RG01-D": 1.05,
+                "REG-RG01-E": 1.05,
+                "REG-RG01-F": 1.05,
+            },
+            transformer_currents={
+                "REG-RG01-D": 150.0,
+                "REG-RG01-E": 199.0,
+                "REG-RG01-F": 240.0,
+            },
+        )
+
+        result = self._run(engine)
+
+        overloaded = result.overloaded_regulators
+        self.assertEqual([(item.segment_index, item.step) for item in overloaded],
+                         [(0, 0), (0, 1), (0, 2), (0, 3)])
+        self.assertEqual(overloaded[0].current, 240.0)
+        self.assertEqual(overloaded[0].inom, 200.0)
+        self.assertAlmostEqual(overloaded[0].percent, 120.0)
+        self.assertTrue(result.has_warnings)
+        self.assertTrue(all(tap.tap == 1.05 for tap in result.regulator_taps[0][0]))
+
+    def test_only_the_patamares_at_or_above_inom_are_reported(self) -> None:
+        # O motor falso soma 100 A por patamar: o pior nó vai de 99,9 A a
+        # 399,9 A, e só os NPAT 2 e 3 alcançam os 200 A do INOM.
+        engine = FakeEngine(
+            transformer_taps={
+                "REG-RG01-D": 1.0,
+                "REG-RG01-E": 1.0,
+                "REG-RG01-F": 1.0,
+            },
+            transformer_currents={
+                "REG-RG01-D": 50.0,
+                "REG-RG01-E": 60.0,
+                "REG-RG01-F": 99.9,
+            },
+        )
+
+        self.assertEqual(
+            [item.step for item in self._run(engine).overloaded_regulators], [2, 3]
+        )
+
     def test_taps_inside_the_range_report_nothing(self) -> None:
         engine = FakeEngine(
             transformer_taps={

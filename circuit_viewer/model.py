@@ -279,6 +279,18 @@ class RegulatorRecord:
     tap: str
     inom: str
     vnom: str
+    # Opcionais no cadastro: um CSV sem as colunas os deixa vazios.
+    vreg_p1: str = ""
+    vreg_p2: str = ""
+    vreg_p3: str = ""
+    vreg_p4: str = ""
+    fixed: str = ""
+
+    @property
+    def vreg_by_level(self) -> tuple[str, str, str, str]:
+        """``VREG_P1``..``VREG_P4``, na ordem dos NPAT 0 a 3."""
+
+        return (self.vreg_p1, self.vreg_p2, self.vreg_p3, self.vreg_p4)
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +393,12 @@ class LoadPatternRecord:
     qd: str
     qe: str
     qf: str
+    # Modelo ZIP da carga no patamar (MODELO_CARGA_SIZ do Interplan): parcelas
+    # de impedância, corrente e potência constantes. Vazios quando o cadastro
+    # não traz o modelo, e então vale o das configurações do OpenDSS.
+    zcte: str = ""
+    icte: str = ""
+    scte: str = ""
 
     def __post_init__(self) -> None:
         if type(self.npat) is not int or self.npat not in {0, 1, 2, 3}:
@@ -1908,6 +1926,11 @@ class RegulatorModel:
         "_tap_values",
         "_inom_values",
         "_vnom_values",
+        "_vreg_p1_values",
+        "_vreg_p2_values",
+        "_vreg_p3_values",
+        "_vreg_p4_values",
+        "_fixed_values",
         "_by_id",
         "_record_by_segment",
         "source_path",
@@ -1928,9 +1951,26 @@ class RegulatorModel:
         inom_values: Iterable[str],
         vnom_values: Iterable[str],
         *,
+        vreg_p1_values: Iterable[str] | None = None,
+        vreg_p2_values: Iterable[str] | None = None,
+        vreg_p3_values: Iterable[str] | None = None,
+        vreg_p4_values: Iterable[str] | None = None,
+        fixed_values: Iterable[str] | None = None,
         source_path: str | None = None,
     ) -> None:
         ids = tuple(str(value) for value in regulator_ids)
+        # VREG por patamar e FIXO são opcionais no cadastro: ausentes, ficam
+        # vazios e a exportação usa o padrão das configurações.
+        optional = tuple(
+            ("",) * len(ids) if values is None else values
+            for values in (
+                vreg_p1_values,
+                vreg_p2_values,
+                vreg_p3_values,
+                vreg_p4_values,
+                fixed_values,
+            )
+        )
         text_columns = tuple(
             tuple(str(value) for value in values)
             for values in (
@@ -1943,6 +1983,7 @@ class RegulatorModel:
                 tap_values,
                 inom_values,
                 vnom_values,
+                *optional,
             )
         )
         associated_segments = np.ascontiguousarray(segment_indices, dtype=np.intp)
@@ -1993,6 +2034,11 @@ class RegulatorModel:
             self._tap_values,
             self._inom_values,
             self._vnom_values,
+            self._vreg_p1_values,
+            self._vreg_p2_values,
+            self._vreg_p3_values,
+            self._vreg_p4_values,
+            self._fixed_values,
         ) = text_columns
         self._segment_indices = associated_segments
         self._by_id = by_id
@@ -2046,6 +2092,26 @@ class RegulatorModel:
         return self._vnom_values
 
     @property
+    def vreg_p1_values(self) -> tuple[str, ...]:
+        return self._vreg_p1_values
+
+    @property
+    def vreg_p2_values(self) -> tuple[str, ...]:
+        return self._vreg_p2_values
+
+    @property
+    def vreg_p3_values(self) -> tuple[str, ...]:
+        return self._vreg_p3_values
+
+    @property
+    def vreg_p4_values(self) -> tuple[str, ...]:
+        return self._vreg_p4_values
+
+    @property
+    def fixed_values(self) -> tuple[str, ...]:
+        return self._fixed_values
+
+    @property
     def segment_indices(self) -> IndexArray:
         return self._segment_indices
 
@@ -2074,6 +2140,11 @@ class RegulatorModel:
             tap=self._tap_values[index],
             inom=self._inom_values[index],
             vnom=self._vnom_values[index],
+            vreg_p1=self._vreg_p1_values[index],
+            vreg_p2=self._vreg_p2_values[index],
+            vreg_p3=self._vreg_p3_values[index],
+            vreg_p4=self._vreg_p4_values[index],
+            fixed=self._fixed_values[index],
         )
 
     def record_for_segment(self, segment_index: int) -> RegulatorRecord | None:

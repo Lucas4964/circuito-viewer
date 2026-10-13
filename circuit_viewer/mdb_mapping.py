@@ -31,8 +31,8 @@ from .generator_import import (
     OPTIONAL_GENERATOR_HEADER,
 )
 from .load_import import EXPECTED_LOAD_HEADER
-from .load_pattern_import import EXPECTED_LOAD_PATTERN_HEADER
-from .regulator_import import EXPECTED_REGULATOR_HEADER
+from .load_pattern_import import EXPECTED_LOAD_PATTERN_HEADER, LOAD_ZIP_HEADER
+from .regulator_import import EXPECTED_REGULATOR_HEADER, OPTIONAL_REGULATOR_HEADER
 from .segment_import import EXPECTED_SEGMENT_HEADER
 from .switch_import import EXPECTED_SWITCH_HEADER
 
@@ -59,10 +59,16 @@ ENTITY_ORDER: tuple[str, ...] = (
 # Ela participa da resolução de tabelas, mas não ganha checkbox nem linha própria
 # no relatório consolidado.
 GENERATOR_CONSUMER_ENTITY = "geradores_mt_cons"
+# ``patamares_zip`` é a fonte auxiliar e **opcional** de ``patamares``: o modelo
+# ZIP por carga e patamar (MODELO_CARGA_SIZ). Ausente, os patamares são
+# importados do mesmo jeito e o OpenDSS usa o modelo das configurações.
+PATTERN_ZIP_ENTITY = "patamares_zip"
 MAPPING_ORDER: tuple[str, ...] = (
     *ENTITY_ORDER[: ENTITY_ORDER.index("geradores") + 1],
     GENERATOR_CONSUMER_ENTITY,
-    *ENTITY_ORDER[ENTITY_ORDER.index("geradores") + 1 :],
+    "patamares",
+    PATTERN_ZIP_ENTITY,
+    *ENTITY_ORDER[ENTITY_ORDER.index("patamares") + 1 :],
 )
 
 # Colunas que cada entidade exige, reaproveitadas dos importadores de CSV para
@@ -76,6 +82,7 @@ REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "geradores": GENERATOR_HEADER,
     GENERATOR_CONSUMER_ENTITY: CONSUMER_HEADER,
     "patamares": EXPECTED_LOAD_PATTERN_HEADER,
+    PATTERN_ZIP_ENTITY: LOAD_ZIP_HEADER,
     "chaves": EXPECTED_SWITCH_HEADER,
     "reguladores": EXPECTED_REGULATOR_HEADER,
     "circuitos": EXPECTED_CIRCUIT_HEADER,
@@ -89,6 +96,7 @@ REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
 # em ``ResolvedEntity.columns``/``header``.
 OPTIONAL_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "geradores": OPTIONAL_GENERATOR_HEADER,
+    "reguladores": OPTIONAL_REGULATOR_HEADER,
     "circuitos": OPTIONAL_CIRCUIT_HEADER,
 }
 
@@ -102,6 +110,7 @@ ENTITY_LABELS: Mapping[str, str] = {
     "geradores": "Geradores",
     GENERATOR_CONSUMER_ENTITY: "MT_CONS dos geradores",
     "patamares": "Patamares de carga",
+    PATTERN_ZIP_ENTITY: "Modelo ZIP das cargas",
     "chaves": "Chaves",
     "reguladores": "Reguladores",
     "circuitos": "Circuitos",

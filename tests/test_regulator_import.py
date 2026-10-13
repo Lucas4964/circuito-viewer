@@ -76,6 +76,25 @@ class RegulatorImportTests(unittest.TestCase):
         self.assertEqual(record.inom, "100")
         self.assertEqual(record.vnom, "13800")
 
+    def test_optional_vreg_and_fixo_are_read_when_present(self) -> None:
+        path = self._write(
+            HEADER.rstrip("\n") + ";VREG_P1;VREG_P2;VREG_P3;VREG_P4;FIXO\n"
+            + "RG1;T1;;;;276;0.1;32;0;200;0;1.02;1.02;1,03;1.02;1\n"
+        )
+
+        record = load_regulators_csv(path, make_segments()).model.record(0)
+
+        self.assertEqual(record.vreg_by_level, ("1.02", "1.02", "1,03", "1.02"))
+        self.assertEqual(record.fixed, "1")
+
+    def test_absent_optional_columns_stay_empty(self) -> None:
+        path = self._write(HEADER + "RG1;T1;;;;276;0.1;32;0;200;0\n")
+
+        record = load_regulators_csv(path, make_segments()).model.record(0)
+
+        self.assertEqual(record.vreg_by_level, ("", "", "", ""))
+        self.assertEqual(record.fixed, "")
+
     def test_numeric_columns_stay_as_text(self) -> None:
         # A regra do projeto: converter só onde há consumidor numérico. Zeros à
         # esquerda e vírgula decimal chegam intactos ao painel.

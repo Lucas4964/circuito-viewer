@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 from PyQt6.QtCore import QSettings, Qt, pyqtSignal
@@ -42,6 +43,17 @@ from .opendss_mapping_store import (
     LibraryNameMapping,
     OpenDssLibraryMappings,
 )
+from .opendss_export import REGULATOR_PT_SECONDARY_V
+from .opendss_regulator_settings import (
+    DEFAULT_OPENDSS_REGULATOR_SETTINGS,
+    DEFAULT_REGULATION_RANGE,
+    DEFAULT_STEP_COUNT,
+    REGULATOR_BAND_RANGE,
+    REGULATOR_VREG_RANGE,
+    OpenDssRegulatorSettings,
+    regulator_settings_from_mapping,
+    regulator_step_pu,
+)
 from .opendss_solution import (
     DEFAULT_MAX_POWER_FLOW_ITER,
     MAX_POWER_FLOW_ITER_RANGE,
@@ -65,6 +77,9 @@ from .table_columns import EXCEL_LIKE_TABLE_STYLE
 
 
 SETTINGS_PREFIX = "opendss/load_"
+REGULATOR_SETTINGS_PREFIX = "opendss/regulator_"
+# 1 pu do VREG e da banda: a tensão de fase no secundário do TP do export.
+REGULATOR_PT_PHASE_VOLTS = REGULATOR_PT_SECONDARY_V / math.sqrt(3.0)
 LINE_PARAMETER_MODE_SETTINGS_KEY = "opendss/line_parameter_mode"
 # Chave própria, e não um campo de OpenDssLoadSettings: o modo não é parâmetro
 # de carga, e a comparação de igualdade daquela dataclass não deve arrastá-lo.
@@ -90,6 +105,27 @@ def save_opendss_settings(
 ) -> None:
     for key, text in value.as_mapping().items():
         settings.setValue(f"{SETTINGS_PREFIX}{key}", text)
+    settings.sync()
+
+
+def load_opendss_regulator_settings(settings: QSettings) -> OpenDssRegulatorSettings:
+    """Lê VREG e banda dos reguladores; ausência ou corrupção caem no padrão."""
+
+    stored = {
+        key: settings.value(f"{REGULATOR_SETTINGS_PREFIX}{key}")
+        for key in DEFAULT_OPENDSS_REGULATOR_SETTINGS.as_mapping()
+    }
+    return regulator_settings_from_mapping(
+        {key: value for key, value in stored.items() if value is not None}
+    )
+
+
+def save_opendss_regulator_settings(
+    settings: QSettings,
+    value: OpenDssRegulatorSettings,
+) -> None:
+    for key, text in value.as_mapping().items():
+        settings.setValue(f"{REGULATOR_SETTINGS_PREFIX}{key}", text)
     settings.sync()
 
 
@@ -411,6 +447,9 @@ class OpenDssSettingsDialog(QDialog):
         ),
         branch_power_source: BranchPowerSource = DEFAULT_BRANCH_POWER_SOURCE,
         max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
+        regulator_settings: OpenDssRegulatorSettings = (
+            DEFAULT_OPENDSS_REGULATOR_SETTINGS
+        ),
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Configurações do OpenDSS")
@@ -424,6 +463,8 @@ class OpenDssSettingsDialog(QDialog):
         self.tabs.setObjectName("opendss_settings_tabs")
         self.voltage_tab = self._build_voltage_tab(current)
         self.tabs.addTab(self.voltage_tab, "Cargas")
+        self.regulators_tab = self._build_regulators_tab(regulator_settings)
+        self.tabs.addTab(self.regulators_tab, "Reguladores")
         self.branches_tab = self._build_branches_tab(
             parse_branch_power_source(branch_power_source)
         )
@@ -654,6 +695,97 @@ class OpenDssSettingsDialog(QDialog):
             self.original_line_parameters_radio.setChecked(True)
         layout.addStretch(1)
         return tab
+
+    def _build_regulators_tab(self, current: OpenDssRegulatorSettings) -> QWidget:
+        """VREG e banda dos reguladores, em pu da tensão de fase.
+
+        O OpenDSS lê os dois em volts no secundário do TP. A equivalência fica
+        à vista, porque a base do export (115/√3 ≈ 66,4 V) não é a de 120 V dos
+        controles reais, e a mesma banda em volts significaria outra coisa.
+        """
+
+        tab = QWidget(self.tabs)
+        tab.setObjectName("opendss_regulators_tab")
+        layout = QVBoxLayout(tab)
+
+        explanation = QLabel(
+            "Valem para todos os reguladores exportados. O VREG é a tensão que o "
+            "controle persegue no lado regulado; a banda é a largura total da "
+            "faixa em que o tap não muda. Uma banda de um degrau leva o tap ao "
+            "valor mais próximo do VREG, que é o que o Interplan calcula.",
+            tab,
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        fields = QWidget(tab)
+        form = QFormLayout(fields)
+        form.setContentsMargins(0, 0, 0, 0)
+        self.regulator_vreg_input = self._spin_box(
+            "opendss_regulator_vreg",
+            REGULATOR_VREG_RANGE,
+            current.vreg_pu,
+            "Tensão regulada, em pu da tensão de fase do circuito. O Interplan "
+            "usa 1,02 quando o cadastro não traz um valor válido.",
+            decimals=4,
+        )
+        self.regulator_vreg_input.setSingleStep(0.005)
+        form.addRow("VREG (pu):", self.regulator_vreg_input)
+        self.regulator_band_input = self._spin_box(
+            "opendss_regulator_band",
+            REGULATOR_BAND_RANGE,
+            current.band_pu,
+            "Largura total da faixa morta, em pu. Menor que um degrau do "
+            "regulador, ela é elevada a um degrau na exportação para o tap não "
+            "oscilar.",
+            decimals=4,
+        )
+        self.regulator_band_input.setSingleStep(0.0005)
+        form.addRow("Banda (pu):", self.regulator_band_input)
+        layout.addWidget(fields)
+
+        self.regulator_hint_label = QLabel(tab)
+        self.regulator_hint_label.setObjectName("opendss_regulator_hint")
+        self.regulator_hint_label.setWordWrap(True)
+        layout.addWidget(self.regulator_hint_label)
+
+        layout.addWidget(QLabel("Efeito nos arquivos gerados:", tab))
+        self.regulator_preview_label = QLabel(tab)
+        self.regulator_preview_label.setObjectName("opendss_regulator_preview")
+        self.regulator_preview_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.regulator_preview_label.setStyleSheet(
+            "font-family: monospace; padding: 6px;border: 1px solid palette(mid);"
+        )
+        self.regulator_preview_label.setWordWrap(True)
+        layout.addWidget(self.regulator_preview_label)
+        layout.addStretch(1)
+
+        self.regulator_vreg_input.valueChanged.connect(self._sync_regulator_preview)
+        self.regulator_band_input.valueChanged.connect(self._sync_regulator_preview)
+        self._sync_regulator_preview()
+        return tab
+
+    def _sync_regulator_preview(self) -> None:
+        base = REGULATOR_PT_PHASE_VOLTS
+        settings = self.regulator_settings()
+        step = regulator_step_pu(DEFAULT_REGULATION_RANGE, DEFAULT_STEP_COUNT)
+        def decimal(value: float, places: int) -> str:
+            # Vírgula, como os campos do diálogo; a prévia abaixo é sintaxe do
+            # OpenDSS e fica com ponto.
+            return f"{value:.{places}f}".replace(".", ",")
+
+        self.regulator_hint_label.setText(
+            f"Na base do TP do export (1 pu = {decimal(base, 2)} V): VREG = "
+            f"{decimal(settings.vreg_pu * base, 2)} V e banda = "
+            f"{decimal(settings.band_pu * base, 3)} V. Um degrau de ±10 % em "
+            f"{DEFAULT_STEP_COUNT} passos vale {decimal(step, 5)} pu."
+        )
+        self.regulator_preview_label.setText(
+            f"New RegControl.<regulador> ... vreg={settings.vreg_pu * base:.6g} "
+            f"band={settings.band_pu * base:.6g} ptratio=<VNOM/0,115>"
+        )
 
     def _build_voltage_tab(self, current: OpenDssLoadSettings) -> QWidget:
         """Só o essencial na tela.
@@ -951,6 +1083,13 @@ class OpenDssSettingsDialog(QDialog):
             self.max_power_flow_iterations_input.setValue(
                 DEFAULT_MAX_POWER_FLOW_ITER
             )
+        elif current_tab is self.regulators_tab:
+            self.regulator_vreg_input.setValue(
+                DEFAULT_OPENDSS_REGULATOR_SETTINGS.vreg_pu
+            )
+            self.regulator_band_input.setValue(
+                DEFAULT_OPENDSS_REGULATOR_SETTINGS.band_pu
+            )
         elif current_tab is self.cable_map_editor:
             self.cable_map_editor.clear_map()
         elif current_tab is self.arrangement_map_editor:
@@ -985,6 +1124,15 @@ class OpenDssSettingsDialog(QDialog):
 
     def max_power_flow_iterations(self) -> int:
         return int(self.max_power_flow_iterations_input.value())
+
+    def regulator_settings(self) -> OpenDssRegulatorSettings:
+        try:
+            return OpenDssRegulatorSettings(
+                vreg_pu=self.regulator_vreg_input.value(),
+                band_pu=self.regulator_band_input.value(),
+            )
+        except ValueError:
+            return DEFAULT_OPENDSS_REGULATOR_SETTINGS
 
     def mappings(self) -> OpenDssLibraryMappings:
         return OpenDssLibraryMappings(

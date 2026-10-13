@@ -11,6 +11,7 @@ from circuit_viewer.mdb_mapping import (
     MAPPING_ORDER,
     MANDATORY_ENTITIES,
     OPTIONAL_COLUMNS,
+    PATTERN_ZIP_ENTITY,
     REQUIRED_COLUMNS,
     EntityMapping,
     MdbMappingError,
@@ -54,6 +55,7 @@ def full_database(**extra: list[str]) -> FakeDatabase:
         "MT_GERADOR_CONS": [*REQUIRED_COLUMNS["geradores"], "OBS"],
         "MT_CONS": [*REQUIRED_COLUMNS[GENERATOR_CONSUMER_ENTITY], "TIPO"],
         "MODELO_CARGA": ["CENARIO_ID", *REQUIRED_COLUMNS["patamares"]],
+        "MODELO_CARGA_SIZ": list(REQUIRED_COLUMNS[PATTERN_ZIP_ENTITY]),
         "CHAVE": [*REQUIRED_COLUMNS["chaves"], "BLOCO1_ID"],
         "REGULADOR": [*REQUIRED_COLUMNS["reguladores"], "FIXO", "VREG_P1"],
         "CIRCUITO": [*REQUIRED_COLUMNS["circuitos"], "SE_ID", "NOME"],
@@ -231,6 +233,18 @@ class ResolveMappingTests(unittest.TestCase):
         self.assertEqual(result.get("geradores").header, REQUIRED_COLUMNS["geradores"])
         self.assertEqual(result.get("circuitos").header, REQUIRED_COLUMNS["circuitos"])
         self.assertEqual(result.unavailable, ())
+
+    def test_patterns_do_not_need_the_zip_table(self) -> None:
+        database = full_database()
+        del database._tables["MODELO_CARGA_SIZ"]
+
+        result = resolve_mapping(database)
+
+        self.assertIsNotNone(result.get("patamares"))
+        self.assertIsNone(result.get(PATTERN_ZIP_ENTITY))
+        self.assertEqual(
+            [item.entity for item in result.unavailable], [PATTERN_ZIP_ENTITY]
+        )
 
     def test_ignores_the_extra_scenario_column_of_the_patterns_table(self) -> None:
         entity = resolve_mapping(full_database()).get("patamares")

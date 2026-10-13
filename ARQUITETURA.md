@@ -100,6 +100,7 @@ CIRCUITO_VIEWER/
 │   ├── opendss_export.py      # geração dos .dss de rede e de cargas
 │   ├── opendss_settings.py    # modelo das cargas (potência constante/ZIPV) e Vminpu/Vmaxpu
 │   ├── opendss_solution.py    # teto de iterações do fluxo (Set MaxIter)
+│   ├── opendss_regulator_settings.py # VREG padrão e banda dos reguladores, em pu
 │   ├── opendss_engine.py      # único acesso ao py_dss_interface (opcional)
 │   ├── opendss_powerflow.py   # execução do fluxo e associação dos resultados
 │   ├── branch_analysis.py     # análise topológica de ramais
@@ -1721,17 +1722,38 @@ fases, que pertencem a outro arquivo.
 #### Reguladores (`reguladores.dss`)
 
 Um regulador trifásico vira **três transformadores monofásicos**, um por fase,
-cada um com o seu `RegControl`. As unidades monofásicas dividem a grandeza
-trifásica do CSV: `kV = VNOM/√3` — a mesma `phase_voltage_kv()` do `C1` dos
-trechos e do `kV` das cargas — e `kVA = SNOM/3`.
+cada um com o seu `RegControl`. Cada unidade usa a tensão de fase do banco,
+`kV = VNOM/√3` — a mesma `phase_voltage_kv()` do `C1` dos trechos e do `kV` das
+cargas.
 
-A modelagem que faltava está fixada em constantes do módulo: transformador quase
-ideal (`XHL` e `%LoadLoss` de 0,01 %), TP de 115 V, `vreg = 115/√3` e banda
-fixa de 3 V — na mesma base de `vreg`, o mesmo jeito de especificar bandwidth
-no dial de um regulador real. A relação de PT é `VNOM×1000/115`, e a
-simplificação é exata: o √3 do primário e o do secundário se cancelam, de modo
-que o controle lê exatamente `vreg` quando a barra está na tensão nominal —
-isto é, regula em 1,0000 pu.
+**O regulador é ideal e não depende da `SNOM`.** Cada unidade tem
+`REGULATOR_UNIT_KVA` (10 MVA) com `XHL` e `%LoadLoss` de 0,01 %. Antes o kVA
+era `SNOM/3`; como a `SNOM` é a potência de regulação (±10 % da passante), os
+0,01 % sobre ela punham no modelo queda e perdas que o equipamento não tem —
+medido no 070004, com a passante a 600 % da `SNOM`: +10 a +16 kW na saída e
++18 a +32 kW de perdas. Sem depender da potência, um regulador com `SNOM` nula
+é exportado (com ocorrência que não descarta), como o Interplan faz.
+
+A faixa e os passos vêm de `FAIXA` e `NPASSOS` (`MaxTap`/`MinTap`/`NumTaps`),
+com ±10 % em 32 passos quando vazios. O TP é de 115 V, `ptratio =
+VNOM×1000/115`: o √3 do primário e o do secundário se cancelam, e 1 pu do
+`vreg`/`band` vale 115/√3 ≈ 66,4 V. VREG e banda vêm de
+`opendss_regulator_settings.OpenDssRegulatorSettings` (aba **Reguladores**,
+persistida em `QSettings` como as demais), e o VREG de cada regulador, de
+`VREG_P1..P4` do cadastro quando válido em [0,5; 1,5] pu — a regra do
+Interplan. O `RegControl` tem um VREG só: valores diferentes por patamar saem
+com o mais frequente e uma ocorrência; o dia em que isso precisar ser exato, o
+caminho é um `Solve` por patamar no master com `Edit RegControl… vreg=` entre
+eles. A banda nunca fica abaixo de 1,05 degrau do regulador
+(`effective_band_pu`), senão o tap oscila até estourar o `MaxControlIter`.
+`FIXO` diferente de zero fixa o tap em `1 + TAP` (`Taps=[1, …]`) sem
+`RegControl`.
+
+A sobrecarga não altera o modelo: `PowerFlowResult.overloaded_regulators`
+compara a corrente do trecho regulado com o `INOM` e o relatório do fluxo a
+lista. O Interplan deixa o tap no neutro quando a corrente da primeira
+iteração passa do `INOM`; isso é efeito do algoritmo dele e, de propósito, não é
+reproduzido.
 
 **O regulador ocupa o lugar do trecho.** Os transformadores ligam as duas barras
 do trecho, exatamente como a `Line ... Switch=Yes` da chave faz, e é por isso que

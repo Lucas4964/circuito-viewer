@@ -45,9 +45,11 @@ from circuit_viewer.opendss_export import (
     parse_number,
     phase_voltage_kv,
     positive_sequence_capacitance_nf,
+    regulators_without_power,
     sanitize_dss_name,
     stage_export_directory,
 )
+from circuit_viewer.opendss_regulator_settings import OpenDssRegulatorSettings
 from circuit_viewer.opendss_settings import OpenDssLoadSettings
 from circuit_viewer.opendss_solution import DEFAULT_MAX_POWER_FLOW_ITER
 from circuit_viewer.phase_config import PhaseConfiguration, PhaseMappingEntry
@@ -796,13 +798,13 @@ class RegulatorExportTests(unittest.TestCase):
             [
                 "New Transformer.REG-X-D phases=1 windings=2 XHL=0.01 "
                 "%LoadLoss=0.01 Buses=[BARRA_A.1.0, BARRA_B.1.0] "
-                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]",
+                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[10000, 10000] MaxTap=1.1 MinTap=0.9 NumTaps=32",
                 "New Transformer.REG-X-E phases=1 windings=2 XHL=0.01 "
                 "%LoadLoss=0.01 Buses=[BARRA_A.2.0, BARRA_B.2.0] "
-                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]",
+                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[10000, 10000] MaxTap=1.1 MinTap=0.9 NumTaps=32",
                 "New Transformer.REG-X-F phases=1 windings=2 XHL=0.01 "
                 "%LoadLoss=0.01 Buses=[BARRA_A.3.0, BARRA_B.3.0] "
-                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]",
+                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[10000, 10000] MaxTap=1.1 MinTap=0.9 NumTaps=32",
             ],
         )
 
@@ -813,11 +815,11 @@ class RegulatorExportTests(unittest.TestCase):
             control_entries(result.text),
             [
                 "New RegControl.CTRL-X-D transformer=REG-X-D winding=2 "
-                "vreg=66.3953 band=3 ptratio=300",
+                "vreg=67.7232 band=0.451488 ptratio=300",
                 "New RegControl.CTRL-X-E transformer=REG-X-E winding=2 "
-                "vreg=66.3953 band=3 ptratio=300",
+                "vreg=67.7232 band=0.451488 ptratio=300",
                 "New RegControl.CTRL-X-F transformer=REG-X-F winding=2 "
-                "vreg=66.3953 band=3 ptratio=300",
+                "vreg=67.7232 band=0.451488 ptratio=300",
             ],
         )
 
@@ -883,11 +885,10 @@ class RegulatorExportTests(unittest.TestCase):
             result.issues,
         )
 
-    def test_a_single_phase_segment_gets_one_unit_with_the_whole_snom(self) -> None:
+    def test_a_single_phase_segment_gets_one_unit(self) -> None:
         # Numa rede predominantemente monofásica é justamente nas pontas que a
         # tensão afunda; restringir o regulador ao trifásico deixaria de fora
-        # quem mais regula. O banco monofásico é uma unidade, então ela leva o
-        # SNOM inteiro.
+        # quem mais regula.
         result = self._export(network=self._network(phases=("1", "13")))
 
         self.assertEqual(result.exported_count, 1)
@@ -898,19 +899,19 @@ class RegulatorExportTests(unittest.TestCase):
             [
                 "New Transformer.REG-X-D phases=1 windings=2 XHL=0.01 "
                 "%LoadLoss=0.01 Buses=[BARRA_A.1.0, BARRA_B.1.0] "
-                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[333, 333]",
+                "conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[10000, 10000] MaxTap=1.1 MinTap=0.9 NumTaps=32",
             ],
         )
         self.assertEqual(
             control_entries(result.text),
             [
                 "New RegControl.CTRL-X-D transformer=REG-X-D winding=2 "
-                "vreg=66.3953 band=3 ptratio=300",
+                "vreg=67.7232 band=0.451488 ptratio=300",
             ],
         )
 
-    def test_a_two_phase_segment_splits_the_snom_in_two(self) -> None:
-        # FASES2 '7' é "DE": duas unidades, e o banco de dois divide por dois.
+    def test_a_two_phase_segment_gets_two_units(self) -> None:
+        # FASES2 '7' é "DE": duas unidades, uma por fase.
         result = self._export(network=self._network(phases=("7", "13")))
 
         self.assertEqual(result.exported_count, 1)
@@ -919,9 +920,9 @@ class RegulatorExportTests(unittest.TestCase):
             [entry.split("Buses=")[1] for entry in transformer_entries(result.text)],
             [
                 "[BARRA_A.1.0, BARRA_B.1.0] conns=[wye, wye] "
-                "kVs=[19.9186, 19.9186] kVAs=[166.5, 166.5]",
+                "kVs=[19.9186, 19.9186] kVAs=[10000, 10000] MaxTap=1.1 MinTap=0.9 NumTaps=32",
                 "[BARRA_A.2.0, BARRA_B.2.0] conns=[wye, wye] "
-                "kVs=[19.9186, 19.9186] kVAs=[166.5, 166.5]",
+                "kVs=[19.9186, 19.9186] kVAs=[10000, 10000] MaxTap=1.1 MinTap=0.9 NumTaps=32",
             ],
         )
 
@@ -958,22 +959,211 @@ class RegulatorExportTests(unittest.TestCase):
             result.issues,
         )
 
-    def test_non_numeric_snom_is_discarded_pointing_to_the_panel(self) -> None:
+    def test_missing_snom_still_exports_an_ideal_regulator(self) -> None:
+        # O regulador ideal não depende da potência: sem SNOM ele sai igual,
+        # com uma ocorrência que não o descarta — é o que o Interplan faz.
         network = self._network()
-        regulators = make_regulators(network, snom_values=("zero",))
+        expected = self._export(network=network)
+        for label, values in (("vazia", ("",)), ("zero", ("0",)), ("texto", ("zero",))):
+            with self.subTest(snom=label):
+                regulators = make_regulators(network, snom_values=values)
+
+                result = self._export(network=network, regulators=regulators)
+
+                self.assertEqual(result.exported_count, 1)
+                self.assertEqual(result.discarded_count, 0)
+                self.assertEqual(result.replaced_segments, frozenset({0}))
+                self.assertEqual(
+                    data_lines(result.text), data_lines(expected.text)
+                )
+                self.assertTrue(
+                    any(
+                        "sem SNOM" in issue.reason and "ideal" in issue.reason
+                        for issue in result.issues
+                    ),
+                    result.issues,
+                )
+
+    def test_the_snom_does_not_change_the_model(self) -> None:
+        network = self._network()
+        small = self._export(
+            network=network,
+            regulators=make_regulators(network, snom_values=("50",)),
+        )
+        large = self._export(
+            network=network,
+            regulators=make_regulators(network, snom_values=("5000",)),
+        )
+
+        self.assertEqual(data_lines(small.text), data_lines(large.text))
+
+    def test_vreg_and_band_come_from_the_settings_in_volts_of_the_pt(self) -> None:
+        network = self._network()
+        catalog = make_catalog(network, voltage="34,5")
+        settings = OpenDssRegulatorSettings(vreg_pu=1.0, band_pu=0.02)
+
+        result = build_regulator_export(
+            catalog, make_regulators(network), PHASES, [0], settings=settings
+        )
+
+        # 1 pu = 115/raiz(3) = 66,3953 V no secundário do TP.
+        self.assertIn(
+            "vreg=66.3953 band=1.32791 ptratio=300", control_entries(result.text)[0]
+        )
+        self.assertEqual(result.issues, ())
+
+    def test_a_band_narrower_than_one_step_is_raised_to_one_step(self) -> None:
+        # Com a banda menor que um degrau o tap oscila sem fim: ±10 % em 32
+        # passos dá degrau de 0,00625 pu, e a banda vai a 1,05 degrau.
+        network = self._network()
+        catalog = make_catalog(network, voltage="34,5")
+        settings = OpenDssRegulatorSettings(vreg_pu=1.02, band_pu=0.002)
+
+        result = build_regulator_export(
+            catalog, make_regulators(network), PHASES, [0], settings=settings
+        )
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertIn("band=0.435719 ", control_entries(result.text)[0])
+        self.assertTrue(
+            any("menor que um degrau" in issue.reason for issue in result.issues),
+            result.issues,
+        )
+
+    def test_range_and_steps_come_from_faixa_and_npassos(self) -> None:
+        network = self._network()
+        for label, faixa, passos, expected in (
+            ("fração", "0.1", "32", "MaxTap=1.1 MinTap=0.9 NumTaps=32"),
+            ("porcentagem", "5", "16", "MaxTap=1.05 MinTap=0.95 NumTaps=16"),
+        ):
+            with self.subTest(faixa=label):
+                regulators = RegulatorModel(
+                    network, ["RG1"], [0], [""], ["X"], ["Y"], ["333"],
+                    [faixa], [passos], ["0"], ["100"], ["34,5"],
+                )
+
+                result = self._export(network=network, regulators=regulators)
+
+                self.assertTrue(
+                    transformer_entries(result.text)[0].endswith(expected),
+                    transformer_entries(result.text)[0],
+                )
+
+    def test_missing_faixa_and_npassos_use_the_interplan_defaults(self) -> None:
+        network = self._network()
+        regulators = RegulatorModel(
+            network, ["RG1"], [0], [""], ["X"], ["Y"], ["333"],
+            ["0"], [""], ["0"], ["100"], ["34,5"],
+        )
 
         result = self._export(network=network, regulators=regulators)
 
-        self.assertEqual(result.exported_count, 0)
-        self.assertEqual(result.discarded_count, 1)
+        self.assertEqual(result.exported_count, 1)
         self.assertTrue(
-            any("SNOM" in issue.reason for issue in result.issues),
+            transformer_entries(result.text)[0].endswith(
+                "MaxTap=1.1 MinTap=0.9 NumTaps=32"
+            )
+        )
+        reasons = " ".join(issue.reason for issue in result.issues)
+        self.assertIn("sem FAIXA", reasons)
+        self.assertIn("sem NPASSOS", reasons)
+
+    def _regulator(self, network, **columns):  # noqa: ANN001, ANN003, ANN202
+        return RegulatorModel(
+            network, ["RG1"], [0], [""], ["X"], ["Y"], ["333"],
+            ["10"], ["32"], [columns.pop("tap", "0")], ["100"], ["34,5"],
+            **{name: [value] for name, value in columns.items()},
+        )
+
+    def test_vreg_of_the_registry_wins_over_the_default(self) -> None:
+        network = self._network()
+        regulators = self._regulator(
+            network,
+            vreg_p1_values="1.03", vreg_p2_values="1,03",
+            vreg_p3_values="1.03", vreg_p4_values="1.03",
+        )
+
+        result = self._export(network=network, regulators=regulators)
+
+        # 1,03 x 66,3953 V
+        self.assertIn(" vreg=68.3871 ", control_entries(result.text)[0])
+        self.assertEqual(result.issues, ())
+
+    def test_invalid_vreg_falls_back_to_the_default_like_the_interplan(self) -> None:
+        network = self._network()
+        regulators = self._regulator(
+            network,
+            vreg_p1_values="0", vreg_p2_values="102",
+            vreg_p3_values="", vreg_p4_values="texto",
+        )
+
+        result = self._export(network=network, regulators=regulators)
+
+        self.assertIn(" vreg=67.7232 ", control_entries(result.text)[0])
+        reasons = " ".join(issue.reason for issue in result.issues)
+        self.assertIn("VREG_P1 = 0", reasons)
+        self.assertIn("VREG_P2 = 102", reasons)
+        self.assertNotIn("VREG_P3", reasons)
+        self.assertEqual(result.discarded_count, 0)
+
+    def test_vreg_varying_by_level_uses_the_most_frequent_and_warns(self) -> None:
+        network = self._network()
+        regulators = self._regulator(
+            network,
+            vreg_p1_values="1.00", vreg_p2_values="1.03",
+            vreg_p3_values="1.03", vreg_p4_values="1.00",
+        )
+
+        result = self._export(network=network, regulators=regulators)
+
+        # Empate entre 1,00 e 1,03: vence o do primeiro patamar.
+        self.assertIn(" vreg=66.3953 ", control_entries(result.text)[0])
+        self.assertTrue(
+            any("diferente por patamar" in issue.reason for issue in result.issues),
             result.issues,
         )
+
+    def test_fixed_regulator_gets_the_tap_and_no_control(self) -> None:
+        network = self._network()
+        regulators = self._regulator(network, fixed_values="1", tap="0.05")
+
+        result = self._export(network=network, regulators=regulators)
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertEqual(control_entries(result.text), [])
+        for entry in transformer_entries(result.text):
+            self.assertTrue(entry.endswith(" Taps=[1, 1.05]"), entry)
         self.assertTrue(
-            any("painel do trecho" in issue.reason for issue in result.issues),
+            any("tap fixo em 5 %" in issue.reason for issue in result.issues),
             result.issues,
         )
+
+    def test_fixed_tap_beyond_the_range_is_limited(self) -> None:
+        network = self._network()
+        regulators = self._regulator(network, fixed_values="1", tap="-15")
+
+        result = self._export(network=network, regulators=regulators)
+
+        self.assertTrue(
+            transformer_entries(result.text)[0].endswith(" Taps=[1, 0.9]")
+        )
+        self.assertTrue(
+            any("além da FAIXA" in issue.reason for issue in result.issues),
+            result.issues,
+        )
+
+    def test_regulators_without_power_lists_only_the_selected_circuits(self) -> None:
+        network = self._network()
+        catalog = make_catalog(network, voltage="34,5")
+
+        self.assertEqual(
+            regulators_without_power(catalog, make_regulators(network), [0]), ()
+        )
+        missing = regulators_without_power(
+            catalog, make_regulators(network, snom_values=("0",)), [0]
+        )
+        self.assertEqual([record.regulator_id for record in missing], ["RG1"])
+        self.assertEqual(regulators_without_power(catalog, None, [0]), ())
 
     def test_missing_vnom_inherits_the_circuit_voltage(self) -> None:
         """Cadastro de MDB com VNOM zerada é comum e não pode descartar o

@@ -59,6 +59,7 @@ from .mdb_mapping import (
     ENTITY_LABELS,
     ENTITY_ORDER,
     GENERATOR_CONSUMER_ENTITY,
+    PATTERN_ZIP_ENTITY,
     EntityMapping,
     ResolvedEntity,
     ResolvedMapping,
@@ -366,6 +367,8 @@ def _count_rows(
         targets = [mapping.get(entity)]
         if entity == "geradores":
             targets.append(mapping.get(GENERATOR_CONSUMER_ENTITY))
+        if entity == "patamares":
+            targets.append(mapping.get(PATTERN_ZIP_ENTITY))
         for target in targets:
             if target is None:
                 continue
@@ -480,6 +483,8 @@ def load_database(
             if emit is not None:
                 emit(consumer_rows_seen + rows)
 
+        # Opcional: sem a tabela do modelo ZIP os patamares saem do mesmo jeito.
+        zip_target = plan.get(PATTERN_ZIP_ENTITY) if entity == "patamares" else None
         try:
             result = _import_entity(
                 entity,
@@ -488,6 +493,7 @@ def load_database(
                 crs,
                 results,
                 consumer_target=consumer_target,
+                zip_target=zip_target,
                 source_path=source_path,
                 scale=scale,
                 switch_types=switch_types,
@@ -527,6 +533,8 @@ def load_database(
             if consumer_target is not None
             else target.table
         )
+        if zip_target is not None:
+            table = f"{table} + {zip_target.table}"
         record(entity, table, result, None)
         rows_read = getattr(result, "total_rows", 0)
         if entity == "geradores":
@@ -1017,6 +1025,7 @@ def _import_entity(
     results: dict[str, Any],
     *,
     consumer_target: ResolvedEntity | None,
+    zip_target: ResolvedEntity | None = None,
     source_path: str,
     scale: float,
     switch_types: SwitchTypeConfiguration | None,
@@ -1078,7 +1087,20 @@ def _import_entity(
             header, rows, results["barras"].model, **common
         )
     if entity == "patamares":
-        return parse_load_pattern_rows(header, rows, results["cargas"].model, **common)
+        zip_rows = None if zip_target is None else _rows(database, zip_target)
+        try:
+            return parse_load_pattern_rows(
+                header,
+                rows,
+                results["cargas"].model,
+                zip_header=None if zip_target is None else zip_target.header,
+                zip_rows=zip_rows,
+                **common,
+            )
+        finally:
+            close = getattr(zip_rows, "close", None)
+            if close is not None:
+                close()
     if entity == "chaves":
         return parse_switch_rows(
             header,

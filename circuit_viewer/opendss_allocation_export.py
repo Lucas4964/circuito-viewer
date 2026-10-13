@@ -35,6 +35,7 @@ from .opendss_export import (
 from .opendss_library import OpenDssLibraryCatalog
 from .opendss_line_mode import OpenDssLineParameterMode
 from .opendss_mapping_store import OpenDssLibraryMappings
+from .opendss_regulator_settings import OpenDssRegulatorSettings
 from .opendss_settings import OpenDssLoadSettings
 from .opendss_solution import (
     DEFAULT_MAX_POWER_FLOW_ITER,
@@ -554,6 +555,7 @@ def build_allocation_export(
     *,
     regulators: RegulatorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
+    regulator_settings: OpenDssRegulatorSettings | None = None,
     max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     line_parameter_mode: OpenDssLineParameterMode = OpenDssLineParameterMode.ORIGINAL,
     library_catalog: OpenDssLibraryCatalog | None = None,
@@ -635,6 +637,7 @@ def build_allocation_export(
         phase_configuration,
         (circuit_index,),
         regulators=regulators,
+        regulator_settings=regulator_settings,
         max_power_flow_iterations=max_power_flow_iterations,
         line_parameter_mode=line_parameter_mode,
         library_catalog=library_catalog,

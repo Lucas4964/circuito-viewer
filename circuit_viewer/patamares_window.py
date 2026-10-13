@@ -135,7 +135,15 @@ class PatamaresWindow(QDialog):
     def set_circuit_levels(
         self, controller: CircuitCalculationLevelsController | None
     ) -> bool:
-        """Instala uma nova fonte de sessão e recompõe as opções da combo."""
+        """Instala uma nova fonte de sessão e recompõe as opções da combo.
+
+        A combo abre no circuito que estava escolhido antes, se ele continuar
+        na fonte nova; senão, no primeiro circuito com patamares próprios. São
+        os horários com que o Interplan calcula aquele circuito e os que o
+        ``Atualizar Geradores`` usa por padrão — abrir em ``DEFAULT`` mostraria
+        uma grade que o cálculo do circuito não usa. ``DEFAULT`` continua na
+        lista, para editar a grade global.
+        """
 
         if not self.confirm_pending_changes():
             return False
@@ -158,6 +166,8 @@ class PatamaresWindow(QDialog):
                     self.schedule_selector.addItem(label, circuit_index)
                     if definition.circuit_id == previous_id:
                         selected_combo_index = self.schedule_selector.count() - 1
+                if selected_combo_index == 0 and self.schedule_selector.count() > 1:
+                    selected_combo_index = 1
                 self.schedule_selector.setCurrentIndex(selected_combo_index)
         self._selected_circuit_index = self.schedule_selector.currentData()
         self._load_selected_schedule()

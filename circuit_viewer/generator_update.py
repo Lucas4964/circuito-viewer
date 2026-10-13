@@ -30,6 +30,31 @@ class GeneratorScheduleMode(str, Enum):
     CIRCUIT = "circuit"
 
 
+def preferred_schedule_choices(
+    default_schedule: CalculationLevelSchedule,
+    own_schedules: Sequence[CalculationLevelSchedule | None],
+) -> tuple[
+    tuple[GeneratorScheduleMode, ...],
+    tuple[CalculationLevelSchedule, ...],
+]:
+    """Origem dos patamares de cada circuito quando ninguém escolheu outra.
+
+    O circuito com patamares próprios usa os dele: é o ``HORARIO_REF`` com que
+    o Interplan calcula aquele alimentador. Com a grade ``DEFAULT`` no lugar, um
+    circuito cuja Tarde é às 16 h teria a geração solar das 12 h, três vezes
+    maior. Sem patamares próprios válidos, vale a grade global.
+    """
+
+    modes = tuple(
+        GeneratorScheduleMode.DEFAULT if own is None else GeneratorScheduleMode.CIRCUIT
+        for own in own_schedules
+    )
+    schedules = tuple(
+        default_schedule if own is None else own for own in own_schedules
+    )
+    return modes, schedules
+
+
 @dataclass(frozen=True, slots=True)
 class GeneratorDemandRecord:
     generator_id: str

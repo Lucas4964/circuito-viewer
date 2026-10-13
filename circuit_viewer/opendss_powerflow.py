@@ -66,6 +66,7 @@ from .opendss_export import (
 from .opendss_library import OpenDssLibraryCatalog
 from .opendss_line_mode import OpenDssLineParameterMode
 from .opendss_mapping_store import OpenDssLibraryMappings
+from .opendss_regulator_settings import OpenDssRegulatorSettings
 from .opendss_settings import OpenDssLoadSettings
 from .opendss_solution import (
     DEFAULT_MAX_POWER_FLOW_ITER,
@@ -193,9 +194,9 @@ class RegulatorTap:
 
     ``tap`` é a relação em pu do enrolamento 2, e ``minimum``/``maximum`` são os
     limites do transformador. ``num_taps`` é o total de passos do comutador
-    entre ``minimum`` e ``maximum`` (``Transformer.NumTaps`` do OpenDSS — por
-    ora sempre o padrão do motor, 32, porque ``FAIXA``/``NPASSOS`` do CSV ainda
-    não alimentam a exportação; ver ``opendss_export.py``).
+    entre ``minimum`` e ``maximum`` (``Transformer.NumTaps`` do OpenDSS, que a
+    exportação tira de ``NPASSOS``, e os limites de ``FAIXA``; ver
+    ``opendss_export.py``).
 
     ``at_limit`` é o que interessa na prática: um regulador encostado no fim do
     curso **parou de regular**, e sem isso a interface mostraria um número que
@@ -233,6 +234,32 @@ class RegulatorTap:
         if span <= 0.0 or self.num_taps <= 0:
             return 0
         return round((self.tap - 1.0) / (span / self.num_taps))
+
+
+@dataclass(frozen=True, slots=True)
+class RegulatorLoading:
+    """Corrente de um regulador acima do ``INOM`` cadastrado, num patamar.
+
+    ``current`` é a maior corrente entre as fases, lida no terminal de entrada
+    do regulador — a mesma que o painel do trecho mostra. Com o tap elevando a
+    tensão, a corrente de saída é menor na proporção do tap, então a de entrada
+    é a leitura conservadora.
+
+    O fluxo não muda nada por causa disso: o regulador continua regulando, como
+    faz em campo. O Interplan, ao contrário, deixa o tap no neutro quando a
+    corrente da primeira iteração já passa do ``INOM`` — um efeito do algoritmo,
+    não do equipamento. Aqui a sobrecarga é **relatada**, que é a informação de
+    engenharia: o equipamento opera acima da corrente nominal.
+    """
+
+    segment_index: int
+    step: int
+    current: float
+    inom: float
+
+    @property
+    def percent(self) -> float:
+        return 100.0 * self.current / self.inom
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,7 +357,12 @@ class PowerFlowResult:
 
     @property
     def has_warnings(self) -> bool:
-        return bool(self.issues or self.unconverged or self.skipped_circuits)
+        return bool(
+            self.issues
+            or self.unconverged
+            or self.skipped_circuits
+            or self.overloaded_regulators
+        )
 
     @property
     def saturated_regulators(self) -> tuple[tuple[int, int, tuple[str, ...]], ...]:
@@ -357,6 +389,33 @@ class PowerFlowResult:
                 key=lambda item: (item[1], item[0]),
             )
         )
+
+    @property
+    def overloaded_regulators(self) -> tuple[RegulatorLoading, ...]:
+        """Reguladores com corrente igual ou acima do ``INOM``, por patamar.
+
+        Vem da corrente medida no trecho regulado e do ``INOM`` do cadastro;
+        regulador sem ``INOM`` numérico positivo fica de fora, porque não há
+        contra o que comparar. Ordenado por patamar e trecho, como
+        :attr:`saturated_regulators`.
+        """
+
+        regulators = self.regulators
+        if regulators is None:
+            return ()
+        found: list[RegulatorLoading] = []
+        for index, raw_segment in enumerate(regulators.segment_indices):
+            currents = self.segment_currents.get(int(raw_segment))
+            inom = parse_number(regulators.inom_values[index])
+            if currents is None or inom is None or inom <= 0.0:
+                continue
+            for step, magnitudes in enumerate(currents.magnitudes):
+                peak = max(magnitudes, default=0.0)
+                if peak >= inom:
+                    found.append(
+                        RegulatorLoading(int(raw_segment), step, peak, inom)
+                    )
+        return tuple(sorted(found, key=lambda item: (item.step, item.segment_index)))
 
     def voltages_for(self, circuit_id: str, step: int) -> StepVoltages | None:
         """Extremos de um patamar, ou ``None`` se ele não foi medido."""
@@ -1106,6 +1165,7 @@ def run_power_flow(
     regulators: RegulatorModel | None = None,
     capacitors: CapacitorModel | None = None,
     load_settings: OpenDssLoadSettings | None = None,
+    regulator_settings: OpenDssRegulatorSettings | None = None,
     max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     line_parameter_mode: OpenDssLineParameterMode = (
         OpenDssLineParameterMode.ORIGINAL
@@ -1176,6 +1236,7 @@ def run_power_flow(
             regulators=regulators,
             capacitors=capacitors,
             load_settings=load_settings,
+            regulator_settings=regulator_settings,
             max_power_flow_iterations=max_power_flow_iterations,
             line_parameter_mode=line_parameter_mode,
             library_catalog=library_catalog,

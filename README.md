@@ -963,17 +963,18 @@ silêncio. A exportação por alocação de energia não inclui capacitores.
 ### reguladores.dss
 
 Um regulador trifásico vira **três transformadores monofásicos**, um por fase,
-cada um com o seu `RegControl`. Para um regulador de 34,5 kV e 333 kVA nas fases
-`D`, `E` e `F`, entre as barras `BARRA1` e `BARRA2`:
+cada um com o seu `RegControl`. Para um regulador de 34,5 kV com `FAIXA` de
+10 % e 32 passos nas fases `D`, `E` e `F`, entre as barras `BARRA1` e `BARRA2`,
+com as configurações padrão (VREG 1,02 pu e banda de 0,0068 pu):
 
 ```
-New Transformer.REG-X-D phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA1.1.0, BARRA2.1.0] conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]
-New Transformer.REG-X-E phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA1.2.0, BARRA2.2.0] conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]
-New Transformer.REG-X-F phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA1.3.0, BARRA2.3.0] conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[111, 111]
+New Transformer.REG-X-D phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA1.1.0, BARRA2.1.0] conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[10000, 10000] MaxTap=1.1 MinTap=0.9 NumTaps=32
+New Transformer.REG-X-E phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA1.2.0, BARRA2.2.0] conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[10000, 10000] MaxTap=1.1 MinTap=0.9 NumTaps=32
+New Transformer.REG-X-F phases=1 windings=2 XHL=0.01 %LoadLoss=0.01 Buses=[BARRA1.3.0, BARRA2.3.0] conns=[wye, wye] kVs=[19.9186, 19.9186] kVAs=[10000, 10000] MaxTap=1.1 MinTap=0.9 NumTaps=32
 
-New RegControl.CTRL-X-D transformer=REG-X-D winding=2 vreg=66.3953 band=3 ptratio=300
-New RegControl.CTRL-X-E transformer=REG-X-E winding=2 vreg=66.3953 band=3 ptratio=300
-New RegControl.CTRL-X-F transformer=REG-X-F winding=2 vreg=66.3953 band=3 ptratio=300
+New RegControl.CTRL-X-D transformer=REG-X-D winding=2 vreg=67.7232 band=0.451488 ptratio=300
+New RegControl.CTRL-X-E transformer=REG-X-E winding=2 vreg=67.7232 band=0.451488 ptratio=300
+New RegControl.CTRL-X-F transformer=REG-X-F winding=2 vreg=67.7232 band=0.451488 ptratio=300
 ```
 
 - **Nome** — `REG-<CODIGO>-<FASE>` e `CTRL-<CODIGO>-<FASE>`, com o `CODIGO` do
@@ -981,12 +982,29 @@ New RegControl.CTRL-X-F transformer=REG-X-F winding=2 vreg=66.3953 band=3 ptrati
 - **Fase → nó** — `D`→1, `E`→2, `F`→3, lido das entradas monofásicas do
   `fases2.json`. O `.0` fecha o neutro do enrolamento em estrela.
 - **`kVs`** — `VNOM/√3`, a tensão de fase, porque cada unidade é monofásica
-  entre fase e neutro. **`kVAs`** — `SNOM/3`.
-- **`vreg`/`band`/`ptratio`** — TP de 115 V: `vreg = 115/√3`, banda fixa de
-  3 V (mesma base de `vreg`) e `ptratio = VNOM×1000/115`. Os √3 do primário e
-  do secundário se cancelam, então o controle regula a barra em **1,0000 pu**.
-- **`XHL` e `%LoadLoss` de 0,01 %** — transformador quase ideal: o regulador
-  injeta tensão em série, não impedância.
+  entre fase e neutro.
+- **Regulador ideal** — `kVAs` fixo de 10 MVA por unidade, com `XHL` e
+  `%LoadLoss` de 0,01 %: o regulador injeta tensão em série, não impedância, e
+  a `SNOM` não entra no modelo. Antes o `kVAs` era `SNOM/3`, e como a `SNOM` é a
+  potência de regulação (±10 % da passante), os 0,01 % sobre ela punham queda e
+  perdas que o equipamento não tem.
+- **`MaxTap`/`MinTap`/`NumTaps`** — de `FAIXA` (fração, ou porcentagem acima
+  de 1) e `NPASSOS`. Vazios ou nulos, valem ±10 % em 32 passos, como no
+  Interplan.
+- **`vreg`/`band`/`ptratio`** — TP de 115 V, `ptratio = VNOM×1000/115`. O
+  `vreg` e a `band` são configurados em pu (**Configurações do OpenDSS →
+  Reguladores**) e convertidos para a base do TP, 1 pu = 115/√3 ≈ 66,4 V. O
+  VREG de cada regulador vem de `VREG_P1..P4` do cadastro (ou da edição no
+  painel); vazio ou fora de [0,5; 1,5] pu vale o padrão da aba, 1,02 pu — a
+  mesma regra do Interplan. O `RegControl` aceita um VREG só: com valores
+  diferentes por patamar sai o mais frequente, com aviso.
+- **Banda** — largura total da faixa morta. O padrão, 0,0068 pu, é pouco mais
+  que um degrau de 0,625 %: o tap chega ao valor mais próximo do VREG, que é o
+  que o Interplan calcula. Uma banda menor que um degrau do regulador é elevada
+  a 1,05 degrau na exportação, porque o tap oscilaria sem fim.
+- **`FIXO`** diferente de zero fixa o tap em `1 + TAP` (`Taps=[1, …]`, limitado
+  à `FAIXA`) e não gera `RegControl` — é o regulador em modo manual. `FIXO` e
+  `TAP` também podem ser editados no painel, para simular um regulador travado.
 - Todas as definições de `Transformer` vêm **antes** de todos os `RegControl`,
   porque cada controle referencia o seu transformador pelo nome.
 
@@ -1004,14 +1022,25 @@ regulador inteiro — o equipamento aparecia no painel mas saía como linha comu
 sem comutar tap e sem diferença de tensão, o que é difícil de distinguir de um
 defeito. A herança fica registrada na lista de ocorrências, sem descarte.
 
+**`SNOM` ausente ou zerada também não descarta o regulador**: como ele é
+ideal, a potência não entra no modelo. Antes de exportar, a aplicação lista os
+reguladores sem `SNOM` e pede confirmação — um cadastro sem potência costuma ter
+outros campos incompletos —, e eles saem regulando normalmente, como no
+Interplan.
+
 Não são exportados, com o motivo na lista de ocorrências: reguladores em trecho
-**não trifásico** (por ora), sem `SNOM` numérico positivo — informe-o no painel
-do trecho —, em trecho que já representa uma chave, com `VNOM` ausente **e**
-circuito sem `VNOM` utilizável, ou com `VNOM` incompatível com a do circuito —
-esta última pega a troca de unidade (volts em vez de kV), que geraria um modelo
-aceito pelo OpenDSS e completamente errado. Em todos esses casos **o trecho
-continua saindo como linha comum**. `FAIXA`, `NPASSOS` e `TAP` ainda não são
-usados: a faixa de regulação é a padrão do OpenDSS (±10 %, 32 passos).
+cujo `FASES2` não resolve as fases, em trecho que já representa uma chave, com
+`VNOM` ausente **e** circuito sem `VNOM` utilizável, ou com `VNOM` incompatível
+com a do circuito — esta última pega a troca de unidade (volts em vez de kV),
+que geraria um modelo aceito pelo OpenDSS e completamente errado. Em todos esses
+casos **o trecho continua saindo como linha comum**.
+
+**Sobrecarga.** O fluxo de potência interno compara a corrente de cada
+regulador com o `INOM` do cadastro e relata, por patamar, os que operam acima
+dele — no relatório do fluxo e no painel do trecho. O regulador continua
+regulando, como em campo. O Interplan, ao contrário, deixa o tap no neutro
+quando a corrente da primeira iteração já passa do `INOM`; é um efeito do
+algoritmo dele, e é a origem de uma diferença esperada nas comparações.
 
 Todo master emite `Set ControlMode=Static` e `Set MaxControlIter=100` antes do
 `Solve`. Cada regulador vira três `RegControl`, então poucos reguladores já
@@ -1284,9 +1313,10 @@ sobrescreveria a primeira.
 
 ## Configurações do OpenDSS
 
-O menu **Configurações → OpenDSS…** é organizado nas abas **Cargas**, **Ramais**,
-**Parâmetros das linhas**, **Solução**, **Mapa de Cabos** e **Mapa de
-Arranjos**. A primeira
+O menu **Configurações → OpenDSS…** é organizado nas abas **Cargas**,
+**Reguladores**, **Ramais**, **Parâmetros das linhas**, **Solução**, **Mapa de
+Cabos** e **Mapa de Arranjos**. A aba **Reguladores** define o VREG padrão e a
+banda, em pu (ver [reguladores.dss](#reguladoresdss)). A primeira
 aba define o **modelo de simulação das cargas** e a faixa de tensão em que ele
 vale, tanto na exportação quanto no fluxo de potência. Os dois caminhos geram o
 mesmo arquivo master.
@@ -1322,6 +1352,18 @@ impedância constante (`model=2`), que é o comportamento físico deles. Os rama
 equivalentes da rede simplificada seguem o modelo das cargas quando a potência
 vem das tabelas, e ficam em `model=1` quando é medida pelo fluxo de potência —
 ver [Exportação da rede simplificada por ramais](#exportação-da-rede-simplificada-por-ramais).
+
+**O modelo do cadastro vence o das configurações.** Se o MDB trouxer a tabela
+`MODELO_CARGA_SIZ` do Interplan (`CARGA_ID`, `NPAT`, `SCTE`, `ICTE`, `ZCTE`), ela
+é importada junto com os patamares, e cada carga que tiver o modelo sai com o
+seu `ZIPV`, o mesmo na ativa e na reativa (pesos em fração ou em porcentagem).
+Num CSV de patamares, as colunas opcionais `ZCTE`, `ICTE` e `SCTE` fazem o
+mesmo. As cargas sem o modelo seguem o desta aba; o equivalente de um ramal
+usa a média dos modelos das cargas dele, ponderada pela potência. Se as cargas
+com o modelo do cadastro forem exportadas com os limites de tensão desligados,
+a exportação avisa: fora de 0,95–1,05 pu o OpenDSS não aplica o ZIPV. No
+Interplan essa tabela costuma estar vazia, e então o modelo usado no fluxo é o
+global do `Geral.mdb`, que a aplicação não lê; nesse caso, configure-o aqui.
 
 ### Faixa de tensão
 
@@ -1632,8 +1674,13 @@ sem modificar o `CURVA_ID` que veio de `MT_GERADOR_CONS`.
 Com geradores, circuitos, `fases2.json` válido e ao menos uma curva salva, o
 menu **Ferramentas → Atualizar Geradores…** abre uma janela modal. Uma única
 curva é escolhida para todos os geradores. Para cada circuito, a coluna
-**PATAMARES** começa em `DEFAULT` e permite `Próprios` somente quando aquele
-circuito possui uma agenda importada válida na cópia da sessão.
+**PATAMARES** começa em `Próprios` quando aquele circuito possui uma agenda
+importada válida na cópia da sessão (o `CIRCUITO_PATAMARES` do MDB), e em
+`DEFAULT` quando não possui. Os patamares próprios são os horários com que o
+Interplan calcula o circuito: com a grade `DEFAULT` no lugar, a Tarde de um
+circuito que o Interplan calcula às 16 h usaria a geração solar das 12 h, cerca
+de três vezes maior. A atualização automática feita ao abrir a rede segue a
+mesma regra.
 
 Alterações ainda pendentes nas janelas **Curvas** ou **Patamares** precisam ser
 salvas ou descartadas antes do cálculo. Assim, o worker recebe somente retratos

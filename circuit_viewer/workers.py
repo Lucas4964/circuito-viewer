@@ -73,6 +73,7 @@ from .opendss_line_mode import OpenDssLineParameterMode
 from .opendss_mapping_store import OpenDssLibraryMappings
 from .opendss_simplified_export import build_simplified_export
 from .opendss_powerflow import run_power_flow
+from .opendss_regulator_settings import OpenDssRegulatorSettings
 from .opendss_settings import OpenDssLoadSettings
 from .opendss_solution import DEFAULT_MAX_POWER_FLOW_ITER
 from .phase_config import PhaseConfiguration
@@ -819,6 +820,7 @@ class OpenDssExportWorker(QObject):
         regulators: RegulatorModel | None = None,
         capacitors: CapacitorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
+        regulator_settings: OpenDssRegulatorSettings | None = None,
         max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
         line_parameter_mode: OpenDssLineParameterMode = (
             OpenDssLineParameterMode.ORIGINAL
@@ -842,6 +844,7 @@ class OpenDssExportWorker(QObject):
         self.regulators = regulators
         self.capacitors = capacitors
         self.load_settings = load_settings
+        self.regulator_settings = regulator_settings
         self.max_power_flow_iterations = int(max_power_flow_iterations)
         self.line_parameter_mode = line_parameter_mode
         self.library_catalog = library_catalog
@@ -865,6 +868,7 @@ class OpenDssExportWorker(QObject):
                 regulators=self.regulators,
                 capacitors=self.capacitors,
                 load_settings=self.load_settings,
+                regulator_settings=self.regulator_settings,
                 max_power_flow_iterations=self.max_power_flow_iterations,
                 line_parameter_mode=self.line_parameter_mode,
                 library_catalog=self.library_catalog,
@@ -924,6 +928,7 @@ class OpenDssAllocationExportWorker(QObject):
         *,
         regulators: RegulatorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
+        regulator_settings: OpenDssRegulatorSettings | None = None,
         max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
         line_parameter_mode: OpenDssLineParameterMode = (
             OpenDssLineParameterMode.ORIGINAL
@@ -943,6 +948,7 @@ class OpenDssAllocationExportWorker(QObject):
         self.settings = settings
         self.regulators = regulators
         self.load_settings = load_settings
+        self.regulator_settings = regulator_settings
         self.max_power_flow_iterations = int(max_power_flow_iterations)
         self.line_parameter_mode = line_parameter_mode
         self.library_catalog = library_catalog
@@ -967,6 +973,7 @@ class OpenDssAllocationExportWorker(QObject):
                 self.settings,
                 regulators=self.regulators,
                 load_settings=self.load_settings,
+                regulator_settings=self.regulator_settings,
                 max_power_flow_iterations=self.max_power_flow_iterations,
                 line_parameter_mode=self.line_parameter_mode,
                 library_catalog=self.library_catalog,
@@ -1004,6 +1011,7 @@ class SimplifiedOpenDssExportWorker(QObject):
         regulators: RegulatorModel | None = None,
         capacitors: CapacitorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
+        regulator_settings: OpenDssRegulatorSettings | None = None,
         max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
     ) -> None:
         super().__init__()
@@ -1018,6 +1026,7 @@ class SimplifiedOpenDssExportWorker(QObject):
         self.regulators = regulators
         self.capacitors = capacitors
         self.load_settings = load_settings
+        self.regulator_settings = regulator_settings
         self.max_power_flow_iterations = int(max_power_flow_iterations)
         self._cancel_event = threading.Event()
 
@@ -1039,6 +1048,7 @@ class SimplifiedOpenDssExportWorker(QObject):
                 regulators=self.regulators,
                 capacitors=self.capacitors,
                 load_settings=self.load_settings,
+                regulator_settings=self.regulator_settings,
                 max_power_flow_iterations=self.max_power_flow_iterations,
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
@@ -1168,6 +1178,7 @@ class PowerFlowWorker(QObject):
         regulators: RegulatorModel | None = None,
         capacitors: CapacitorModel | None = None,
         load_settings: OpenDssLoadSettings | None = None,
+        regulator_settings: OpenDssRegulatorSettings | None = None,
         max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
         line_parameter_mode: OpenDssLineParameterMode = (
             OpenDssLineParameterMode.ORIGINAL
@@ -1186,6 +1197,7 @@ class PowerFlowWorker(QObject):
         self.regulators = regulators
         self.capacitors = capacitors
         self.load_settings = load_settings
+        self.regulator_settings = regulator_settings
         self.max_power_flow_iterations = int(max_power_flow_iterations)
         self.line_parameter_mode = line_parameter_mode
         self.library_catalog = library_catalog
@@ -1214,6 +1226,7 @@ class PowerFlowWorker(QObject):
                     regulators=self.regulators,
                     capacitors=self.capacitors,
                     load_settings=self.load_settings,
+                    regulator_settings=self.regulator_settings,
                     max_power_flow_iterations=self.max_power_flow_iterations,
                     line_parameter_mode=self.line_parameter_mode,
                     library_catalog=self.library_catalog,

@@ -100,7 +100,9 @@ class UpdateGeneratorsDialog(QDialog):
                 combo.setToolTip(
                     "Este circuito não possui quatro patamares próprios válidos."
                 )
-            combo.setCurrentIndex(0)
+            # Os patamares próprios vêm pré-selecionados: são os horários com
+            # que o Interplan calcula o circuito (ver preferred_schedule_choices).
+            combo.setCurrentIndex(0 if own_schedule is None else 1)
             combo.setObjectName(f"generator_schedule_mode_{row}")
             self._mode_combos.append(combo)
             self.circuit_table.setCellWidget(row, 2, combo)

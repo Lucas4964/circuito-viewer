@@ -137,7 +137,7 @@ class UpdateGeneratorsDialogTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_lists_saved_curves_and_all_circuits_start_with_default(self) -> None:
+    def test_circuits_with_own_levels_start_with_them(self) -> None:
         _, circuits = make_models()
         own = default_calculation_levels()
         imported = CircuitCalculationLevelsModel(circuits, (own, None))
@@ -160,21 +160,26 @@ class UpdateGeneratorsDialogTests(unittest.TestCase):
             ],
             ["CIRC_ID", "CODIGO", "PATAMARES"],
         )
+        # O primeiro circuito tem patamares próprios e já abre com eles; o
+        # segundo não tem, e só lhe resta o DEFAULT.
         self.assertEqual(
             dialog.schedule_modes(),
-            (GeneratorScheduleMode.DEFAULT, GeneratorScheduleMode.DEFAULT),
+            (GeneratorScheduleMode.CIRCUIT, GeneratorScheduleMode.DEFAULT),
         )
         self.assertEqual(dialog._mode_combos[0].count(), 2)
         self.assertEqual(dialog._mode_combos[1].count(), 1)
         self.assertEqual(dialog._mode_combos[0].itemText(1), "Próprios")
-
-        dialog._mode_combos[0].setCurrentIndex(1)
-        self.assertEqual(
-            dialog.schedule_modes()[0], GeneratorScheduleMode.CIRCUIT
-        )
         self.assertIs(dialog.effective_schedules()[0], own)
         self.assertIs(
             dialog.effective_schedules()[1], dialog._default_schedule
+        )
+
+        dialog._mode_combos[0].setCurrentIndex(0)
+        self.assertEqual(
+            dialog.schedule_modes()[0], GeneratorScheduleMode.DEFAULT
+        )
+        self.assertIs(
+            dialog.effective_schedules()[0], dialog._default_schedule
         )
 
     def test_rejects_controller_from_another_catalog(self) -> None:
@@ -457,6 +462,28 @@ class GeneratorUpdateMainWindowTests(unittest.TestCase):
             (schedule,) * len(circuits),
             (GeneratorScheduleMode.DEFAULT,) * len(circuits),
         )
+
+    def test_the_automatic_run_uses_the_circuit_own_levels_when_present(self) -> None:
+        # O diálogo pré-seleciona os patamares próprios; o automático, que
+        # repete as escolhas pré-selecionadas, precisa fazer o mesmo. Senão a
+        # geração solar sai na hora de referência errada sem ninguém notar.
+        window, _, circuits = self.make_window_with_models()
+        own = default_calculation_levels()
+        window._set_circuit_level_model(
+            CircuitCalculationLevelsModel(circuits, (own, None))
+        )
+
+        with patch.object(window, "_start_generator_update") as start:
+            window._auto_update_generators()
+
+        start.assert_called_once()
+        _, schedules, modes = start.call_args.args
+        self.assertEqual(
+            modes,
+            (GeneratorScheduleMode.CIRCUIT, GeneratorScheduleMode.DEFAULT),
+        )
+        self.assertIs(schedules[0], window._circuit_level_controller.schedule(0))
+        self.assertIs(schedules[1], window.calculation_level_schedule)
 
     def test_without_a_default_marked_curve_the_first_one_is_used(self) -> None:
         window, _, _ = self.make_window_with_models()

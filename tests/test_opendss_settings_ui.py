@@ -57,11 +57,17 @@ try:
         load_branch_power_source,
         load_max_power_flow_iterations,
         load_opendss_line_parameter_mode,
+        load_opendss_regulator_settings,
         load_opendss_settings,
         save_branch_power_source,
         save_max_power_flow_iterations,
         save_opendss_line_parameter_mode,
+        save_opendss_regulator_settings,
         save_opendss_settings,
+    )
+    from circuit_viewer.opendss_regulator_settings import (
+        DEFAULT_OPENDSS_REGULATOR_SETTINGS,
+        OpenDssRegulatorSettings,
     )
     from circuit_viewer.opendss_mapping_store import (
         LibraryNameMapping,
@@ -98,6 +104,26 @@ class PersistenceTests(unittest.TestCase):
             load_opendss_settings(self.settings),
             DEFAULT_OPENDSS_LOAD_SETTINGS,
         )
+
+    def test_regulator_settings_round_trip_and_default(self) -> None:
+        self.assertEqual(
+            load_opendss_regulator_settings(self.settings),
+            DEFAULT_OPENDSS_REGULATOR_SETTINGS,
+        )
+        chosen = OpenDssRegulatorSettings(vreg_pu=1.035, band_pu=0.0125)
+
+        save_opendss_regulator_settings(self.settings, chosen)
+
+        self.assertEqual(load_opendss_regulator_settings(self.settings), chosen)
+
+    def test_corrupted_regulator_settings_fall_back_field_by_field(self) -> None:
+        self.settings.setValue("opendss/regulator_vreg_pu", "7")
+        self.settings.setValue("opendss/regulator_band_pu", "0.01")
+
+        result = load_opendss_regulator_settings(self.settings)
+
+        self.assertEqual(result.vreg_pu, DEFAULT_OPENDSS_REGULATOR_SETTINGS.vreg_pu)
+        self.assertEqual(result.band_pu, 0.01)
 
     def test_round_trip(self) -> None:
         chosen = OpenDssLoadSettings(
@@ -672,13 +698,37 @@ class DialogTests(unittest.TestCase):
 
         self.assertEqual(dialog.settings(), DEFAULT_OPENDSS_LOAD_SETTINGS)
 
-    def test_dialog_has_the_six_named_tabs(self) -> None:
+    def test_regulator_tab_shows_and_returns_the_settings(self) -> None:
+        dialog = OpenDssSettingsDialog(
+            regulator_settings=OpenDssRegulatorSettings(vreg_pu=1.0, band_pu=0.01)
+        )
+        self.addCleanup(dialog.close)
+
+        self.assertEqual(dialog.regulator_vreg_input.value(), 1.0)
+        self.assertEqual(dialog.regulator_band_input.value(), 0.01)
+        # O OpenDSS lê vreg e band em volts no TP: a prévia mostra a conversão.
+        self.assertIn("vreg=66.3953 band=0.663953", dialog.regulator_preview_label.text())
+
+        dialog.regulator_vreg_input.setValue(1.03)
+        self.assertEqual(
+            dialog.regulator_settings(),
+            OpenDssRegulatorSettings(vreg_pu=1.03, band_pu=0.01),
+        )
+
+        dialog.tabs.setCurrentWidget(dialog.regulators_tab)
+        dialog.restore_defaults()
+        self.assertEqual(
+            dialog.regulator_settings(), DEFAULT_OPENDSS_REGULATOR_SETTINGS
+        )
+
+    def test_dialog_has_the_seven_named_tabs(self) -> None:
         dialog = self._dialog()
 
         self.assertEqual(
             [dialog.tabs.tabText(index) for index in range(dialog.tabs.count())],
             [
                 "Cargas",
+                "Reguladores",
                 "Ramais",
                 "Parâmetros das linhas",
                 "Solução",
