@@ -444,30 +444,48 @@ def _change(project, workspace, operation, equipment_ids=(), *, cancel_check=Non
 
 
 def edit_equipment(project, equipment_id, values, *, cancel_check=None):
-    record = project.equipment(equipment_id)
-    if record is None:
-        raise CompositionError("Equipamento não encontrado no projeto.")
-    existing = dict(record.values)
-    entity = ENTITY_BY_NAME.get(record.key.entity)
-    protected = {entity.id_column} if entity else {"circuit_id"}
-    if not set(values) <= existing.keys() or set(values) & protected:
-        raise CompositionError("Campo inexistente ou identidade não editável.")
-    existing.update(values)
-    origin = RecordOrigin(FileIdentity("", ""), record.key.native_id, "manual", str(uuid4()), record.key.entity,
-                          datetime.now(timezone.utc).isoformat())
-    field_origins = dict(record.field_origins)
-    field_origins.update((name, origin) for name in values)
-    updated = replace(record, values=tuple(existing.items()), accepted_origin=origin, origins=(*record.origins, origin),
-                      field_origins=tuple(field_origins.items()))
+    return edit_equipments(project, {equipment_id: values}, cancel_check=cancel_check)
+
+
+def edit_equipments(project, edits, *, cancel_check=None):
+    """Aplica as edições de vários equipamentos numa revisão só.
+
+    ``edits`` é ``{equipment_id: {coluna: valor}}``. Trecho, chave e regulador
+    do mesmo trecho — ou a carga e os patamares dela — editados juntos viram
+    uma operação, um passo de desfazer e uma única recomposição da rede.
+    """
+
+    if not edits:
+        raise CompositionError("Nenhuma alteração a aplicar.")
+    timestamp = datetime.now(timezone.utc).isoformat()
+    updated_by_network = {}
+    for equipment_id, values in edits.items():
+        record = project.equipment(equipment_id)
+        if record is None:
+            raise CompositionError("Equipamento não encontrado no projeto.")
+        existing = dict(record.values)
+        entity = ENTITY_BY_NAME.get(record.key.entity)
+        protected = {entity.id_column} if entity else {"circuit_id"}
+        if not set(values) <= existing.keys() or set(values) & protected:
+            raise CompositionError("Campo inexistente ou identidade não editável.")
+        existing.update(values)
+        origin = RecordOrigin(FileIdentity("", ""), record.key.native_id, "manual", str(uuid4()),
+                              record.key.entity, timestamp)
+        field_origins = dict(record.field_origins)
+        field_origins.update((name, origin) for name in values)
+        updated = replace(record, values=tuple(existing.items()), accepted_origin=origin,
+                          origins=(*record.origins, origin), field_origins=tuple(field_origins.items()))
+        updated_by_network.setdefault(record.key.network_id, {})[record.key] = updated
     workspace = project.workspace
-    for dataset in workspace:
-        if dataset.registry.network_id == record.key.network_id:
-            rows = dict(dataset.registry.records)
-            rows[record.key] = updated
-            registry = replace(dataset.registry, records=rows)
-            workspace = workspace.registered(registry.materialize(dataset, cancel_check, operational=True))
-            break
-    return _change(project, workspace, "edit", (equipment_id,), cancel_check=cancel_check)
+    for dataset in project.workspace:
+        updated = updated_by_network.get(dataset.registry.network_id)
+        if not updated:
+            continue
+        rows = dict(dataset.registry.records)
+        rows.update(updated)
+        registry = replace(dataset.registry, records=rows)
+        workspace = workspace.registered(registry.materialize(dataset, cancel_check, operational=True))
+    return _change(project, workspace, "edit", tuple(edits), cancel_check=cancel_check)
 
 
 def create_equipment(project, tag, entity, values, *, cancel_check=None):

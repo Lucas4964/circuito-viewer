@@ -708,6 +708,71 @@ class PowerFlowUiTests(unittest.TestCase):
 
     # ----------------------------------------------------- consistência/estado
 
+    def test_stale_generators_are_updated_before_the_power_flow(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        window._generator_model = object()
+
+        def start_update() -> None:
+            window._generator_update_thread = object()
+
+        with patch.object(window, "_default_curve", return_value=object()), patch.object(
+            window, "_auto_update_generators", side_effect=start_update
+        ) as update, patch("circuit_viewer.main_window.PowerFlowWorker") as worker:
+            window._run_power_flow()
+
+        update.assert_called_once()
+        worker.assert_not_called()
+        self.assertTrue(window._pending_power_flow_after_generators)
+
+        # Ao fim da atualização, com resultado vigente, o fluxo é retomado.
+        window._generator_update_thread = None
+        with patch.object(window, "_exportable_generators", return_value=object()), patch.object(
+            window, "_run_power_flow"
+        ) as rerun:
+            window._on_generator_update_thread_finished()
+        rerun.assert_called_once()
+        self.assertFalse(window._pending_power_flow_after_generators)
+
+    def test_cancelled_generator_update_does_not_run_the_flow(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        window._pending_power_flow_after_generators = True
+
+        with patch.object(window, "_run_power_flow") as rerun:
+            window._on_generator_update_cancelled()
+            window._on_generator_update_thread_finished()
+
+        rerun.assert_not_called()
+        self.assertFalse(window._pending_power_flow_after_generators)
+
+    def test_current_generator_result_is_reused(self) -> None:
+        window = self._window()
+        self._load_everything(window)
+        window._generator_model = object()
+
+        with patch.object(window, "_exportable_generators", return_value=None), patch.object(
+            window, "_default_curve", return_value=None
+        ), patch.object(window, "_auto_update_generators") as update, patch(
+            "circuit_viewer.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ):
+            window._run_power_flow()
+        # Sem curva salva não há como atualizar: vale a pergunta de antes.
+        update.assert_not_called()
+
+        with patch.object(window, "_exportable_generators", return_value=object()), patch.object(
+            window, "_auto_update_generators"
+        ) as update, patch("circuit_viewer.main_window.PowerFlowWorker"), patch(
+            "circuit_viewer.main_window.QThread.start"
+        ):
+            window._run_power_flow()
+        update.assert_not_called()
+        thread = window._power_flow_thread
+        window._on_power_flow_thread_finished()
+        if thread is not None:
+            thread.deleteLater()
+
     def test_power_flow_worker_receives_saved_library_snapshots(self) -> None:
         window = self._window()
         self._load_everything(window)
@@ -1064,12 +1129,14 @@ class PowerFlowUiTests(unittest.TestCase):
         self.assertIsNone(window._power_flow_thread)
         self.assertIn("Marque ao menos um circuito", window.statusBar().currentMessage())
 
-    def test_run_without_updated_generators_asks_before_proceeding(self) -> None:
+    def test_run_without_updated_generators_nor_curve_asks_before_proceeding(self) -> None:
+        # Com curva salva os geradores seriam atualizados antes do fluxo; sem
+        # ela não há como, e o usuário decide se segue sem eles.
         window = self._window()
         self._load_everything(window)
         window._generator_model = object()
 
-        with patch(
+        with patch.object(window, "_default_curve", return_value=None), patch(
             "circuit_viewer.main_window.QMessageBox.question",
             return_value=QMessageBox.StandardButton.Cancel,
         ) as question:

@@ -12,7 +12,10 @@ from circuit_viewer.main_window import MainWindow
 from circuit_viewer.mdb_import import MdbSourceLoad
 from circuit_viewer.network_registry import FileIdentity
 from circuit_viewer.project_dialogs import ImportProposalDialog, FieldConflictDialog, ProjectProvenanceDialog
-from circuit_viewer.project_state import ProjectState, propose_import, resolve_import, edit_equipment
+from circuit_viewer.project_state import (
+    ProjectState, propose_import, resolve_import, edit_equipment, edit_equipments,
+)
+from circuit_viewer.model import FeatureSelection
 from circuit_viewer.workers import MdbImportWorker
 from tests.test_mdb_import import network_database
 from tests.test_project_state import imported, row, changed_regulator, FILE
@@ -173,3 +176,35 @@ def test_provenance_contains_internal_identity_and_field_origin(qtbot):
     from PyQt6.QtWidgets import QPlainTextEdit
     text = dialog.findChild(QPlainTextEdit).toPlainText()
     assert regulator.equipment_id in text and "manual" in text and "original.mdb" in text
+
+
+def test_edit_keeps_the_view_and_refreshes_the_panel(window):
+    first = imported(window._project)
+    window._commit_project_change(first)
+    window.view.scale(7.0, 7.0)
+    window.view.centerOn(12.0, -34.0)
+    transform = window.view.transform()
+    segment = int(window._regulator_model.segment_indices[0])
+    selection = FeatureSelection("segment", segment)
+    window._set_selection(selection)
+    assert window.edit_element_button.isEnabled()
+    form, legacy = window._edit_form(selection)
+    assert legacy == {}
+    assert [tab.title for tab in form.tabs] == ["Trecho", "Regulador", "Tap", "Tensão"]
+
+    regulator = row(window._project, "regulators")
+    window._commit_project_change(
+        edit_equipments(window._project, {regulator.equipment_id: {"vreg_p1_values": "1.03"}})
+    )
+
+    assert window.view.transform() == transform
+    assert window._selected_feature == selection
+    assert window.regulator_tracked_labels["vreg_p1"].text() == "1.03"
+    assert window.regulator_tracked_labels["vreg_p1"].font().bold()
+
+
+def test_import_still_fits_the_view(window, monkeypatch):
+    fit = Mock()
+    monkeypatch.setattr(window, "_fit_all", fit)
+    window._commit_project_change(imported(window._project))
+    fit.assert_called_once()

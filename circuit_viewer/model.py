@@ -1686,6 +1686,10 @@ class LineNetworkModel:
         return self._codes
 
     @property
+    def arrangement_ids(self) -> tuple[str, ...]:
+        return self._arrangement_ids
+
+    @property
     def phases(self) -> tuple[str, ...]:
         return self._phases
 

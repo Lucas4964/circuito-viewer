@@ -305,7 +305,11 @@ from .search import GlobalSearchIndex, SearchResult
 from .search_palette import SearchPalette
 from .segment_import import SegmentLoadResult
 from .switch_import import SwitchLoadResult
-from .table_columns import EXCEL_LIKE_TABLE_STYLE, enable_interactive_columns
+from .table_columns import (
+    EXCEL_LIKE_TABLE_STYLE,
+    AllRowsTableView,
+    enable_interactive_columns,
+)
 from .theme import (
     THEME_LABELS,
     AppTheme,
@@ -950,6 +954,9 @@ class MainWindow(QMainWindow):
         # a thread de importação sai do caminho.
         self._pending_generator_update = False
         self._close_after_import = False
+        # "Executar fluxo" sem resultado vigente de geradores atualiza-os
+        # primeiro; o fluxo é retomado quando a thread da atualização termina.
+        self._pending_power_flow_after_generators = False
         self._branch_thread: QThread | None = None
         self._branch_worker: BranchAnalysisWorker | None = None
         self._branch_progress_dialog: QProgressDialog | None = None
@@ -1586,6 +1593,13 @@ class MainWindow(QMainWindow):
             self.power_flow_action.setToolTip(engine_error)
         self.power_flow_action.triggered.connect(self._run_power_flow)
 
+        self.edit_element_action = QAction("Editar…", self)
+        self.edit_element_action.setObjectName("edit_element_action")
+        self.edit_element_action.setShortcut(QKeySequence(Qt.Key.Key_F2))
+        self.edit_element_action.setEnabled(False)
+        self.edit_element_action.triggered.connect(self._edit_selected_feature)
+        self.addAction(self.edit_element_action)
+
         self.branches_action = QAction("Ramais…", self)
         self.branches_action.setEnabled(False)
         self.branches_action.setToolTip(
@@ -1847,7 +1861,9 @@ class MainWindow(QMainWindow):
             layout.addWidget(combo)
 
             model = PowerFlowTableModel(self)
-            table = QTableView(section)
+            # A altura acompanha as linhas **e** a barra horizontal: com altura
+            # fixa de quatro linhas, a barra cobria o último patamar.
+            table = AllRowsTableView(section)
             table.setObjectName(f"{object_name}_table")
             table.setModel(model)
             table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1867,14 +1883,6 @@ class MainWindow(QMainWindow):
             table.verticalHeader().setDefaultSectionSize(28)
             enable_interactive_columns(table, always_refit=True)
             table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
-            # Quatro patamares sempre; altura fixa evita a barra de rolagem
-            # vertical dentro de uma tabela que nunca cresce.
-            table.setFixedHeight(
-                table.horizontalHeader().sizeHint().height()
-                + 4 * table.verticalHeader().defaultSectionSize()
-                + 2 * table.frameWidth()
-                + 4
-            )
             layout.addWidget(table)
 
             note = QLabel("")
@@ -1962,7 +1970,7 @@ class MainWindow(QMainWindow):
         self.load_patterns_title = QLabel("Patamares da carga")
         pattern_layout.addWidget(self.load_patterns_title)
         self.load_pattern_table_model = LoadPatternTableModel(self)
-        self.load_patterns_table = QTableView(self.load_patterns_section)
+        self.load_patterns_table = AllRowsTableView(self.load_patterns_section)
         self.load_patterns_table.setModel(self.load_pattern_table_model)
         self.load_patterns_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers
@@ -1983,13 +1991,6 @@ class MainWindow(QMainWindow):
         self.load_patterns_table.verticalHeader().setDefaultSectionSize(28)
         enable_interactive_columns(self.load_patterns_table, always_refit=True)
         self.load_patterns_table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
-        table_height = (
-            self.load_patterns_table.horizontalHeader().sizeHint().height()
-            + 4 * self.load_patterns_table.verticalHeader().defaultSectionSize()
-            + 2 * self.load_patterns_table.frameWidth()
-            + 4
-        )
-        self.load_patterns_table.setFixedHeight(table_height)
         pattern_layout.addWidget(self.load_patterns_table)
         self.load_patterns_section.setVisible(False)
         load_layout.addWidget(self.load_patterns_section)
@@ -2102,14 +2103,13 @@ class MainWindow(QMainWindow):
             table.verticalHeader().setDefaultSectionSize(28)
             enable_interactive_columns(table, always_refit=True)
             table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
-            table.setFixedHeight(table_height)
 
         self.generator_demand_section = QWidget(self.generator_details_body)
         generator_demand_layout = QVBoxLayout(self.generator_demand_section)
         generator_demand_layout.setContentsMargins(0, 0, 0, 0)
         generator_demand_layout.addWidget(QLabel("Demanda por Patamar"))
         self.generator_demand_table_model = GeneratorDemandTableModel(self)
-        self.generator_demand_table = QTableView(self.generator_demand_section)
+        self.generator_demand_table = AllRowsTableView(self.generator_demand_section)
         self.generator_demand_table.setObjectName("generator_demand_table")
         self.generator_demand_table.setModel(self.generator_demand_table_model)
         configure_generator_result_table(self.generator_demand_table)
@@ -2124,7 +2124,7 @@ class MainWindow(QMainWindow):
         self.generator_phase_power_table_model = GeneratorPhasePowerTableModel(
             self
         )
-        self.generator_phase_power_table = QTableView(
+        self.generator_phase_power_table = AllRowsTableView(
             self.generator_phase_power_section
         )
         self.generator_phase_power_table.setObjectName(
@@ -2186,7 +2186,7 @@ class MainWindow(QMainWindow):
         equivalent_pattern_layout.setContentsMargins(0, 0, 0, 0)
         equivalent_pattern_layout.addWidget(QLabel("Patamares equivalentes"))
         self.equivalent_pattern_table_model = LoadPatternTableModel(self)
-        self.equivalent_patterns_table = QTableView(
+        self.equivalent_patterns_table = AllRowsTableView(
             self.equivalent_patterns_section
         )
         self.equivalent_patterns_table.setModel(
@@ -2213,7 +2213,6 @@ class MainWindow(QMainWindow):
             self.equivalent_patterns_table, always_refit=True
         )
         self.equivalent_patterns_table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
-        self.equivalent_patterns_table.setFixedHeight(table_height)
         equivalent_pattern_layout.addWidget(self.equivalent_patterns_table)
         self.equivalent_patterns_section.setVisible(False)
         equivalent_layout.addWidget(self.equivalent_patterns_section)
@@ -2327,20 +2326,17 @@ class MainWindow(QMainWindow):
         ) = create_table(
             regulator_fields,
             self.regulator_details_section,
-            editable=REGULATOR_EDITABLE_FIELDS,
         )
         regulator_layout.addWidget(self.regulator_details_table)
-        # Editores dos campos que a exportação consome. O MDB nunca é escrito:
-        # o valor digitado vive só nesta sessão (ver `regulator_overrides`).
-        self.regulator_value_editors = {
+        # Os campos que se editam pela janela "Editar…" ficam em negrito quando
+        # diferem do importado, com o valor do banco na dica. O painel é só de
+        # visualização: o MDB nunca é escrito, a edição vive no projeto.
+        self.regulator_tracked_labels = {
             key: self.regulator_detail_labels[key]
             for key in REGULATOR_EDITABLE_FIELDS
         }
-        for key, editor in self.regulator_value_editors.items():
-            editor.setObjectName(f"regulator_{key}_editor")
-            editor.editingFinished.connect(
-                lambda key=key: self._commit_regulator_editor(key)
-            )
+        for key, label in self.regulator_tracked_labels.items():
+            label.setObjectName(f"regulator_{key}_value")
         self.regulator_restore_button = QPushButton(
             "Restaurar do banco",
             self.regulator_details_section,
@@ -2367,7 +2363,7 @@ class MainWindow(QMainWindow):
         self.regulator_tap_table_title.setVisible(False)
         regulator_layout.addWidget(self.regulator_tap_table_title)
         self.regulator_tap_table_model = PowerFlowTableModel(self)
-        self.regulator_tap_table = QTableView(self.regulator_details_section)
+        self.regulator_tap_table = AllRowsTableView(self.regulator_details_section)
         self.regulator_tap_table.setObjectName("regulator_tap_table")
         self.regulator_tap_table.setModel(self.regulator_tap_table_model)
         self.regulator_tap_table.setEditTriggers(
@@ -2389,12 +2385,6 @@ class MainWindow(QMainWindow):
         self.regulator_tap_table.verticalHeader().setDefaultSectionSize(28)
         enable_interactive_columns(self.regulator_tap_table, always_refit=True)
         self.regulator_tap_table.setStyleSheet(EXCEL_LIKE_TABLE_STYLE)
-        self.regulator_tap_table.setFixedHeight(
-            self.regulator_tap_table.horizontalHeader().sizeHint().height()
-            + 4 * self.regulator_tap_table.verticalHeader().defaultSectionSize()
-            + 2 * self.regulator_tap_table.frameWidth()
-            + 4
-        )
         self.regulator_tap_table.setVisible(False)
         regulator_layout.addWidget(self.regulator_tap_table)
 
@@ -2424,6 +2414,16 @@ class MainWindow(QMainWindow):
         details_container = QWidget(self.details_dock)
         details_layout = QVBoxLayout(details_container)
         details_layout.setContentsMargins(0, 0, 0, 0)
+        # O painel só mostra; editar é abrir a janela pequena do elemento. O
+        # botão fica no topo, à vista em qualquer página, e o F2 faz o mesmo.
+        edit_row = QHBoxLayout()
+        edit_row.setContentsMargins(6, 4, 6, 0)
+        edit_row.addStretch(1)
+        self.edit_element_button = QPushButton("✎ Editar…", details_container)
+        self.edit_element_button.setObjectName("edit_element_button")
+        self.edit_element_button.clicked.connect(self._edit_selected_feature)
+        edit_row.addWidget(self.edit_element_button)
+        details_layout.addLayout(edit_row)
         details_layout.addWidget(self.details_stack, 1)
         provenance_button = QPushButton("Origem e histórico…", details_container)
         provenance_button.clicked.connect(self._show_project_provenance)
@@ -3013,8 +3013,13 @@ class MainWindow(QMainWindow):
         composed: ComposedModels,
         workspace: SourceWorkspace,
         *, adopt_project: bool = True,
+        fit_view: bool = True,
     ) -> None:
         """O **único** caminho de instalação da cadeia.
+
+        ``fit_view`` desligado preserva o enquadramento do mapa: é o caso das
+        edições do projeto, em que a rede é a mesma e reenquadrá-la a cada
+        campo alterado tiraria o usuário do ponto em que estava trabalhando.
 
         Substituir e acrescentar passam os dois por aqui, e não há cascata nova:
         reusar ``_set_*_model`` na mesma ordem é o que mantém as invalidações
@@ -3026,7 +3031,7 @@ class MainWindow(QMainWindow):
         previous = self._composition, self._workspace, self._project, self._project_topology
         display = self._circuit_display_state()
         try:
-            self._install_composed_models(composed, workspace)
+            self._install_composed_models(composed, workspace, fit_view=fit_view)
         except Exception:
             old_composed, old_workspace, old_project, old_topology = previous
             try:
@@ -3045,8 +3050,14 @@ class MainWindow(QMainWindow):
             from .project_state import ProjectState
             self._project = ProjectState.from_workspace(workspace)
 
-    def _install_composed_models(self, composed, workspace):
+    def _install_composed_models(self, composed, workspace, *, fit_view=True):
         bars = composed.bars
+        saved_view = None
+        if not fit_view and self._model is not None:
+            saved_view = (
+                self.view.transform(),
+                self.view.mapToScene(self.view.viewport().rect().center()),
+            )
         # O que o usuário escolheu para cada circuito é capturado ANTES de a
         # cascata derrubar o catálogo, e reaplicado depois por (fonte, id).
         display_state = self._circuit_display_state()
@@ -3099,7 +3110,15 @@ class MainWindow(QMainWindow):
         self._sync_search_availability()
         self._sync_export_availability()
         self._sync_mdb_actions()
-        self._fit_all()
+        if saved_view is None:
+            self._fit_all()
+        else:
+            transform, center = saved_view
+            self.view.setTransform(transform)
+            self.view.centerOn(center)
+            self.virtualizer.refresh(force=True)
+            self.load_virtualizer.refresh(force=True)
+            self.equivalent_load_virtualizer.refresh(force=True)
 
     def _commit_project_change(self, change):
         change.validate(self._project)
@@ -3113,7 +3132,15 @@ class MainWindow(QMainWindow):
                     self._install_composed_models(*previous)
                 raise
         else:
-            self._install_composed_chain(change.composed, change.state.workspace, adopt_project=False)
+            # Editar e desfazer mexem nos dados, não na rede que o usuário está
+            # olhando: o enquadramento fica onde estava.
+            operation = change.state.history[-1].operation if change.state.history else ""
+            self._install_composed_chain(
+                change.composed,
+                change.state.workspace,
+                adopt_project=False,
+                fit_view=operation not in {"edit", "undo"},
+            )
         self._project = change.state
         self._workspace = change.state.workspace
         self._project_topology = change.topology
@@ -4140,6 +4167,217 @@ class MainWindow(QMainWindow):
         self._sync_export_availability()
         self.view.viewport().update()
 
+    # -- edição pela janela ------------------------------------------------
+
+    _EDITABLE_ENTITIES = {
+        "segment": "segments",
+        "load": "loads",
+        "capacitor": "capacitors",
+        "generator": "generators",
+    }
+
+    def _legacy_regulator_index(self, segment_index: int) -> int | None:
+        """Regulador do trecho importado sem projeto (CSV), ou ``None``.
+
+        Ele não tem registro onde guardar a edição; ela vai para as
+        sobreposições da sessão (``regulator_overrides``), como antes.
+        """
+
+        model = self._regulator_model
+        if model is None or self._regulator_source_model is None:
+            return None
+        index = int(model.record_indices_by_segment[int(segment_index)])
+        if index < 0 or self._project_equipment_at("regulators", index) is not None:
+            return None
+        return index
+
+    def _edit_unavailable_reason(self, selection) -> str | None:  # noqa: ANN001
+        if selection is None:
+            return "Selecione um trecho, carga, capacitor ou gerador para editar."
+        entity = self._EDITABLE_ENTITIES.get(selection.kind)
+        if entity is None:
+            return "Este elemento não tem dados editáveis."
+        if self._project_equipment_at(entity, selection.index) is not None:
+            return None
+        if (
+            selection.kind == "segment"
+            and self._legacy_regulator_index(selection.index) is not None
+        ):
+            return None
+        return (
+            "Este elemento não está no projeto em memória; importe a rede pelo "
+            "banco para editá-lo."
+        )
+
+    def _sync_edit_action(self, selection) -> None:  # noqa: ANN001
+        if not hasattr(self, "edit_element_button"):
+            return
+        reason = self._edit_unavailable_reason(selection)
+        tooltip = reason or "Editar os dados do elemento selecionado (F2)"
+        for widget in (self.edit_element_action, self.edit_element_button):
+            widget.setEnabled(reason is None)
+            widget.setToolTip(tooltip)
+
+    def _phase_choices(self) -> tuple[tuple[str, str], ...]:
+        configuration = self._phase_configuration
+        if configuration is None:
+            return ()
+        return tuple(
+            (entry.fases2, f"{entry.fases2} — {entry.name}" if entry.name else entry.fases2)
+            for entry in configuration.entries
+        )
+
+    def _cable_choices(self) -> tuple[tuple[str, str], ...]:
+        cables = self._cable_model
+        if cables is None:
+            return ()
+        return tuple(
+            (cable_id, f"{(name or code or cable_id).strip()} ({cable_id})")
+            for cable_id, name, code in zip(cables.cable_ids, cables.names, cables.codes)
+        )
+
+    def _edit_form(self, selection):  # noqa: ANN001, ANN202
+        """Formulário do elemento e as chaves de edição da sessão (CSV)."""
+
+        from .equipment_edit_dialog import (
+            capacitor_form,
+            generator_form,
+            load_form,
+            segment_form,
+        )
+        from .network_registry import EquipmentKey
+
+        entity = self._EDITABLE_ENTITIES[selection.kind]
+        record = self._project_equipment_at(entity, selection.index)
+        legacy: dict[str, str] = {}
+        if selection.kind == "segment":
+            segments = self._line_model
+            if record is not None:
+                segment_id, segment_values = record.equipment_id, dict(record.values)
+            else:
+                item = segments.record(selection.index)
+                segment_id = f"sessao-trecho:{item.segment_id}"
+                segment_values = {
+                    "segment_ids": item.segment_id, "codes": item.code, "phases": item.phases,
+                    "phase_cable_ids": item.phase_cable_id,
+                    "neutral_cable_ids": item.neutral_cable_id,
+                    "arrangement_ids": item.arrangement_id, "lengths": item.length,
+                    "start_indices": item.start_bar_id, "end_indices": item.end_bar_id,
+                }
+            regulator_id = regulator_values = None
+            regulator_columns = None
+            model = self._regulator_model
+            regulator_index = (
+                -1 if model is None
+                else int(model.record_indices_by_segment[selection.index])
+            )
+            if regulator_index >= 0:
+                regulator_record = self._project_equipment_at("regulators", regulator_index)
+                if regulator_record is not None:
+                    regulator_id = regulator_record.equipment_id
+                    regulator_values = dict(regulator_record.values)
+                elif self._regulator_source_model is not None:
+                    item = model.record(regulator_index)
+                    regulator_id = f"sessao-regulador:{item.regulator_id}"
+                    legacy[regulator_id] = item.regulator_id
+                    regulator_values = {
+                        "codes": item.code, "snom_values": item.snom, "vnom_values": item.vnom,
+                        "inom_values": item.inom, "regulation_ranges": item.regulation_range,
+                        "step_counts": item.step_count, "fixed_values": item.fixed,
+                        "tap_values": item.tap, "vreg_p1_values": item.vreg_p1,
+                        "vreg_p2_values": item.vreg_p2, "vreg_p3_values": item.vreg_p3,
+                        "vreg_p4_values": item.vreg_p4,
+                    }
+                    regulator_columns = frozenset(
+                        f"{field}_values" for field in REGULATOR_EDITABLE_FIELDS
+                    )
+            arrangements = sorted(
+                {value for value in segments.arrangement_ids if str(value).strip()}
+            )
+            form = segment_form(
+                segment_id,
+                segment_values,
+                regulator_id=regulator_id,
+                regulator=regulator_values,
+                phase_choices=self._phase_choices(),
+                cable_choices=self._cable_choices(),
+                arrangement_choices=arrangements,
+                segment_editable=record is not None,
+                regulator_columns=regulator_columns,
+            )
+            return form, legacy
+        values = dict(record.values)
+        if selection.kind == "load":
+            patterns = self._project.records.get(
+                EquipmentKey(record.key.network_id, "patterns", record.key.native_id)
+            )
+            return load_form(
+                record.equipment_id,
+                values,
+                patterns_id=None if patterns is None else patterns.equipment_id,
+                patterns=() if patterns is None else dict(patterns.values)["records"],
+                phase_choices=self._phase_choices(),
+            ), legacy
+        if selection.kind == "capacitor":
+            return capacitor_form(record.equipment_id, values), legacy
+        return generator_form(record.equipment_id, values), legacy
+
+    def _edit_selected_feature(self) -> None:
+        """Abre a janela de edição do elemento selecionado e aplica o resultado."""
+
+        from .equipment_edit_dialog import EquipmentEditDialog
+
+        selection = self._selected_feature
+        reason = self._edit_unavailable_reason(selection)
+        if reason is not None:
+            self.statusBar().showMessage(reason, 5_000)
+            return
+        if self._busy():
+            self.statusBar().showMessage(
+                "Aguarde a operação em andamento terminar para editar.", 5_000
+            )
+            return
+        form, legacy = self._edit_form(selection)
+        dialog = EquipmentEditDialog(form, self)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            changes = dialog.changes()
+        finally:
+            dialog.deleteLater()
+        self._apply_equipment_changes(changes, legacy)
+
+    def _apply_equipment_changes(
+        self,
+        changes: dict[str, dict[str, object]],
+        legacy: dict[str, str] | None = None,
+    ) -> None:
+        """Leva as alterações da janela ao projeto (ou à sessão, sem projeto).
+
+        Tudo o que pertence ao projeto vira **uma** operação de edição — uma
+        revisão, um passo de desfazer — e o mapa não é reenquadrado (ver
+        ``_commit_project_change``). O regulador de rede importada sem projeto
+        segue para as sobreposições da sessão, campo a campo.
+        """
+
+        legacy = legacy or {}
+        if not changes:
+            self.statusBar().showMessage("Nenhuma alteração para salvar.", 4_000)
+            return
+        project_edits = {key: values for key, values in changes.items() if key not in legacy}
+        for key, regulator_id in legacy.items():
+            for column, value in changes.get(key, {}).items():
+                self._apply_regulator_override(
+                    regulator_id, column.removesuffix("_values"), str(value)
+                )
+        if project_edits:
+            from .project_state import edit_equipments
+
+            project = self._project
+            self._start_project_operation(
+                lambda cancel: edit_equipments(project, project_edits, cancel_check=cancel)
+            )
+
     def _selected_regulator_record(self):  # noqa: ANN201
         """Regulador do trecho selecionado, no modelo efetivo."""
 
@@ -4152,34 +4390,13 @@ class MainWindow(QMainWindow):
             return None
         return self._regulator_model.record_for_segment(selection.index)
 
-    def _commit_regulator_editor(self, field: str) -> None:
-        """Valida o texto do painel e o aplica ao modelo em memória."""
-
-        record = self._selected_regulator_record()
-        if record is None:
-            return
-        editor = self.regulator_value_editors[field]
-        text = editor.text().strip()
-        if text and parse_number(text) is None:
-            QMessageBox.warning(
-                self,
-                "Valor inválido",
-                f"{REGULATOR_FIELD_LABELS[field]} deve ser um número. Use ponto "
-                "ou vírgula como separador decimal, não os dois.",
-            )
-            # Recarrega o valor corrente: texto inválido nunca fica na tela.
-            self._sync_regulator_editors(record)
-            editor.setFocus()
-            return
-        self._apply_regulator_override(record.regulator_id, field, text)
-
     def _restore_selected_regulator(self) -> None:
         record = self._selected_regulator_record()
         if record is not None:
             self._restore_regulator_from_database(record.regulator_id)
 
-    def _sync_regulator_editors(self, record) -> None:  # noqa: ANN001
-        """Reflete o registro efetivo nos editores e marca o que foi editado."""
+    def _sync_regulator_tracked_labels(self, record) -> None:  # noqa: ANN001
+        """Reflete o registro efetivo no painel e marca o que foi editado."""
 
         source = self._regulator_source_model
         index = (
@@ -4188,10 +4405,9 @@ class MainWindow(QMainWindow):
             else source.index_for_id(record.regulator_id)
         )
         edited_any = False
-        for field, editor in self.regulator_value_editors.items():
+        for field, editor in self.regulator_tracked_labels.items():
             value = getattr(record, field)
-            if editor.text() != value:
-                editor.setText(value)
+            editor.setText(value or "—")
             original = (
                 ""
                 if index is None
@@ -5237,10 +5453,18 @@ class MainWindow(QMainWindow):
 
     def _on_generator_update_failed(self, reason: str) -> None:
         self._close_generator_update_progress()
+        self._pending_power_flow_after_generators = False
         QMessageBox.critical(self, "Falha ao atualizar geradores", reason)
 
     def _on_generator_update_cancelled(self) -> None:
         self._close_generator_update_progress()
+        if self._pending_power_flow_after_generators:
+            self._pending_power_flow_after_generators = False
+            self.statusBar().showMessage(
+                "Atualização dos geradores cancelada; o fluxo não foi executado.",
+                5_000,
+            )
+            return
         self.statusBar().showMessage(
             "Atualização cancelada; o resultado anterior foi mantido.",
             5_000,
@@ -5268,6 +5492,13 @@ class MainWindow(QMainWindow):
             and not self._close_after_generator_update
         ):
             self._start_equivalent_build()
+        if self._pending_power_flow_after_generators:
+            self._pending_power_flow_after_generators = False
+            if (
+                self._exportable_generators() is not None
+                and not self._close_after_generator_update
+            ):
+                self._run_power_flow()
         if self._close_after_generator_update:
             self._close_after_generator_update = False
             self.close()
@@ -6319,6 +6550,20 @@ class MainWindow(QMainWindow):
         exportable_loads = self._exportable_loads()
         loads, patterns = exportable_loads or (None, None)
         generator_updates = self._exportable_generators()
+        if (
+            self._generator_model is not None
+            and generator_updates is None
+            and self._default_curve() is not None
+        ):
+            # Um resultado vigente é reaproveitado — inclusive a curva escolhida
+            # à mão no diálogo. Desatualizado, ele é refeito com as escolhas
+            # padrão e o fluxo segue sozinho ao fim (ver
+            # _on_generator_update_thread_finished).
+            self._pending_power_flow_after_generators = True
+            self._auto_update_generators()
+            if self._generator_update_thread is not None:
+                return
+            self._pending_power_flow_after_generators = False
         missing_parts: list[str] = []
         if exportable_loads is None:
             missing_parts.append(
@@ -7923,6 +8168,14 @@ class MainWindow(QMainWindow):
         """
 
         menu = QMenu(self)
+        if (
+            feature is not None
+            and self._selected_feature is not None
+            and feature == self._selected_feature
+            and self._edit_unavailable_reason(feature) is None
+        ):
+            menu.addAction(self.edit_element_action)
+            menu.addSeparator()
         if feature is not None and feature.kind == "segment":
             self._add_block_actions(menu, int(feature.index))
         if feature is not None and feature.kind in {"bar", "segment"}:
@@ -9619,6 +9872,7 @@ class MainWindow(QMainWindow):
         reveal_hidden: bool = False,
         preserve_highlight: bool = False,
     ) -> None:
+        self._sync_edit_action(selection)
         # O destaque sobrevive ao clique que cai **dentro** dele: inspecionar um
         # trecho, uma barra ou uma carga da própria região não deveria custar o
         # lugar onde se estava. Qualquer outro elemento, ou o vazio, limpa.
@@ -9996,7 +10250,7 @@ class MainWindow(QMainWindow):
         )
         if regulator_record is None:
             for key, widget in self.regulator_detail_labels.items():
-                widget.setText("" if key in REGULATOR_EDITABLE_FIELDS else "—")
+                widget.setText("—")
             self.regulator_restore_button.setVisible(False)
             self.regulator_tap_label.setVisible(False)
             self.regulator_tap_label.setText("")
@@ -10027,7 +10281,7 @@ class MainWindow(QMainWindow):
                 if key in REGULATOR_EDITABLE_FIELDS:
                     continue
                 self.regulator_detail_labels[key].setText(value or "—")
-            self._sync_regulator_editors(regulator_record)
+            self._sync_regulator_tracked_labels(regulator_record)
             self._apply_regulator_tap(selection.index)
             self.regulator_details_section.setVisible(True)
 

@@ -14,7 +14,9 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox
+
+    from circuit_viewer.equipment_edit_dialog import EquipmentEditDialog
 
     from circuit_viewer.csv_import import CsvLoadResult
     from circuit_viewer.main_window import ImportChoiceDialog, MainWindow
@@ -155,7 +157,15 @@ class RegulatorUiTests(unittest.TestCase):
         window._set_selection(FeatureSelection("segment", 1))
         self.assertFalse(window.regulator_details_section.isVisible())
 
-    def test_editable_fields_are_line_edits_showing_the_registry(self) -> None:
+    def _edit(self, window: MainWindow, column: str, value: str) -> None:
+        """Edita o regulador do trecho 0 pelo mesmo caminho da janela."""
+
+        form, legacy = window._edit_form(FeatureSelection("segment", 0))
+        key = next(iter(legacy))
+        window._apply_equipment_changes({key: {column: value}}, legacy)
+        self.app.processEvents()
+
+    def test_the_panel_only_shows_the_registry(self) -> None:
         window = self._window()
         self._load_network(window)
         self._load_regulators(window)
@@ -163,67 +173,65 @@ class RegulatorUiTests(unittest.TestCase):
         window._set_selection(FeatureSelection("segment", 0))
 
         self.assertEqual(
-            set(window.regulator_value_editors),
+            set(window.regulator_tracked_labels),
             {"vnom", "snom", "vreg_p1", "vreg_p2", "vreg_p3", "vreg_p4", "fixed", "tap"},
         )
-        self.assertEqual(window.regulator_value_editors["vnom"].text(), "13800")
-        self.assertEqual(window.regulator_value_editors["snom"].text(), "1000")
-        self.assertEqual(window.regulator_value_editors["tap"].text(), "3")
-        # O CSV da fixture não traz as colunas opcionais: os campos ficam vazios.
-        self.assertEqual(window.regulator_value_editors["vreg_p1"].text(), "")
-        self.assertEqual(window.regulator_value_editors["fixed"].text(), "")
+        # Só visualização: rótulos, não editores.
+        for label in window.regulator_tracked_labels.values():
+            self.assertIsInstance(label, QLabel)
+        self.assertEqual(window.regulator_tracked_labels["vnom"].text(), "13800")
+        self.assertEqual(window.regulator_tracked_labels["snom"].text(), "1000")
+        self.assertEqual(window.regulator_tracked_labels["tap"].text(), "3")
+        # O CSV da fixture não traz as colunas opcionais.
+        self.assertEqual(window.regulator_tracked_labels["vreg_p1"].text(), "—")
         self.assertFalse(window.regulator_restore_button.isVisible())
+        self.assertTrue(window.edit_element_button.isEnabled())
 
     def test_an_edit_reaches_the_effective_model_without_touching_the_source(
         self,
     ) -> None:
-        """O OpenDSS passa a ler o valor da tela; o retrato do MDB fica igual."""
+        """O OpenDSS passa a ler o valor editado; o retrato do banco fica igual."""
 
         window = self._window()
         self._load_network(window)
         source = self._load_regulators(window)
         window._set_selection(FeatureSelection("segment", 0))
 
-        editor = window.regulator_value_editors["snom"]
-        editor.setText("276")
-        editor.editingFinished.emit()
-        self.app.processEvents()
+        self._edit(window, "snom_values", "276")
 
         self.assertEqual(window._regulator_model.record(0).snom, "276")
         self.assertIsNot(window._regulator_model, source)
-        # A fonte importada permanece exatamente como veio do banco.
         self.assertIs(window._regulator_source_model, source)
         self.assertEqual(source.record(0).snom, "1000")
+        self.assertEqual(window.regulator_tracked_labels["snom"].text(), "276")
+        self.assertTrue(window.regulator_tracked_labels["snom"].font().bold())
         self.assertTrue(window.regulator_restore_button.isVisible())
 
-    def test_an_invalid_number_is_refused_and_the_editor_reloads(self) -> None:
+    def test_the_edit_button_opens_the_dialog_and_applies_it(self) -> None:
         window = self._window()
         self._load_network(window)
         self._load_regulators(window)
         window._set_selection(FeatureSelection("segment", 0))
-        editor = window.regulator_value_editors["snom"]
 
-        editor.setText("1.234,5")
-        with patch.object(QMessageBox, "warning") as warning:
-            editor.editingFinished.emit()
+        def accept(dialog):  # noqa: ANN001, ANN202
+            dialog._widgets[next(key for key in dialog._widgets if key.endswith(":vreg_p2_values:"))].setText("1.03")
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(EquipmentEditDialog, "exec", new=accept):
+            window.edit_element_button.click()
         self.app.processEvents()
 
-        warning.assert_called_once()
-        self.assertEqual(editor.text(), "1000")
-        self.assertEqual(window._regulator_model.record(0).snom, "1000")
+        self.assertEqual(window._regulator_model.record(0).vreg_p2, "1.03")
+        self.assertEqual(window.regulator_tracked_labels["vreg_p2"].text(), "1.03")
 
     def test_typing_the_registry_value_back_clears_the_override(self) -> None:
         window = self._window()
         self._load_network(window)
         source = self._load_regulators(window)
         window._set_selection(FeatureSelection("segment", 0))
-        editor = window.regulator_value_editors["snom"]
 
-        editor.setText("276")
-        editor.editingFinished.emit()
-        editor.setText("1000")
-        editor.editingFinished.emit()
-        self.app.processEvents()
+        self._edit(window, "snom_values", "276")
+        self._edit(window, "snom_values", "1000")
 
         self.assertTrue(window._regulator_overrides.is_empty)
         self.assertIs(window._regulator_model, source)
@@ -234,17 +242,14 @@ class RegulatorUiTests(unittest.TestCase):
         self._load_network(window)
         source = self._load_regulators(window)
         window._set_selection(FeatureSelection("segment", 0))
-        editor = window.regulator_value_editors["snom"]
-        editor.setText("276")
-        editor.editingFinished.emit()
-        self.app.processEvents()
+        self._edit(window, "snom_values", "276")
 
         window.regulator_restore_button.click()
         self.app.processEvents()
 
         self.assertTrue(window._regulator_overrides.is_empty)
         self.assertIs(window._regulator_model, source)
-        self.assertEqual(window.regulator_value_editors["snom"].text(), "1000")
+        self.assertEqual(window.regulator_tracked_labels["snom"].text(), "1000")
 
     def test_reimporting_the_regulators_discards_the_session_edits(self) -> None:
         """Recarregar o circuito devolve exatamente o que está no banco."""
@@ -253,10 +258,7 @@ class RegulatorUiTests(unittest.TestCase):
         self._load_network(window)
         self._load_regulators(window)
         window._set_selection(FeatureSelection("segment", 0))
-        editor = window.regulator_value_editors["snom"]
-        editor.setText("276")
-        editor.editingFinished.emit()
-        self.app.processEvents()
+        self._edit(window, "snom_values", "276")
         self.assertFalse(window._regulator_overrides.is_empty)
 
         reloaded = self._load_regulators(window)
@@ -264,7 +266,17 @@ class RegulatorUiTests(unittest.TestCase):
 
         self.assertTrue(window._regulator_overrides.is_empty)
         self.assertIs(window._regulator_model, reloaded)
-        self.assertEqual(window.regulator_value_editors["snom"].text(), "1000")
+        self.assertEqual(window.regulator_tracked_labels["snom"].text(), "1000")
+
+    def test_segment_without_regulator_nor_project_cannot_be_edited(self) -> None:
+        window = self._window()
+        self._load_network(window)
+        self._load_regulators(window)
+
+        window._set_selection(FeatureSelection("segment", 1))
+
+        self.assertFalse(window.edit_element_button.isEnabled())
+        self.assertIn("projeto", window.edit_element_button.toolTip())
 
     def test_every_column_reaches_the_panel(self) -> None:
         window = self._window()
@@ -289,11 +301,11 @@ class RegulatorUiTests(unittest.TestCase):
                 "regulation_range": "10",
                 "step_count": "32",
                 "tap": "3",
-                "fixed": "",
-                "vreg_p1": "",
-                "vreg_p2": "",
-                "vreg_p3": "",
-                "vreg_p4": "",
+                "fixed": "—",
+                "vreg_p1": "—",
+                "vreg_p2": "—",
+                "vreg_p3": "—",
+                "vreg_p4": "—",
                 "inom": "100",
                 "vnom": "13800",
             },

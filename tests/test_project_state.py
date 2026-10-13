@@ -5,7 +5,7 @@ import pytest
 from circuit_viewer.model import constructor_columns, CableModel
 from circuit_viewer.network_registry import FileIdentity, IdentityMapping
 from circuit_viewer.project_state import (
-    ProjectState, ProjectChangeSet, propose_import, resolve_import, edit_equipment,
+    ProjectState, ProjectChangeSet, propose_import, resolve_import, edit_equipment, edit_equipments,
     create_equipment, undo, remove_network, detach_origins,
 )
 from circuit_viewer.source_composition import CompositionError, compose
@@ -61,6 +61,36 @@ def test_local_edit_survives_other_source_reimport_and_undo():
     assert dict(reverted.state.equipment(regulator.equipment_id).values)["vnom_values"] == "13.8"
     assert reverted.state.revision > edited.revision
     assert reverted.state.previous is None
+
+
+def test_batch_edit_is_one_revision_and_one_undo():
+    project = imported().state
+    regulator = row(project, "regulators")
+    segment = row(project, "segments")
+    change = edit_equipments(project, {
+        regulator.equipment_id: {"vreg_p1_values": "1.03", "snom_values": "400"},
+        segment.equipment_id: {"lengths": 42.0},
+    })
+    edited = change.state
+    assert edited.revision == project.revision + 1
+    assert edited.history[-1].operation == "edit"
+    assert dict(edited.equipment(regulator.equipment_id).values)["vreg_p1_values"] == "1.03"
+    assert dict(edited.equipment(segment.equipment_id).values)["lengths"] == 42.0
+    assert change.composed.regulators.record(0).vreg_p1 == "1.03"
+    reverted = undo(edited).state
+    assert dict(reverted.equipment(regulator.equipment_id).values)["snom_values"] != "400"
+    assert dict(reverted.equipment(segment.equipment_id).values)["lengths"] != 42.0
+
+
+def test_batch_edit_refuses_identity_and_unknown_fields():
+    project = imported().state
+    regulator = row(project, "regulators")
+    with pytest.raises(CompositionError, match="não editável"):
+        edit_equipments(project, {regulator.equipment_id: {"regulator_ids": "X"}})
+    with pytest.raises(CompositionError, match="não editável"):
+        edit_equipments(project, {regulator.equipment_id: {"inexistente": "1"}})
+    with pytest.raises(CompositionError, match="Nenhuma"):
+        edit_equipments(project, {})
 
 
 def changed_regulator(value):

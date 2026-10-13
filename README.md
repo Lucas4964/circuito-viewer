@@ -127,14 +127,28 @@ regulador**, abaixo da tabela de chave quando as duas existirem. Os reguladores
 também entram na busca global: procurar pelo `REGU_ID` ou pelo `CODIGO` enquadra
 o trecho e rola o painel até a seção.
 
-**`VNOM` e `SNOM` podem ser corrigidos ali mesmo**, quando o cadastro vem
-incompleto. A edição vale **somente para a sessão atual**: o `.mdb` nunca é
-escrito, e recarregar o circuito ou reabrir o aplicativo devolve exatamente o
-valor gravado no banco. Enquanto durar, porém, é ela que vale — a exportação
-OpenDSS e o fluxo de potência usam o valor que está na tela, não o do arquivo.
-O campo editado fica em negrito, com o valor original no tooltip, e o botão
-**Restaurar do banco** desfaz as alterações do regulador selecionado. Os demais
-campos seguem somente leitura, porque a exportação não os consome.
+**O painel é só de visualização; editar é pelo botão ✎ Editar…** (ou **F2**, ou o
+menu de contexto do mapa sobre o elemento selecionado). Ele abre uma janela
+pequena, no estilo do Interplan, com abas por parte do equipamento:
+
+| Elemento | Abas e campos editáveis |
+|---|---|
+| Trecho | **Trecho**: código, FASES2, cabo fase e neutro (combo com filtro), arranjo e comprimento. Com regulador, também **Regulador** (SNOM, VNOM, INOM), **Tap** (FAIXA, NPASSOS, controle automático ou tap fixo e TAP) e **Tensão** (VREG_P1..P4) |
+| Carga | **Dados**: código, SNOM, SADM, FASES2 e TIPO_LIG; **Patamares**: PD..QF e o modelo ZIP (ZCTE, ICTE, SCTE) dos quatro NPAT |
+| Capacitor | VNOM, Q1..Q4, FASES e ligação |
+| Gerador | **Dados**: código, SNOM, VNOM, ligação, CURVA_ID e geração mensal; **Potência por patamar**: P1..P4 e Q1..Q4 cadastrados |
+
+Números aceitam vírgula ou ponto, e o **Salvar** fica bloqueado enquanto algum
+campo estiver inválido. Tudo o que se salva numa janela vira **uma** edição do
+projeto — uma revisão, um passo de **Desfazer** — e o mapa **não é
+reenquadrado**: o zoom e a posição ficam onde estavam. O `.mdb` nunca é escrito.
+Os campos editados do regulador ficam em negrito no painel, com o valor
+importado no tooltip, e o botão **Restaurar do banco** desfaz as alterações do
+regulador selecionado. A manobra de chaves continua nos botões **Abrir no
+estudo** e **Fechar no estudo** do painel.
+
+Numa rede importada só por CSV, sem projeto, apenas o regulador pode ser editado
+(VNOM, SNOM, VREG, FIXO e TAP), e a edição vale para a sessão atual.
 
 No diagrama, cada trecho com regulador ganha um **anel laranja no seu ponto
 médio** — é como se localiza o equipamento na rede sem precisar clicar trecho a
@@ -1739,8 +1753,11 @@ parte com outro modelo. Trocar o modo ou, enquanto ele estiver ativo, salvar
 mapas ou bibliotecas descarta o resultado anterior.
 
 O fluxo usa o mesmo retrato de geradores da exportação. Se houver geradores
-importados sem **Atualizar Geradores…**, pede confirmação para executar sem
-eles. Atualizar, substituir ou invalidar esse retrato descarta qualquer fluxo já
+importados sem resultado vigente de **Atualizar Geradores…**, o botão os
+atualiza primeiro — com a curva padrão e os patamares próprios de cada circuito
+— e executa o fluxo em seguida. Um resultado vigente é reaproveitado, inclusive
+a curva escolhida à mão no diálogo. Sem nenhuma curva salva não há como
+atualizar, e o fluxo pede confirmação para executar sem os geradores. Atualizar, substituir ou invalidar esse retrato descarta qualquer fluxo já
 calculado, evitando exibir grandezas de um modelo elétrico anterior. O relatório
 do fluxo informa quantos geradores entraram no modelo e quantos foram descartados
 durante a exportação interna.
