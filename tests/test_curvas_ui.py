@@ -68,7 +68,7 @@ class CurvesWindowTests(unittest.TestCase):
     def test_new_curve_populates_the_list_and_shows_the_table(self) -> None:
         window = self._window()
         window._on_new_curve()
-        self.assertEqual(window.curve_list.count(), 1)
+        self.assertEqual(window.curve_list.rowCount(), 1)
         self.assertTrue(window.table.isVisible())
         self.assertFalse(window.empty_label.isVisible())
         self.assertTrue(window.is_dirty)
@@ -86,14 +86,14 @@ class CurvesWindowTests(unittest.TestCase):
         original_id = catalog.draft(0).curve_id
         window.name_edit.setText("Nova")
         window._on_name_edited("Nova")
-        self.assertEqual(window.curve_list.item(0).text(), "Nova")
+        self.assertEqual(window.curve_list.item(0, 1).text(), "Nova")
         self.assertEqual(catalog.draft(0).curve_id, original_id)
         self.assertTrue(window.is_dirty)
 
     def test_duplicate_name_is_reported_but_not_blocked(self) -> None:
         catalog = CurveCatalog([_filled_draft("A"), _filled_draft("B")])
         window = self._window(catalog)
-        window.curve_list.setCurrentRow(1)
+        window.curve_list.setCurrentCell(1, 1)
         window._on_name_edited("A")
         self.assertIn("Já existe", window.status_label.text())
         self.assertEqual(catalog.draft(1).name, "A")
@@ -153,7 +153,7 @@ class CurvesWindowTests(unittest.TestCase):
             [_filled_draft("A", 1.0), _filled_draft("B", 100.0)]
         )
         window = self._window(catalog)
-        window.curve_list.setCurrentRow(1)
+        window.curve_list.setCurrentCell(1, 1)
         self.assertEqual(window.name_edit.text(), "B")
         self.assertEqual(window.chart.values[0], 100.0)
 
@@ -327,6 +327,51 @@ class CurveChartTests(unittest.TestCase):
         chart.set_values(values)
         chart.set_values(list(values))
         self.assertEqual(chart.values, tuple(values))
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class CurveLinkIdWindowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = _application()
+        self._directory = TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.path = Path(self._directory.name) / "curvas.json"
+
+    def _window(self, catalog: "CurveCatalog") -> "CurvesWindow":
+        window = CurvesWindow(catalog, storage_path=self.path)
+        self.addCleanup(window.deleteLater)
+        window.show()
+        self.addCleanup(window.hide)
+        return window
+
+    def test_the_list_shows_id_and_name_columns(self) -> None:
+        draft = _filled_draft("Clientes BT IP - Dia útil")
+        draft.link_id = "1"
+        window = self._window(CurveCatalog([draft]))
+        header = window.curve_list.horizontalHeaderItem
+        self.assertEqual((header(0).text(), header(1).text()), ("ID", "Nome"))
+        self.assertEqual(window.curve_list.item(0, 0).text(), "1")
+        self.assertEqual(window.curve_list.item(0, 1).text(), draft.name)
+        self.assertEqual(window.link_id_edit.text(), "1")
+
+    def test_editing_the_id_updates_the_column_and_is_saved(self) -> None:
+        catalog = CurveCatalog([_filled_draft("A")])
+        window = self._window(catalog)
+        window.link_id_edit.setText(" 387 ")
+        window._on_link_id_edited(" 387 ")
+        self.assertEqual(catalog.draft(0).link_id, "387")
+        self.assertEqual(window.curve_list.item(0, 0).text(), "387")
+        self.assertTrue(window.is_dirty)
+        self.assertTrue(window._save())
+        self.assertEqual(load_curves(self.path).curves[0].link_id, "387")
+
+    def test_selecting_another_curve_shows_its_id(self) -> None:
+        first, second = _filled_draft("A"), _filled_draft("B")
+        first.link_id, second.link_id = "1", "2"
+        window = self._window(CurveCatalog([first, second]))
+        window.curve_list.setCurrentCell(1, 1)
+        self.assertEqual(window.link_id_edit.text(), "2")
+        self.assertEqual(window.name_edit.text(), "B")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,7 +1,8 @@
 """Janela de cadastro e edição das curvas horárias.
 
-Composição mestre-detalhe: a lista das curvas à esquerda, e à direita o nome, a
-grade das 24 horas e o gráfico do que está selecionado.
+Composição mestre-detalhe: a tabela das curvas (ID de vínculo e nome) à
+esquerda, e à direita o nome, o ID, a grade das 24 horas e o gráfico do que está
+selecionado.
 
 **As alterações ficam pendentes até "Salvar".** É o que permite desistir de uma
 edição errada — inclusive de uma exclusão. A contrapartida é que fechar a janela
@@ -25,16 +26,19 @@ from PyQt6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QHeaderView,
     QLineEdit,
-    QListWidget,
     QMessageBox,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from .curva_chart import CurveChartWidget
 from .curvas import (
+    MAX_CURVE_LINK_ID_LENGTH,
     MAX_CURVE_NAME_LENGTH,
     CurveCatalog,
     CurveDraft,
@@ -48,6 +52,8 @@ from .table_columns import EXCEL_LIKE_TABLE_STYLE, enable_interactive_columns
 
 _EMPTY_TEXT = 'Nenhuma curva cadastrada. Use "Nova curva" para começar.'
 _NEW_CURVE_NAME = "Nova curva"
+_ID_COLUMN = 0
+_NAME_COLUMN = 1
 
 
 class CurvesWindow(QDialog):
@@ -87,16 +93,37 @@ class CurvesWindow(QDialog):
 
     def _build_side_panel(self) -> QWidget:
         panel = QWidget(self)
-        panel.setFixedWidth(220)
+        panel.setFixedWidth(320)
         column = QVBoxLayout(panel)
         column.setContentsMargins(0, 0, 0, 0)
 
         column.addWidget(QLabel("Curvas", panel))
-        self.curve_list = QListWidget(panel)
+        # Tabela só de leitura: nome e ID se editam nos campos ao lado, que já
+        # validam e marcam a pendência. A ordem das linhas é a do catálogo —
+        # sem ordenação por clique, que desalinharia linha e índice.
+        self.curve_list = QTableWidget(0, 2, panel)
         self.curve_list.setObjectName("curves_list")
+        self.curve_list.setHorizontalHeaderLabels(("ID", "Nome"))
         self.curve_list.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
+        self.curve_list.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.curve_list.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.curve_list.verticalHeader().hide()
+        self.curve_list.setWordWrap(False)
+        # Nomes longos perdem o meio, não o fim: é no fim que fica o período
+        # (dia útil, sábado…) que distingue as curvas de uma mesma categoria.
+        self.curve_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        header = self.curve_list.horizontalHeader()
+        header.setSectionResizeMode(
+            _ID_COLUMN, QHeaderView.ResizeMode.Interactive
+        )
+        header.setSectionResizeMode(_NAME_COLUMN, QHeaderView.ResizeMode.Stretch)
+        self.curve_list.setColumnWidth(_ID_COLUMN, 56)
         column.addWidget(self.curve_list, 1)
 
         self.new_button = QPushButton("Nova curva", panel)
@@ -128,6 +155,17 @@ class CurvesWindow(QDialog):
         self.name_edit.setMaxLength(MAX_CURVE_NAME_LENGTH)
         self.name_edit.setPlaceholderText("Ex.: Residencial típica")
         name_row.addWidget(self.name_edit, 1)
+        self.link_id_label = QLabel("ID:", editor)
+        name_row.addWidget(self.link_id_label)
+        self.link_id_edit = QLineEdit(editor)
+        self.link_id_edit.setObjectName("curve_link_id_edit")
+        self.link_id_edit.setMaxLength(MAX_CURVE_LINK_ID_LENGTH)
+        self.link_id_edit.setFixedWidth(110)
+        self.link_id_edit.setToolTip(
+            "Identificador para vínculos e mapas — nas curvas do Interplan, o "
+            "CAT_ID da categoria referenciado pelo CURVA_ID da rede"
+        )
+        name_row.addWidget(self.link_id_edit)
         column.addLayout(name_row)
 
         self.table_model = CurveValuesTableModel(self)
@@ -192,10 +230,11 @@ class CurvesWindow(QDialog):
         return editor
 
     def _connect_signals(self) -> None:
-        self.curve_list.currentRowChanged.connect(self._on_curve_selected)
+        self.curve_list.currentCellChanged.connect(self._on_curve_selected)
         self.new_button.clicked.connect(self._on_new_curve)
         self.delete_button.clicked.connect(self._on_delete_curve)
         self.name_edit.textEdited.connect(self._on_name_edited)
+        self.link_id_edit.textEdited.connect(self._on_link_id_edited)
         self.save_button.clicked.connect(self._on_save_clicked)
         self.close_button.clicked.connect(self.close)
         self.table_model.dataChanged.connect(self._on_values_changed)
@@ -215,13 +254,20 @@ class CurvesWindow(QDialog):
         self._loading = True
         try:
             current = self.curve_list.currentRow()
-            self.curve_list.clear()
-            for draft in self.catalog.drafts:
-                self.curve_list.addItem(draft.name or "(sem nome)")
-            count = len(self.catalog)
+            drafts = self.catalog.drafts
+            self.curve_list.setRowCount(0)
+            self.curve_list.setRowCount(len(drafts))
+            for row, draft in enumerate(drafts):
+                self.curve_list.setItem(
+                    row, _ID_COLUMN, QTableWidgetItem(draft.link_id)
+                )
+                name_item = QTableWidgetItem(draft.name or "(sem nome)")
+                name_item.setToolTip(draft.name)
+                self.curve_list.setItem(row, _NAME_COLUMN, name_item)
+            count = len(drafts)
             if count:
                 row = min(max(current, 0), count - 1)
-                self.curve_list.setCurrentRow(row)
+                self.curve_list.setCurrentCell(row, _NAME_COLUMN)
         finally:
             self._loading = False
         self._sync_visibility()
@@ -254,6 +300,8 @@ class CurvesWindow(QDialog):
         for widget in (
             self.name_label,
             self.name_edit,
+            self.link_id_label,
+            self.link_id_edit,
             self.table,
             self.chart,
             self.save_button,
@@ -272,6 +320,7 @@ class CurvesWindow(QDialog):
         self._loading = True
         try:
             self.name_edit.setText("" if draft is None else draft.name)
+            self.link_id_edit.setText("" if draft is None else draft.link_id)
         finally:
             self._loading = False
         self.table_model.set_draft(draft)
@@ -306,7 +355,7 @@ class CurvesWindow(QDialog):
 
     # --------------------------------------------------------------- ações --
 
-    def _on_curve_selected(self, row: int) -> None:  # noqa: ARG002
+    def _on_curve_selected(self, *args) -> None:  # noqa: ANN002, ARG002
         if self._loading:
             return
         self._load_selected()
@@ -317,7 +366,7 @@ class CurvesWindow(QDialog):
         index = self.catalog.add(CurveDraft.new(name))
         self._mark_dirty()
         self.refresh()
-        self.curve_list.setCurrentRow(index)
+        self.curve_list.setCurrentCell(index, _NAME_COLUMN)
         self._load_selected()
         self.name_edit.setFocus()
         self.name_edit.selectAll()
@@ -360,9 +409,10 @@ class CurvesWindow(QDialog):
             return
         if self.catalog.rename(row, text):
             self._mark_dirty()
-        item = self.curve_list.item(row)
+        item = self.curve_list.item(row, _NAME_COLUMN)
         if item is not None:
             item.setText(draft.name or "(sem nome)")
+            item.setToolTip(draft.name)
         # A unicidade avisa mas não bloqueia a digitação: bloquear caractere a
         # caractere impediria até trocar os nomes de duas curvas entre si.
         problem = validate_curve_name(
@@ -374,6 +424,19 @@ class CurvesWindow(QDialog):
             self._clear_status()
         else:
             self._show_error(problem)
+
+    def _on_link_id_edited(self, text: str) -> None:
+        if self._loading:
+            return
+        row = self.curve_list.currentRow()
+        draft = self._current_draft()
+        if draft is None:
+            return
+        if self.catalog.set_link_id(row, text):
+            self._mark_dirty()
+        item = self.curve_list.item(row, _ID_COLUMN)
+        if item is not None:
+            item.setText(draft.link_id)
 
     def _on_values_changed(self, *args) -> None:  # noqa: ANN002, ARG002
         self._mark_dirty()

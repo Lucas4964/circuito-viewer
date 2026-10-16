@@ -226,5 +226,50 @@ class CurvesLoadToleranceTests(unittest.TestCase):
         self.assertEqual(load_curves(self.path).curves, ())
 
 
+class CurveLinkIdTests(unittest.TestCase):
+    """O ID de vínculo (CAT_ID nas curvas do Interplan) é opcional e textual."""
+
+    def setUp(self) -> None:
+        self._directory = TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.path = Path(self._directory.name) / "curvas.json"
+
+    def _write(self, entry: dict) -> None:
+        self.path.write_text(
+            json.dumps({"version": 1, "curvas": [entry]}), encoding="utf-8"
+        )
+
+    def test_round_trip_preserves_the_link_id(self) -> None:
+        original = (Curve("a", "Residencial - Dia útil", _values(), "2"),)
+        save_curves(original, self.path)
+        self.assertEqual(load_curves(self.path).curves, original)
+
+    def test_curves_without_link_id_keep_the_old_format(self) -> None:
+        save_curves((Curve("a", "X", _values()),), self.path)
+        entry = json.loads(self.path.read_text(encoding="utf-8"))["curvas"][0]
+        self.assertNotIn("id_vinculo", entry)
+        self.assertEqual(load_curves(self.path).curves[0].link_id, "")
+
+    def test_numeric_link_id_is_read_as_text(self) -> None:
+        self._write({"id": "a", "id_vinculo": 387, "nome": "X", "valores": list(_values())})
+        self.assertEqual(load_curves(self.path).curves[0].link_id, "387")
+
+    def test_invalid_link_id_is_dropped_but_keeps_the_curve(self) -> None:
+        self._write({"id": "a", "id_vinculo": [1], "nome": "X", "valores": list(_values())})
+        curves = load_curves(self.path).curves
+        self.assertEqual(len(curves), 1)
+        self.assertEqual(curves[0].link_id, "")
+
+    def test_link_id_does_not_need_to_be_unique(self) -> None:
+        original = (
+            Curve("a", "Categoria - Dia útil", _values(), "2"),
+            Curve("b", "Categoria - Sábado", _values(1.0), "2"),
+        )
+        save_curves(original, self.path)
+        result = load_curves(self.path)
+        self.assertIsNone(result.issue)
+        self.assertEqual(result.curves, original)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -179,6 +179,7 @@ from .csv_import import (
 from .curvas import (
     CURVE_DISPLAY_DECIMALS,
     HOURLY_CURVE_POINT_COUNT,
+    MAX_CURVE_LINK_ID_LENGTH,
     MAX_CURVE_NAME_LENGTH,
     Curve,
     CurveCatalog,
@@ -508,6 +509,7 @@ __all__ = [
     "detect_coordinate_scale",
     "HOURLY_CURVE_POINT_COUNT",
     "load_curves",
+    "MAX_CURVE_LINK_ID_LENGTH",
     "MAX_CURVE_NAME_LENGTH",
     "new_curve_id",
     "save_curves",

@@ -18,6 +18,12 @@ pode estar incompleta — o usuário preenche as 24 horas aos poucos —, mas um
 curva gravada nunca pode. Separar os dois tipos faz o compilador de invariantes
 trabalhar a nosso favor: tudo que é :class:`Curve` já passou pela validação, e
 o momento da conversão (``to_curve``) é exatamente o momento de salvar.
+
+**O que é o ``link_id``.** Um identificador de fora do programa, para vínculos e
+mapas: nas curvas típicas do Interplan é o ``CAT_ID`` da categoria, o mesmo
+número que o ``CURVA_ID`` das cargas e geradores da rede referencia. Não é
+único — as curvas de dia útil, sábado, domingo e média de uma categoria
+compartilham o mesmo — e por isso não substitui o ``curve_id``.
 """
 
 from __future__ import annotations
@@ -41,6 +47,9 @@ HOURLY_CURVE_POINT_COUNT = 24
 # janela sem elipse e ainda descreve a curva. O saneamento para a exportação
 # (acentos, pontos) é problema de ``sanitize_dss_name``, no momento de exportar.
 MAX_CURVE_NAME_LENGTH = 60
+
+# O ID de vínculo é um código curto vindo de outro sistema, não um rótulo.
+MAX_CURVE_LINK_ID_LENGTH = 30
 
 # Arredondamento **só de exibição**, como em ``load_pattern_table``: o valor
 # guardado continua com a precisão que o usuário digitou.
@@ -75,6 +84,7 @@ class Curve:
     curve_id: str
     name: str
     values: tuple[float, ...]
+    link_id: str = ""
 
     def __post_init__(self) -> None:
         if not str(self.curve_id).strip():
@@ -109,6 +119,7 @@ class CurveDraft:
     values: list[float | None] = field(
         default_factory=lambda: [None] * HOURLY_CURVE_POINT_COUNT
     )
+    link_id: str = ""
 
     def __post_init__(self) -> None:
         if len(self.values) != HOURLY_CURVE_POINT_COUNT:
@@ -126,7 +137,7 @@ class CurveDraft:
     def from_curve(cls, curve: Curve) -> CurveDraft:
         """Rascunho editável a partir de uma curva gravada."""
 
-        return cls(curve.curve_id, curve.name, list(curve.values))
+        return cls(curve.curve_id, curve.name, list(curve.values), curve.link_id)
 
     def set_value(self, hour_index: int, value: float | None) -> bool:
         """Grava (ou apaga, com ``None``) o valor de uma hora 0-based.
@@ -165,7 +176,12 @@ class CurveDraft:
             raise ValueError(
                 f"Faltam valores nas horas {_join_hours(missing)}."
             )
-        return Curve(self.curve_id, _clean_name(self.name), tuple(self.values))
+        return Curve(
+            self.curve_id,
+            _clean_name(self.name),
+            tuple(self.values),
+            _clean_name(self.link_id),
+        )
 
 
 def _join_hours(hours: Sequence[int]) -> str:
@@ -252,6 +268,15 @@ class CurveCatalog:
         if self._drafts[index].name == cleaned:
             return False
         self._drafts[index].name = cleaned
+        return True
+
+    def set_link_id(self, index: int, link_id: str) -> bool:
+        """Troca o ID de vínculo; devolve ``False`` quando já era esse."""
+
+        cleaned = _clean_name(link_id)
+        if self._drafts[index].link_id == cleaned:
+            return False
+        self._drafts[index].link_id = cleaned
         return True
 
     def to_curves(self) -> tuple[Curve, ...]:

@@ -115,8 +115,15 @@ def _curve_from_entry(entry: object) -> Curve | None:
     # Identificador ausente é migração silenciosa, não erro: um arquivo escrito
     # à mão não tem por que inventar um uuid.
     curve_id = raw_id.strip() if isinstance(raw_id, str) and raw_id.strip() else new_curve_id()
+    # O ID de vínculo é opcional; número também vale, porque no banco de origem
+    # ele é inteiro e um arquivo editado à mão pode trazê-lo sem aspas.
+    raw_link = entry.get("id_vinculo")
+    if isinstance(raw_link, bool) or not isinstance(raw_link, (str, int)):
+        link_id = ""
+    else:
+        link_id = " ".join(str(raw_link).split())
     try:
-        return Curve(curve_id, name.strip(), tuple(values))
+        return Curve(curve_id, name.strip(), tuple(values), link_id)
     except ValueError:
         return None
 
@@ -211,6 +218,7 @@ def save_curves(
         "curvas": [
             {
                 "id": curve.curve_id,
+                **({"id_vinculo": curve.link_id} if curve.link_id else {}),
                 "nome": curve.name,
                 "valores": list(curve.values),
             }

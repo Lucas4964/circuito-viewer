@@ -1683,6 +1683,14 @@ Cada curva guarda um identificador interno que a renomeação não altera. A
 atualização dos geradores registra esse identificador no resultado da sessão,
 sem modificar o `CURVA_ID` que veio de `MT_GERADOR_CONS`.
 
+**ID de vínculo.** A lista de curvas tem duas colunas, **ID** e **Nome**, e o
+campo **ID** ao lado do nome edita a curva selecionada. É um identificador de
+fora do programa, para vínculos e mapas, gravado como `id_vinculo` no JSON (e
+omitido quando vazio). Nas curvas típicas do Interplan é o `CAT_ID` da
+categoria, o número que o `CURVA_ID` das cargas e geradores da rede referencia;
+por isso não precisa ser único — dia útil, sábado, domingo e média de uma
+categoria compartilham o mesmo ID.
+
 ## Atualização dos geradores
 
 Com geradores, circuitos, `fases2.json` válido e ao menos uma curva salva, o
