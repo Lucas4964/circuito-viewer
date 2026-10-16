@@ -100,6 +100,7 @@ CIRCUITO_VIEWER/
 │   ├── calculation_levels.py  # NÚCLEO: agenda imutável + rascunhos editáveis
 │   ├── calculation_levels_store.py # leitura/gravação atômica de patamares.json
 │   ├── generator_update.py    # cálculo derivado das demandas dos geradores
+│   ├── energy_demand.py       # NÚCLEO: D e G de cada UC pela energia (modo Energia)
 │   │
 │   ├── opendss_export.py      # geração dos .dss de rede e de cargas
 │   ├── opendss_settings.py    # modelo das cargas (potência constante/ZIPV) e Vminpu/Vmaxpu
@@ -234,6 +235,7 @@ Exceções conhecidas e deliberadas:
 | `curvas_mdb.py` | Ler o `Curvas.mdb` pelo protocolo `AccessDatabase` (curvas de id fixo `interplan-cat<N>-p<P>`, `link_id` = `CAT_ID`, período) e juntar o resultado ao que está gravado | Qt, abrir conexão (o worker abre) |
 | `calculation_levels.py` | Agenda imutável dos NPAT 0–3, rascunhos isolados e validação do ciclo contínuo de 24 horas | I/O, Qt, executar cálculos |
 | `calculation_levels_store.py` | Ler/gravar `dados/patamares.json` atomicamente; arquivo inválido recua integralmente aos padrões | Qt |
+| `energy_demand.py` | Porta do `calcular_dg.py`: escolha da curva de cada UC (faixa por classe, sorteio determinístico do Interplan por ponto de serviço, A4 iterativo, GD por `CURVA_ID`/`TIPOGD`), D e G que fecham consumo e injeção do mês, IP por `DEMANDA × NLAMP`, e P/Q/G nos quatro patamares pela `HORARIO_REF` | Qt, I/O, exportar |
 | `generator_update.py` | Resolver circuito/fases, aplicar curva e agenda e produzir demandas e potências por fase imutáveis | Qt, I/O, mutar geradores/curvas/patamares |
 | `circuit_colors.py` | Gerar paleta contrastante em OKLCH; normalizar `#RRGGBB` | Aplicar cores |
 | `search.py` | Índice por `CODIGO` e índice por todas as colunas; consultas canceláveis | Widgets |
@@ -3418,6 +3420,7 @@ lido por uma build anterior.
 | `test_curvas_store.py` | ida e volta preservando id/acentos/negativos, criação do diretório, regravação por cima (regressão de `os.rename` no Windows), nenhum `.tmp` remanescente, e a tolerância de leitura: JSON quebrado, raiz inesperada, entrada inválida entre válidas, versão mais nova, ids/nomes repetidos, id ausente gerado e chaves desconhecidas ignoradas |
 | `test_curvas_table.py` | coluna "Hora" sintética e não editável, `EditRole` sem truncar a precisão, `setData` com ponto e vírgula, texto recusado sem apagar o valor anterior, célula esvaziada, colagem com âncora, truncamento na hora 24 e a **regressão de alinhamento** (um texto não numérico no meio não desloca as horas seguintes) |
 | `test_curvas_categorias.py` · `test_curvas_mdb.py` | faixa `[MIN, MAX)` com limites abertos, validação da categoria, ordem numérica de `CAT_ID`; leitura do banco falso (ids, nomes, período, `MEDIA_P`, categorias, `FAT_POT`), categoria sem 24 pontos, curva com ponto faltando, banco antigo sem `PERIODO`/`TIPO`, nome cortado no limite, descrição repetida, tabela/coluna ausente, cancelamento; mesclagem (substitui no lugar, sufixo na do banco, categorias por id) e o worker (senha pedida, senha fora da mensagem, cancelado em silêncio) |
+| `test_energy_demand.py` | gerador do Delphi, faixa sem sorteio, sorteio pela `PART_MERC`, só curvas médias normalizadas pelo pico, A4 arredondado, GD por id ou tipo, bissecção fechando as duas energias, os status (ajustado, só geração, autoconsumo total, sem energia, sem curva, inativo, IP), patamares pela `HORARIO_REF` com a reativa do `FAT_POT`, e a G repartida entre geradores. A fidelidade ao script é conferida por `benchmarks/validate_energy_demand.py` (231003: 1.594 UCs sem nenhuma diferença) |
 | `test_transformer_consumers.py` | vínculo de UCs, IP e GD à CARGA pela ET e pelo EP, trafo da UTC, EP pela `CARGA`, ET+EP num trafo só (divergência avisada, vale a ET), soma de duas ETs, ET sem UTC, ids com casa decimal, órfãos e repetidos; importação pelo banco falso (banco sem `BT_ET` em silêncio, coluna ausente em `consumers_error`, tabela ausente como nota, nada no relatório da importação), recorte, composição de duas fontes com aliases e com fonte sem UCs, e a ida e volta pelo cadastro do projeto |
 | `test_curvas_ui.py` | estado vazio, criação/renomeação/exclusão com confirmação, recusa de salvar incompleta sem criar o arquivo, gravação e `curvesSaved`, fechar com Salvar/Descartar/Cancelar (Descartar relê o disco), gráfico acompanhando a edição, os casos-limite de pintura (vazio, todos iguais, todos zero, faixa negativa, lacunas) e a entrada de menu **Configurações → Curvas…** |
 | `test_calculation_levels.py` · `test_calculation_levels_store.py` | padrões, invariantes do ciclo de 24 horas, referência nos limites, isolamento do rascunho, round-trip JSON, fallback integral e gravação atômica |
