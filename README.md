@@ -30,6 +30,12 @@ de instalação por `python -m pip install -e ".[opendss]"`. Para a
 `".[mdb]"`; para os dois, `".[opendss,mdb]"`. Sem esses extras a aplicação
 funciona por inteiro, apenas com os itens correspondentes desabilitados.
 
+**Se o programa fechar ou travar.** Exceções, falhas nativas e travamentos ficam
+em `crash.log`, na pasta `%LOCALAPPDATA%\Circuit Viewer\Visualizador de Circuitos
+Elétricos`. Num travamento (janela "Não está respondendo"), o programa anota a
+hora e, uns 20 s depois, grava onde cada thread estava. Esse trecho mostra a
+causa, então espere esse tempo antes de fechar a janela.
+
 Ao importar, informe a zona e o hemisfério UTM. X e Y aceitam ponto ou vírgula
 decimal. As colunas obrigatórias podem aparecer em qualquer ordem e todas as
 colunas adicionais são ignoradas. Linhas inválidas são ignoradas e apresentadas

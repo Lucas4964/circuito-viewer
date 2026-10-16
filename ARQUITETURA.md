@@ -1052,8 +1052,23 @@ python -m circuit_viewer
        │    ├─ GlobalSearchIndex + SearchPalette + PhaseLegend
        │    ├─ modelos/janelas de tabela (circuitos, sobreposições, ramais)
        │    └─ ações, menus, toolbar, dock de detalhes, status bar
-       └─ window.showMaximized(); app.exec()
+       ├─ window.showMaximized()
+       ├─ _start_freeze_watchdog(app)  (vigia de travamento → crash.log)
+       └─ app.exec()
 ```
+
+**Registro de travamentos.** O `crash.log`, na pasta de dados do app, já
+recebia exceções de slot e falhas nativas pelo `faulthandler`. Um travamento
+não gera nem uma nem outra, então o vigia cobre esse caso: um `QTimer` marca a
+pulsação da interface a cada segundo, e uma thread vigia rearma o
+`faulthandler.dump_traceback_later` enquanto a pulsação está em dia. Se a
+interface ficar 5 s sem pulsar, o vigia anota "Interface sem resposta desde…"
+e para de rearmar. No prazo de 20 s, a thread em C do faulthandler grava a
+pilha de todas as threads, sem precisar do GIL. Quando a interface volta, o
+vigia anota quanto tempo ela ficou parada. Quem rearma é a vigia, e não a
+interface, porque cancelar o prazo anterior espera a thread do faulthandler
+terminar. Uma volta atrasada da própria vigia (suspensão do Windows ou GIL
+preso) não conta como travamento.
 
 `ItemIndexMethod.NoIndex` é deliberado: a cena tem poucos itens de fato
 (agregados + no máximo ~1.000 itens materializados por camada), e o índice BSP
@@ -3469,6 +3484,7 @@ lido por uma build anterior.
 | `test_curvas_store.py` | ida e volta preservando id/acentos/negativos, criação do diretório, regravação por cima (regressão de `os.rename` no Windows), nenhum `.tmp` remanescente, e a tolerância de leitura: JSON quebrado, raiz inesperada, entrada inválida entre válidas, versão mais nova, ids/nomes repetidos, id ausente gerado e chaves desconhecidas ignoradas |
 | `test_curvas_table.py` | coluna "Hora" sintética e não editável, `EditRole` sem truncar a precisão, `setData` com ponto e vírgula, texto recusado sem apagar o valor anterior, célula esvaziada, colagem com âncora, truncamento na hora 24 e a **regressão de alinhamento** (um texto não numérico no meio não desloca as horas seguintes) |
 | `test_curvas_categorias.py` · `test_curvas_mdb.py` | faixa `[MIN, MAX)` com limites abertos, validação da categoria, ordem numérica de `CAT_ID`; leitura do banco falso (ids, nomes, período, `MEDIA_P`, categorias, `FAT_POT`), categoria sem 24 pontos, curva com ponto faltando, banco antigo sem `PERIODO`/`TIPO`, nome cortado no limite, descrição repetida, tabela/coluna ausente, cancelamento; mesclagem (substitui no lugar, sufixo na do banco, categorias por id) e o worker (senha pedida, senha fora da mensagem, cancelado em silêncio) |
+| `test_freeze_watchdog.py` | em processo à parte: a interface parada numa espera deixa no log o aviso, a pilha de onde parou e a volta; com o GIL preso por uma chamada nativa a pilha sai do mesmo jeito; a interface saudável não escreve nada |
 | `test_transformer_consumers_window.py` · `test_load_model_mode.py` | linhas das tabelas (patamares nomeados, classe, curva, status, G repartida, sem cálculo), ordenação numérica; na janela: Energia sem UCs avisa e volta ao Interplan, cálculo feito com as curvas do diretório injetado, um símbolo de GD por trafo, o clique no agregado abrindo a página e a tabela, o painel da carga com as cargas do trafo, e o Interplan mantendo os geradores do cadastro |
 | `test_opendss_energy_export.py` | trafo ideal D-Y e split-phase, `Load` por UC na perna ou entre as pernas, GD negativa sem `-0`, `SetkVBase` depois do `calcvoltagebases`, **sem dupla contagem** (a CARGA sai do arquivo de cargas, o gerador MT sai do de geradores, um trafo só, soma dos patamares igual à das UCs), fallback ao Interplan sem tensão do secundário, `VPRIMARIO` incoerente, exportação sem `energy` idêntica à de antes, e o fluxo repassando o modelo |
 | `test_energy_demand.py` | gerador do Delphi, faixa sem sorteio, sorteio pela `PART_MERC`, só curvas médias normalizadas pelo pico, A4 arredondado, GD por id ou tipo, bissecção fechando as duas energias, os status (ajustado, só geração, autoconsumo total, sem energia, sem curva, inativo, IP), patamares pela `HORARIO_REF` com a reativa do `FAT_POT`, e a G repartida entre geradores. A fidelidade ao script é conferida por `benchmarks/validate_energy_demand.py` (231003: 1.594 UCs sem nenhuma diferença) |
