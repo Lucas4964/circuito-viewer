@@ -44,6 +44,11 @@ if TYPE_CHECKING:
     from .network_registry import NetworkRegistry
 
 from .allocation import TransformerAllocationModel
+from .transformer_consumers import (
+    ConsumerDataIssue,
+    TransformerConsumersModel,
+    TransformerConsumersRecord,
+)
 from .circuit_calculation_levels import CircuitCalculationLevelsModel
 from .dss_names import sanitize_dss_name
 from .model import (
@@ -203,6 +208,7 @@ class SourceDataset:
     catalog: CircuitCatalogModel | None = None
     circuit_levels: CircuitCalculationLevelsModel | None = None
     allocations: TransformerAllocationModel | None = None
+    consumers: TransformerConsumersModel | None = None
     #: Vazio significa "o banco inteiro", não "nenhum circuito".
     chosen_circuit_ids: tuple[str, ...] = ()
     registry: NetworkRegistry | None = field(default=None, repr=False, compare=False)
@@ -390,6 +396,7 @@ class ComposedModels:
     catalog: CircuitCatalogModel | None = None
     circuit_levels: CircuitCalculationLevelsModel | None = None
     allocations: TransformerAllocationModel | None = None
+    consumers: TransformerConsumersModel | None = None
     provenance: ComposedProvenance = field(default_factory=ComposedProvenance)
     report: CompositionReport = field(default_factory=CompositionReport)
 
@@ -795,6 +802,22 @@ def restrict_to_circuits(
         )
     updates["allocations"] = new_allocations
 
+    new_consumers = None
+    if dataset.consumers is not None and new_loads is not None:
+        kept_load_ids = frozenset(new_loads.load_ids)
+        new_consumers = TransformerConsumersModel(
+            loads=new_loads,
+            records=tuple(dataset.consumers.record(int(i)) for i in kept_loads),
+            issues=tuple(
+                issue
+                for issue in dataset.consumers.issues
+                if issue.load_id is None or issue.load_id in kept_load_ids
+            ),
+            omitted_issues=dataset.consumers.omitted_issues,
+            source_path=dataset.consumers.source_path,
+        )
+    updates["consumers"] = new_consumers
+
     new_catalog = None
     if new_segments is not None:
         definitions = tuple(catalog.definition(index) for index in circuit_indices)
@@ -1165,6 +1188,7 @@ def compose(
             catalog=dataset.catalog,
             circuit_levels=dataset.circuit_levels,
             allocations=dataset.allocations,
+            consumers=dataset.consumers,
             provenance=_single_source_provenance(dataset),
             report=CompositionReport(notes=dataset.diagnostics),
         )
@@ -1318,6 +1342,7 @@ def compose(
     loads = composed.get("loads")
     patterns = _merged_patterns(values, loads, alias_plans["loads"], counts)
     allocations = _merged_allocations(values, loads, alias_plans["loads"], counts)
+    consumers = _merged_consumers(values, loads, alias_plans["loads"], counts)
     catalog, notes = _merged_catalog(
         values, composed, offsets, counts, alias_plans, circuit_plan
     )
@@ -1387,6 +1412,7 @@ def compose(
         catalog=catalog,
         circuit_levels=circuit_levels,
         allocations=allocations,
+        consumers=consumers,
         provenance=provenance,
         report=report,
     )
@@ -1480,6 +1506,60 @@ def _merged_allocations(
         phase_configuration=contributors[0].allocations.phase_configuration,
         records=tuple(records),
         issues=issues,
+        source_path=None,
+    )
+
+
+def _merged_consumers(
+    values: Sequence[SourceDataset],
+    loads: LoadModel | None,
+    load_aliases: _AliasPlan,
+    counts: Mapping[str, Sequence[int]],
+) -> TransformerConsumersModel | None:
+    """Compõe as UCs mesmo quando só parte das fontes as trouxe.
+
+    Ao contrário das alocações, aqui a lacuna tem um significado seguro: uma
+    CARGA sem dados de UC segue no modelo do Interplan, exatamente como uma
+    CARGA sem ET nem EP. O registro vazio diz isso, e uma nota diz de quem é.
+    """
+
+    contributors = [
+        (ordinal, dataset)
+        for ordinal, dataset in enumerate(values)
+        if counts["loads"][ordinal]
+    ]
+    if loads is None or not any(dataset.consumers is not None for _, dataset in contributors):
+        return None
+    records: list[TransformerConsumersRecord] = []
+    issues: list[ConsumerDataIssue] = []
+    omitted = 0
+    for ordinal, dataset in contributors:
+        aliases = load_aliases.for_source(ordinal)
+        if dataset.consumers is None:
+            records.extend(
+                TransformerConsumersRecord(aliases.get(load_id, load_id))
+                for load_id in dataset.loads.load_ids
+            )
+            issues.append(
+                ConsumerDataIssue(
+                    dataset.name,
+                    "fonte sem dados de unidades consumidoras; as cargas dela "
+                    "seguem no modelo do Interplan.",
+                )
+            )
+            continue
+        for index in range(len(dataset.loads)):
+            record = dataset.consumers.record(index)
+            if aliases and record.load_id in aliases:
+                record = replace(record, load_id=aliases[record.load_id])
+            records.append(record)
+        issues.extend(_aliased_issues(dataset.consumers.issues, aliases))
+        omitted += dataset.consumers.omitted_issues
+    return TransformerConsumersModel(
+        loads=loads,
+        records=tuple(records),
+        issues=tuple(issues),
+        omitted_issues=omitted,
         source_path=None,
     )
 

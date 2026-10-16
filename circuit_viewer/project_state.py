@@ -146,7 +146,8 @@ def _dependencies(key, row):
                      for column, target in entity.index_columns.items())
     if key.entity == "circuits":
         return (EquipmentKey(key.network_id, "bars", values["root_bar_id"]),)
-    parent = {"patterns": "loads", "allocations": "loads", "circuit_levels": "circuits"}.get(key.entity)
+    parent = {"patterns": "loads", "allocations": "loads", "consumers": "loads",
+              "circuit_levels": "circuits"}.get(key.entity)
     return (EquipmentKey(key.network_id, parent, key.native_id),) if parent else ()
 
 

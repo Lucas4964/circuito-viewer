@@ -87,6 +87,7 @@ CIRCUITO_VIEWER/
 │   ├── mdb_engine.py          # único acesso ao pyodbc (opcional) + conversão
 │   ├── mdb_mapping.py         # tabela/coluna → entidade, a partir do JSON
 │   ├── mdb_import.py          # importação encadeada das dez entidades lógicas
+│   ├── transformer_consumers.py # NÚCLEO: UCs, IP e GD de cada CARGA (modo Energia)
 │   ├── source_composition.py  # NÚCLEO: compõe N fontes numa cadeia só
 │   ├── dss_names.py           # NÚCLEO: saneamento de nomes do OpenDSS
 │   ├── circuit_level_import.py # parser CSV/MDB dos patamares por circuito
@@ -229,6 +230,7 @@ Exceções conhecidas e deliberadas:
 | `curvas.py` | `Curve`/`CurveDraft`/`CurveCatalog`, validação de nome e das 24 horas, interpretação do bloco colado | I/O, Qt |
 | `curvas_store.py` | Ler/gravar `dados/curvas.json` e `dados/categorias_curvas.json` de forma atômica e tolerante a arquivo corrompido | Qt, validar regras de negócio |
 | `curvas_categorias.py` | `CurveCategory` de `CURVAS_CATEGORIA` (classe, faixa `MIN`–`MAX` com limite negativo aberto, `PART_MERC`, tipo, `FAT_POT`) e a ordem do Interplan por `CAT_ID` numérico | I/O, Qt |
+| `transformer_consumers.py` | Ligar cada UC da BT e da MT, ponto de IP e GD à sua CARGA (`BT_CONS.ET_ID → BT_ET.MT_CAR_ID`, `MT_CONS.CARGA_ID`) e montar o trafo de cada uma (`BT_UTC` na ET; `SNOM`/`VLINHASEC` da `CARGA` no EP; ET e EP na mesma CARGA são um trafo só) | Qt, abrir o banco, somar à carga do `MODELO_CARGA` |
 | `curvas_mdb.py` | Ler o `Curvas.mdb` pelo protocolo `AccessDatabase` (curvas de id fixo `interplan-cat<N>-p<P>`, `link_id` = `CAT_ID`, período) e juntar o resultado ao que está gravado | Qt, abrir conexão (o worker abre) |
 | `calculation_levels.py` | Agenda imutável dos NPAT 0–3, rascunhos isolados e validação do ciclo contínuo de 24 horas | I/O, Qt, executar cálculos |
 | `calculation_levels_store.py` | Ler/gravar `dados/patamares.json` atomicamente; arquivo inválido recua integralmente aos padrões | Qt |
@@ -916,6 +918,25 @@ Na chegada, `_on_mdb_import_finished` instala os modelos pelos **setters
 existentes** (`_set_line_model`, `_set_switch_model`, `_set_circuit_catalog`…),
 na mesma ordem. Nenhuma cascata nova é escrita: é o que mantém as invalidações
 descritas abaixo exatamente como estão.
+
+### UCs por trafo (modo de cargas Energia)
+
+Logo depois das alocações, `_load_transformer_consumers` lê `BT_ET`, `BT_UTC`,
+`BT_CONS`, `MT_CONS`, `BT_IP` e a GD de BT e de MT e entrega um
+`TransformerConsumersModel`: um registro por CARGA, na ordem do `LoadModel`, com
+o trafo, as UCs e os geradores. É `BT_ET` que marca o banco estendido; sem ela o
+resultado é `None`, em silêncio. Tabela ausente vale vazia, com nota; coluna
+obrigatória ausente vira `consumers_error`.
+
+O modelo segue o mesmo caminho das alocações — `SourceDataset`, recorte por
+`kept_loads`, `ComposedModels`, captura e reconstrução no `NetworkRegistry` (grupo
+`consumers`, filho de `loads`) —, com uma diferença de propósito: a composição
+aceita fonte sem UCs. Uma CARGA sem dados de UC segue no modelo do Interplan,
+exatamente como uma CARGA sem ET nem EP, então o registro vazio não mente.
+
+As ocorrências e o `consumers_error` ficam **fora** do relatório da importação e
+de `has_warnings`: só interessam a quem escolhe o modo Energia, e o modo
+Interplan não deve ganhar aviso por dados que não usa.
 
 ### Substituição em cascata
 
@@ -3397,6 +3418,7 @@ lido por uma build anterior.
 | `test_curvas_store.py` | ida e volta preservando id/acentos/negativos, criação do diretório, regravação por cima (regressão de `os.rename` no Windows), nenhum `.tmp` remanescente, e a tolerância de leitura: JSON quebrado, raiz inesperada, entrada inválida entre válidas, versão mais nova, ids/nomes repetidos, id ausente gerado e chaves desconhecidas ignoradas |
 | `test_curvas_table.py` | coluna "Hora" sintética e não editável, `EditRole` sem truncar a precisão, `setData` com ponto e vírgula, texto recusado sem apagar o valor anterior, célula esvaziada, colagem com âncora, truncamento na hora 24 e a **regressão de alinhamento** (um texto não numérico no meio não desloca as horas seguintes) |
 | `test_curvas_categorias.py` · `test_curvas_mdb.py` | faixa `[MIN, MAX)` com limites abertos, validação da categoria, ordem numérica de `CAT_ID`; leitura do banco falso (ids, nomes, período, `MEDIA_P`, categorias, `FAT_POT`), categoria sem 24 pontos, curva com ponto faltando, banco antigo sem `PERIODO`/`TIPO`, nome cortado no limite, descrição repetida, tabela/coluna ausente, cancelamento; mesclagem (substitui no lugar, sufixo na do banco, categorias por id) e o worker (senha pedida, senha fora da mensagem, cancelado em silêncio) |
+| `test_transformer_consumers.py` | vínculo de UCs, IP e GD à CARGA pela ET e pelo EP, trafo da UTC, EP pela `CARGA`, ET+EP num trafo só (divergência avisada, vale a ET), soma de duas ETs, ET sem UTC, ids com casa decimal, órfãos e repetidos; importação pelo banco falso (banco sem `BT_ET` em silêncio, coluna ausente em `consumers_error`, tabela ausente como nota, nada no relatório da importação), recorte, composição de duas fontes com aliases e com fonte sem UCs, e a ida e volta pelo cadastro do projeto |
 | `test_curvas_ui.py` | estado vazio, criação/renomeação/exclusão com confirmação, recusa de salvar incompleta sem criar o arquivo, gravação e `curvesSaved`, fechar com Salvar/Descartar/Cancelar (Descartar relê o disco), gráfico acompanhando a edição, os casos-limite de pintura (vazio, todos iguais, todos zero, faixa negativa, lacunas) e a entrada de menu **Configurações → Curvas…** |
 | `test_calculation_levels.py` · `test_calculation_levels_store.py` | padrões, invariantes do ciclo de 24 horas, referência nos limites, isolamento do rascunho, round-trip JSON, fallback integral e gravação atômica |
 | `test_patamares_ui.py` | cinco colunas totalmente editáveis, limites dos delegates, estado sujo, validação conjunta, salvamento, ordenação, descarte/cancelamento, menu e persistência entre janelas principais |

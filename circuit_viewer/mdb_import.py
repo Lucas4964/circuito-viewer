@@ -54,6 +54,24 @@ from .generator_import import GeneratorCsvResult, parse_generator_rows
 from .load_import import LoadCsvResult, parse_load_rows
 from .consumer_counts import read_consumer_counts
 from .load_pattern_import import LoadPatternCsvResult, parse_load_pattern_rows
+from .transformer_consumers import (
+    BT_CONSUMER_COLUMNS,
+    BT_CONSUMER_OPTIONAL_COLUMNS,
+    BT_GENERATOR_COLUMNS,
+    GENERATOR_OPTIONAL_COLUMNS,
+    MT_CONSUMER_COLUMNS,
+    MT_CONSUMER_OPTIONAL_COLUMNS,
+    MT_GENERATOR_COLUMNS,
+    PUBLIC_LIGHTING_COLUMNS,
+    PUBLIC_LIGHTING_OPTIONAL_COLUMNS,
+    TRANSFORMER_COLUMNS,
+    TRANSFORMER_OPTIONAL_COLUMNS,
+    TRANSFORMER_UNIT_COLUMNS,
+    TRANSFORMER_UNIT_OPTIONAL_COLUMNS,
+    ConsumerDataIssue,
+    TransformerConsumersModel,
+    build_transformer_consumers,
+)
 from .mdb_engine import AccessDatabase
 from .mdb_mapping import (
     ENTITY_LABELS,
@@ -148,6 +166,11 @@ class MdbImportResult:
     circuit_levels: CircuitLevelCsvResult | None = None
     allocations: TransformerAllocationModel | None = None
     allocation_error: str | None = None
+    # UCs por trafo, do modo de cargas Energia. Ficam fora de has_warnings e
+    # do relatório da importação: só interessam a quem escolher o modo Energia,
+    # e é na escolha que as ocorrências aparecem.
+    consumers: TransformerConsumersModel | None = None
+    consumers_error: str | None = None
     outcomes: tuple[MdbEntityOutcome, ...] = ()
     applied_scale: float = 1.0
     empty_entities: tuple[str, ...] = ()
@@ -254,6 +277,7 @@ def dataset_from_result(
         catalog=model(result.circuits),
         circuit_levels=model(result.circuit_levels),
         allocations=result.allocations,
+        consumers=result.consumers,
         provided_entities=frozenset(entities[name] for name in (*result.imported_entities, *result.empty_entities)),
         source_tables=tuple((entities[item.entity], item.table) for item in result.outcomes if item.table),
         omitted_fields=result.omitted_fields,
@@ -561,6 +585,21 @@ def load_database(
         except Exception as exc:  # noqa: BLE001 — agregado não derruba a rede
             allocation_error = str(exc)
 
+    consumers = None
+    consumers_error = None
+    if results.get("cargas") is not None:
+        try:
+            consumers = _load_transformer_consumers(
+                database,
+                results["cargas"].model,
+                source_path=source_path,
+                cancel_event=cancel_event,
+            )
+        except InterruptedError:
+            raise CsvImportCancelled("Importação cancelada.")
+        except Exception as exc:  # noqa: BLE001 — as UCs não derrubam a rede
+            consumers_error = str(exc)
+
     empty_entities = []
     for entity in wanted:
         target = plan.get(entity)
@@ -606,6 +645,8 @@ def load_database(
         circuit_levels=results.get("patamares_circuitos"),
         allocations=allocations,
         allocation_error=allocation_error,
+        consumers=consumers,
+        consumers_error=consumers_error,
         outcomes=tuple(outcomes),
         applied_scale=scale,
         empty_entities=tuple(empty_entities),
@@ -921,6 +962,80 @@ def list_circuits(
         if diagnostics is not None:
             diagnostics.append("Não foi possível listar os alimentadores; verifique a tabela de circuitos.")
         return ()
+
+
+# Tabelas das UCs por trafo, para o modo de cargas Energia: (tabela, colunas
+# obrigatórias, opcionais, argumento de build_transformer_consumers).
+_CONSUMER_TABLES: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
+    ("BT_ET", TRANSFORMER_COLUMNS, TRANSFORMER_OPTIONAL_COLUMNS, "transformers"),
+    ("BT_UTC", TRANSFORMER_UNIT_COLUMNS, TRANSFORMER_UNIT_OPTIONAL_COLUMNS, "transformer_units"),
+    ("BT_CONS", BT_CONSUMER_COLUMNS, BT_CONSUMER_OPTIONAL_COLUMNS, "bt_consumers"),
+    ("MT_CONS", MT_CONSUMER_COLUMNS, MT_CONSUMER_OPTIONAL_COLUMNS, "mt_consumers"),
+    ("BT_IP", PUBLIC_LIGHTING_COLUMNS, PUBLIC_LIGHTING_OPTIONAL_COLUMNS, "public_lighting"),
+    ("BT_GERADOR_CONS", BT_GENERATOR_COLUMNS, GENERATOR_OPTIONAL_COLUMNS, "bt_generators"),
+    ("MT_GERADOR_CONS", MT_GENERATOR_COLUMNS, GENERATOR_OPTIONAL_COLUMNS, "mt_generators"),
+)
+
+
+def _load_transformer_consumers(
+    database: AccessDatabase,
+    loads,  # noqa: ANN001 — LoadModel já garantido pelo resultado de cargas
+    *,
+    source_path: str,
+    cancel_event: threading.Event | None,
+) -> TransformerConsumersModel | None:
+    """Lê as UCs, o IP e a GD de cada CARGA, para o modo de cargas Energia.
+
+    É ``BT_ET`` que identifica o banco estendido, como na leitura das
+    alocações: sem ela o resultado é ``None``, em silêncio — o modo Interplan
+    não precisa de nada disto e não deve ganhar aviso por isso. Com ela, uma
+    tabela ausente vale vazia (banco sem iluminação pública ou sem GD é um
+    banco válido), com uma nota no relatório; já uma coluna obrigatória
+    ausente numa tabela presente levanta, porque a tabela pela metade daria
+    UCs sem consumo ou sem trafo.
+    """
+
+    tables = {name.casefold(): name for name in database.tables()}
+    if "bt_et" not in tables:
+        return None
+    arguments: dict[str, list[dict[str, str]]] = {}
+    labels: dict[str, str] = {}
+    notes: list[ConsumerDataIssue] = []
+    for canonical, required, optional, argument in _CONSUMER_TABLES:
+        actual = tables.get(canonical.casefold())
+        if actual is None:
+            arguments[argument] = []
+            notes.append(
+                ConsumerDataIssue(
+                    source_label(source_path, canonical),
+                    "tabela ausente; tratada como vazia.",
+                )
+            )
+            continue
+        by_name = {column.casefold(): column for column in database.columns(actual)}
+        absent = [name for name in required if name.casefold() not in by_name]
+        if absent:
+            raise ValueError(
+                f"{canonical} sem as colunas obrigatórias: {', '.join(absent)}."
+            )
+        logical = (*required, *(name for name in optional if name.casefold() in by_name))
+        projected = tuple(by_name[name.casefold()] for name in logical)
+        arguments[argument] = [
+            dict(zip(logical, row)) for row in database.iter_rows(actual, projected)
+        ]
+        labels[canonical] = source_label(source_path, actual)
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("Importação cancelada.")
+    model = build_transformer_consumers(
+        loads,
+        **arguments,
+        sources=labels,
+        source_path=source_path,
+        cancel_check=None if cancel_event is None else cancel_event.is_set,
+    )
+    if not notes:
+        return model
+    return replace(model, issues=(*notes, *model.issues))
 
 
 def _load_transformer_allocations(

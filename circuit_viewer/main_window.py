@@ -150,6 +150,7 @@ from .graphics import (
 from .generator_import import GeneratorCsvResult
 from .load_import import LoadCsvResult
 from .load_model_mode import LoadModelMode, LoadModelModeDialog
+from .transformer_consumers import TransformerConsumersModel
 from .load_pattern_import import LoadPatternCsvResult
 from .load_pattern_table import LoadPatternTableModel
 from .mdb_engine import (
@@ -844,6 +845,8 @@ class MainWindow(QMainWindow):
         self._line_item: LineNetworkItem | None = None
         self._load_model: LoadModel | None = None
         self._allocation_model: TransformerAllocationModel | None = None
+        # UCs, IP e GD de cada CARGA, para o modo de cargas Energia.
+        self._consumers_model: TransformerConsumersModel | None = None
         self._load_pattern_model: LoadPatternModel | None = None
         self._generator_model: GeneratorModel | None = None
         self._capacitor_model: CapacitorModel | None = None
@@ -3111,6 +3114,8 @@ class MainWindow(QMainWindow):
             self._set_capacitor_model(composed.capacitors)
         if composed.allocations is not None:
             self._set_allocation_model(composed.allocations)
+        if composed.consumers is not None:
+            self._set_consumers_model(composed.consumers)
         if composed.generators is not None:
             self._set_generator_model(composed.generators)
         if composed.patterns is not None:
@@ -3977,6 +3982,7 @@ class MainWindow(QMainWindow):
         if model is not self._load_model:
             self._set_generator_model(None)
             self._set_allocation_model(None)
+            self._set_consumers_model(None)
         if (
             self._selected_feature is not None
             and self._selected_feature.kind == "load"
@@ -4011,6 +4017,11 @@ class MainWindow(QMainWindow):
                 )
         self._allocation_model = model
         self._sync_export_availability()
+
+    def _set_consumers_model(self, model: TransformerConsumersModel | None) -> None:
+        if model is not None and model.loads is not self._load_model:
+            raise ValueError("As UCs devem pertencer às cargas exibidas.")
+        self._consumers_model = model
 
     def _set_allocation_measurements(
         self,
@@ -9641,6 +9652,7 @@ class MainWindow(QMainWindow):
         self._set_load_pattern_model(None)
         self._set_generator_model(None)
         self._set_allocation_model(None)
+        self._set_consumers_model(None)
         self._set_capacitor_model(None)
         self._set_load_model(None)
         self._set_line_model(None)

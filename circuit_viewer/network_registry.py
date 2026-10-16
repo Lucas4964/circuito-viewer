@@ -20,6 +20,7 @@ from typing import Callable, Mapping
 import numpy as np
 
 from .allocation import TransformerAllocationModel
+from .transformer_consumers import TransformerConsumersModel, TransformerConsumersRecord
 from .circuit_calculation_levels import CircuitCalculationLevelsModel
 from .model import CircuitCatalogModel, CircuitDefinition, LoadPatternModel, constructor_columns
 from .source_composition import (
@@ -144,7 +145,8 @@ class NetworkRegistry:
         """Recria referências por índices usando exclusivamente os IDs do cadastro."""
         diagnostics = []
         groups = {entity: self.entity(entity) for entity in (
-            *(item.name for item in ENTITIES), "circuits", "patterns", "allocations", "circuit_levels")}
+            *(item.name for item in ENTITIES), "circuits", "patterns", "allocations", "consumers",
+            "circuit_levels")}
         indices = {entity: {native_id: i for i, native_id in enumerate(sorted(group))}
                    for entity, group in groups.items()}
         models = {}
@@ -178,7 +180,7 @@ class NetworkRegistry:
         if definitions and models["segments"] is not None:
             catalog = CircuitCatalogModel.build(models["segments"], models["switches"], definitions,
                                                 cancel_check=cancel_check, operational=operational)
-        models.update(catalog=catalog, patterns=None, circuit_levels=None, allocations=None)
+        models.update(catalog=catalog, patterns=None, circuit_levels=None, allocations=None, consumers=None)
         loads = models["loads"]
         if loads is not None:
             patterns = [dict(groups["patterns"][key].values)["records"] if key in groups["patterns"] else None
@@ -197,6 +199,17 @@ class NetworkRegistry:
                     loads, allocations[0]["phases"], tuple(row["record"] for row in allocations),
                     tuple(dict.fromkeys(issue for row in allocations for issue in row["issues"])),
                 )
+            # As UCs aceitam lacuna: CARGA sem registro segue no modelo do Interplan.
+            consumers = [dict(groups["consumers"][key].values) if key in groups["consumers"] else None
+                         for key in loads.load_ids]
+            if any(row is not None for row in consumers):
+                models["consumers"] = TransformerConsumersModel(
+                    loads,
+                    tuple(row["record"] if row is not None else TransformerConsumersRecord(load_id)
+                          for load_id, row in zip(loads.load_ids, consumers)),
+                    tuple(dict.fromkeys(issue for row in consumers if row is not None
+                                        for issue in row["issues"])),
+                )
         if catalog is not None:
             schedules = [dict(groups["circuit_levels"][item.circuit_id].values)["schedule"]
                          if item.circuit_id in groups["circuit_levels"] else None for item in catalog.definitions]
@@ -214,7 +227,8 @@ def _capture(dataset, network_id, file, mappings, cancel_check):
     aliases = {(item.entity, item.incoming_id): item.existing_id for item in mappings}
 
     def canonical(entity, native_id):
-        entity = {"patterns": "loads", "allocations": "loads", "circuit_levels": "circuits"}.get(entity, entity)
+        entity = {"patterns": "loads", "allocations": "loads", "consumers": "loads",
+                  "circuit_levels": "circuits"}.get(entity, entity)
         return aliases.get((entity, native_id), native_id)
 
     def add(entity, native_id, values):
@@ -271,6 +285,13 @@ def _capture(dataset, network_id, file, mappings, cancel_check):
                 add("allocations", native_id, {
                     "record": replace(model.record(i), load_id=load_id),
                     "phases": model.phase_configuration,
+                    "issues": tuple(replace(issue, load_id=load_id) if issue.load_id else issue
+                                    for issue in model.issues_for_loads((native_id,), include_unattributed=True)),
+                })
+            if dataset.consumers is not None:
+                model = dataset.consumers
+                add("consumers", native_id, {
+                    "record": replace(model.record(i), load_id=load_id),
                     "issues": tuple(replace(issue, load_id=load_id) if issue.load_id else issue
                                     for issue in model.issues_for_loads((native_id,), include_unattributed=True)),
                 })
