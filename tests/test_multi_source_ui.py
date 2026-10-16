@@ -49,6 +49,30 @@ def ensure_app():  # noqa: ANN201
     return QApplication.instance() or QApplication([])
 
 
+# A janela do modelo de cargas é modal; aqui a escolha é sempre a de hoje,
+# o padrão Interplan. A janela em si é testada em ``test_load_model_mode``.
+_load_model_patch = None
+
+
+def setUpModule() -> None:  # noqa: N802
+    global _load_model_patch
+    if not PYQT_AVAILABLE:
+        return
+    from unittest import mock
+
+    from circuit_viewer.load_model_mode import LoadModelMode
+
+    _load_model_patch = mock.patch.object(
+        MainWindow, "_ask_load_model_mode", return_value=LoadModelMode.INTERPLAN
+    )
+    _load_model_patch.start()
+
+
+def tearDownModule() -> None:  # noqa: N802
+    if _load_model_patch is not None:
+        _load_model_patch.stop()
+
+
 def source_load(
     workspace: SourceWorkspace,
     *,

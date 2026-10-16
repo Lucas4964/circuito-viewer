@@ -149,6 +149,7 @@ from .graphics import (
 )
 from .generator_import import GeneratorCsvResult
 from .load_import import LoadCsvResult
+from .load_model_mode import LoadModelMode, LoadModelModeDialog
 from .load_pattern_import import LoadPatternCsvResult
 from .load_pattern_table import LoadPatternTableModel
 from .mdb_engine import (
@@ -954,6 +955,8 @@ class MainWindow(QMainWindow):
         # a thread de importação sai do caminho.
         self._pending_generator_update = False
         self._close_after_import = False
+        # Modelo de cargas escolhido na última importação de banco.
+        self._load_model_mode = LoadModelMode.INTERPLAN
         # "Executar fluxo" sem resultado vigente de geradores atualiza-os
         # primeiro; o fluxo é retomado quando a thread da atualização termina.
         self._pending_power_flow_after_generators = False
@@ -2977,6 +2980,14 @@ class MainWindow(QMainWindow):
             if isinstance(payload, MdbSourceLoad)
             else self._single_source_load(payload)
         )
+        # A escolha vem depois da leitura e antes de qualquer objeto ir para a
+        # tela: cancelar aqui descarta a importação e mantém o mapa anterior.
+        mode = self._load_model_mode
+        if load.composed is not None and load.composed.loads is not None:
+            mode = self._ask_load_model_mode()
+            if mode is None:
+                self._on_import_cancelled()
+                return
         try:
             if load.project_change is not None:
                 self._commit_project_change(load.project_change)
@@ -2985,6 +2996,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._on_import_failed(str(exc))
             return
+        self._load_model_mode = mode
         if load.composed is not None and load.composed.catalog is not None:
             self._show_circuits_window()
         if load.result is not None:
@@ -2994,6 +3006,17 @@ class MainWindow(QMainWindow):
         # O disparo real espera o teardown da thread de importação: enquanto
         # ela existe, _busy() recusa qualquer operação pesada.
         self._pending_generator_update = True
+
+    def _ask_load_model_mode(self) -> LoadModelMode | None:
+        """Pergunta o modelo de cargas; ``None`` quando o usuário cancela."""
+
+        dialog = LoadModelModeDialog(self)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            return dialog.selected_mode()
+        finally:
+            dialog.deleteLater()
 
     def _single_source_load(self, result: MdbImportResult) -> MdbSourceLoad:
         """Um ``MdbImportResult`` cru como espaço de trabalho de uma fonte só."""

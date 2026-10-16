@@ -9,6 +9,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QDialogButtonBox
 
 from circuit_viewer.main_window import MainWindow
+from circuit_viewer.load_model_mode import LoadModelMode
 from circuit_viewer.mdb_import_dialog import MdbImportDialog
 from circuit_viewer.network_registry import FileIdentity, IdentityMapping, register_import
 from circuit_viewer.network_registry_dialog import NetworkConflictDialog, NetworkMappingDialog
@@ -16,6 +17,14 @@ from circuit_viewer.source_composition import SourceWorkspace
 from circuit_viewer.workers import MdbImportWorker
 from tests.test_mdb_import import network_database
 from tests.test_source_composition import CRS, SWITCH_TYPE_TABLES, dataset
+
+
+@pytest.fixture(autouse=True)
+def answer_interplan(monkeypatch):
+    # A janela do modelo de cargas é modal; aqui a escolha é sempre a de hoje.
+    monkeypatch.setattr(
+        MainWindow, "_ask_load_model_mode", lambda self: LoadModelMode.INTERPLAN
+    )
 
 
 @pytest.fixture
