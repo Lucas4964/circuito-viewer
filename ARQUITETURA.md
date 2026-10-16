@@ -2394,6 +2394,38 @@ milhares, precisão interna completa, `UTF-8-SIG` e `CRLF`. O conteúdo inteiro 
 construído antes de criar o temporário; depois segue o mesmo contrato de
 `fsync` + `os.replace`, preservando o destino em cancelamentos e falhas.
 
+#### Modo de cargas Energia (`build_energy_export`)
+
+Com um `EnergyDemandModel` em `build_export(energy=...)`, cada CARGA que ele
+assume vira, em `trafos_energia.dss`:
+
+```
+barra MT ──[TRF-<CARGA>]── BT_<CARGA> ── Load de cada UC, ponto de IP e GD
+```
+
+- **Trafo ideal**, topologia do `agregar_trafos_dss`: D-Y de dois enrolamentos
+  quando a CARGA tem três fases; split-phase de três enrolamentos (primário
+  fase-neutro ou entre fases, secundário `BT.1.0`/`BT.0.2`) quando tem uma ou
+  duas. `%R`/X de 0,001 %, sem perdas, `ppm_antifloat=0`. O `VPRIMARIO` da UTC
+  vale quando está a menos de 15 % da tensão da ligação (é o tap); senão vale a
+  do circuito, com aviso.
+- **Barra secundária fictícia**: sem coordenada, então o mapa não muda. O
+  master recebe um `SetkVBase` por barra logo depois do `calcvoltagebases`, que
+  sem isso daria a ela a base da MT.
+- **Uma `Load` por UC**: fase-neutro em estrela, entre fases em delta,
+  trifásica equilibrada; split-phase com as pernas do `FASES_BT2`. `kW=1
+  kvar=1` e a potência dos patamares no `LoadShape`, como nas cargas do
+  Interplan. A GD é `Load` negativa com `model=1`.
+- **Sem dupla contagem**: `replaced_load_indices` tira essas CARGAs de
+  `build_load_export` (`include_load_indices`), e os geradores MT delas saem
+  de `build_generator_export` (`include_generator_indices`).
+- **Fallback**: CARGA sem UC conhecida, ou cujo trafo não dá para montar (sem
+  VNOM, fases ou tensão do secundário), segue no modelo do Interplan, com o
+  motivo no relatório.
+
+Na 231003, o primário de cada um dos 1.097 trafos difere da soma das cargas
+do seu secundário em menos de 0,6 kW somados, nos quatro patamares.
+
 ### 12.4 Fluxo de potência (`opendss_powerflow.py`, `opendss_engine.py`)
 
 **Objetivo:** resolver o fluxo de potência dos circuitos **visíveis** e devolver
@@ -3420,6 +3452,7 @@ lido por uma build anterior.
 | `test_curvas_store.py` | ida e volta preservando id/acentos/negativos, criação do diretório, regravação por cima (regressão de `os.rename` no Windows), nenhum `.tmp` remanescente, e a tolerância de leitura: JSON quebrado, raiz inesperada, entrada inválida entre válidas, versão mais nova, ids/nomes repetidos, id ausente gerado e chaves desconhecidas ignoradas |
 | `test_curvas_table.py` | coluna "Hora" sintética e não editável, `EditRole` sem truncar a precisão, `setData` com ponto e vírgula, texto recusado sem apagar o valor anterior, célula esvaziada, colagem com âncora, truncamento na hora 24 e a **regressão de alinhamento** (um texto não numérico no meio não desloca as horas seguintes) |
 | `test_curvas_categorias.py` · `test_curvas_mdb.py` | faixa `[MIN, MAX)` com limites abertos, validação da categoria, ordem numérica de `CAT_ID`; leitura do banco falso (ids, nomes, período, `MEDIA_P`, categorias, `FAT_POT`), categoria sem 24 pontos, curva com ponto faltando, banco antigo sem `PERIODO`/`TIPO`, nome cortado no limite, descrição repetida, tabela/coluna ausente, cancelamento; mesclagem (substitui no lugar, sufixo na do banco, categorias por id) e o worker (senha pedida, senha fora da mensagem, cancelado em silêncio) |
+| `test_opendss_energy_export.py` | trafo ideal D-Y e split-phase, `Load` por UC na perna ou entre as pernas, GD negativa sem `-0`, `SetkVBase` depois do `calcvoltagebases`, **sem dupla contagem** (a CARGA sai do arquivo de cargas, o gerador MT sai do de geradores, um trafo só, soma dos patamares igual à das UCs), fallback ao Interplan sem tensão do secundário, `VPRIMARIO` incoerente, exportação sem `energy` idêntica à de antes, e o fluxo repassando o modelo |
 | `test_energy_demand.py` | gerador do Delphi, faixa sem sorteio, sorteio pela `PART_MERC`, só curvas médias normalizadas pelo pico, A4 arredondado, GD por id ou tipo, bissecção fechando as duas energias, os status (ajustado, só geração, autoconsumo total, sem energia, sem curva, inativo, IP), patamares pela `HORARIO_REF` com a reativa do `FAT_POT`, e a G repartida entre geradores. A fidelidade ao script é conferida por `benchmarks/validate_energy_demand.py` (231003: 1.594 UCs sem nenhuma diferença) |
 | `test_transformer_consumers.py` | vínculo de UCs, IP e GD à CARGA pela ET e pelo EP, trafo da UTC, EP pela `CARGA`, ET+EP num trafo só (divergência avisada, vale a ET), soma de duas ETs, ET sem UTC, ids com casa decimal, órfãos e repetidos; importação pelo banco falso (banco sem `BT_ET` em silêncio, coluna ausente em `consumers_error`, tabela ausente como nota, nada no relatório da importação), recorte, composição de duas fontes com aliases e com fonte sem UCs, e a ida e volta pelo cadastro do projeto |
 | `test_curvas_ui.py` | estado vazio, criação/renomeação/exclusão com confirmação, recusa de salvar incompleta sem criar o arquivo, gravação e `curvesSaved`, fechar com Salvar/Descartar/Cancelar (Descartar relê o disco), gráfico acompanhando a edição, os casos-limite de pintura (vazio, todos iguais, todos zero, faixa negativa, lacunas) e a entrada de menu **Configurações → Curvas…** |

@@ -75,6 +75,7 @@ from .opendss_solution import (
 from .phase_config import PhaseConfiguration
 
 if TYPE_CHECKING:
+    from .energy_demand import EnergyDemandModel
     from .generator_update import GeneratorUpdateModel
 
 
@@ -1173,6 +1174,7 @@ def run_power_flow(
     library_catalog: OpenDssLibraryCatalog | None = None,
     library_mappings: OpenDssLibraryMappings | None = None,
     step_count: int = LOAD_PATTERN_COUNT,
+    energy: EnergyDemandModel | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> PowerFlowResult:
@@ -1203,6 +1205,11 @@ def run_power_flow(
     **oscila** entre as tentativas em vez de se aproximar de um valor. Por isso
     ``step_voltages`` acompanha ``unconverged`` no resultado: sem saber quanto o
     patamar afundou, os dois casos são indistinguíveis para quem lê o relatório.
+
+    ``energy`` liga o modo de cargas Energia (ver ``build_export``). As barras
+    secundárias dos trafos não são barras da aplicação: as tensões delas não vão
+    para o painel, e o ``SetkVBase`` do master dá a elas a base certa, para que
+    entrem nos extremos de tensão de cada patamar em pu verdadeiro.
     """
 
     if step_count <= 0:
@@ -1244,6 +1251,7 @@ def run_power_flow(
             # Ver o docstring de build_master_export: Compile executa o
             # arquivo, e o laço abaixo é quem resolve os patamares.
             include_solve=False,
+            energy=energy,
             cancel_check=cancel_check,
         )
 

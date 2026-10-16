@@ -35,6 +35,7 @@ from .generator_update import (
 )
 from .curvas import Curve
 from .curvas_mdb import CurveDatabaseError, read_curve_database
+from .energy_demand import EnergyDemandModel, calculate_energy_demands
 from .calculation_levels import CalculationLevelSchedule
 from .capacitor_import import load_capacitors_csv
 from .load_import import load_loads_csv
@@ -889,6 +890,7 @@ class OpenDssExportWorker(QObject):
         library_catalog: OpenDssLibraryCatalog | None = None,
         library_mappings: OpenDssLibraryMappings | None = None,
         destination_base: Path | None = None,
+        energy: EnergyDemandModel | None = None,
     ) -> None:
         super().__init__()
         self.catalog = catalog
@@ -910,6 +912,7 @@ class OpenDssExportWorker(QObject):
         self.line_parameter_mode = line_parameter_mode
         self.library_catalog = library_catalog
         self.library_mappings = library_mappings
+        self.energy = energy
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -934,6 +937,7 @@ class OpenDssExportWorker(QObject):
                 line_parameter_mode=self.line_parameter_mode,
                 library_catalog=self.library_catalog,
                 library_mappings=self.library_mappings,
+                energy=self.energy,
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
             )
@@ -1246,12 +1250,14 @@ class PowerFlowWorker(QObject):
         ),
         library_catalog: OpenDssLibraryCatalog | None = None,
         library_mappings: OpenDssLibraryMappings | None = None,
+        energy: EnergyDemandModel | None = None,
     ) -> None:
         super().__init__()
         self.catalog = catalog
         self.cables = cables
         self.phase_configuration = phase_configuration
         self.circuit_indices = tuple(circuit_indices)
+        self.energy = energy
         self.loads = loads
         self.patterns = patterns
         self.generator_updates = generator_updates
@@ -1292,6 +1298,7 @@ class PowerFlowWorker(QObject):
                     line_parameter_mode=self.line_parameter_mode,
                     library_catalog=self.library_catalog,
                     library_mappings=self.library_mappings,
+                    energy=self.energy,
                     cancel_check=self._cancel_event.is_set,
                     progress=lambda current, total: self.progress.emit(
                         current, total
