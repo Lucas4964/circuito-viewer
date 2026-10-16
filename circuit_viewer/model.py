@@ -473,7 +473,13 @@ class FeatureSelection:
     """Referência leve para um elemento selecionado em um dos modelos."""
 
     kind: Literal[
-        "bar", "segment", "load", "equivalent_load", "generator", "capacitor"
+        "bar",
+        "segment",
+        "load",
+        "equivalent_load",
+        "generator",
+        "capacitor",
+        "transformer_generation",
     ]
     index: int
 
@@ -485,6 +491,7 @@ class FeatureSelection:
             "equivalent_load",
             "generator",
             "capacitor",
+            "transformer_generation",
         }:
             raise ValueError(f"Tipo de elemento desconhecido: {self.kind}")
         if self.index < 0:

@@ -1715,6 +1715,65 @@ modo de cargas Energia usa para escolher a curva de cada consumidor.
   a média do 1, 2 e 3 ponderada pelo `FAT_NORM`, e o 2 tem mais carga que o 3
   nas categorias comerciais e industriais (sábado e domingo).
 
+## Modo de cargas Energia
+
+Depois de ler um banco, a janela **Modelo de cargas** pergunta como modelar as
+cargas. **Padrão Interplan** é o de sempre: cada `CARGA` vira `Load` na barra
+de MT com os patamares do `MODELO_CARGA`. **Energia** modela o que está atrás
+de cada trafo, como o `calcular_dg.py`:
+
+```
+barra MT ──[trafo ideal]── barra secundária fictícia ── uma carga por UC e por GD
+```
+
+**O que é preciso.** O banco com as UCs por trafo (`BT_ET`, `BT_UTC`,
+`BT_CONS`, `MT_CONS`, `BT_IP` e a GD de BT e de MT) e as curvas típicas
+importadas na janela **Curvas** ("Importar banco de curvas…"). Sem as UCs, o
+programa avisa e a rede segue no Padrão Interplan.
+
+**Como cada carga é calculada.**
+
+- **Escolha da curva**, como o Interplan:
+  - UC da BT: curva da sua classe e faixa de consumo, com o sorteio
+    determinístico entre as tipologias;
+  - UC da MT (A4): tipologia 1 da faixa em kW;
+  - GD: curva do `CURVA_ID` ou do `TIPOGD`.
+- **D e G** (demanda máxima e potência da GD) fecham o consumo e a energia
+  injetada do mês, com a curva média (`PERIODO` 4).
+- **Iluminação pública:** cada ponto vale `DEMANDA × NLAMP`, com a curva de IP.
+- **Nos quatro patamares:** P = D × curva na `HORARIO_REF` (os patamares
+  próprios do circuito ou os globais). A reativa sai do `FAT_POT` da categoria;
+  a GD tem FP 1.
+
+**O que muda na exportação e no fluxo.**
+
+- **Trafo:** cada CARGA vira um trafo ideal, sem perdas (D-Y quando tem três
+  fases, split-phase quando tem uma ou duas), com uma barra secundária
+  `BT_<CARGA>` que só existe no `.dss`. As cargas do trafo ficam em
+  `trafos_energia.dss`, uma `Load` por UC e por GD (negativa).
+- **Sem dupla contagem:** a carga agregada do `MODELO_CARGA` e os geradores de
+  MT dessas CARGAs não saem; a GD vem do cálculo.
+- **CARGA que fica no Interplan:** a CARGA sem UC cadastrada, ou cujo trafo não
+  dá para montar, segue no modelo do Interplan, com o motivo no relatório da
+  exportação.
+
+**O mapa não muda.** O símbolo da carga e o de gerador na barra de MT são o
+agregado:
+
+- **Carga:** o painel da carga diz quantas cargas estão no trafo e traz
+  **Abrir tabela de cargas…**, com uma linha por UC e ponto de IP (curva,
+  sorteio, D, status e P nos patamares).
+- **Gerador:** no modo Energia aparece um símbolo de gerador por trafo com GD.
+  O painel dele traz **Abrir tabela de GD…**, com uma linha por gerador.
+
+**Diferenças a ter em mente.**
+
+- **Sem correção de demanda:** a carga sai só da energia faturada. O
+  `MODELO_CARGA` do Interplan pode vir corrigido pela medição do alimentador,
+  então a carga na saída pode diferir.
+- **Alocação OpenDSS:** não foi adaptada ao modo Energia; ela continua usando
+  a CARGA agregada.
+
 ## Atualização dos geradores
 
 Com geradores, circuitos, `fases2.json` válido e ao menos uma curva salva, o

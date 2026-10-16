@@ -54,6 +54,7 @@ from .model import (
     SwitchModel,
 )
 from .equivalent_network import EquivalentNetworkModel
+from .transformer_consumers import TransformerGenerationModel
 from .mapa_tiles import (
     GerenciadorTiles,
     cantos_lonlat_da_faixa,
@@ -70,8 +71,15 @@ except ModuleNotFoundError:  # pragma: no cover - dependência obrigatória do p
 
 
 LoadRenderModel = (
-    LoadModel | EquivalentNetworkModel | GeneratorModel | CapacitorModel
+    LoadModel
+    | EquivalentNetworkModel
+    | GeneratorModel
+    | CapacitorModel
+    | TransformerGenerationModel
 )
+# Modelos desenhados com o símbolo de gerador: o do cadastro e o agregado por
+# trafo do modo de cargas Energia.
+_GENERATOR_RENDER_MODELS = (GeneratorModel, TransformerGenerationModel)
 
 
 POINT_DIAMETER_PX = 5.0
@@ -134,7 +142,7 @@ ROOT_BAR_RING_STEP_PX = 4.0
 
 
 def _feature_ids(model: LoadRenderModel) -> tuple[str, ...]:
-    if isinstance(model, GeneratorModel):
+    if isinstance(model, _GENERATOR_RENDER_MODELS):
         return model.generator_ids
     if isinstance(model, CapacitorModel):
         return model.capacitor_ids
@@ -204,7 +212,7 @@ def load_layout_offsets_for_models(
 
     vertical_pitch = (
         ATTACHED_VERTICAL_PITCH_PX
-        if any(isinstance(model, GeneratorModel) for model in models)
+        if any(isinstance(model, _GENERATOR_RENDER_MODELS) for model in models)
         else LOAD_VERTICAL_PITCH_PX
     )
     offsets = [

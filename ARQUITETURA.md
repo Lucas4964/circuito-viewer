@@ -137,6 +137,7 @@ CIRCUITO_VIEWER/
 │   ├── overlap_report.py      # relatório de trechos sobrepostos
 │   ├── search_palette.py      # janela de busca não modal
 │   ├── curvas_window.py       # Configurações → Curvas… (lista, grade, gráfico)
+│   ├── transformer_consumers_window.py # tabelas de cargas e de GD de um trafo (modo Energia)
 │   ├── curvas_table.py        # grade editável das 24 horas + colar/copiar
 │   ├── curva_chart.py         # gráfico da curva, desenhado com QPainter
 │   ├── patamares_window.py     # Configurações → Patamares…
@@ -939,6 +940,22 @@ exatamente como uma CARGA sem ET nem EP, então o registro vazio não mente.
 As ocorrências e o `consumers_error` ficam **fora** do relatório da importação e
 de `has_warnings`: só interessam a quem escolhe o modo Energia, e o modo
 Interplan não deve ganhar aviso por dados que não usa.
+
+### O modo Energia na janela
+
+`MainWindow._load_model_mode` vem da janela "Modelo de cargas". No modo
+Energia, `_refresh_energy_model` refaz o `EnergyDemandModel` sempre que mudam
+as UCs, as curvas salvas (inclusive pela importação do banco de curvas), os
+patamares globais ou os do circuito, ou o projeto. Roda na thread da interface:
+é linear nas UCs e leva 0,15 s na base 231003. `_exportable_energy` só o
+entrega à exportação e ao fluxo quando ele é das cargas exibidas.
+
+A camada de geradores desenha `_generator_display_model()`: no modo Energia, o
+`TransformerGenerationModel`, um símbolo por CARGA com GD; no Interplan, o
+`GeneratorModel`. O clique no agregado vira a seleção
+`transformer_generation`, cujo índice é o do agregado. Edição e proveniência,
+que leem o cadastro, não conhecem esse tipo e ficam de fora sem regra extra. A
+janela de jusante converte o gerador do cadastro no símbolo da sua CARGA.
 
 ### Substituição em cascata
 
@@ -3452,6 +3469,7 @@ lido por uma build anterior.
 | `test_curvas_store.py` | ida e volta preservando id/acentos/negativos, criação do diretório, regravação por cima (regressão de `os.rename` no Windows), nenhum `.tmp` remanescente, e a tolerância de leitura: JSON quebrado, raiz inesperada, entrada inválida entre válidas, versão mais nova, ids/nomes repetidos, id ausente gerado e chaves desconhecidas ignoradas |
 | `test_curvas_table.py` | coluna "Hora" sintética e não editável, `EditRole` sem truncar a precisão, `setData` com ponto e vírgula, texto recusado sem apagar o valor anterior, célula esvaziada, colagem com âncora, truncamento na hora 24 e a **regressão de alinhamento** (um texto não numérico no meio não desloca as horas seguintes) |
 | `test_curvas_categorias.py` · `test_curvas_mdb.py` | faixa `[MIN, MAX)` com limites abertos, validação da categoria, ordem numérica de `CAT_ID`; leitura do banco falso (ids, nomes, período, `MEDIA_P`, categorias, `FAT_POT`), categoria sem 24 pontos, curva com ponto faltando, banco antigo sem `PERIODO`/`TIPO`, nome cortado no limite, descrição repetida, tabela/coluna ausente, cancelamento; mesclagem (substitui no lugar, sufixo na do banco, categorias por id) e o worker (senha pedida, senha fora da mensagem, cancelado em silêncio) |
+| `test_transformer_consumers_window.py` · `test_load_model_mode.py` | linhas das tabelas (patamares nomeados, classe, curva, status, G repartida, sem cálculo), ordenação numérica; na janela: Energia sem UCs avisa e volta ao Interplan, cálculo feito com as curvas do diretório injetado, um símbolo de GD por trafo, o clique no agregado abrindo a página e a tabela, o painel da carga com as cargas do trafo, e o Interplan mantendo os geradores do cadastro |
 | `test_opendss_energy_export.py` | trafo ideal D-Y e split-phase, `Load` por UC na perna ou entre as pernas, GD negativa sem `-0`, `SetkVBase` depois do `calcvoltagebases`, **sem dupla contagem** (a CARGA sai do arquivo de cargas, o gerador MT sai do de geradores, um trafo só, soma dos patamares igual à das UCs), fallback ao Interplan sem tensão do secundário, `VPRIMARIO` incoerente, exportação sem `energy` idêntica à de antes, e o fluxo repassando o modelo |
 | `test_energy_demand.py` | gerador do Delphi, faixa sem sorteio, sorteio pela `PART_MERC`, só curvas médias normalizadas pelo pico, A4 arredondado, GD por id ou tipo, bissecção fechando as duas energias, os status (ajustado, só geração, autoconsumo total, sem energia, sem curva, inativo, IP), patamares pela `HORARIO_REF` com a reativa do `FAT_POT`, e a G repartida entre geradores. A fidelidade ao script é conferida por `benchmarks/validate_energy_demand.py` (231003: 1.594 UCs sem nenhuma diferença) |
 | `test_transformer_consumers.py` | vínculo de UCs, IP e GD à CARGA pela ET e pelo EP, trafo da UTC, EP pela `CARGA`, ET+EP num trafo só (divergência avisada, vale a ET), soma de duas ETs, ET sem UTC, ids com casa decimal, órfãos e repetidos; importação pelo banco falso (banco sem `BT_ET` em silêncio, coluna ausente em `consumers_error`, tabela ausente como nota, nada no relatório da importação), recorte, composição de duas fontes com aliases e com fonte sem UCs, e a ida e volta pelo cadastro do projeto |

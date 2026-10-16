@@ -32,7 +32,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Sequence
 
-from .model import LoadModel
+import numpy as np
+
+from .model import LoadModel, StaticPointIndex
 from .opendss_export import parse_number
 
 
@@ -196,6 +198,99 @@ class TransformerConsumersModel:
             if issue.load_id in selected
             or (include_unattributed and issue.load_id is None)
         )
+
+
+@dataclass(frozen=True, slots=True)
+class TransformerGenerationRecord:
+    """O agregado de GD de uma CARGA, como o símbolo do mapa o representa."""
+
+    load_id: str
+    generator_count: int
+    generation_kwh: float
+    # Lido pela camada de símbolos para compor a dica, como nas cargas equivalentes.
+    origin_kind: str = "transformer_generation"
+
+
+class TransformerGenerationModel:
+    """Um símbolo de gerador por CARGA com GD: o agregado do modo Energia.
+
+    Segue o contrato que a camada de símbolos usa do ``GeneratorModel`` —
+    ``bars``, ``bar_indices``, ``spatial_index``, ``generator_ids``, ``record`` e
+    ``len`` —, então o desenho, a seleção e o leiaute por barra são os mesmos.
+    ``load_indices`` liga cada símbolo à sua CARGA, que é onde estão os
+    geradores de fato.
+    """
+
+    __slots__ = (
+        "consumers",
+        "bars",
+        "_load_indices",
+        "_bar_indices",
+        "_ids",
+        "_records",
+        "_spatial_index",
+    )
+
+    def __init__(self, consumers: TransformerConsumersModel) -> None:
+        loads = consumers.loads
+        indices = [
+            index for index, record in enumerate(consumers.records) if record.generators
+        ]
+        load_indices = np.asarray(indices, dtype=np.intp)
+        bar_indices = np.ascontiguousarray(
+            np.asarray(loads.bar_indices, dtype=np.intp)[load_indices], dtype=np.intp
+        )
+        load_indices.setflags(write=False)
+        bar_indices.setflags(write=False)
+        self.consumers = consumers
+        self.bars = loads.bars
+        self._load_indices = load_indices
+        self._bar_indices = bar_indices
+        self._ids = tuple(
+            f"GD-{loads.codes[index] or loads.load_ids[index]}" for index in indices
+        )
+        self._records = tuple(
+            TransformerGenerationRecord(
+                load_id=loads.load_ids[index],
+                generator_count=len(consumers.records[index].generators),
+                generation_kwh=sum(
+                    item.generation_kwh or 0.0
+                    for item in consumers.records[index].generators
+                ),
+            )
+            for index in indices
+        )
+        self._spatial_index = StaticPointIndex(
+            self.bars.x[bar_indices], self.bars.y[bar_indices]
+        )
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    @property
+    def generator_ids(self) -> tuple[str, ...]:
+        return self._ids
+
+    @property
+    def load_indices(self) -> np.ndarray:
+        return self._load_indices
+
+    @property
+    def bar_indices(self) -> np.ndarray:
+        return self._bar_indices
+
+    @property
+    def spatial_index(self) -> StaticPointIndex:
+        return self._spatial_index
+
+    def record(self, index: int) -> TransformerGenerationRecord:
+        return self._records[int(index)]
+
+    def index_for_load(self, load_index: int) -> int | None:
+        """O símbolo da CARGA, ou ``None`` se ela não tem GD."""
+
+        positions = np.flatnonzero(self._load_indices == int(load_index))
+        return int(positions[0]) if positions.size else None
 
 
 class _Report:

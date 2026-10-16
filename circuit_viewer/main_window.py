@@ -121,7 +121,12 @@ from .csv_import import (
     CsvLoadResult,
 )
 from .curvas import Curve, CurveCatalog
-from .curvas_store import load_curves
+from .curvas_store import categories_path_for, load_curve_categories, load_curves
+from .energy_demand import (
+    EnergyDemandModel,
+    calculate_energy_demands,
+    schedules_for_loads,
+)
 from .curvas_window import CurvesWindow
 from .generator_update import (
     GeneratorScheduleMode,
@@ -150,7 +155,13 @@ from .graphics import (
 from .generator_import import GeneratorCsvResult
 from .load_import import LoadCsvResult
 from .load_model_mode import LoadModelMode, LoadModelModeDialog
-from .transformer_consumers import TransformerConsumersModel
+from .transformer_consumers import TransformerConsumersModel, TransformerGenerationModel
+from .transformer_consumers_window import (
+    TransformerTableWindow,
+    consumer_rows,
+    generator_rows,
+    status_summary,
+)
 from .load_pattern_import import LoadPatternCsvResult
 from .load_pattern_table import LoadPatternTableModel
 from .mdb_engine import (
@@ -788,6 +799,13 @@ SHOW_GENERATORS_BY_DEFAULT = False
 HIGHLIGHT_ROOT_BAR_BY_DEFAULT = True
 
 
+# Seleção do símbolo de GD agregado por trafo (modo de cargas Energia). Tem tipo
+# próprio porque o índice é o do agregado, não o do cadastro de geradores: edição
+# e proveniência, que leem o cadastro, ficam de fora por não conhecerem o tipo.
+TRANSFORMER_GENERATION_KIND = "transformer_generation"
+_GENERATOR_SELECTION_KINDS = ("generator", TRANSFORMER_GENERATION_KIND)
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -847,6 +865,10 @@ class MainWindow(QMainWindow):
         self._allocation_model: TransformerAllocationModel | None = None
         # UCs, IP e GD de cada CARGA, para o modo de cargas Energia.
         self._consumers_model: TransformerConsumersModel | None = None
+        # O cálculo do modo Energia e o agregado de GD que o mapa mostra nele.
+        self._energy_model: EnergyDemandModel | None = None
+        self._generation_model: TransformerGenerationModel | None = None
+        self._energy_table_window: TransformerTableWindow | None = None
         self._load_pattern_model: LoadPatternModel | None = None
         self._generator_model: GeneratorModel | None = None
         self._capacitor_model: CapacitorModel | None = None
@@ -2000,6 +2022,27 @@ class MainWindow(QMainWindow):
         pattern_layout.addWidget(self.load_patterns_table)
         self.load_patterns_section.setVisible(False)
         load_layout.addWidget(self.load_patterns_section)
+
+        # No modo Energia o símbolo da CARGA é só o agregado: as cargas de fato
+        # estão no secundário do trafo e abrem numa tabela.
+        self.load_energy_section = QWidget(self.load_details_body)
+        energy_layout = QVBoxLayout(self.load_energy_section)
+        energy_layout.setContentsMargins(0, 0, 0, 0)
+        energy_layout.addWidget(QLabel("Cargas do trafo (modo Energia)"))
+        self.load_energy_label = QLabel(self.load_energy_section)
+        self.load_energy_label.setWordWrap(True)
+        energy_layout.addWidget(self.load_energy_label)
+        self.load_energy_button = QPushButton(
+            "Abrir tabela de cargas…", self.load_energy_section
+        )
+        self.load_energy_button.setToolTip(
+            "Uma linha por carga conectada neste ponto: UCs da BT e da MT e "
+            "iluminação pública"
+        )
+        self.load_energy_button.clicked.connect(self._open_load_energy_table)
+        energy_layout.addWidget(self.load_energy_button)
+        self.load_energy_section.setVisible(False)
+        load_layout.addWidget(self.load_energy_section)
         load_layout.addStretch(1)
         self.load_details_page.setWidget(self.load_details_body)
         self.details_stack.addWidget(self.load_details_page)
@@ -2152,6 +2195,28 @@ class MainWindow(QMainWindow):
         generator_layout.addStretch(1)
         self.generator_details_page.setWidget(self.generator_details_body)
         self.details_stack.addWidget(self.generator_details_page)
+
+        self.transformer_generation_page = QWidget(self.details_stack)
+        generation_layout = QVBoxLayout(self.transformer_generation_page)
+        generation_layout.addWidget(QLabel("GD agregada do trafo (modo Energia)"))
+        self.transformer_generation_label = QLabel(self.transformer_generation_page)
+        self.transformer_generation_label.setWordWrap(True)
+        self.transformer_generation_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        generation_layout.addWidget(self.transformer_generation_label)
+        self.transformer_generation_button = QPushButton(
+            "Abrir tabela de GD…", self.transformer_generation_page
+        )
+        self.transformer_generation_button.setToolTip(
+            "Uma linha por gerador conectado neste trafo, da BT e da MT"
+        )
+        self.transformer_generation_button.clicked.connect(
+            self._open_generation_energy_table
+        )
+        generation_layout.addWidget(self.transformer_generation_button)
+        generation_layout.addStretch(1)
+        self.details_stack.addWidget(self.transformer_generation_page)
 
         equivalent_fields = (
             ("origin", "ORIGEM:"),
@@ -3000,6 +3065,7 @@ class MainWindow(QMainWindow):
             self._on_import_failed(str(exc))
             return
         self._load_model_mode = mode
+        self._apply_load_model_mode(load.result)
         if load.composed is not None and load.composed.catalog is not None:
             self._show_circuits_window()
         if load.result is not None:
@@ -3075,6 +3141,9 @@ class MainWindow(QMainWindow):
         if adopt_project:
             from .project_state import ProjectState
             self._project = ProjectState.from_workspace(workspace)
+        # Caminho único de instalação, então é aqui que o modo Energia acompanha
+        # toda troca de rede: acrescentar e remover fontes e editar o projeto.
+        self._refresh_energy_model()
 
     def _install_composed_models(self, composed, workspace, *, fit_view=True):
         bars = composed.bars
@@ -4022,6 +4091,259 @@ class MainWindow(QMainWindow):
         if model is not None and model.loads is not self._load_model:
             raise ValueError("As UCs devem pertencer às cargas exibidas.")
         self._consumers_model = model
+        self._energy_model = None
+        self._generation_model = (
+            None if model is None else TransformerGenerationModel(model)
+        )
+        self._sync_generator_display()
+
+    # -- modo de cargas Energia ---------------------------------------------
+
+    def _energy_mode(self) -> bool:
+        return self._load_model_mode is LoadModelMode.ENERGIA
+
+    def _apply_load_model_mode(self, result: MdbImportResult | None = None) -> None:
+        """Passa a valer o modo escolhido na importação.
+
+        Sem as UCs por trafo não há modo Energia possível: o usuário é avisado
+        e a rede segue no Padrão Interplan, em vez de ficar sem carga nenhuma.
+        """
+
+        if self._energy_mode() and self._consumers_model is None:
+            reason = None if result is None else result.consumers_error
+            QMessageBox.warning(
+                self,
+                "Modo Energia indisponível",
+                "O banco não trouxe as unidades consumidoras por trafo "
+                "(BT_ET, BT_UTC, BT_CONS, MT_CONS…)"
+                + (f":\n\n{reason}" if reason else ".")
+                + "\n\nA rede segue no modelo Padrão Interplan.",
+            )
+            self._load_model_mode = LoadModelMode.INTERPLAN
+        self._refresh_energy_model(announce=True)
+        self._sync_generator_display()
+
+    def _refresh_energy_model(self, *, announce: bool = False) -> None:
+        """Refaz o cálculo do modo Energia com as curvas e patamares vigentes.
+
+        Roda na thread da interface de propósito: é linear nas UCs e leva
+        0,15 s nas 1.664 cargas da base 231003 — menos que abrir uma janela de
+        progresso. Sem modo Energia, só descarta o resultado anterior.
+        """
+
+        consumers = self._consumers_model
+        if not self._energy_mode() or consumers is None:
+            self._energy_model = None
+            return
+        categories = load_curve_categories(categories_path_for(self._curves_path))
+        catalog = self._circuit_catalog
+        default = self.calculation_level_schedule
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            if catalog is None:
+                schedules = schedules_for_loads(consumers, None, (), default)
+            else:
+                levels = self._circuit_level_controller
+                if levels is not None and levels.circuits is not catalog:
+                    levels = None
+                _, own = preferred_schedule_choices(
+                    default,
+                    tuple(
+                        None if levels is None else levels.schedule(index)
+                        for index in range(len(catalog))
+                    ),
+                )
+                schedules = schedules_for_loads(consumers, catalog, own, default)
+            model = calculate_energy_demands(
+                consumers, self._saved_curves, categories.categories, schedules
+            )
+        except ValueError as exc:
+            self._energy_model = None
+            if announce:
+                QMessageBox.warning(self, "Modo Energia", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._energy_model = model
+        modeled = sum(
+            1 for item in model.transformers if item is not None and item.modeled
+        )
+        self.statusBar().showMessage(
+            f"Modo Energia: {modeled:n} trafo(s) com cargas no secundário, "
+            f"{consumers.consumer_count:n} carga(s) e {consumers.generator_count:n} GD.",
+            8_000,
+        )
+        problems = [*model.issues, *((categories.issue,) if categories.issue else ())]
+        if announce and problems:
+            QMessageBox.warning(self, "Modo Energia", "\n\n".join(problems))
+        selection = self._selected_feature
+        if selection is not None and selection.kind in ("load", TRANSFORMER_GENERATION_KIND):
+            self._set_selection(selection)
+
+    def _exportable_energy(self) -> EnergyDemandModel | None:
+        """O cálculo do modo Energia, se o modo vale e ele é das cargas exibidas."""
+
+        model = self._energy_model
+        if (
+            not self._energy_mode()
+            or model is None
+            or model.consumers is not self._consumers_model
+            or model.consumers.loads is not self._load_model
+        ):
+            return None
+        return model
+
+    def _generators_need_update(self) -> bool:
+        """Há gerador MT fora das CARGAs que o modo Energia assume?
+
+        No modo Energia a GD de cada trafo sai do próprio cálculo; só um
+        gerador de uma CARGA que ficou no modelo do Interplan ainda precisa
+        de "Atualizar Geradores".
+        """
+
+        generators = self._generator_model
+        if generators is None:
+            return False
+        energy = self._exportable_energy()
+        if energy is None:
+            return True
+        return any(
+            energy.transformer(int(index)) is None for index in generators.load_indices
+        )
+
+    def _generator_display_model(self):  # noqa: ANN202
+        """O que a camada de geradores desenha: no modo Energia, um símbolo por trafo."""
+
+        if self._energy_mode() and self._generation_model is not None:
+            return self._generation_model
+        return self._generator_model
+
+    def _sync_generator_display(self, *, force: bool = False) -> None:
+        display = self._generator_display_model()
+        if not force and display is self.generator_virtualizer.model:
+            return
+        if (
+            self._selected_feature is not None
+            and self._selected_feature.kind in _GENERATOR_SELECTION_KINDS
+        ):
+            self._set_selection(None)
+        self.view.set_generator_model(display)
+        self.generator_virtualizer.reset_model(display)
+        self._sync_load_layout()
+        self.show_generators_action.setEnabled(display is not None)
+        self.generator_status.setText(
+            f"GD: {len(display):n} trafo(s)"
+            if isinstance(display, TransformerGenerationModel)
+            else f"Geradores: {len(display) if display is not None else 0:n}"
+        )
+        self._apply_circuit_visibility()
+        if display is not None and self.show_generators_action.isChecked():
+            self.generator_virtualizer.refresh(force=True)
+        self.view.viewport().update()
+
+    def _sync_load_energy_section(self, load_index: int) -> None:
+        consumers = self._consumers_model
+        if not self._energy_mode() or consumers is None:
+            self.load_patterns_title.setText("Patamares da carga")
+            self.load_energy_section.setVisible(False)
+            return
+        record = consumers.record(load_index)
+        energy = self._exportable_energy()
+        transformer = None if energy is None else energy.transformer(load_index)
+        # Assumida pelo modo Energia, a CARGA não exporta o MODELO_CARGA: os
+        # patamares continuam à vista, mas o título diz que não valem.
+        self.load_patterns_title.setText(
+            "Patamares da carga"
+            if transformer is None
+            else "Patamares do Interplan (não usados no modo Energia)"
+        )
+        kinds: dict[str, int] = {}
+        for item in record.consumers:
+            kinds[item.kind] = kinds.get(item.kind, 0) + 1
+        spec = record.transformer
+        lines = [
+            f"{len(record.consumers):n} carga(s) conectada(s)"
+            + (
+                " (" + ", ".join(f"{count:n} {kind}" for kind, count in sorted(kinds.items())) + ")"
+                if kinds
+                else ""
+            )
+        ]
+        if spec is not None:
+            lines.append(
+                f"Trafo {spec.origin}"
+                + (f" de {spec.kva:g} kVA" if spec.kva else "")
+                + (f", secundário de {spec.secondary_v:g} V" if spec.secondary_v else "")
+            )
+        if transformer is None:
+            lines.append("Sem cálculo do modo Energia: a CARGA segue no modelo do Interplan.")
+        else:
+            demand = sum(item.demand_kw or 0.0 for item in transformer.consumers)
+            lines.append(f"Σ D = {demand:.3f} kW — {status_summary(transformer)}")
+        self.load_energy_label.setText("\n".join(lines))
+        self.load_energy_button.setEnabled(bool(record.consumers))
+        self.load_energy_section.setVisible(True)
+
+    def _generation_summary(self, index: int) -> str:
+        generation = self._generation_model
+        record = generation.record(index)
+        load_index = int(generation.load_indices[index])
+        energy = self._exportable_energy()
+        transformer = None if energy is None else energy.transformer(load_index)
+        lines = [
+            f"CARGA {record.load_id} — {record.generator_count:n} gerador(es)",
+            f"Energia injetada no mês: {record.generation_kwh:.2f} kWh",
+        ]
+        if transformer is not None:
+            total = sum(item.generation_kw for item in transformer.generators)
+            lines.append(f"Σ G = {total:.3f} kW")
+        return "\n".join(lines)
+
+    def _energy_table(self) -> TransformerTableWindow:
+        if self._energy_table_window is None:
+            self._energy_table_window = TransformerTableWindow(self)
+        return self._energy_table_window
+
+    def _open_load_energy_table(self) -> None:
+        selection = self._selected_feature
+        consumers = self._consumers_model
+        if selection is None or selection.kind != "load" or consumers is None:
+            return
+        record = consumers.record(selection.index)
+        energy = self._exportable_energy()
+        transformer = None if energy is None else energy.transformer(selection.index)
+        headers, rows = consumer_rows(record, transformer)
+        code = self._load_model.codes[selection.index] if self._load_model is not None else ""
+        self._energy_table().show_rows(
+            f"Cargas do trafo {code or record.load_id}",
+            f"CARGA {record.load_id} ({code}) — {len(rows):n} carga(s). "
+            + status_summary(transformer),
+            headers,
+            rows,
+        )
+
+    def _open_generation_energy_table(self) -> None:
+        selection = self._selected_feature
+        generation = self._generation_model
+        consumers = self._consumers_model
+        if (
+            selection is None
+            or selection.kind != TRANSFORMER_GENERATION_KIND
+            or generation is None
+            or consumers is None
+        ):
+            return
+        load_index = int(generation.load_indices[selection.index])
+        record = consumers.record(load_index)
+        energy = self._exportable_energy()
+        transformer = None if energy is None else energy.transformer(load_index)
+        headers, rows = generator_rows(record, transformer)
+        self._energy_table().show_rows(
+            f"GD do trafo {generation.generator_ids[selection.index]}",
+            self._generation_summary(selection.index).replace("\n", " — "),
+            headers,
+            rows,
+        )
 
     def _set_allocation_measurements(
         self,
@@ -4044,18 +4366,8 @@ class MainWindow(QMainWindow):
         ):
             self._set_selection(None)
         self._generator_model = model
-        self.view.set_generator_model(model)
-        self.generator_virtualizer.reset_model(model)
-        self._sync_load_layout()
-        self.show_generators_action.setEnabled(model is not None)
-        self.generator_status.setText(
-            f"Geradores: {len(model) if model is not None else 0:n}"
-        )
-        self._apply_circuit_visibility()
-        if model is not None and self.show_generators_action.isChecked():
-            self.generator_virtualizer.refresh(force=True)
+        self._sync_generator_display(force=True)
         self._refresh_downstream_selection()
-        self.view.viewport().update()
 
     def _set_capacitor_model(self, model: CapacitorModel | None) -> None:
         """Instala os bancos de capacitores.
@@ -4798,10 +5110,11 @@ class MainWindow(QMainWindow):
             if controller is None or self._load_model is None
             else controller.bar_visible_mask[self._load_model.bar_indices]
         )
+        generator_display = self._generator_display_model()
         generator_mask = (
             None
-            if controller is None or self._generator_model is None
-            else controller.bar_visible_mask[self._generator_model.bar_indices]
+            if controller is None or generator_display is None
+            else controller.bar_visible_mask[generator_display.bar_indices]
         )
         capacitor_mask = (
             None
@@ -4921,7 +5234,7 @@ class MainWindow(QMainWindow):
                 and equivalent_mask is not None
                 and not bool(equivalent_mask[selection.index])
             ) or (
-                selection.kind == "generator"
+                selection.kind in _GENERATOR_SELECTION_KINDS
                 and generator_mask is not None
                 and not bool(generator_mask[selection.index])
             )
@@ -4956,14 +5269,18 @@ class MainWindow(QMainWindow):
         self.calculation_level_schedule = schedule
         self._sync_voltage_step_names()
         self.statusBar().showMessage("4 patamares salvos.", 6_000)
+        self._refresh_energy_model()
 
     def _on_calculation_levels_reloaded(
         self, schedule: CalculationLevelSchedule
     ) -> None:
-        if schedule != self.calculation_level_schedule:
+        changed = schedule != self.calculation_level_schedule
+        if changed:
             self._invalidate_generator_update()
         self.calculation_level_schedule = schedule
         self._sync_voltage_step_names()
+        if changed:
+            self._refresh_energy_model()
 
     def _on_circuit_calculation_levels_saved(
         self, _circuit_id: str, _schedule: CalculationLevelSchedule
@@ -4984,6 +5301,7 @@ class MainWindow(QMainWindow):
                         project, record.equipment_id, {"schedule": _schedule}, cancel_check=cancel))
                     return
         self._invalidate_generator_update()
+        self._refresh_energy_model()
         self.statusBar().showMessage(
             "Patamares do circuito salvos; atualize os geradores novamente.",
             6_000,
@@ -5013,6 +5331,7 @@ class MainWindow(QMainWindow):
         self._sync_generator_update_availability()
         self._sync_export_availability()
         self.statusBar().showMessage(f"{count:n} curva(s) salva(s).", 6_000)
+        self._refresh_energy_model()
 
     def _show_switch_types_warning(self) -> None:
         """Avisa que TIPO e MANOBRAVEL não sairão, e por quê.
@@ -6263,11 +6582,16 @@ class MainWindow(QMainWindow):
             return
         exportable_loads = self._exportable_loads()
         generator_updates = self._exportable_generators()
+        energy = self._exportable_energy()
         thread = QThread(self)
         # Os modelos são imutáveis: o worker guarda as próprias referências e o
         # arquivo sai como um retrato consistente do estado atual, mesmo que uma
         # importação substitua os modelos enquanto a exportação corre.
         loads, patterns = exportable_loads or (None, None)
+        if loads is None and energy is not None:
+            # O modo Energia monta os trafos só com as cargas: os patamares do
+            # Interplan valem apenas para as CARGAs que ficam fora dele.
+            loads = self._load_model
         library_catalog = (
             self.opendss_library_session.saved_catalog()
             if self._uses_opendss_library_parameters()
@@ -6297,6 +6621,7 @@ class MainWindow(QMainWindow):
             # A gravação acontece no worker, numa pasta temporária ao lado do
             # destino: arquivos grandes não congelam mais a interface.
             destination_base=destination.parent,
+            energy=energy,
         )
         worker.moveToThread(thread)
 
@@ -6584,8 +6909,11 @@ class MainWindow(QMainWindow):
         exportable_loads = self._exportable_loads()
         loads, patterns = exportable_loads or (None, None)
         generator_updates = self._exportable_generators()
+        energy = self._exportable_energy()
+        if loads is None and energy is not None:
+            loads = self._load_model
         if (
-            self._generator_model is not None
+            self._generators_need_update()
             and generator_updates is None
             and self._default_curve() is not None
         ):
@@ -6599,12 +6927,12 @@ class MainWindow(QMainWindow):
                 return
             self._pending_power_flow_after_generators = False
         missing_parts: list[str] = []
-        if exportable_loads is None:
+        if exportable_loads is None and energy is None:
             missing_parts.append(
                 "cargas e patamares não estão ambos importados; as cargas "
                 "de consumo serão omitidas"
             )
-        if self._generator_model is not None and generator_updates is None:
+        if self._generators_need_update() and generator_updates is None:
             missing_parts.append(
                 "há geradores importados sem resultado válido de ‘Atualizar "
                 "Geradores’; eles serão omitidos"
@@ -6649,6 +6977,7 @@ class MainWindow(QMainWindow):
             line_parameter_mode=self._opendss_line_parameter_mode,
             library_catalog=library_catalog,
             library_mappings=library_mappings,
+            energy=energy,
         )
         worker.moveToThread(thread)
 
@@ -6980,9 +7309,10 @@ class MainWindow(QMainWindow):
             self.simplified_network_action.isChecked()
             and equivalent_model is not None
         )
+        generator_display = self._generator_display_model()
         candidates = (
             (self._load_model, None),
-            (self._generator_model, None),
+            (generator_display, None),
             (self._capacitor_model, None),
             (
                 equivalent_model if show_equivalent else None,
@@ -7004,7 +7334,7 @@ class MainWindow(QMainWindow):
         if self._load_model is not None:
             self.load_virtualizer.set_layout_offsets(*layouts[layout_index])
             layout_index += 1
-        if self._generator_model is not None:
+        if generator_display is not None:
             self.generator_virtualizer.set_layout_offsets(*layouts[layout_index])
             layout_index += 1
         if self._capacitor_model is not None:
@@ -8140,8 +8470,16 @@ class MainWindow(QMainWindow):
             feature = FeatureSelection("capacitor", row.index)
             bar = int(selection.capacitors.bar_indices[row.index])
         elif row.kind == GERADOR and selection.generators is not None:
-            feature = FeatureSelection("generator", row.index)
             bar = int(selection.generators.bar_indices[row.index])
+            if isinstance(self.generator_virtualizer.model, TransformerGenerationModel):
+                position = self.generator_virtualizer.model.index_for_load(
+                    int(selection.generators.load_indices[row.index])
+                )
+                if position is None:
+                    return
+                feature = FeatureSelection(TRANSFORMER_GENERATION_KIND, position)
+            else:
+                feature = FeatureSelection("generator", row.index)
         else:
             return
         if not self._downstream_highlighted:
@@ -9892,7 +10230,7 @@ class MainWindow(QMainWindow):
         if (
             not visible
             and self._selected_feature is not None
-            and self._selected_feature.kind == "generator"
+            and self._selected_feature.kind in _GENERATOR_SELECTION_KINDS
             and not self._search_focus_active
         ):
             self._set_selection(None)
@@ -9907,6 +10245,12 @@ class MainWindow(QMainWindow):
         reveal_hidden: bool = False,
         preserve_highlight: bool = False,
     ) -> None:
+        if (
+            selection is not None
+            and selection.kind == "generator"
+            and isinstance(self.generator_virtualizer.model, TransformerGenerationModel)
+        ):
+            selection = FeatureSelection(TRANSFORMER_GENERATION_KIND, selection.index)
         self._sync_edit_action(selection)
         # O destaque sobrevive ao clique que cai **dentro** dele: inspecionar um
         # trecho, uma barra ou uma carga da própria região não deveria custar o
@@ -9919,6 +10263,7 @@ class MainWindow(QMainWindow):
         if selection is None or selection.kind != "load":
             self.load_pattern_table_model.set_records(())
             self.load_patterns_section.setVisible(False)
+            self.load_energy_section.setVisible(False)
         if selection is None or selection.kind != "equivalent_load":
             self.equivalent_pattern_table_model.set_records(())
             self.equivalent_patterns_section.setVisible(False)
@@ -9953,7 +10298,7 @@ class MainWindow(QMainWindow):
             self.details_stack.setCurrentWidget(self.empty_details_page)
             return
 
-        if selection.kind != "generator":
+        if selection.kind not in _GENERATOR_SELECTION_KINDS:
             self.generator_virtualizer.set_selected_index(None)
         if selection.kind != "capacitor":
             self.capacitor_virtualizer.set_selected_index(None)
@@ -10020,6 +10365,7 @@ class MainWindow(QMainWindow):
             )
             self.load_pattern_table_model.set_records(pattern_records)
             self.load_patterns_section.setVisible(bool(pattern_records))
+            self._sync_load_energy_section(selection.index)
             self.details_dock.setWindowTitle("Carga selecionada")
             self.details_stack.setCurrentWidget(self.load_details_page)
             self.load_details_page.verticalScrollBar().setValue(0)
@@ -10131,6 +10477,25 @@ class MainWindow(QMainWindow):
             self.details_dock.setWindowTitle("Capacitor selecionado")
             self.details_stack.setCurrentWidget(self.capacitor_details_page)
             self.capacitor_details_page.verticalScrollBar().setValue(0)
+            return
+
+        if selection.kind == TRANSFORMER_GENERATION_KIND:
+            generation = self._generation_model
+            if generation is None or not 0 <= selection.index < len(generation):
+                return
+            self._selected_feature = selection
+            self.virtualizer.set_selected_index(None)
+            self.load_virtualizer.set_selected_index(None)
+            self.equivalent_load_virtualizer.set_selected_index(None)
+            self.segment_selection_overlay.clear()
+            self.generator_virtualizer.set_selected_index(
+                selection.index, reveal_hidden=reveal_hidden
+            )
+            self.transformer_generation_label.setText(
+                self._generation_summary(selection.index)
+            )
+            self.details_dock.setWindowTitle("GD do trafo selecionada")
+            self.details_stack.setCurrentWidget(self.transformer_generation_page)
             return
 
         if selection.kind == "generator":
