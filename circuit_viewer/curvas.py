@@ -24,6 +24,10 @@ mapas: nas curvas típicas do Interplan é o ``CAT_ID`` da categoria, o mesmo
 número que o ``CURVA_ID`` das cargas e geradores da rede referencia. Não é
 único — as curvas de dia útil, sábado, domingo e média de uma categoria
 compartilham o mesmo — e por isso não substitui o ``curve_id``.
+
+**O que é o ``period``.** O tipo de dia que a curva descreve: ``DU`` (dia útil),
+``SA`` (sábado), ``DO`` (domingo) ou ``MED`` (média do mês). É o ``PERIODO`` 1 a
+4 das curvas típicas do Interplan; vazio quando a curva não é de um dia típico.
 """
 
 from __future__ import annotations
@@ -50,6 +54,15 @@ MAX_CURVE_NAME_LENGTH = 60
 
 # O ID de vínculo é um código curto vindo de outro sistema, não um rótulo.
 MAX_CURVE_LINK_ID_LENGTH = 30
+
+# Tipos de dia, na ordem do PERIODO do Interplan (1 a 4).
+CURVE_PERIOD_LABELS = {
+    "DU": "Dia útil",
+    "SA": "Sábado",
+    "DO": "Domingo",
+    "MED": "Média",
+}
+CURVE_PERIODS = tuple(CURVE_PERIOD_LABELS)
 
 # Arredondamento **só de exibição**, como em ``load_pattern_table``: o valor
 # guardado continua com a precisão que o usuário digitou.
@@ -85,10 +98,13 @@ class Curve:
     name: str
     values: tuple[float, ...]
     link_id: str = ""
+    period: str = ""
 
     def __post_init__(self) -> None:
         if not str(self.curve_id).strip():
             raise ValueError("A curva precisa de um identificador.")
+        if self.period and self.period not in CURVE_PERIODS:
+            raise ValueError(f"Período de curva desconhecido: {self.period}.")
         if not _clean_name(self.name):
             raise ValueError("A curva precisa de um nome.")
         if len(self.values) != HOURLY_CURVE_POINT_COUNT:
@@ -120,6 +136,7 @@ class CurveDraft:
         default_factory=lambda: [None] * HOURLY_CURVE_POINT_COUNT
     )
     link_id: str = ""
+    period: str = ""
 
     def __post_init__(self) -> None:
         if len(self.values) != HOURLY_CURVE_POINT_COUNT:
@@ -137,7 +154,13 @@ class CurveDraft:
     def from_curve(cls, curve: Curve) -> CurveDraft:
         """Rascunho editável a partir de uma curva gravada."""
 
-        return cls(curve.curve_id, curve.name, list(curve.values), curve.link_id)
+        return cls(
+            curve.curve_id,
+            curve.name,
+            list(curve.values),
+            curve.link_id,
+            curve.period,
+        )
 
     def set_value(self, hour_index: int, value: float | None) -> bool:
         """Grava (ou apaga, com ``None``) o valor de uma hora 0-based.
@@ -181,6 +204,7 @@ class CurveDraft:
             _clean_name(self.name),
             tuple(self.values),
             _clean_name(self.link_id),
+            self.period,
         )
 
 
@@ -277,6 +301,16 @@ class CurveCatalog:
         if self._drafts[index].link_id == cleaned:
             return False
         self._drafts[index].link_id = cleaned
+        return True
+
+    def set_period(self, index: int, period: str) -> bool:
+        """Troca o tipo de dia; devolve ``False`` quando já era esse."""
+
+        if period and period not in CURVE_PERIODS:
+            raise ValueError(f"Período de curva desconhecido: {period}.")
+        if self._drafts[index].period == period:
+            return False
+        self._drafts[index].period = period
         return True
 
     def to_curves(self) -> tuple[Curve, ...]:

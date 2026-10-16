@@ -34,6 +34,7 @@ from .generator_update import (
     calculate_generator_demands,
 )
 from .curvas import Curve
+from .curvas_mdb import CurveDatabaseError, read_curve_database
 from .calculation_levels import CalculationLevelSchedule
 from .capacitor_import import load_capacitors_csv
 from .load_import import load_loads_csv
@@ -559,6 +560,66 @@ class MdbInspectionWorker(QObject):
                 # Exceções ODBC podem conter a conexão, incluindo PWD.
                 self.failed.emit(self.request_id,
                                  "Não foi possível ler o banco. Verifique o arquivo e o driver Access.")
+        finally:
+            self._password = None
+            self.completed.emit()
+
+
+def _without_password(message: str, password: str | None) -> str:
+    """Tira a senha de uma mensagem que pode trazer a conexão ODBC."""
+
+    if password:
+        message = message.replace(password, "[senha omitida]")
+    return re.sub(r"(?i)\bPWD\s*=.*", "PWD=[omitida]", message)
+
+
+class CurveDatabaseWorker(QObject):
+    """Lê o banco de curvas típicas na própria thread.
+
+    Mesmo contrato do :class:`MdbInspectionWorker`: a conexão nasce e morre aqui
+    dentro, e um banco protegido pede a senha pelo sinal em vez de falhar.
+    """
+
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    password_required = pyqtSignal()
+    completed = pyqtSignal()
+
+    def __init__(self, path: str, *, password: str | None = None) -> None:
+        super().__init__()
+        self.path = path
+        self._password = password
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            if self._cancel_event.is_set():
+                return
+            with open_database(self.path, self._password) as database:
+                contents = read_curve_database(
+                    database, cancel_check=self._cancel_event.is_set
+                )
+            if not self._cancel_event.is_set():
+                self.finished.emit(contents)
+        except MdbPasswordError:
+            if not self._cancel_event.is_set():
+                self.password_required.emit()
+        except InterruptedError:
+            pass
+        except (MdbEngineError, CurveDatabaseError) as exc:
+            if not self._cancel_event.is_set():
+                self.failed.emit(_without_password(str(exc), self._password))
+        except Exception:
+            if not self._cancel_event.is_set():
+                # Exceções ODBC podem conter a conexão, incluindo PWD.
+                self.failed.emit(
+                    "Não foi possível ler o banco de curvas. Verifique o arquivo "
+                    "e o driver Access."
+                )
         finally:
             self._password = None
             self.completed.emit()

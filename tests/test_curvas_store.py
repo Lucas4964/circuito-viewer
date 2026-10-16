@@ -6,10 +6,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from circuit_viewer.curvas import HOURLY_CURVE_POINT_COUNT, Curve, new_curve_id
+from circuit_viewer.curvas_categorias import CurveCategory
 from circuit_viewer.curvas_store import (
     CURVES_FILE_VERSION,
+    categories_path_for,
+    default_categories_path,
     default_curves_path,
+    load_curve_categories,
     load_curves,
+    save_curve_categories,
     save_curves,
 )
 
@@ -269,6 +274,113 @@ class CurveLinkIdTests(unittest.TestCase):
         result = load_curves(self.path)
         self.assertIsNone(result.issue)
         self.assertEqual(result.curves, original)
+
+
+class CurvePeriodTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._directory = TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.path = Path(self._directory.name) / "curvas.json"
+
+    def _write(self, entry: dict) -> None:
+        self.path.write_text(
+            json.dumps({"version": 1, "curvas": [entry]}), encoding="utf-8"
+        )
+
+    def test_round_trip_preserves_the_period(self) -> None:
+        original = (Curve("a", "Residencial - Sábado", _values(), "2", "SA"),)
+        save_curves(original, self.path)
+        self.assertEqual(load_curves(self.path).curves, original)
+
+    def test_curves_without_period_keep_the_old_format(self) -> None:
+        save_curves((Curve("a", "X", _values()),), self.path)
+        entry = json.loads(self.path.read_text(encoding="utf-8"))["curvas"][0]
+        self.assertNotIn("periodo", entry)
+
+    def test_lowercase_period_is_accepted(self) -> None:
+        self._write({"id": "a", "periodo": " du ", "nome": "X", "valores": list(_values())})
+        self.assertEqual(load_curves(self.path).curves[0].period, "DU")
+
+    def test_unknown_period_is_dropped_but_keeps_the_curve(self) -> None:
+        self._write({"id": "a", "periodo": "FERIADO", "nome": "X", "valores": list(_values())})
+        curves = load_curves(self.path).curves
+        self.assertEqual(len(curves), 1)
+        self.assertEqual(curves[0].period, "")
+
+
+def _category(category_id: str = "2", **changes) -> CurveCategory:
+    fields = dict(
+        category_id=category_id,
+        description="Clientes BT res_0_100 kWh - Tipologia 1",
+        consumer_class=0,
+        minimum=-1.0,
+        maximum=100.0,
+        market_share=25.527344128043676,
+        power_factor=0.92,
+    )
+    fields.update(changes)
+    return CurveCategory(**fields)
+
+
+class CurveCategoryStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._directory = TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.path = Path(self._directory.name) / "categorias_curvas.json"
+
+    def test_the_file_lives_beside_the_curves(self) -> None:
+        self.assertEqual(default_categories_path().parent, default_curves_path().parent)
+        curves = Path(self._directory.name) / "curvas.json"
+        self.assertEqual(categories_path_for(curves), self.path)
+        self.assertEqual(categories_path_for(None), default_categories_path())
+
+    def test_round_trip_preserves_every_field(self) -> None:
+        original = (
+            _category(),
+            _category("387", description="Geração Solar", kind="F", power_factor=1.0),
+            _category("1", description="Clientes BT IP", consumer_class=5, pu_max=1,
+                      power_factor=None),
+        )
+        save_curve_categories(original, self.path)
+        result = load_curve_categories(self.path)
+        self.assertIsNone(result.issue)
+        self.assertEqual(
+            result.categories,
+            tuple(sorted(original, key=lambda item: int(item.category_id))),
+        )
+
+    def test_missing_file_is_not_a_problem(self) -> None:
+        result = load_curve_categories(self.path)
+        self.assertEqual(result.categories, ())
+        self.assertIsNone(result.issue)
+
+    def test_invalid_and_repeated_entries_are_reported(self) -> None:
+        valid = {
+            "cat_id": 2, "descricao": "Residencial", "classe": "0", "min": -1,
+            "max": "100", "part_merc": "25,5", "tipo": "c", "pu_max": 0, "tipodem": 0,
+        }
+        self.path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "categorias": [valid, dict(valid), dict(valid, cat_id=3, classe=0.5)],
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = load_curve_categories(self.path)
+        (category,) = result.categories
+        self.assertEqual(category.category_id, "2")
+        self.assertEqual(category.kind, "C")
+        self.assertEqual(category.market_share, 25.5)
+        self.assertIn("ignoradas", result.issue)
+        self.assertIn("repetidas", result.issue)
+
+    def test_corrupted_file_does_not_raise(self) -> None:
+        self.path.write_text("{", encoding="utf-8")
+        result = load_curve_categories(self.path)
+        self.assertEqual(result.categories, ())
+        self.assertIn("JSON", result.issue)
 
 
 if __name__ == "__main__":  # pragma: no cover

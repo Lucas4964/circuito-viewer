@@ -20,7 +20,14 @@ if PYQT_AVAILABLE:
         CurveCatalog,
         CurveDraft,
     )
-    from circuit_viewer.curvas_store import load_curves, save_curves
+    from circuit_viewer.curvas import Curve
+    from circuit_viewer.curvas_categorias import CurveCategory
+    from circuit_viewer.curvas_mdb import CurveDatabaseContents
+    from circuit_viewer.curvas_store import (
+        load_curve_categories,
+        load_curves,
+        save_curves,
+    )
     from circuit_viewer.curvas_window import CurvesWindow
     from circuit_viewer.main_window import MainWindow
 
@@ -86,7 +93,7 @@ class CurvesWindowTests(unittest.TestCase):
         original_id = catalog.draft(0).curve_id
         window.name_edit.setText("Nova")
         window._on_name_edited("Nova")
-        self.assertEqual(window.curve_list.item(0, 1).text(), "Nova")
+        self.assertEqual(window.curve_list.item(0, 2).text(), "Nova")
         self.assertEqual(catalog.draft(0).curve_id, original_id)
         self.assertTrue(window.is_dirty)
 
@@ -344,14 +351,17 @@ class CurveLinkIdWindowTests(unittest.TestCase):
         self.addCleanup(window.hide)
         return window
 
-    def test_the_list_shows_id_and_name_columns(self) -> None:
+    def test_the_list_shows_id_period_and_name_columns(self) -> None:
         draft = _filled_draft("Clientes BT IP - Dia útil")
         draft.link_id = "1"
         window = self._window(CurveCatalog([draft]))
         header = window.curve_list.horizontalHeaderItem
-        self.assertEqual((header(0).text(), header(1).text()), ("ID", "Nome"))
+        self.assertEqual(
+            tuple(header(column).text() for column in range(3)),
+            ("ID", "Per.", "Nome"),
+        )
         self.assertEqual(window.curve_list.item(0, 0).text(), "1")
-        self.assertEqual(window.curve_list.item(0, 1).text(), draft.name)
+        self.assertEqual(window.curve_list.item(0, 2).text(), draft.name)
         self.assertEqual(window.link_id_edit.text(), "1")
 
     def test_editing_the_id_updates_the_column_and_is_saved(self) -> None:
@@ -376,3 +386,111 @@ class CurveLinkIdWindowTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class CurvePeriodWindowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = _application()
+        self._directory = TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.path = Path(self._directory.name) / "curvas.json"
+
+    def _window(self, catalog: "CurveCatalog") -> "CurvesWindow":
+        window = CurvesWindow(catalog, storage_path=self.path)
+        self.addCleanup(window.deleteLater)
+        window.show()
+        self.addCleanup(window.hide)
+        return window
+
+    def test_the_period_shows_in_the_list_and_the_combo(self) -> None:
+        draft = _filled_draft("Clientes BT IP - Sábado")
+        draft.period = "SA"
+        window = self._window(CurveCatalog([draft]))
+        self.assertEqual(window.curve_list.item(0, 1).text(), "SA")
+        self.assertEqual(window.period_combo.currentData(), "SA")
+
+    def test_choosing_a_period_updates_the_column_and_is_saved(self) -> None:
+        catalog = CurveCatalog([_filled_draft("A")])
+        window = self._window(catalog)
+        window.period_combo.setCurrentIndex(window.period_combo.findData("DO"))
+        self.assertEqual(catalog.draft(0).period, "DO")
+        self.assertEqual(window.curve_list.item(0, 1).text(), "DO")
+        self.assertTrue(window.is_dirty)
+        self.assertTrue(window._save())
+        self.assertEqual(load_curves(self.path).curves[0].period, "DO")
+
+    def test_selecting_another_curve_shows_its_period(self) -> None:
+        first, second = _filled_draft("A"), _filled_draft("B")
+        first.period, second.period = "DU", ""
+        window = self._window(CurveCatalog([first, second]))
+        window.curve_list.setCurrentCell(1, 2)
+        self.assertEqual(window.period_combo.currentData(), "")
+        self.assertFalse(window.is_dirty)
+
+
+@unittest.skipUnless(PYQT_AVAILABLE, "PyQt6 não está instalado")
+class CurveDatabaseImportWindowTests(unittest.TestCase):
+    """A leitura do banco é testada em test_curvas_mdb; aqui, só a instalação."""
+
+    def setUp(self) -> None:
+        self.app = _application()
+        self._directory = TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.path = Path(self._directory.name) / "curvas.json"
+
+    def _contents(self) -> "CurveDatabaseContents":
+        values = tuple(float(hour) for hour in range(HOURLY_CURVE_POINT_COUNT))
+        return CurveDatabaseContents(
+            curves=(
+                Curve("interplan-cat2-p1", "Residencial - Dia útil", values, "2", "DU"),
+                Curve("interplan-cat2-p4", "Residencial - Média", values, "2", "MED"),
+            ),
+            categories=(
+                CurveCategory("2", "Residencial", 0, -1.0, 100.0, 25.5,
+                              power_factor=0.92),
+            ),
+            issues=("Categoria 9: N_PONTOS 96 diferente de 24; ignorada.",),
+        )
+
+    def test_install_saves_curves_and_categories_beside_each_other(self) -> None:
+        user = _filled_draft("Minha curva")
+        window = CurvesWindow(CurveCatalog([user]), storage_path=self.path)
+        self.addCleanup(window.deleteLater)
+        saved = []
+        window.curvesSaved.connect(saved.append)
+        with patch.object(QMessageBox, "information") as information:
+            self.assertTrue(window.install_imported_database(self._contents()))
+        information.assert_called_once()
+        self.assertEqual(saved, [3])
+        self.assertFalse(window.is_dirty)
+        self.assertEqual(
+            [curve.name for curve in load_curves(self.path).curves],
+            ["Minha curva", "Residencial - Dia útil", "Residencial - Média"],
+        )
+        categories = load_curve_categories(self.path.with_name("categorias_curvas.json"))
+        self.assertEqual([item.category_id for item in categories.categories], ["2"])
+        self.assertEqual(window.curve_list.rowCount(), 3)
+        self.assertIn("2 curva(s) nova(s)", window.status_label.text())
+
+    def test_importing_again_updates_the_same_curves(self) -> None:
+        window = CurvesWindow(CurveCatalog(), storage_path=self.path)
+        self.addCleanup(window.deleteLater)
+        with patch.object(QMessageBox, "information"):
+            window.install_imported_database(self._contents())
+            window.install_imported_database(self._contents())
+        self.assertEqual(len(load_curves(self.path).curves), 2)
+        self.assertIn("2 atualizada(s)", window.status_label.text())
+
+    def test_the_button_resolves_pending_edits_before_asking_for_a_file(self) -> None:
+        window = CurvesWindow(CurveCatalog(), storage_path=self.path)
+        self.addCleanup(window.deleteLater)
+        window._on_new_curve()
+        with patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ), patch("circuit_viewer.curvas_window.QFileDialog.getOpenFileName") as chooser:
+            window._on_import_clicked()
+        chooser.assert_not_called()
+        self.assertFalse(window.is_importing)

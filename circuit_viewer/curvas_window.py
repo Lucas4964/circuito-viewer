@@ -1,8 +1,8 @@
 """Janela de cadastro e edição das curvas horárias.
 
-Composição mestre-detalhe: a tabela das curvas (ID de vínculo e nome) à
-esquerda, e à direita o nome, o ID, a grade das 24 horas e o gráfico do que está
-selecionado.
+Composição mestre-detalhe: a tabela das curvas (ID de vínculo, período e nome)
+à esquerda, e à direita o nome, o ID, o período, a grade das 24 horas e o
+gráfico do que está selecionado.
 
 **As alterações ficam pendentes até "Salvar".** É o que permite desistir de uma
 edição errada — inclusive de uma exclusão. A contrapartida é que fechar a janela
@@ -13,22 +13,30 @@ edições que o usuário acabou de descartar.
 
 A janela nunca chama a janela principal: o que precisa subir sobe pelo sinal
 :attr:`CurvesWindow.curvesSaved`, como nas demais janelas secundárias.
+
+**"Importar banco…" não fica pendente.** Ler o Curvas.mdb do Interplan é uma
+importação, como as da janela principal: com o rascunho resolvido antes, as
+curvas e as categorias vão direto para o disco e a janela relê o resultado. As
+curvas do banco têm id fixo, então importar de novo atualiza as mesmas.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QHeaderView,
     QLineEdit,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -38,6 +46,8 @@ from PyQt6.QtWidgets import (
 
 from .curva_chart import CurveChartWidget
 from .curvas import (
+    CURVE_PERIOD_LABELS,
+    CURVE_PERIODS,
     MAX_CURVE_LINK_ID_LENGTH,
     MAX_CURVE_NAME_LENGTH,
     CurveCatalog,
@@ -45,7 +55,14 @@ from .curvas import (
     validate_catalog,
     validate_curve_name,
 )
-from .curvas_store import load_curves, save_curves
+from .curvas_mdb import CurveDatabaseContents, merge_curve_database
+from .curvas_store import (
+    categories_path_for,
+    load_curve_categories,
+    load_curves,
+    save_curve_categories,
+    save_curves,
+)
 from .curvas_table import CurveTableView, CurveValuesTableModel
 from .table_columns import EXCEL_LIKE_TABLE_STYLE, enable_interactive_columns
 
@@ -53,7 +70,10 @@ from .table_columns import EXCEL_LIKE_TABLE_STYLE, enable_interactive_columns
 _EMPTY_TEXT = 'Nenhuma curva cadastrada. Use "Nova curva" para começar.'
 _NEW_CURVE_NAME = "Nova curva"
 _ID_COLUMN = 0
-_NAME_COLUMN = 1
+_PERIOD_COLUMN = 1
+_NAME_COLUMN = 2
+# Quantas ocorrências da leitura do banco a mensagem final lista.
+_SHOWN_IMPORT_ISSUES = 15
 
 
 class CurvesWindow(QDialog):
@@ -67,6 +87,7 @@ class CurvesWindow(QDialog):
         catalog: CurveCatalog,
         *,
         storage_path: str | Path | None = None,
+        categories_path: str | Path | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -77,7 +98,22 @@ class CurvesWindow(QDialog):
 
         self.catalog = catalog
         self._storage_path = storage_path
+        self._categories_path = (
+            categories_path_for(storage_path)
+            if categories_path is None
+            else Path(categories_path)
+        )
         self._dirty = False
+        # Importação do banco de curvas: uma por vez, e o resultado só é lido
+        # quando a thread termina, para nunca haver duas conexões abertas.
+        self._import_path: str | None = None
+        self._import_thread: QThread | None = None
+        self._import_worker = None
+        self._import_progress: QProgressDialog | None = None
+        self._import_outcome: tuple[str, object] | None = None
+        self._import_cancelled = False
+        self._import_password_attempts = 0
+        self._default_password_tried = False
         # Guarda de reentrância: repovoar a lista dispara currentRowChanged, e
         # sem ela a troca de seleção gravaria o nome de uma curva em outra.
         self._loading = False
@@ -93,7 +129,7 @@ class CurvesWindow(QDialog):
 
     def _build_side_panel(self) -> QWidget:
         panel = QWidget(self)
-        panel.setFixedWidth(320)
+        panel.setFixedWidth(360)
         column = QVBoxLayout(panel)
         column.setContentsMargins(0, 0, 0, 0)
 
@@ -101,9 +137,12 @@ class CurvesWindow(QDialog):
         # Tabela só de leitura: nome e ID se editam nos campos ao lado, que já
         # validam e marcam a pendência. A ordem das linhas é a do catálogo —
         # sem ordenação por clique, que desalinharia linha e índice.
-        self.curve_list = QTableWidget(0, 2, panel)
+        self.curve_list = QTableWidget(0, 3, panel)
         self.curve_list.setObjectName("curves_list")
-        self.curve_list.setHorizontalHeaderLabels(("ID", "Nome"))
+        self.curve_list.setHorizontalHeaderLabels(("ID", "Per.", "Nome"))
+        self.curve_list.horizontalHeaderItem(_PERIOD_COLUMN).setToolTip(
+            "Tipo de dia: DU dia útil, SA sábado, DO domingo, MED média do mês"
+        )
         self.curve_list.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
@@ -119,11 +158,11 @@ class CurvesWindow(QDialog):
         # (dia útil, sábado…) que distingue as curvas de uma mesma categoria.
         self.curve_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         header = self.curve_list.horizontalHeader()
-        header.setSectionResizeMode(
-            _ID_COLUMN, QHeaderView.ResizeMode.Interactive
-        )
+        for section in (_ID_COLUMN, _PERIOD_COLUMN):
+            header.setSectionResizeMode(section, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(_NAME_COLUMN, QHeaderView.ResizeMode.Stretch)
-        self.curve_list.setColumnWidth(_ID_COLUMN, 56)
+        self.curve_list.setColumnWidth(_ID_COLUMN, 48)
+        self.curve_list.setColumnWidth(_PERIOD_COLUMN, 44)
         column.addWidget(self.curve_list, 1)
 
         self.new_button = QPushButton("Nova curva", panel)
@@ -135,6 +174,14 @@ class CurvesWindow(QDialog):
         self.delete_button.setObjectName("curve_delete_button")
         self.delete_button.setToolTip("Excluir a curva selecionada")
         column.addWidget(self.delete_button)
+
+        self.import_button = QPushButton("Importar banco de curvas…", panel)
+        self.import_button.setObjectName("curve_import_button")
+        self.import_button.setToolTip(
+            "Ler as curvas típicas e as categorias de um banco do Interplan "
+            "(Curvas.mdb); importar de novo atualiza as mesmas curvas"
+        )
+        column.addWidget(self.import_button)
         return panel
 
     def _build_editor(self) -> QWidget:
@@ -160,12 +207,25 @@ class CurvesWindow(QDialog):
         self.link_id_edit = QLineEdit(editor)
         self.link_id_edit.setObjectName("curve_link_id_edit")
         self.link_id_edit.setMaxLength(MAX_CURVE_LINK_ID_LENGTH)
-        self.link_id_edit.setFixedWidth(110)
+        self.link_id_edit.setFixedWidth(72)
         self.link_id_edit.setToolTip(
             "Identificador para vínculos e mapas — nas curvas do Interplan, o "
             "CAT_ID da categoria referenciado pelo CURVA_ID da rede"
         )
         name_row.addWidget(self.link_id_edit)
+        self.period_label = QLabel("Período:", editor)
+        name_row.addWidget(self.period_label)
+        self.period_combo = QComboBox(editor)
+        self.period_combo.setObjectName("curve_period_combo")
+        self.period_combo.addItem("—", "")
+        for period in CURVE_PERIODS:
+            self.period_combo.addItem(
+                f"{period} — {CURVE_PERIOD_LABELS[period]}", period
+            )
+        self.period_combo.setToolTip(
+            "Tipo de dia da curva; nas curvas típicas do Interplan, o PERIODO 1 a 4"
+        )
+        name_row.addWidget(self.period_combo)
         column.addLayout(name_row)
 
         self.table_model = CurveValuesTableModel(self)
@@ -235,6 +295,8 @@ class CurvesWindow(QDialog):
         self.delete_button.clicked.connect(self._on_delete_curve)
         self.name_edit.textEdited.connect(self._on_name_edited)
         self.link_id_edit.textEdited.connect(self._on_link_id_edited)
+        self.period_combo.currentIndexChanged.connect(self._on_period_changed)
+        self.import_button.clicked.connect(self._on_import_clicked)
         self.save_button.clicked.connect(self._on_save_clicked)
         self.close_button.clicked.connect(self.close)
         self.table_model.dataChanged.connect(self._on_values_changed)
@@ -260,6 +322,9 @@ class CurvesWindow(QDialog):
             for row, draft in enumerate(drafts):
                 self.curve_list.setItem(
                     row, _ID_COLUMN, QTableWidgetItem(draft.link_id)
+                )
+                self.curve_list.setItem(
+                    row, _PERIOD_COLUMN, self._period_item(draft.period)
                 )
                 name_item = QTableWidgetItem(draft.name or "(sem nome)")
                 name_item.setToolTip(draft.name)
@@ -302,6 +367,8 @@ class CurvesWindow(QDialog):
             self.name_edit,
             self.link_id_label,
             self.link_id_edit,
+            self.period_label,
+            self.period_combo,
             self.table,
             self.chart,
             self.save_button,
@@ -321,6 +388,9 @@ class CurvesWindow(QDialog):
         try:
             self.name_edit.setText("" if draft is None else draft.name)
             self.link_id_edit.setText("" if draft is None else draft.link_id)
+            self.period_combo.setCurrentIndex(
+                max(0, self.period_combo.findData("" if draft is None else draft.period))
+            )
         finally:
             self._loading = False
         self.table_model.set_draft(draft)
@@ -438,6 +508,25 @@ class CurvesWindow(QDialog):
         if item is not None:
             item.setText(draft.link_id)
 
+    @staticmethod
+    def _period_item(period: str) -> QTableWidgetItem:
+        item = QTableWidgetItem(period)
+        if period:
+            item.setToolTip(CURVE_PERIOD_LABELS[period])
+        return item
+
+    def _on_period_changed(self, index: int) -> None:
+        if self._loading:
+            return
+        row = self.curve_list.currentRow()
+        draft = self._current_draft()
+        if draft is None:
+            return
+        period = self.period_combo.itemData(index) or ""
+        if self.catalog.set_period(row, period):
+            self._mark_dirty()
+        self.curve_list.setItem(row, _PERIOD_COLUMN, self._period_item(draft.period))
+
     def _on_values_changed(self, *args) -> None:  # noqa: ANN002, ARG002
         self._mark_dirty()
         self._sync_chart()
@@ -475,6 +564,172 @@ class CurvesWindow(QDialog):
         self.refresh()
         self._clear_status()
 
+    # ------------------------------------------------- importação do banco --
+
+    @property
+    def is_importing(self) -> bool:
+        return self._import_thread is not None
+
+    def _on_import_clicked(self) -> None:
+        if self.is_importing or not self.confirm_pending_changes():
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importar banco de curvas",
+            "",
+            "Bancos Access (*.mdb *.accdb);;Todos os arquivos (*)",
+        )
+        if not path:
+            return
+        self._import_path = path
+        self._import_cancelled = False
+        self._import_password_attempts = 0
+        self._default_password_tried = False
+        progress = QProgressDialog("Lendo o banco de curvas…", "Cancelar", 0, 0, self)
+        progress.setWindowTitle("Importar banco de curvas")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(300)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.canceled.connect(self._cancel_import)
+        progress.setValue(0)
+        self._import_progress = progress
+        self._start_import(None)
+
+    def _start_import(self, password: str | None) -> None:
+        from .workers import CurveDatabaseWorker
+
+        self._import_outcome = None
+        thread = QThread(self)
+        worker = CurveDatabaseWorker(self._import_path, password=password)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(lambda contents: self._set_import_outcome("finished", contents))
+        worker.failed.connect(lambda message: self._set_import_outcome("failed", message))
+        worker.password_required.connect(lambda: self._set_import_outcome("password", None))
+        worker.completed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_import_thread_finished)
+        self._import_thread = thread
+        self._import_worker = worker
+        self.import_button.setEnabled(False)
+        thread.start()
+
+    def _set_import_outcome(self, kind: str, value: object) -> None:
+        self._import_outcome = (kind, value)
+
+    def _cancel_import(self) -> None:
+        self._import_cancelled = True
+        if self._import_worker is not None:
+            self._import_worker.cancel()
+
+    def _on_import_thread_finished(self) -> None:
+        """Decide o passo seguinte só depois que a conexão já foi fechada."""
+
+        self._import_thread = None
+        self._import_worker = None
+        outcome, self._import_outcome = self._import_outcome, None
+        if self._import_cancelled or outcome is None:
+            self._finish_import()
+            self._show_info("Importação do banco de curvas cancelada.")
+            return
+        kind, value = outcome
+        if kind == "password":
+            password = self._ask_import_password()
+            if password is None:
+                self._finish_import()
+                self._show_info("Importação do banco de curvas cancelada.")
+            else:
+                self._start_import(password)
+            return
+        self._finish_import()
+        if kind == "failed":
+            self._show_error(str(value))
+        else:
+            self.install_imported_database(value)
+
+    def _ask_import_password(self) -> str | None:
+        """Senha padrão do cofre primeiro; depois, a digitada pelo usuário."""
+
+        from .mdb_credentials import load_default_password
+        from .mdb_import_dialog import MdbPasswordDialog
+
+        if not self._default_password_tried:
+            self._default_password_tried = True
+            password = load_default_password()
+            if password:
+                return password
+        progress = self._import_progress
+        if progress is not None:
+            progress.hide()
+        dialog = MdbPasswordDialog(
+            Path(self._import_path or "").name,
+            self,
+            retry=self._import_password_attempts > 0,
+        )
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            self._import_password_attempts += 1
+            return dialog.password()
+        finally:
+            dialog.deleteLater()
+            if progress is not None:
+                progress.show()
+
+    def _finish_import(self) -> None:
+        progress, self._import_progress = self._import_progress, None
+        if progress is not None:
+            progress.canceled.disconnect(self._cancel_import)
+            progress.close()
+            progress.deleteLater()
+        self.import_button.setEnabled(True)
+
+    def install_imported_database(self, contents: CurveDatabaseContents) -> bool:
+        """Junta o banco lido às curvas gravadas e grava curvas e categorias."""
+
+        categories = load_curve_categories(self._categories_path)
+        merged = merge_curve_database(
+            self.catalog.to_curves(), categories.categories, contents
+        )
+        try:
+            # As categorias primeiro: sem as curvas elas não atrapalham nada,
+            # mas curvas sem as categorias não serviriam ao modo Energia.
+            save_curve_categories(merged.categories, self._categories_path)
+            save_curves(merged.curves, self._storage_path)
+        except OSError as exc:
+            self._show_error(
+                f"Não foi possível gravar as curvas importadas: {exc.strerror or exc}"
+            )
+            return False
+        self.catalog = CurveCatalog.from_curves(merged.curves)
+        self._dirty = False
+        self.refresh()
+        summary = (
+            f"Banco de curvas importado: {merged.added:n} curva(s) nova(s), "
+            f"{merged.replaced:n} atualizada(s) e {len(contents.categories):n} "
+            "categoria(s)."
+        )
+        if merged.renamed:
+            summary += (
+                f" {len(merged.renamed):n} curva(s) do banco ganharam sufixo no "
+                "nome por coincidir com curvas suas."
+            )
+        self._show_info(summary)
+        self.curvesSaved.emit(len(self.catalog))
+        if contents.issues:
+            lines = list(contents.issues[:_SHOWN_IMPORT_ISSUES])
+            hidden = len(contents.issues) - len(lines) + contents.omitted_issues
+            if hidden:
+                lines.append(f"… e mais {hidden:n}.")
+            QMessageBox.information(
+                self,
+                "Importar banco de curvas",
+                summary + "\n\nFicaram de fora:\n" + "\n".join(lines),
+            )
+        return True
+
     # -------------------------------------------------------------- status --
 
     def _show_error(self, message: str) -> None:
@@ -494,6 +749,11 @@ class CurvesWindow(QDialog):
     # ------------------------------------------------------------ fechamento --
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if self.is_importing:
+            # O diálogo de progresso é modal; fechar por fora só cancela.
+            self._cancel_import()
+            event.ignore()
+            return
         if self.confirm_pending_changes():
             event.accept()
         else:

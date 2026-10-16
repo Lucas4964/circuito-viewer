@@ -67,6 +67,7 @@ CIRCUITO_VIEWER/
 │   │   └── mdb_tabelas.json   # mapeamento tabela/coluna → entidade (dado externo)
 │   ├── dados/                 # DADO DO USUÁRIO (gitignored, criado em runtime)
 │   │   ├── curvas.json        # curvas horárias cadastradas na interface
+│   │   ├── categorias_curvas.json # categorias das curvas típicas do Interplan
 │   │   └── patamares.json     # agenda dos quatro patamares de cálculo
 │   │
 │   ├── model.py               # NÚCLEO: entidades, índices espaciais, topologia
@@ -92,7 +93,9 @@ CIRCUITO_VIEWER/
 │   ├── circuit_calculation_levels.py # fonte imutável e cópia de sessão
 │   │
 │   ├── curvas.py              # NÚCLEO: curvas de 24 pontos, validação, colagem
-│   ├── curvas_store.py        # NÚCLEO: leitura/gravação atômica de curvas.json
+│   ├── curvas_store.py        # NÚCLEO: leitura/gravação atômica de curvas e categorias
+│   ├── curvas_categorias.py   # NÚCLEO: categorias de curva (classe, faixa, sorteio)
+│   ├── curvas_mdb.py          # NÚCLEO: leitura do Curvas.mdb do Interplan + mesclagem
 │   ├── calculation_levels.py  # NÚCLEO: agenda imutável + rascunhos editáveis
 │   ├── calculation_levels_store.py # leitura/gravação atômica de patamares.json
 │   ├── generator_update.py    # cálculo derivado das demandas dos geradores
@@ -224,7 +227,9 @@ Exceções conhecidas e deliberadas:
 | `model.py` | Entidades imutáveis, modelos colunares, índices espaciais, adjacência CSR, busca elétrica, controlador de visibilidade | I/O, Qt |
 | `phase_config.py` | Ler/validar `fases2.json`; classificar `FASES2` em categorias de renderização | Definir cores da UI (só as constantes) |
 | `curvas.py` | `Curve`/`CurveDraft`/`CurveCatalog`, validação de nome e das 24 horas, interpretação do bloco colado | I/O, Qt |
-| `curvas_store.py` | Ler/gravar `dados/curvas.json` de forma atômica e tolerante a arquivo corrompido | Qt, validar regras de negócio |
+| `curvas_store.py` | Ler/gravar `dados/curvas.json` e `dados/categorias_curvas.json` de forma atômica e tolerante a arquivo corrompido | Qt, validar regras de negócio |
+| `curvas_categorias.py` | `CurveCategory` de `CURVAS_CATEGORIA` (classe, faixa `MIN`–`MAX` com limite negativo aberto, `PART_MERC`, tipo, `FAT_POT`) e a ordem do Interplan por `CAT_ID` numérico | I/O, Qt |
+| `curvas_mdb.py` | Ler o `Curvas.mdb` pelo protocolo `AccessDatabase` (curvas de id fixo `interplan-cat<N>-p<P>`, `link_id` = `CAT_ID`, período) e juntar o resultado ao que está gravado | Qt, abrir conexão (o worker abre) |
 | `calculation_levels.py` | Agenda imutável dos NPAT 0–3, rascunhos isolados e validação do ciclo contínuo de 24 horas | I/O, Qt, executar cálculos |
 | `calculation_levels_store.py` | Ler/gravar `dados/patamares.json` atomicamente; arquivo inválido recua integralmente aos padrões | Qt |
 | `generator_update.py` | Resolver circuito/fases, aplicar curva e agenda e produzir demandas e potências por fase imutáveis | Qt, I/O, mutar geradores/curvas/patamares |
@@ -3391,6 +3396,7 @@ lido por uma build anterior.
 | `test_curvas.py` | invariantes da curva (24 pontos, sem `nan`/`inf`, negativos e zero aceitos), `curve_id` sobrevivendo à renomeação, unicidade de nome sem caixa, horas faltantes em base 1, e o parser de colagem: `\r\n`/`\r`, linha vazia final descartada mas a do meio preservada, bloco de duas colunas, vírgula decimal e recusa de `1.234,56` |
 | `test_curvas_store.py` | ida e volta preservando id/acentos/negativos, criação do diretório, regravação por cima (regressão de `os.rename` no Windows), nenhum `.tmp` remanescente, e a tolerância de leitura: JSON quebrado, raiz inesperada, entrada inválida entre válidas, versão mais nova, ids/nomes repetidos, id ausente gerado e chaves desconhecidas ignoradas |
 | `test_curvas_table.py` | coluna "Hora" sintética e não editável, `EditRole` sem truncar a precisão, `setData` com ponto e vírgula, texto recusado sem apagar o valor anterior, célula esvaziada, colagem com âncora, truncamento na hora 24 e a **regressão de alinhamento** (um texto não numérico no meio não desloca as horas seguintes) |
+| `test_curvas_categorias.py` · `test_curvas_mdb.py` | faixa `[MIN, MAX)` com limites abertos, validação da categoria, ordem numérica de `CAT_ID`; leitura do banco falso (ids, nomes, período, `MEDIA_P`, categorias, `FAT_POT`), categoria sem 24 pontos, curva com ponto faltando, banco antigo sem `PERIODO`/`TIPO`, nome cortado no limite, descrição repetida, tabela/coluna ausente, cancelamento; mesclagem (substitui no lugar, sufixo na do banco, categorias por id) e o worker (senha pedida, senha fora da mensagem, cancelado em silêncio) |
 | `test_curvas_ui.py` | estado vazio, criação/renomeação/exclusão com confirmação, recusa de salvar incompleta sem criar o arquivo, gravação e `curvesSaved`, fechar com Salvar/Descartar/Cancelar (Descartar relê o disco), gráfico acompanhando a edição, os casos-limite de pintura (vazio, todos iguais, todos zero, faixa negativa, lacunas) e a entrada de menu **Configurações → Curvas…** |
 | `test_calculation_levels.py` · `test_calculation_levels_store.py` | padrões, invariantes do ciclo de 24 horas, referência nos limites, isolamento do rascunho, round-trip JSON, fallback integral e gravação atômica |
 | `test_patamares_ui.py` | cinco colunas totalmente editáveis, limites dos delegates, estado sujo, validação conjunta, salvamento, ordenação, descarte/cancelamento, menu e persistência entre janelas principais |

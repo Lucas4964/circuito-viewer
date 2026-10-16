@@ -178,6 +178,8 @@ from .csv_import import (
 )
 from .curvas import (
     CURVE_DISPLAY_DECIMALS,
+    CURVE_PERIOD_LABELS,
+    CURVE_PERIODS,
     HOURLY_CURVE_POINT_COUNT,
     MAX_CURVE_LINK_ID_LENGTH,
     MAX_CURVE_NAME_LENGTH,
@@ -189,11 +191,22 @@ from .curvas import (
     validate_curve_name,
     validate_draft,
 )
+from .curvas_categorias import CurveCategory
+from .curvas_mdb import (
+    CurveDatabaseContents,
+    CurveDatabaseError,
+    merge_curve_database,
+    read_curve_database,
+)
 from .curvas_store import (
     CURVES_FILE_VERSION,
+    CategoriesLoadResult,
     CurvesLoadResult,
+    default_categories_path,
     default_curves_path,
+    load_curve_categories,
     load_curves,
+    save_curve_categories,
     save_curves,
 )
 from .mdb_engine import (
@@ -509,6 +522,17 @@ __all__ = [
     "detect_coordinate_scale",
     "HOURLY_CURVE_POINT_COUNT",
     "load_curves",
+    "load_curve_categories",
+    "save_curve_categories",
+    "default_categories_path",
+    "CategoriesLoadResult",
+    "CurveCategory",
+    "CurveDatabaseContents",
+    "CurveDatabaseError",
+    "read_curve_database",
+    "merge_curve_database",
+    "CURVE_PERIOD_LABELS",
+    "CURVE_PERIODS",
     "MAX_CURVE_LINK_ID_LENGTH",
     "MAX_CURVE_NAME_LENGTH",
     "new_curve_id",

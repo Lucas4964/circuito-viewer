@@ -1683,13 +1683,37 @@ Cada curva guarda um identificador interno que a renomeação não altera. A
 atualização dos geradores registra esse identificador no resultado da sessão,
 sem modificar o `CURVA_ID` que veio de `MT_GERADOR_CONS`.
 
-**ID de vínculo.** A lista de curvas tem duas colunas, **ID** e **Nome**, e o
-campo **ID** ao lado do nome edita a curva selecionada. É um identificador de
+**ID de vínculo.** A lista de curvas tem as colunas **ID**, **Per.** e **Nome**,
+e o campo **ID** ao lado do nome edita a curva selecionada. É um identificador de
 fora do programa, para vínculos e mapas, gravado como `id_vinculo` no JSON (e
 omitido quando vazio). Nas curvas típicas do Interplan é o `CAT_ID` da
 categoria, o número que o `CURVA_ID` das cargas e geradores da rede referencia;
 por isso não precisa ser único — dia útil, sábado, domingo e média de uma
 categoria compartilham o mesmo ID.
+
+**Período.** A coluna **Per.** e o campo **Período** dizem o tipo de dia da
+curva: `DU` (dia útil), `SA` (sábado), `DO` (domingo) ou `MED` (média do mês) —
+o `PERIODO` 1 a 4 das curvas típicas do Interplan. É gravado como `periodo` e
+fica vazio nas curvas que não descrevem um dia típico.
+
+**Importar banco de curvas…** O botão abaixo da lista lê o `Curvas.mdb` do
+Interplan, somente para leitura. Cada curva típica (`CURVAS_CURVATIPICA` +
+`CURVAS_PONTOS`, valor `MEDIA_P`) vira uma curva de id
+`interplan-cat<CAT_ID>-p<PERIODO>`, nome `<CAT_DESC> - <período>`, ID igual ao
+`CAT_ID` e o período preenchido. As categorias (`CURVAS_CATEGORIA`: classe,
+faixa `MIN`–`MAX`, participação de mercado, tipo e o `FAT_POT` das curvas) vão
+para `dados/categorias_curvas.json`, ao lado do `curvas.json`: são elas que o
+modo de cargas Energia usa para escolher a curva de cada consumidor.
+
+- Alterações pendentes precisam ser salvas ou descartadas antes; a importação
+  grava direto, sem passar por **Salvar**.
+- Importar de novo atualiza as mesmas curvas. As suas ficam intactas, e se uma
+  delas já usa o nome de uma curva do banco, é a do banco que ganha um sufixo.
+- Banco protegido: a senha padrão do cofre do Windows é tentada antes de
+  perguntar; a senha nunca é gravada.
+- O banco não descreve o `PERIODO`; o significado foi deduzido dos dados: o 4 é
+  a média do 1, 2 e 3 ponderada pelo `FAT_NORM`, e o 2 tem mais carga que o 3
+  nas categorias comerciais e industriais (sábado e domingo).
 
 ## Atualização dos geradores
 
