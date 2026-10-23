@@ -64,6 +64,7 @@ CIRCUITO_VIEWER/
 │   ├── __main__.py            # ponto de entrada (QApplication + MainWindow)
 │   ├── config/
 │   │   ├── fases2.json        # mapeamento FASES2 → NUMERO_FASES (dado externo)
+│   │   ├── fases2_carga.json  # FASES2 da CARGA (TCarga::FasesMT): 7/8/9 e 13 em delta
 │   │   └── mdb_tabelas.json   # mapeamento tabela/coluna → entidade (dado externo)
 │   ├── dados/                 # DADO DO USUÁRIO (gitignored, criado em runtime)
 │   │   ├── curvas.json        # curvas horárias cadastradas na interface
@@ -2005,7 +2006,7 @@ espaços de nomes distintos de `Line.*`.
 | nome da `Load` | `<CODIGO>-<N>F-<FASE>`; `CARGA_ID` como fallback do `CODIGO` |
 | `phases` | sempre `1` — a carga multifásica é decomposta, não declarada |
 | `bus1` | **`CODIGO`** da barra + nó da fase (ver abaixo) |
-| `conn` | `wye`; `delta` na trifásica de `TIPO_LIG` 2 |
+| `conn` | `wye`; `delta` quando a relação do `FASES2` em `fases2_carga.json` tem `LIGACAO` delta (7/8/9 e 13) |
 | `kV` | `VNOM` do circuito dono **dividida por `√3`**; a própria `VNOM` em `delta` |
 | `kW`/`kvar` | fixos em `1` |
 | `daily` | `PERFIL-<nome da Load>` |
@@ -2024,17 +2025,26 @@ igualmente entre as fases, apagando exatamente o desequilíbrio que os patamares
 por fase (`PD`/`PE`/`PF`) descrevem. A monofásica segue a mesma forma com uma
 fase só, por uniformidade.
 
-**ET e EP trifásicos são ligados entre fases.** O Interplan modela a carga
-trifásica de `TIPO_LIG` 2 no primário em delta do transformador: os `PD`/`PE`/`PF`
-do `MODELO_CARGA` são as potências dos pares `DE`/`EF`/`FD`. A prova está nas
-correntes do relatório — 2,809/2,809/0,069 kW nos pares dão 0,22/0,37/0,22 A nas
-linhas, que só a ligação em delta reproduz (em estrela seriam 0,37/0,37/0,01 A).
-Para essas cargas cada letra vai para o par que começa nela
-(`_DELTA_PAIR_BY_PHASE`), com os nós vindos dos mesmos terminais das
-monofásicas, `conn=delta` e o `kV` de linha. Nome e perfil não mudam, então
-nenhum leitor de resultado precisa saber da diferença. Monofásicas e bifásicas
-seguem fase-neutro: as monofásicas são assim no Interplan, e as bifásicas ainda
-não têm um caso conferido.
+**O `FASES2` da CARGA tem tabela própria.** O Interplan traduz o `FASES2` da
+`TCarga` pela tabela de `TCarga::FasesMT`, diferente da dos trechos e
+consumidores. Ela vive em `config/fases2_carga.json` e chega aos exportadores
+por `PhaseConfiguration.for_loads()`. Todo código que lê `CARGA.FASES2` passa
+por ali: `build_load_export`, o primário de `build_energy_export`, as fases do
+transformador em `build_transformer_allocations` e
+`opendss_allocation_export`. Sem o arquivo, `for_loads()` devolve a própria
+configuração.
+
+**A ligação entre fases sai do `FASES2`, não do `TIPO_LIG`.** A trifásica 13 é
+delta: os `PD`/`PE`/`PF` do `MODELO_CARGA` são as potências dos pares
+`DE`/`EF`/`FD`. A prova está nas correntes do relatório — 2,809/2,809/0,069 kW
+nos pares dão 0,22/0,37/0,22 A nas linhas, que só a ligação em delta reproduz
+(em estrela seriam 0,37/0,37/0,01 A). Cada letra vai para o par que começa nela
+(`_DELTA_PAIR_BY_PHASE`), com `conn=delta` e o `kV` de linha. As 7/8/9 são
+**monofásicas entre fases**: a potência fica numa coluna só (`PD` na 7, `PE` na
+8, `PF` na 9), e a única `Load` vai para o par do `DSS` (`1.2`, `2.3`, `3.1`).
+Nome e perfil não mudam, então nenhum leitor de resultado precisa saber da
+diferença. A 14 e as monofásicas 1 a 6 seguem fase-neutro. Um `TIPO_LIG` que
+discorde do `FASES2` numa trifásica vira aviso não descartante.
 
 **A nomenclatura carrega a contagem de fases.** `<CODIGO>-<N>F-<FASE>` deixa o
 arquivo legível sem consultar o `fases2.json` e, de quebra, torna impossível que
@@ -2342,8 +2352,8 @@ normais. Os equivalentes válidos e não zerados são emitidos em
 `ramalmonofasico.dss` e `ramalbifasico.dss`, como `Load` monofásicas por fase,
 com `LoadShape` de quatro NPAT e potência líquida sem inversão adicional. As
 cargas externas aos ramais — todas as trifásicas, que ficam no tronco — passam
-pelo mesmo `build_load_export` do modo completo, inclusive a ligação em delta de
-`TIPO_LIG` 2, e o equivalente recebe o `model` das cargas quando a potência vem
+pelo mesmo `build_load_export` do modo completo, inclusive a ligação em delta
+decidida pelo `FASES2`, e o equivalente recebe o `model` das cargas quando a potência vem
 das tabelas (ver *Modelo de carga*): os dois modos falam a mesma língua.
 
 O namespace `Load.*` é reservado na ordem cargas externas, geradores externos e
@@ -2429,11 +2439,38 @@ construído antes de criar o temporário; depois segue o mesmo contrato de
 #### Modo de cargas Energia (`build_energy_export`)
 
 Com um `EnergyDemandModel` em `build_export(energy=...)`, cada CARGA que ele
-assume vira, em `trafos_energia.dss`:
+assume vira:
 
 ```
 barra MT ──[TRF-<CARGA>]── BT_<CARGA> ── Load de cada UC, ponto de IP e GD
 ```
+
+**Arquivos, na convenção do modo Interplan.** O critério é o `phases=` da
+`Load`, e `phases=1` vale para o mono mesmo quando a `Load` é ligada entre
+fases (delta).
+
+| Elemento | Arquivo |
+|---|---|
+| trafo split-phase / trifásico | `trafosmonofasicos.dss` / `trafostrifasicos.dss` |
+| UC | `cargasmonofasicas.dss`, `cargasbifasicas.dss` ou `cargastrifasicas.dss` |
+| IP | `iluminacaopublica.dss` |
+| GD | `geradoresmonofasicos.dss`, `geradoresbifasicos.dss` ou `geradorestrifasicos.dss` |
+
+`build_energy_export` devolve os elementos já separados:
+
+- `own_files`: os arquivos só do Energia, que são os de trafos e o de IP;
+- `sections`: blocos a anexar aos `cargas*`/`geradores*`, por nome de arquivo.
+
+Quem junta é `OpenDssExportBundle.element_files`, com `_merged_file_text`. As
+CARGAs e os geradores que ficaram no modelo do Interplan vêm na frente, e o
+bloco do Energia vem depois. Sem eles, o arquivo nasce com título próprio.
+
+Cada `LoadShape` fica no arquivo da sua `Load`, antes dela. Os arquivos de
+trafo vêm **antes** dos de carga no master. Com Energia exportado, os três
+`cargas*` saem sempre, e os três `geradores*` saem quando há GD ou resultado
+de geradores.
+
+Sem `energy`, `element_files` é idêntico ao do modo Interplan.
 
 - **Trafo ideal**, topologia do `agregar_trafos_dss`: D-Y de dois enrolamentos
   quando a CARGA tem três fases; split-phase de três enrolamentos (primário
@@ -2630,6 +2667,82 @@ A seção nasce invisível e só aparece quando o elemento selecionado tem resul
 Qualquer reimportação chama `_invalidate_power_flow()` e a esconde: o resultado
 deriva de catálogo, trechos, chaves, cabos, cargas e patamares, e sobreviver a
 uma troca de qualquer um deles seria exibir número velho como se fosse novo.
+
+**A saída do alimentador é lida na fonte.** `read_head_power()` ativa o
+`Vsource.source` que o `New Circuit` cria na barra raiz e soma os condutores do
+terminal 1, com sinal trocado: a fonte mede o que entra nela. Cada patamar vai
+para `PowerFlowResult.head_powers`, lido logo após o solve e antes dos
+colhedores, que trocam o elemento ativo.
+
+### 12.4.1 Correção de demanda (`demand_correction.py`, `opendss_demand_correction.py`)
+
+**Objetivo:** achar, por patamar, `fP` e `fQ` independentes que fazem P e Q da
+saída calculados pelo OpenDSS baterem com a medição. Não há fluxo externo. O
+método vem do PQ3F do `CORRECAO_DEMANDA`: um ponto fixo multiplicativo
+`f ← f·(alvo − fixo)/(calculado − fixo)`.
+
+**Três camadas, sem ciclo.**
+
+- **`demand_correction.py`:** é núcleo puro e não importa nem o exportador.
+  - Escopo (`DemandScope`), fatores aplicáveis (`DemandCorrection`) e o
+    laço `solve_patamar(evaluate, alvo, settings)`.
+  - `evaluate(fP, fQ) → HeadReading` é injetado, então o método é testado sem
+    motor.
+- **`opendss_export.py`** importa o núcleo para aplicar os fatores nos perfis.
+- **`opendss_demand_correction.py`** liga o método ao motor. Ele reaproveita de
+  `opendss_powerflow` o `_write_circuit_files`, o `_step_mode_commands` e o
+  `read_head_power`.
+
+**Sem recompilar.** O modelo é gerado uma vez por `build_export`, sem correção
+(os fatores são sempre sobre a base), e compilado. Cada avaliação faz três
+coisas:
+
+1. regrava `kW=fP kvar=fQ` nas `Load` do escopo, via `engine.loads.idx`;
+2. reposiciona o relógio com `Set time=(k, 0)`;
+3. chama `solve()`.
+
+Isso vale porque a carga de consumo sai com `kW=1 kvar=1` e a potência no
+`LoadShape`: no modo diário o solve usa um ponto só, e `kW` multiplica esse
+ponto. Duas medidas na DLL deram forma ao código:
+
+- **A ordem kW → kvar é obrigatória.** Gravar `kW` recalcula o `kvar` pelo FP
+  corrente.
+- **Custo da escrita.** 20 mil cargas levam ~0,05 s para escrever e ~0,1 s para
+  ler. Por isso não há `BatchEdit` por regex, que também não cobriria a carga do
+  Interplan, que não tem prefixo.
+
+**O escopo vem do que o exportador emitiu**, não de regra de nome:
+
+- os `used_names` dos arquivos de carga formam o grupo `CARGA`;
+- os do modo Energia são separados pelo prefixo que o próprio exportador
+  escreve (`UC-BT-`, `UC-MT-`, `IP-`);
+- `GER-`, `GD-` e `CAP-` nunca entram.
+
+**O fixo é medido no mesmo solve:**
+
+- geração, capacitores (com o Q da tensão do patamar) e cargas fora do escopo;
+- lê-se o **menor** dos dois conjuntos (escopo ou fixo), e o outro sai do
+  balanço `saída = escopo + fixo + perdas`, com as perdas de `circuit.losses`.
+
+**Aplicação.** `build_export(demand_correction={circuit_id: DemandCorrection})`
+multiplica `mult[k]·fP[k]` e `qmult[k]·fQ[k]` nos perfis das cargas do circuito e
+do grupo. Isso acontece em `build_load_export` e no `emit` de
+`build_energy_export`, e o `kW` exportado continua 1. O mesmo dicionário vai
+para `run_power_flow` e para a exportação, então o fluxo resolve exatamente o que
+seria exportado.
+
+**Sessão.** A janela guarda os fatores com a **base** em que foram calculados:
+
+- catálogo, cargas, patamares, modelo Energia e modo de cargas;
+- `_active_demand_corrections()` compara essa base por identidade e descarta os
+  fatores, com aviso, quando ela mudou.
+
+A execução ocupa o slot `_power_flow_thread`/`_power_flow_worker`, porque o
+motor é o mesmo. Com isso herda:
+
+- a exclusão mútua;
+- o cancelamento ao fechar a janela;
+- o cancelamento por `_invalidate_power_flow()`.
 
 ### 12.5 Leitura de bancos Access (`mdb_engine.py`, `mdb_mapping.py`, `mdb_import.py`)
 
@@ -3114,10 +3227,13 @@ branch_power_flow  → {branch_analysis, equivalent_network, opendss_export,
 branch_power_source → ∅
 branch_analysis    → {model, phase_config}
 opendss_powerflow  → {model, phase_config, opendss_export, opendss_settings,
-                      opendss_solution, opendss_engine}
+                      opendss_solution, opendss_engine, demand_correction}
+opendss_demand_correction → {demand_correction, opendss_export,
+                             opendss_powerflow, opendss_engine, model}
 opendss_settings   → opendss_export (só parse_number, para não haver duas
                      regras de leitura numérica)
-opendss_export     → {model, phase_config, opendss_solution}
+opendss_export     → {model, phase_config, opendss_solution, demand_correction}
+demand_correction  → ∅
 opendss_solution   → ∅
 opendss_engine     → ∅  (py_dss_interface entra por import tardio)
 search   → model

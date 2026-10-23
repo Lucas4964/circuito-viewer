@@ -11,6 +11,7 @@ from circuit_viewer.phase_config import (
     PHASE_COLORS,
     UNMAPPED_PHASE_COLOR,
     PhaseConfigurationError,
+    default_load_phase_configuration_path,
     default_phase_configuration_path,
     load_phase_configuration,
 )
@@ -50,14 +51,95 @@ class PhaseConfigurationTests(unittest.TestCase):
                 ("8", "EF", 2, "2.3"),
                 ("9", "FD", 2, "1.3"),
                 ("10", "DE", 2, "1.2"),
+                ("11", "EF", 2, "2.3"),
+                ("12", "FD", 2, "1.3"),
                 ("13", "DEF", 3, "1.2.3"),
                 ("14", "DEFN", 3, "1.2.3.0"),
+                ("15", "EF", 2, "2.3"),
+                ("16", "DE", 2, "1.2"),
             ],
         )
+        # Trechos e consumidores: 7/8/9 são bifásicos.
         self.assertEqual(config.phase_letters_for_value("7"), ("D", "E"))
         self.assertEqual(config.phase_letters_for_value("8"), ("E", "F"))
         self.assertEqual(config.phase_letters_for_value("9"), ("D", "F"))
         self.assertEqual(config.phase_letters_for_value("14"), ("D", "E", "F"))
+        self.assertFalse(any(entry.is_delta for entry in config.entries))
+
+    def test_default_load_table_follows_tcarga_fases_mt(self) -> None:
+        """CARGA: 7/8/9 monofásicas entre fases, 13 delta, 14 estrela."""
+
+        loads = load_phase_configuration().for_loads()
+
+        self.assertTrue(default_load_phase_configuration_path().is_file())
+        self.assertEqual(
+            [
+                (entry.fases2, entry.name, entry.phase_count, entry.dss, entry.is_delta)
+                for entry in loads.entries
+            ],
+            [
+                ("1", "D", 1, "1", False),
+                ("2", "E", 1, "2", False),
+                ("3", "F", 1, "3", False),
+                ("4", "DN", 1, "1.0", False),
+                ("5", "EN", 1, "2.0", False),
+                ("6", "FN", 1, "3.0", False),
+                ("7", "D", 1, "1.2", True),
+                ("8", "E", 1, "2.3", True),
+                ("9", "F", 1, "3.1", True),
+                ("10", "DEN", 2, "1.2.0", False),
+                ("11", "EFN", 2, "2.3.0", False),
+                ("12", "FDN", 2, "1.3.0", False),
+                ("13", "DEF", 3, "1.2.3", True),
+                ("14", "DEFN", 3, "1.2.3.0", False),
+            ],
+        )
+        self.assertEqual(loads.phase_letters_for_value("7"), ("D",))
+        self.assertEqual(loads.phase_letters_for_value("8"), ("E",))
+        self.assertEqual(loads.phase_letters_for_value("9"), ("F",))
+        self.assertEqual(loads.phase_letters_for_value("12"), ("D", "F"))
+        self.assertEqual(loads.phase_letters_for_value("13"), ("D", "E", "F"))
+        self.assertIsNone(loads.load_configuration)
+
+    def test_load_table_is_the_sibling_file_or_falls_back_to_the_main_one(self) -> None:
+        path = self.write_json([{"FASES2": "7", "NOME": "DE", "NUMERO_FASES": 2}])
+
+        without = load_phase_configuration(path)
+        self.assertIs(without.for_loads(), without)
+
+        (self.root / "fases2_carga.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "FASES2": "7",
+                        "NOME": "D",
+                        "NUMERO_FASES": 1,
+                        "DSS": "1.2",
+                        "LIGACAO": " Delta ",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        with_table = load_phase_configuration(path)
+
+        self.assertEqual(with_table.phase_letters_for_value("7"), ("D", "E"))
+        entry = with_table.for_loads().entry_for_value(7)
+        self.assertEqual((entry.name, entry.connection), ("D", "delta"))
+        self.assertTrue(entry.is_delta)
+
+    def test_errors_in_the_load_table_name_the_file(self) -> None:
+        path = self.write_json([{"FASES2": "1", "NUMERO_FASES": 1}])
+        (self.root / "fases2_carga.json").write_text("[{", encoding="utf-8")
+
+        with self.assertRaisesRegex(PhaseConfigurationError, "^fases2_carga.json: "):
+            load_phase_configuration(path)
+
+    def test_explicit_load_path_must_exist(self) -> None:
+        path = self.write_json([{"FASES2": "1", "NUMERO_FASES": 1}])
+
+        with self.assertRaisesRegex(PhaseConfigurationError, "Não foi possível ler"):
+            load_phase_configuration(path, self.root / "ausente.json")
 
     def test_accepts_numeric_values_normalizes_text_and_ignores_extras(self) -> None:
         path = self.write_json(
@@ -163,6 +245,18 @@ class PhaseConfigurationTests(unittest.TestCase):
             (
                 [{"FASES2": "1", "NUMERO_FASES": 1, "DSS": 123}],
                 "DSS deve ser texto",
+            ),
+            (
+                [{"FASES2": "1", "NUMERO_FASES": 1, "LIGACAO": "triangulo"}],
+                "LIGACAO deve ser",
+            ),
+            (
+                [{"FASES2": "1", "NUMERO_FASES": 1, "LIGACAO": 2}],
+                "LIGACAO deve ser",
+            ),
+            (
+                [{"FASES2": "10", "NUMERO_FASES": 2, "LIGACAO": "delta"}],
+                "delta vale só",
             ),
         )
         for payload, message in invalid_payloads:

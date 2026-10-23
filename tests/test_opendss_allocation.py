@@ -256,19 +256,104 @@ class AllocationAggregationTests(unittest.TestCase):
         )
         self.assertEqual(allocation.issues, ())
 
-    def test_phase_incompatibility_remains_strict_for_multiphase_bt_and_all_mt(self):
+    def test_phase_phase_transformer_puts_everything_in_its_single_column(self):
+        """CARGA 7/8/9 é monofásica entre fases: tudo vai para PD/PE/PF.
+
+        É a tabela ``TCarga::FasesMT`` do Interplan: o consumidor em F de um
+        trafo 7 (D-E) não é incompatível — a energia dele sai inteira em D.
+        """
+
+        bars, _catalog, _loads, _cables = make_models()
+        phases = load_phase_configuration()
+        for transformer_phase, expected in (
+            ("7", (900, 0, 0)),
+            ("8", (0, 900, 0)),
+            ("9", (0, 0, 900)),
+        ):
+            with self.subTest(transformer_phase=transformer_phase):
+                loads = LoadModel(
+                    bars,
+                    ["LFF"],
+                    [2],
+                    [""],
+                    ["MONO-FF"],
+                    ["1"],
+                    ["1"],
+                    ["220"],
+                    [transformer_phase],
+                    ["Y"],
+                )
+                allocation = build_transformer_allocations(
+                    loads,
+                    phases,
+                    bt_et=table(("ID", "MT_CAR_ID"), [("ET1", "LFF")], "BT_ET"),
+                    bt_consumers=table(
+                        ("ET_ID", "FASES2", "CONSUMO"),
+                        [("ET1", "3", "600"), ("ET1", "8", "300")],
+                        "BT_CONS",
+                    ),
+                    bt_generators=table(("ET_ID", "GERACAO_KWH"), [], "BT_GD"),
+                    mt_consumers=table(
+                        ("ID", "CARGA_ID", "FASES2", "CONSUMO"), [], "MT_CONS"
+                    ),
+                    mt_generators=table(("MT_CONS_ID", "GERACAO_KWH"), [], "MT_GD"),
+                )
+
+                record = allocation.record(0)
+                self.assertEqual(
+                    (record.energy_bt.d, record.energy_bt.e, record.energy_bt.f),
+                    expected,
+                )
+                self.assertEqual(allocation.issues, ())
+
+    def test_mt_consumer_on_monophase_transformer_uses_its_single_phase(self):
         bars, _catalog, _loads, _cables = make_models()
         loads = LoadModel(
             bars,
-            ["LBI", "LMONO"],
-            [2, 2],
-            ["", ""],
-            ["BI-DE", "MONO-D"],
-            ["1", "1"],
-            ["1", "1"],
-            ["220", "220"],
-            ["7", "1"],
-            ["Y", "Y"],
+            ["LMONO"],
+            [2],
+            [""],
+            ["MONO-D"],
+            ["1"],
+            ["1"],
+            ["220"],
+            ["1"],
+            ["Y"],
+        )
+        allocation = build_transformer_allocations(
+            loads,
+            load_phase_configuration(),
+            bt_et=table(("ID", "MT_CAR_ID"), [], "BT_ET"),
+            bt_consumers=table(("ET_ID", "FASES2", "CONSUMO"), [], "BT_CONS"),
+            bt_generators=table(("ET_ID", "GERACAO_KWH"), [], "BT_GD"),
+            mt_consumers=table(
+                ("ID", "CARGA_ID", "FASES2", "CONSUMO"),
+                [("MT1", "LMONO", "7", "300")],
+                "MT_CONS",
+            ),
+            mt_generators=table(("MT_CONS_ID", "GERACAO_KWH"), [], "MT_GD"),
+        )
+
+        record = allocation.record(0)
+        self.assertEqual(
+            (record.energy_mt.d, record.energy_mt.e, record.energy_mt.f),
+            (300, 0, 0),
+        )
+        self.assertEqual(allocation.issues, ())
+
+    def test_phase_incompatibility_remains_strict_for_multiphase_transformers(self):
+        bars, _catalog, _loads, _cables = make_models()
+        loads = LoadModel(
+            bars,
+            ["LBI"],
+            [2],
+            [""],
+            ["BI-DE"],
+            ["1"],
+            ["1"],
+            ["220"],
+            ["10"],
+            ["Y"],
         )
         phases = load_phase_configuration()
         allocation = build_transformer_allocations(
@@ -283,20 +368,19 @@ class AllocationAggregationTests(unittest.TestCase):
             bt_generators=table(("ET_ID", "GERACAO_KWH"), [], "BT_GD"),
             mt_consumers=table(
                 ("ID", "CARGA_ID", "FASES2", "CONSUMO"),
-                [("MT1", "LMONO", "7", "300")],
+                [("MT1", "LBI", "3", "300")],
                 "MT_CONS",
             ),
             mt_generators=table(("MT_CONS_ID", "GERACAO_KWH"), [], "MT_GD"),
         )
 
+        record = allocation.record(0)
         self.assertEqual(
-            (allocation.record(0).energy_bt.d, allocation.record(0).energy_bt.e,
-             allocation.record(0).energy_bt.f),
+            (record.energy_bt.d, record.energy_bt.e, record.energy_bt.f),
             (0, 0, 0),
         )
         self.assertEqual(
-            (allocation.record(1).energy_mt.d, allocation.record(1).energy_mt.e,
-             allocation.record(1).energy_mt.f),
+            (record.energy_mt.d, record.energy_mt.e, record.energy_mt.f),
             (0, 0, 0),
         )
         self.assertEqual(len(allocation.issues), 2)
@@ -310,7 +394,7 @@ class AllocationAggregationTests(unittest.TestCase):
         self.assertIn("FASES2=8 (E-F)", bt_reason)
         self.assertIn("CARGA_ID=LBI", bt_reason)
         self.assertIn("CODIGO=BI-DE", bt_reason)
-        self.assertIn("FASES2=7 (D-E)", bt_reason)
+        self.assertIn("FASES2=10 (D-E)", bt_reason)
 
     def test_monophase_exception_still_requires_valid_bt_consumer_phase(self):
         bars, _catalog, _loads, _cables = make_models()
@@ -589,10 +673,13 @@ class AllocationExportTests(unittest.TestCase):
         self.assertIn("kWh=3600 kWhDays=30 CFactor=4 PF=0.92", energy)
         self.assertIn("kWh=600", energy)
         self.assertIn("kWh=100", energy)
-        self.assertIn("kV=19.9186", energy)
-        self.assertIn(".1 conn=wye", energy)
-        self.assertIn(".2 conn=wye", energy)
-        self.assertIn(".3 conn=wye", energy)
+        # FASES2 13 é delta no Interplan: pares DE/EF/FD na tensão de linha.
+        self.assertIn("kV=34.5", energy)
+        self.assertIn("bus1=6401_AUX.1.2 conn=delta", energy)
+        self.assertIn("bus1=6401_AUX.2.3 conn=delta", energy)
+        self.assertIn("bus1=6401_AUX.3.1 conn=delta", energy)
+        self.assertIn("bus1=6401_AUX.1.2 conn=delta", gd_bt)
+        self.assertIn("bus1=6401_AUX.1.2 conn=delta", gd_mt)
 
         self.assertEqual(gd_bt.count("New Load."), 3)
         self.assertIn("kW=-0.666667 kvar=0 status=fixed", gd_bt)
@@ -652,11 +739,11 @@ class AllocationExportTests(unittest.TestCase):
             ["M", "B", "T"],
             [2, 2, 2],
             ["", "", ""],
-            ["MONO", "BI", "TRI"],
+            ["MONO", "FF", "TRI"],
             ["1", "1", "1"],
             ["1", "1", "1"],
             ["220", "220", "220"],
-            ["1", "7", "13"],
+            ["1", "7", "14"],
             ["Y", "Y", "Y"],
         )
         phases = load_phase_configuration()
@@ -698,12 +785,23 @@ class AllocationExportTests(unittest.TestCase):
             OpenDssAllocationSettings(),
         )
         level = bundle.levels[0]
-        self.assertEqual(level.load_count, 18)
+        # O 7 é monofásico entre fases: um objeto de cada tipo, como o 1.
+        self.assertEqual(level.load_count, 15)
         files = dict(level.files)
-        self.assertEqual(files[ENERGY_LOADS_FILENAME].count("New Load."), 6)
-        self.assertIn("Load.MONO-1F-D", files[ENERGY_LOADS_FILENAME])
-        self.assertIn("Load.BI-2F-E", files[ENERGY_LOADS_FILENAME])
-        self.assertIn("Load.TRI-3F-F", files[ENERGY_LOADS_FILENAME])
+        self.assertEqual(files[ENERGY_LOADS_FILENAME].count("New Load."), 5)
+        self.assertIn(
+            "Load.MONO-1F-D phases=1 bus1=6401_AUX.1 conn=wye kV=19.9186",
+            files[ENERGY_LOADS_FILENAME],
+        )
+        self.assertIn(
+            "Load.FF-1F-D phases=1 bus1=6401_AUX.1.2 conn=delta kV=34.5",
+            files[ENERGY_LOADS_FILENAME],
+        )
+        self.assertNotIn("Load.FF-1F-E", files[ENERGY_LOADS_FILENAME])
+        self.assertIn(
+            "Load.TRI-3F-F phases=1 bus1=6401_AUX.3 conn=wye",
+            files[ENERGY_LOADS_FILENAME],
+        )
         self.assertNotIn("kW=-0", files[BT_GENERATION_FILENAME])
         self.assertIn("kW=0", files[BT_GENERATION_FILENAME])
 
@@ -780,7 +878,7 @@ class AllocationExportTests(unittest.TestCase):
             ["L1"],
             [2],
             [""],
-            ["BI-DE"],
+            ["MONO-FF"],
             ["1"],
             ["1"],
             ["220"],
@@ -796,7 +894,7 @@ class AllocationExportTests(unittest.TestCase):
                 ("ET_ID", "FASES2", "CONSUMO", "ID", "CODIGO"),
                 [
                     ("733", "7", "600", "912", "VALIDO"),
-                    ("733", "8", "0", "913", "396000"),
+                    ("733", "404", "0", "913", "396000"),
                 ],
                 "BT_CONS",
             ),
@@ -837,9 +935,10 @@ class AllocationExportTests(unittest.TestCase):
         self.assertIn("GERACAO_KWH deve ser numérico e não negativo", warnings)
         files = dict(bundle.levels[0].files)
         energy = files[ENERGY_LOADS_FILENAME]
-        self.assertIn("Load.BI-DE-2F-D", energy)
-        self.assertIn("Load.BI-DE-2F-E", energy)
-        self.assertEqual(energy.count("kWh=300"), 2)
+        self.assertIn("FASES2 sem relação válida: 404", warnings)
+        self.assertIn("Load.MONO-FF-1F-D", energy)
+        self.assertEqual(energy.count("New Load."), 1)
+        self.assertIn("kWh=600", energy)
         self.assertIn("kW=0", files[BT_GENERATION_FILENAME])
 
     def test_invalid_transformer_is_skipped_while_valid_transformer_exports(self):

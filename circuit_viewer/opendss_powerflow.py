@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
 
+from .demand_correction import DemandCorrections
 from .model import (
     CableModel,
     CapacitorModel,
@@ -96,6 +97,29 @@ DEAD_NODE_PU = 1e-9
 # ser conhecido aqui porque o corte relatado tem de ser o que **valeu**, não o
 # que o usuário digitou — com os limites desligados, quem vale é este.
 DEFAULT_DSS_VMINPU = 0.95
+
+# O ``New Circuit`` do master cria a fonte com este nome, na barra raiz: a
+# potência que passa por ela é a da saída do alimentador.
+SOURCE_ELEMENT = "Vsource.source"
+
+
+def read_head_power(engine: DssEngine) -> tuple[float, float]:
+    """P e Q entregues pela fonte ao alimentador no solve corrente (kW, kvar).
+
+    O OpenDSS mede a potência que **entra** no elemento pelo terminal 1; numa
+    fonte que alimenta a rede ela sai negativa, então o entregue é o oposto —
+    a mesma convenção que o benchmark contra o Interplan valida.
+    """
+
+    engine.circuit.set_active_element(SOURCE_ELEMENT)
+    element = engine.cktelement
+    count = int(element.num_conductors)
+    powers = element.powers
+    return (
+        -math.fsum(powers[0 : 2 * count : 2]),
+        -math.fsum(powers[1 : 2 * count : 2]),
+    )
+
 
 def _step_mode_commands(max_power_flow_iterations: int) -> tuple[str, ...]:
     """Comandos que reconduzem a solução ao primeiro patamar, um passo por vez.
@@ -352,6 +376,13 @@ class PowerFlowResult:
     # Um registro por (circuito, patamar): é o que permite dizer *quanto* um
     # patamar reprovado afundou, em vez de só que ele reprovou.
     step_voltages: tuple[StepVoltages, ...] = ()
+    # Circuito → (P, Q) entregues na saída, um par por patamar, em kW e kvar.
+    head_powers: Mapping[str, tuple[tuple[float, float], ...]] = field(
+        default_factory=dict
+    )
+    # A correção de demanda com que o fluxo foi resolvido, para o relatório
+    # poder pôr o fator ao lado da saída.
+    demand_correction: DemandCorrections | None = None
     issues: tuple[PowerFlowIssue, ...] = ()
     omitted_issues: int = 0
     input_revision: object | None = None
@@ -1175,6 +1206,7 @@ def run_power_flow(
     library_mappings: OpenDssLibraryMappings | None = None,
     step_count: int = LOAD_PATTERN_COUNT,
     energy: EnergyDemandModel | None = None,
+    demand_correction: DemandCorrections | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> PowerFlowResult:
@@ -1210,6 +1242,10 @@ def run_power_flow(
     secundárias dos trafos não são barras da aplicação: as tensões delas não vão
     para o painel, e o ``SetkVBase`` do master dá a elas a base certa, para que
     entrem nos extremos de tensão de cada patamar em pu verdadeiro.
+
+    ``demand_correction`` atravessa até ``build_export``, que multiplica os
+    perfis das cargas corrigidas. A potência na saída de cada patamar vai para
+    ``head_powers``, com ou sem correção: é com ela que se confere a medição.
     """
 
     if step_count <= 0:
@@ -1252,6 +1288,7 @@ def run_power_flow(
             # arquivo, e o laço abaixo é quem resolve os patamares.
             include_solve=False,
             energy=energy,
+            demand_correction=demand_correction,
             cancel_check=cancel_check,
         )
 
@@ -1285,6 +1322,7 @@ def run_power_flow(
     unconverged: list[tuple[str, int]] = []
     control_iterations: list[tuple[str, int, int]] = []
     step_voltages: list[StepVoltages] = []
+    head_powers: dict[str, tuple[tuple[float, float], ...]] = {}
     # O corte que de fato vale nas Loads: com os limites desligados nenhum
     # BatchEdit sai no master, então quem vale é o padrão do próprio OpenDSS.
     effective_vminpu = (
@@ -1361,6 +1399,7 @@ def run_power_flow(
         # vez fora do laço, como segment_by_line_name e bar_by_bus_name.
         regulator_unit_index = _regulator_unit_index(bundle)
         circuit_taps: dict[int, list[tuple[RegulatorTap, ...]]] = {}
+        circuit_head: list[tuple[float, float]] = []
 
         for step in range(step_count):
             if cancel_check is not None and cancel_check():
@@ -1368,6 +1407,8 @@ def run_power_flow(
             engine.solution.solve()
             if not engine.solution.converged:
                 unconverged.append((definition.circuit_id, step))
+            # Antes dos colhedores: eles trocam o elemento ativo.
+            circuit_head.append(read_head_power(engine))
             # Lido junto do converged, do mesmo objeto e do mesmo passo. Um
             # motor que não exponha a propriedade não pode derrubar a execução:
             # a contagem é diagnóstico, não resultado.
@@ -1430,6 +1471,7 @@ def run_power_flow(
 
         for segment_index, steps in circuit_taps.items():
             regulator_taps.setdefault(segment_index, tuple(steps))
+        head_powers[definition.circuit_id] = tuple(circuit_head)
 
         _merge_circuit_results(
             catalog,
@@ -1479,6 +1521,8 @@ def run_power_flow(
         ),
         control_iterations=tuple(control_iterations),
         step_voltages=tuple(step_voltages),
+        head_powers=head_powers,
+        demand_correction=demand_correction,
         issues=tuple(report.issues),
         omitted_issues=report.omitted,
     )

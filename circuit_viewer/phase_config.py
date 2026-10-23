@@ -17,6 +17,16 @@ from .model import IndexArray
 PHASE_COLORS = ("#0000FF", "#00FF00", "#FF0000")
 UNMAPPED_PHASE_COLOR = "#555555"
 
+# O Interplan não tem uma tabela FASES2 só. Trechos e consumidores (BT_CONS,
+# BT_IP, MT_CONS) seguem a do ``fases2.json``; a CARGA (trafo/ET) usa a de
+# ``TCarga::FasesMT``, em que 7/8/9 são monofásicas entre fases (PD em D-E, PE
+# em E-F, PF em F-D) e 13 é delta. Ela fica num arquivo próprio, irmão do
+# ``fases2.json``.
+LOAD_PHASE_CONFIGURATION_FILENAME = "fases2_carga.json"
+CONNECTION_WYE = "estrela"
+CONNECTION_DELTA = "delta"
+_CONNECTIONS = frozenset({CONNECTION_WYE, CONNECTION_DELTA})
+
 
 class PhaseConfigurationError(ValueError):
     """Erro legível ao carregar ou validar ``fases2.json``."""
@@ -28,6 +38,24 @@ class PhaseMappingEntry:
     name: str | None
     phase_count: int
     dss: str | None = None
+    # ``LIGACAO``: ``None`` e ``"estrela"`` são fase-neutro; ``"delta"`` liga
+    # entre fases. Só a tabela da CARGA usa ``"delta"``.
+    connection: str | None = None
+
+    @property
+    def is_delta(self) -> bool:
+        return self.connection == CONNECTION_DELTA
+
+    @property
+    def valid_for_transformer(self) -> bool:
+        """Se a relação descreve um trafo que existe na rede.
+
+        Trafo é monofásico fase-neutro (1 a 6) ou trifásico (13, 14). Um
+        FASES2 de CARGA monofásico entre fases (7/8/9) ou de duas fases
+        (10/11/12) é erro de cadastro, mesmo que o Interplan o aceite.
+        """
+
+        return self.phase_count == 3 or (self.phase_count == 1 and not self.is_delta)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +79,9 @@ class PhaseClassification:
 @dataclass(frozen=True, slots=True)
 class PhaseConfiguration:
     entries: tuple[PhaseMappingEntry, ...]
+    # Tabela própria do FASES2 da CARGA (``fases2_carga.json``). ``None``
+    # quando não há arquivo: a CARGA usa então a mesma tabela dos trechos.
+    load_configuration: PhaseConfiguration | None = None
     _phase_count_by_value: Mapping[str, int] = field(
         init=False,
         repr=False,
@@ -77,6 +108,24 @@ class PhaseConfiguration:
     @property
     def phase_count_by_value(self) -> Mapping[str, int]:
         return self._phase_count_by_value
+
+    def for_loads(self) -> PhaseConfiguration:
+        """A tabela que traduz o FASES2 da CARGA (trafo/ET).
+
+        Todo código que lê ``CARGA.FASES2`` passa por aqui; trechos e
+        consumidores usam a própria configuração.
+        """
+
+        return self if self.load_configuration is None else self.load_configuration
+
+    def entry_for_value(self, value: object) -> PhaseMappingEntry | None:
+        """A relação de um FASES2, ou ``None`` sem relação."""
+
+        try:
+            key = normalize_phase_value(value)
+        except ValueError:
+            return None
+        return next((item for item in self.entries if item.fases2 == key), None)
 
     def classify(self, values: Iterable[str]) -> PhaseClassification:
         source_values = tuple(str(value) for value in values)
@@ -183,8 +232,41 @@ def default_phase_configuration_path() -> Path:
     return Path(__file__).resolve().parent / "config" / "fases2.json"
 
 
-def load_phase_configuration(path: str | Path | None = None) -> PhaseConfiguration:
+def default_load_phase_configuration_path() -> Path:
+    return default_phase_configuration_path().with_name(
+        LOAD_PHASE_CONFIGURATION_FILENAME
+    )
+
+
+def load_phase_configuration(
+    path: str | Path | None = None,
+    load_path: str | Path | None = None,
+) -> PhaseConfiguration:
+    """Carrega o ``fases2.json`` e, se existir, a tabela da CARGA.
+
+    Sem ``load_path``, a tabela da CARGA é o ``fases2_carga.json`` ao lado do
+    ``fases2.json``; sem esse arquivo, a CARGA usa a tabela principal. Um
+    ``load_path`` explícito precisa existir.
+    """
+
     source = default_phase_configuration_path() if path is None else Path(path)
+    entries = _read_phase_entries(source)
+    load_source = (
+        source.with_name(LOAD_PHASE_CONFIGURATION_FILENAME)
+        if load_path is None
+        else Path(load_path)
+    )
+    load_configuration = None
+    if load_path is not None or load_source.is_file():
+        try:
+            load_entries = _read_phase_entries(load_source)
+        except PhaseConfigurationError as exc:
+            raise PhaseConfigurationError(f"{load_source.name}: {exc}") from exc
+        load_configuration = PhaseConfiguration(load_entries)
+    return PhaseConfiguration(entries, load_configuration)
+
+
+def _read_phase_entries(source: Path) -> tuple[PhaseMappingEntry, ...]:
     try:
         text = source.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
@@ -247,6 +329,24 @@ def load_phase_configuration(path: str | Path | None = None) -> PhaseConfigurati
                 f"Relação {row_number}: DSS deve ser texto quando informado."
             )
         dss = None if raw_dss is None else raw_dss.strip() or None
+        raw_connection = raw_entry.get("LIGACAO")
+        connection = (
+            raw_connection.strip().casefold()
+            if isinstance(raw_connection, str)
+            else raw_connection
+        )
+        if connection is not None and connection not in _CONNECTIONS:
+            raise PhaseConfigurationError(
+                f"Relação {row_number}: LIGACAO deve ser "
+                f"\"{CONNECTION_WYE}\" ou \"{CONNECTION_DELTA}\" quando informada."
+            )
+        if connection == CONNECTION_DELTA and phase_count == 2:
+            raise PhaseConfigurationError(
+                f"Relação {row_number}: LIGACAO delta vale só para uma fase "
+                "(entre duas fases) ou três fases."
+            )
         seen[fases2] = row_number
-        entries.append(PhaseMappingEntry(fases2, name, phase_count, dss))
-    return PhaseConfiguration(tuple(entries))
+        entries.append(
+            PhaseMappingEntry(fases2, name, phase_count, dss, connection)
+        )
+    return tuple(entries)

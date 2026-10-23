@@ -316,11 +316,31 @@ class FakeCktElement:
         active = self._owner.active_element
         return active[1] if active is not None and active[0] == "transformer" else None
 
+    @property
+    def _is_source(self) -> bool:
+        active = self._owner.active_element
+        return active is not None and active[0] == "vsource"
+
+    def _source_powers(self) -> list[float]:
+        """A fonte mede o que entra nela: o entregue ao alimentador é o oposto.
+
+        Desloca com o passo, como as demais grandezas, para um teste provar que
+        cada patamar foi lido no seu próprio solve.
+        """
+
+        shift = 10.0 * (self._owner.step - 1)
+        values: list[float] = []
+        for active, reactive in self._owner.source_powers:
+            values.extend([-(active + shift), -reactive])
+        return values + [0.0] * len(values)
+
     def _transformer_nodes(self, name: str) -> tuple[int, ...]:
         return (self._owner.transformer_node(name), 0)
 
     @property
     def num_conductors(self) -> int:
+        if self._is_source:
+            return len(self._owner.source_powers)
         name = self._transformer
         if name is not None:
             return len(self._transformer_nodes(name))
@@ -379,6 +399,8 @@ class FakeCktElement:
         pelo outro. Assim um teste prova que só o terminal 1 é guardado.
         """
 
+        if self._is_source:
+            return self._source_powers()
         name = self._transformer
         if name is not None:
             active, reactive = self._owner.transformer_powers[name]
@@ -468,6 +490,11 @@ class FakeCircuit:
     def __init__(self, owner: FakeEngine) -> None:
         self._owner = owner
 
+    def set_active_element(self, name: str) -> int:
+        kind, _, element = name.partition(".")
+        self._owner.active_element = (kind.casefold(), element)
+        return 0
+
     @property
     def nodes_names(self) -> list[str]:
         return list(self._owner.node_names)
@@ -540,8 +567,15 @@ class FakeEngine:
         node_angles: tuple[float, ...] = (0.0, -120.0, 120.0, 0.0),
         line_current_angles: dict[str, tuple[float, ...]] | None = None,
         diverging_steps: frozenset[int] = frozenset(),
+        source_powers: tuple[tuple[float, float], ...] = (
+            (300.0, 90.0),
+            (310.0, 93.0),
+            (320.0, 96.0),
+        ),
     ) -> None:
         self.commands: list[str] = []
+        # (kW, kvar) entregues por fase na saída, no primeiro patamar.
+        self.source_powers = source_powers
         self.solves: list[int] = []
         self.step = 0
         self.compiles = 0
@@ -708,6 +742,19 @@ class PowerFlowRunTests(unittest.TestCase):
         self.assertEqual(engine.solves, [1, 2, 3, 4])
         self.assertEqual(result.step_count, 4)
         self.assertEqual(result.solved_circuits, ("C1",))
+
+    def test_the_feeder_head_power_is_read_at_the_source_on_every_patamar(self) -> None:
+        engine = FakeEngine()
+
+        result = self._run(engine)
+
+        # A fonte mede o que entra nela; o entregue é o oposto, somado nas
+        # três fases, e o falso desloca 10 kW por fase a cada patamar.
+        self.assertEqual(
+            result.head_powers["C1"],
+            tuple((930.0 + 30.0 * step, 279.0) for step in range(4)),
+        )
+        self.assertIsNone(result.demand_correction)
 
     def test_the_iteration_ceiling_is_reemitted_after_the_compile(self) -> None:
         # O engine é singleton: sem reemitir, um MaxIter de outra execução

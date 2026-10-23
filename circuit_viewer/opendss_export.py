@@ -23,9 +23,10 @@ linha:
 
 O ``kV`` das cargas e dos geradores é a mesma tensão de fase, pela mesma razão:
 cada ``Load`` é ligada entre fase e neutro (``conn=wye``). A exceção são as
-cargas trifásicas de ``TIPO_LIG`` 2 (ET e EP), que o Interplan liga **entre
-fases**: elas saem com ``conn=delta`` e a tensão de linha, ver
-:data:`DELTA_CONNECTION_TYPE`.
+cargas que o Interplan liga **entre fases**, decididas pelo FASES2 da CARGA na
+tabela de ``TCarga::FasesMT`` (``fases2_carga.json``, ``LIGACAO`` delta): a
+monofásica 7/8/9 (PD em D-E, PE em E-F, PF em F-D) e a trifásica 13. Elas
+saem com ``conn=delta`` e a tensão de linha.
 """
 
 from __future__ import annotations
@@ -40,6 +41,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
+from .demand_correction import (
+    PATAMAR_COUNT,
+    DemandCorrections,
+    DemandScope,
+    correction_for,
+    energy_scope_for_kind,
+)
 from .dss_names import sanitize_dss_name
 from .model import (
     CLOSED_SWITCH_STATE,
@@ -115,6 +123,8 @@ MAX_REPORTED_ISSUES = 200
 LOAD_SHAPE_PREFIX = "PERFIL-"
 # NPAT 0..3: o LoadShape diário tem exatamente quatro pontos.
 LOAD_PATTERN_COUNT = 4
+# A correção de demanda tem um par de fatores por ponto do LoadShape.
+assert LOAD_PATTERN_COUNT == PATAMAR_COUNT
 # Cada regulador vira três RegControl (um por fase), então um alimentador com
 # poucos reguladores já passa do teto padrão de 10 do OpenDSS. Estourá-lo aborta
 # a solução e nenhum tap comuta — teto folgado em todo master, não só onde há
@@ -146,11 +156,12 @@ _PATTERN_COLUMNS_BY_PHASE = {
     "F": ("pf", "qf"),
 }
 
-# TIPO_LIG da carga trifásica de ET e EP. O Interplan a liga **entre fases**: o
-# primário do transformador é em delta, e PD/PE/PF do MODELO_CARGA são as
-# potências dos pares DE/EF/FD, não de fase-neutro. Conferido contra as
+# Quem decide se a CARGA é ligada entre fases é o FASES2 dela (``TCarga``
+# ``FasesMT``), não o TIPO_LIG: 13 é delta — PD/PE/PF do MODELO_CARGA são as
+# potências dos pares DE/EF/FD — e 14 é estrela com neutro. Conferido contra as
 # correntes do relatório: 2,809/2,809/0,069 kW nos três pares dão 0,22/0,37/0,22 A
-# nas linhas, que em estrela seriam 0,37/0,37/0,01 A.
+# nas linhas, que em estrela seriam 0,37/0,37/0,01 A. O TIPO_LIG 2 (ET e EP)
+# costuma acompanhar o 13; quando discorda do FASES2, a exportação avisa.
 DELTA_CONNECTION_TYPE = "2"
 # Par fase-fase de cada coluna de patamar: PD vai para DE, PE para EF, PF para FD.
 _DELTA_PAIR_BY_PHASE = {
@@ -178,8 +189,16 @@ UNSPECIFIED_GENERATOR_PHASES = frozenset({"", "0"})
 
 # --- Modo de cargas Energia ---------------------------------------------------
 # Um trafo por CARGA, com as UCs na barra secundária. A barra é fictícia — só
-# existe no .dss, sem coordenada —, e o mapa não muda.
-ENERGY_TRANSFORMERS_FILENAME = "trafos_energia.dss"
+# existe no .dss, sem coordenada —, e o mapa não muda. Os arquivos seguem a
+# convenção do modo Interplan: trafos por contagem de fases, UCs nos
+# cargas*.dss e GD nos geradores*.dss pelo ``phases=`` da Load, IP à parte.
+SINGLE_PHASE_TRANSFORMERS_FILENAME = "trafosmonofasicos.dss"
+THREE_PHASE_TRANSFORMERS_FILENAME = "trafostrifasicos.dss"
+PUBLIC_LIGHTING_FILENAME = "iluminacaopublica.dss"
+_TRANSFORMER_FILES = {
+    1: (SINGLE_PHASE_TRANSFORMERS_FILENAME, "monofasicos"),
+    3: (THREE_PHASE_TRANSFORMERS_FILENAME, "trifasicos"),
+}
 ENERGY_TRANSFORMER_PREFIX = "TRF-"
 ENERGY_SECONDARY_BUS_PREFIX = "BT_"
 # Trafo ideal, como no agregar_trafos_dss: %R e reatâncias mínimos, sem perdas a
@@ -411,7 +430,13 @@ class OpenDssGeneratorExportResult:
 
 @dataclass(frozen=True, slots=True)
 class OpenDssEnergyExportResult:
-    """Arquivo dos trafos do modo Energia.
+    """Elementos do modo Energia, já separados pelos arquivos da convenção.
+
+    ``own_files`` são os arquivos só do modo Energia — os dois de trafos e o de
+    IP —, completos. ``sections`` são blocos (``LoadShape`` + ``Load``) a anexar
+    aos ``cargas*.dss`` (UCs) e ``geradores*.dss`` (GD), por nome de arquivo:
+    quem junta é o :class:`OpenDssExportBundle`, porque esses arquivos também
+    recebem as CARGAs que ficaram no modelo do Interplan.
 
     ``exported_count`` conta trafos; ``load_count`` e ``generator_count``, as
     ``Load`` de UC/IP e de GD. ``replaced_load_indices`` são as CARGAs que o modo
@@ -420,7 +445,8 @@ class OpenDssEnergyExportResult:
     ``calcvoltagebases``: é o que dá às barras secundárias a base certa.
     """
 
-    text: str
+    own_files: tuple[tuple[str, str], ...]
+    sections: tuple[tuple[str, str], ...]
     exported_count: int
     load_count: int
     generator_count: int
@@ -430,10 +456,20 @@ class OpenDssEnergyExportResult:
     used_names: frozenset[str] = frozenset()
     replaced_load_indices: frozenset[int] = frozenset()
     voltage_base_commands: tuple[str, ...] = ()
+    # Contagens por arquivo, para o relatório: ``(phases, quantidade)``.
+    transformer_counts: tuple[tuple[int, int], ...] = ()
+    consumer_counts: tuple[tuple[int, int], ...] = ()
+    lighting_count: int = 0
+    generation_counts: tuple[tuple[int, int], ...] = ()
 
     @property
     def has_warnings(self) -> bool:
         return self.discarded_count > 0 or bool(self.issues)
+
+    def section(self, filename: str) -> str:
+        """O bloco a anexar a ``filename``, ou ``""``."""
+
+        return next((text for name, text in self.sections if name == filename), "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,12 +567,40 @@ class OpenDssExportBundle:
 
         ``reguladores.dss`` só entra quando há regulador exportado: um arquivo
         vazio mudaria o master de exportações que não têm reguladores.
+
+        No modo Energia, os trafos vêm **antes** das cargas — a barra
+        ``BT_<CARGA>`` já existe quando a ``Load`` é lida —, as UCs e a GD
+        entram nos ``cargas*.dss`` e ``geradores*.dss`` depois das CARGAs que
+        ficaram no modelo do Interplan, e a IP tem arquivo próprio. Quando o
+        modo Energia exporta, os três ``cargas*.dss`` saem sempre, e os três
+        ``geradores*.dss`` saem se houver GD ou resultado de geradores.
         """
 
         regulators = self.regulators
         capacitors = self.capacitors
         library = self.library
-        energy = self.energy
+        energy = self.energy if self.energy is not None and self.energy.exported_count else None
+        own = {} if energy is None else dict(energy.own_files)
+        loads = dict(self.loads_by_phase_count)
+        generators = dict(self.generators_by_phase_count)
+        energy_generation = energy is not None and any(
+            energy.section(_GENERATOR_FILES[count][0]) for count in GENERATOR_PHASE_COUNTS
+        )
+
+        def merged(files, results, kind: str, with_energy: bool):  # noqa: ANN001, ANN202
+            for count in sorted(files):
+                filename, label = files[count]
+                result = results.get(count)
+                section = "" if energy is None else energy.section(filename)
+                if result is None and not with_energy:
+                    continue
+                yield filename, _merged_file_text(
+                    None if result is None else result.text,
+                    section,
+                    f"! {kind} {label} exportad{'a' if kind == 'Cargas' else 'o'}s "
+                    "pelo Visualizador de Circuitos Eletricos (modo Energia)",
+                )
+
         return (
             *(
                 ()
@@ -555,18 +619,17 @@ class OpenDssExportBundle:
                 else ((REGULATORS_FILENAME, regulators.text),)
             ),
             *(
-                (_LOAD_FILES[count][0], result.text)
-                for count, result in self.loads_by_phase_count
+                (filename, own[filename])
+                for filename, _ in _TRANSFORMER_FILES.values()
+                if filename in own
             ),
+            *merged(_LOAD_FILES, loads, "Cargas", energy is not None),
             *(
-                (_GENERATOR_FILES[count][0], result.text)
-                for count, result in self.generators_by_phase_count
+                ((PUBLIC_LIGHTING_FILENAME, own[PUBLIC_LIGHTING_FILENAME]),)
+                if PUBLIC_LIGHTING_FILENAME in own
+                else ()
             ),
-            *(
-                ()
-                if energy is None or not energy.exported_count
-                else ((ENERGY_TRANSFORMERS_FILENAME, energy.text),)
-            ),
+            *merged(_GENERATOR_FILES, generators, "Geradores", energy_generation),
             *(
                 ()
                 if capacitors is None or not capacitors.exported_count
@@ -642,6 +705,21 @@ class OpenDssExportBundle:
             or (self.capacitors is not None and self.capacitors.has_warnings)
             or (self.master is not None and self.master.has_warnings)
         )
+
+
+def _merged_file_text(base: str | None, section: str, standalone_title: str) -> str:
+    """Um arquivo da convenção com o bloco do modo Energia anexado.
+
+    ``base`` é o texto do modo Interplan (CARGAs ou geradores que ficaram fora
+    do modo Energia), que segue intacto na frente; sem ele, o arquivo nasce com
+    ``standalone_title``. Sem bloco, ``base`` sai idêntico.
+    """
+
+    if base is None:
+        return f"{standalone_title}\n\n{section}" if section else f"{standalone_title}\n"
+    if not section:
+        return base
+    return f"{base}\n{section}"
 
 
 def parse_number(value: str) -> float | None:
@@ -2370,6 +2448,22 @@ def _phase_nodes(
     return tuple(terminals[letter] for letter in letters), None
 
 
+def _single_phase_delta_error(entry) -> str | None:  # noqa: ANN001
+    """Por que o ``DSS`` de uma monofásica delta não é um par de fases.
+
+    A carga 7/8/9 do Interplan é monofásica **entre fases**: o ``DSS`` precisa
+    nomear dois nós de fase distintos (``1.2``), nunca o neutro.
+    """
+
+    nodes = [node.strip() for node in (entry.dss or "").split(".")]
+    if len(nodes) == 2 and "0" not in nodes and nodes[0] != nodes[1] and all(nodes):
+        return None
+    return (
+        f"FASES2 '{entry.fases2}' com LIGACAO delta precisa de DSS com duas "
+        f"fases (ex.: 1.2), não '{entry.dss or '<vazio>'}'"
+    )
+
+
 # Tolerâncias da soma dos pesos ZIP do cadastro: fração (1) ou porcentagem
 # (100), como o Interplan grava. Mesma precisão do diálogo para a fração.
 _ZIP_FRACTION_TOLERANCE = 1e-4
@@ -2475,6 +2569,7 @@ def build_load_export(
     reserved_names: frozenset[str] = frozenset(),
     include_load_indices: frozenset[int] | None = None,
     load_settings: OpenDssLoadSettings | None = None,
+    demand_correction: DemandCorrections | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssLoadExportResult:
@@ -2491,16 +2586,24 @@ def build_load_export(
     o prefixo ``PERFIL-``. ``kW=1 kvar=1`` são fixos: a potência real de cada
     patamar vive no perfil.
 
-    A trifásica de ``TIPO_LIG`` :data:`DELTA_CONNECTION_TYPE` (ET e EP) é ligada
-    entre fases, como no Interplan: a ``Load`` de cada letra vai para o par
-    seguinte (``-D`` em DE, ``-E`` em EF, ``-F`` em FD), com ``conn=delta`` e o
-    ``kV`` de linha. Nome e perfil não mudam — o ``-D`` continua levando PD/QD.
+    O FASES2 da CARGA é lido na tabela da CARGA
+    (:meth:`PhaseConfiguration.for_loads`). As relações com ``LIGACAO`` delta
+    são ligadas entre fases, como no Interplan, com ``conn=delta`` e o ``kV`` de
+    linha. Na trifásica (13), a ``Load`` de cada letra vai para o par seguinte
+    (``-D`` em DE, ``-E`` em EF, ``-F`` em FD). Na monofásica (7/8/9), a única
+    ``Load`` vai para o par do ``DSS`` (``1.2``) e leva a coluna do ``NOME``
+    (PD na 7). Nome e perfil não mudam — o ``-D`` continua levando PD/QD.
 
     ``CircuitMembership`` não associa cargas, apenas barras, então a carga é
     atribuída ao circuito pela barra em que está pendurada.
 
     Uma carga sai completa ou não sai: qualquer problema em uma das fases
     descarta todas, porque carga pela metade subestimaria a demanda em silêncio.
+
+    ``demand_correction`` multiplica cada patamar do perfil pelo fator daquele
+    patamar (``mult[k]·fP[k]``, ``qmult[k]·fQ[k]``) nas cargas do circuito
+    corrigido. ``kW=1 kvar=1`` não muda: um ``kW`` diferente de 1 multiplicaria
+    os quatro patamares pelo mesmo valor.
     """
 
     if phase_count not in _LOAD_FILES:
@@ -2520,8 +2623,9 @@ def build_load_export(
     uses_zipv = False
 
     selected = _selected_indices(catalog, circuit_indices)
-    entries_by_value = _entries_by_value(phase_configuration)
-    terminals = _terminals_by_phase_letter(phase_configuration)
+    load_configuration = phase_configuration.for_loads()
+    entries_by_value = _entries_by_value(load_configuration)
+    terminals = _terminals_by_phase_letter(load_configuration)
     report = _ExportReport()
     bus_name = bus_namer(catalog)
     owner_by_bar, conflicting_bars = _bar_owners(catalog, selected)
@@ -2582,6 +2686,8 @@ def build_load_export(
             continue
 
         nodes, node_error = _phase_nodes(entry, letters, terminals)
+        if node_error is None and entry.is_delta and phase_count == 1:
+            node_error = _single_phase_delta_error(entry)
         if node_error is not None:
             report.add(load_id, node_error)
             continue
@@ -2628,6 +2734,9 @@ def build_load_export(
                 "foi descartada",
             )
             continue
+        correction = correction_for(demand_correction, owner_id, DemandScope.CARGA)
+        if correction is not None:
+            series = [correction.scale(active, reactive) for active, reactive in series]
 
         registry_directive, zip_notes = _registry_zip_directive(group, zip_cutoff)
         for note in zip_notes:
@@ -2679,18 +2788,33 @@ def build_load_export(
                 discarded=False,
             )
 
+        if not entry.valid_for_transformer:
+            report.add(
+                load_id,
+                f"FASES2 '{entry.fases2}' inválido para trafo (só monofásico "
+                "fase-neutro ou trifásico); exportada como o Interplan a modela",
+                discarded=False,
+            )
         bus = bus_name(bar_index)
-        delta = (
-            phase_count == 3
-            and loads.connection_types[load_index].strip() == DELTA_CONNECTION_TYPE
-        )
-        if delta:
+        delta = entry.is_delta
+        connection_type = loads.connection_types[load_index].strip()
+        if phase_count == 3 and (connection_type == DELTA_CONNECTION_TYPE) != delta:
+            report.add(
+                load_id,
+                f"TIPO_LIG '{connection_type or '<vazio>'}' discorda do FASES2 "
+                f"'{entry.fases2}' ({entry.name or '?'}); valeu o FASES2, como no "
+                f"Interplan: ligada em {'delta' if delta else 'estrela'}",
+                discarded=False,
+            )
+        if delta and phase_count == 3:
             # Os terminais das três fases já foram exigidos por _phase_nodes,
-            # então o par de cada letra sempre resolve.
+            # então o par de cada letra sempre resolve. Na monofásica entre
+            # fases o nó já é o par do próprio DSS (``1.2``).
             nodes = tuple(
                 ".".join(terminals[phase] for phase in _DELTA_PAIR_BY_PHASE[letter])
                 for letter in letters
             )
+        if delta:
             connection = "delta"
             voltage = _format(nominal_voltage)
         else:
@@ -2764,8 +2888,8 @@ def build_load_export(
         ),
         *(
             (
-                "! TIPO_LIG 2 (ET e EP) e ligada entre fases, como no Interplan: "
-                "conn=delta e kV de linha (VNOM)",
+                "! FASES2 de LIGACAO delta (fases2_carga.json) e ligada entre "
+                "fases, como no Interplan: conn=delta e kV de linha (VNOM)",
                 "! -D, -E e -F ocupam os pares DE, EF e FD, com PD, PE e PF do "
                 "patamar",
             )
@@ -3088,14 +3212,21 @@ def build_energy_export(
     *,
     reserved_names: frozenset[str] = frozenset(),
     load_settings: OpenDssLoadSettings | None = None,
+    demand_correction: DemandCorrections | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssEnergyExportResult:
-    """Gera o arquivo dos trafos do modo de cargas Energia.
+    """Gera os elementos do modo de cargas Energia, separados por arquivo.
 
     Para cada CARGA com resultado no ``EnergyDemandModel``::
 
         barra MT ──[TRF-<CARGA>]── BT_<CARGA> ── Load de cada UC, IP e GD
+
+    Os arquivos seguem a convenção do modo Interplan: o trafo vai para
+    ``trafosmonofasicos.dss`` ou ``trafostrifasicos.dss``; a UC e a GD vão
+    para o ``cargas*.dss`` e o ``geradores*.dss`` do ``phases=`` da ``Load`` —
+    ``phases=1`` no mono, inclusive a ligada entre fases —; a IP vai para
+    ``iluminacaopublica.dss``. Cada ``LoadShape`` fica no arquivo da ``Load``.
 
     O trafo é ideal e segue a topologia do ``agregar_trafos_dss``:
 
@@ -3114,6 +3245,9 @@ def build_energy_export(
     Uma CARGA cujo trafo não dá para montar (sem VNOM, fases ou tensão do
     secundário) **segue no modelo do Interplan**, com o motivo no relatório:
     perder a carga em silêncio seria pior que usar a agregada.
+
+    ``demand_correction`` multiplica, patamar a patamar, os níveis das UCs e da
+    IP dos grupos corrigidos (ver :func:`build_load_export`). A GD não muda.
     """
 
     from .energy_demand import STATUS_NO_CURVE, STATUS_NO_GD_CURVE
@@ -3127,15 +3261,22 @@ def build_energy_export(
     selected = _selected_indices(catalog, circuit_indices)
     owner_by_bar, _ = _bar_owners(catalog, selected)
     terminals = _terminals_by_phase_letter(phase_configuration)
+    # O primário lê o FASES2 da CARGA; UCs e GD seguem o fases2.json.
+    load_configuration = phase_configuration.for_loads()
     bus_name = bus_namer(catalog)
     taken_buses = {bus_name(bar_index).casefold() for bar_index in owner_by_bar}
     used_transformers: set[str] = set()
     used_names: dict[str, str] = {}
     suffixes = loads.name_suffixes
     report = _ExportReport()
-    transformers: list[str] = []
-    shapes: list[str] = []
-    entries: list[str] = []
+    # Trafos por contagem de fases do primário (split-phase é monofásico).
+    transformers: dict[int, list[str]] = {count: [] for count in _TRANSFORMER_FILES}
+    # Por arquivo de destino: (LoadShape, Load), na ordem de emissão. O perfil
+    # fica no mesmo arquivo da Load que o usa.
+    groups: dict[str, list[tuple[str, str]]] = {}
+    consumer_counts: dict[int, int] = {}
+    generation_counts: dict[int, int] = {}
+    lighting_count = 0
     voltage_commands: list[str] = []
     replaced: set[int] = set()
     exported = load_count = generator_count = 0
@@ -3157,7 +3298,9 @@ def build_energy_export(
 
     def emit(name: str, nodes: tuple[int, ...], bus: str, vfn: float, vll: float,
              active: Sequence[float], reactive: Sequence[float], directive: str,
-             sign: int) -> None:
+             sign: int) -> tuple[str, str, int]:
+        """O ``LoadShape``, a ``Load`` e o ``phases`` dela, que escolhe o arquivo."""
+
         if len(nodes) == 1:
             phases, bus_spec, connection, voltage = 1, f"{bus}.{nodes[0]}.0", "wye", vfn
         elif len(nodes) == 2:
@@ -3165,14 +3308,14 @@ def build_energy_export(
         else:
             phases, bus_spec, connection, voltage = 3, f"{bus}.1.2.3", "wye", vll
         shape_name = f"{LOAD_SHAPE_PREFIX}{name}"
-        shapes.append(
+        shape = (
             f"New LoadShape.{shape_name}"
             f" npts={LOAD_PATTERN_COUNT}"
             " interval=1"
             f" mult=[{' '.join(_format_pattern(value) for value in active)}]"
             f" qmult=[{' '.join(_format_pattern(value) for value in reactive)}]"
         )
-        entries.append(
+        entry = (
             f"New Load.{name}"
             f" phases={phases}"
             f" bus1={bus_spec}"
@@ -3182,6 +3325,7 @@ def build_energy_export(
             f" daily={shape_name}"
             f" class={sign * phases}"
         )
+        return shape, entry, phases
 
     for load_index, demand in enumerate(energy.transformers):
         if cancel_check is not None and load_index % 1_024 == 0 and cancel_check():
@@ -3226,7 +3370,19 @@ def build_energy_export(
                 "no modelo do Interplan",
             )
             continue
-        primary = phase_configuration.phase_letters_for_value(loads.phases[load_index])
+        primary = load_configuration.phase_letters_for_value(loads.phases[load_index])
+        primary_entry = load_configuration.entry_for_value(loads.phases[load_index])
+        # 7/8/9: monofásico entre fases, com o par no DSS da tabela da CARGA.
+        # Trafo assim não existe na rede; ele é montado como o Interplan o
+        # modela, mas avisado quando a CARGA chega a ser exportada (abaixo).
+        primary_pair = (
+            primary_entry.dss
+            if primary_entry is not None
+            and primary_entry.is_delta
+            and len(primary or ()) == 1
+            and _single_phase_delta_error(primary_entry) is None
+            else None
+        )
         if not primary or any(letter not in terminals for letter in primary):
             report.add(
                 load_id,
@@ -3241,6 +3397,14 @@ def build_energy_export(
                 "seguiu no modelo do Interplan",
             )
             continue
+        if primary_entry is not None and not primary_entry.valid_for_transformer:
+            report.add(
+                load_id,
+                f"FASES2 '{primary_entry.fases2}' inválido para trafo (só "
+                "monofásico fase-neutro ou trifásico); trafo montado como o "
+                "Interplan o modela",
+                discarded=False,
+            )
 
         base = sanitize_dss_name(loads.codes[load_index]) or sanitize_dss_name(load_id)
         if suffixes is not None and suffixes[load_index]:
@@ -3273,7 +3437,7 @@ def build_energy_export(
             primary_kv = _energy_primary_kv(spec.primary_kv, nominal_kv, report, load_id)
             vfn = vll / sqrt3
             nodes = ".".join(terminals[letter] for letter in primary)
-            transformers.append(
+            transformers[3].append(
                 f"New Transformer.{transformer} phases=3 windings=2"
                 f" buses=[{primary_bus}.{nodes} {bus}.1.2.3]"
                 f" conns=[delta wye] kVs=[{_format(primary_kv)} {_format(vll)}]"
@@ -3282,7 +3446,10 @@ def build_energy_export(
             )
             legs: dict[str, int] = {}
         else:
-            if len(primary) == 1:
+            if primary_pair is not None:
+                primary_nodes = f".{primary_pair}"
+                expected = nominal_kv
+            elif len(primary) == 1:
                 primary_nodes = f".{terminals[primary[0]]}.0"
                 expected = nominal_kv / sqrt3
             else:
@@ -3301,7 +3468,7 @@ def build_energy_export(
                 )
                 secondary = ("D", "E")
             legs = {secondary[0]: 1, secondary[1]: 2}
-            transformers.append(
+            transformers[1].append(
                 f"New Transformer.{transformer} phases=1 windings=3"
                 f" buses=[{primary_bus}{primary_nodes} {bus}.1.0 {bus}.0.2]"
                 f" conns=[wye wye wye]"
@@ -3331,8 +3498,28 @@ def build_energy_export(
             )
             if note is not None:
                 report.add(load_id, f"{consumer.kind} {consumer.consumer_id}: {note}", discarded=False)
-            emit(name, nodes, bus, vfn, vll, item.load_levels, item.reactive_levels,
-                 model_directive, 1)
+            active_levels, reactive_levels = item.load_levels, item.reactive_levels
+            scope = energy_scope_for_kind(consumer.kind)
+            correction = (
+                None
+                if scope is None
+                else correction_for(demand_correction, circuit_id, scope)
+            )
+            if correction is not None:
+                active_levels, reactive_levels = correction.scale(
+                    active_levels, reactive_levels
+                )
+            shape, entry, phases = emit(
+                name, nodes, bus, vfn, vll, active_levels, reactive_levels,
+                model_directive, 1,
+            )
+            if consumer.kind == CONSUMER_KIND_IP:
+                destination = PUBLIC_LIGHTING_FILENAME
+                lighting_count += 1
+            else:
+                destination = _LOAD_FILES[phases][0]
+                consumer_counts[phases] = consumer_counts.get(phases, 0) + 1
+            groups.setdefault(destination, []).append((shape, entry))
             used_names[name] = load_id
             load_count += 1
         for item in generators:
@@ -3352,8 +3539,12 @@ def build_energy_export(
                 {key.casefold() for key in used_names},
             )
             # 0.0 - valor, e não -valor: o patamar sem sol sairia "-0.000000".
-            emit(name, nodes, bus, vfn, vll, tuple(0.0 - value for value in item.levels),
-                 (0.0,) * len(item.levels), "model=1", -1)
+            shape, entry, phases = emit(
+                name, nodes, bus, vfn, vll, tuple(0.0 - value for value in item.levels),
+                (0.0,) * len(item.levels), "model=1", -1,
+            )
+            groups.setdefault(_GENERATOR_FILES[phases][0], []).append((shape, entry))
+            generation_counts[phases] = generation_counts.get(phases, 0) + 1
             used_names[name] = load_id
             generator_count += 1
         replaced.add(load_index)
@@ -3383,33 +3574,87 @@ def build_energy_export(
             discarded=False,
         )
 
-    header = (
-        "! Modo de cargas Energia: um trafo por CARGA, com as UCs no secundario",
-        "! Trafo ideal (%R e X de 0,001 %, sem perdas): a carga vista pela MT e a "
-        "soma das UCs",
-        f"! {ENERGY_SECONDARY_BUS_PREFIX}<CARGA> e uma barra ficticia, sem "
-        "coordenada: o mapa nao muda",
+    circuits_line = "! Circuitos: " + ", ".join(
+        sanitize_dss_name(catalog.definition(index).circuit_id) for index in selected
+    )
+    profile_line = (
         "! kW=1 e kvar=1 sao fixos: o LoadShape traz D x curva media na HORARIO_REF "
-        "de cada patamar",
-        "! GD: Load negativa, model=1, FP 1",
-        "! Circuitos: "
-        + ", ".join(
-            sanitize_dss_name(catalog.definition(index).circuit_id) for index in selected
-        ),
-        "",
+        "de cada patamar"
     )
-    body = (
-        *transformers,
-        *(("",) if transformers and shapes else ()),
-        *shapes,
-        *(("",) if shapes and entries else ()),
-        *entries,
-    )
-    text = "\n".join((*header, *body))
-    if body:
-        text += "\n"
+
+    def joined(header: Sequence[str], lines: Sequence[str]) -> str:
+        text = "\n".join((*header, "", *lines))
+        return f"{text}\n" if lines else text
+
+    def load_block(pairs: Sequence[tuple[str, str]]) -> list[str]:
+        # Os perfis antes das Load, como nos arquivos de cargas do Interplan.
+        shapes = [shape for shape, _ in pairs]
+        entries = [entry for _, entry in pairs]
+        return [*shapes, *(("",) if shapes and entries else ()), *entries]
+
+    own_files: list[tuple[str, str]] = []
+    if exported:
+        for count, (filename, label) in _TRANSFORMER_FILES.items():
+            own_files.append(
+                (
+                    filename,
+                    joined(
+                        (
+                            f"! Trafos {label} do modo de cargas Energia: um trafo "
+                            "por CARGA, com as UCs no secundario",
+                            "! Trafo ideal (%R e X de 0,001 %, sem perdas): a carga "
+                            "vista pela MT e a soma das UCs",
+                            f"! {ENERGY_SECONDARY_BUS_PREFIX}<CARGA> e uma barra "
+                            "ficticia, sem coordenada: o mapa nao muda",
+                            "! UCs nos cargas*.dss, IP em "
+                            f"{PUBLIC_LIGHTING_FILENAME} e GD nos geradores*.dss",
+                            circuits_line,
+                        ),
+                        transformers[count],
+                    ),
+                )
+            )
+        own_files.append(
+            (
+                PUBLIC_LIGHTING_FILENAME,
+                joined(
+                    (
+                        "! Iluminacao publica do modo de cargas Energia, no "
+                        "secundario dos trafos",
+                        profile_line,
+                        circuits_line,
+                    ),
+                    load_block(groups.get(PUBLIC_LIGHTING_FILENAME, ())),
+                ),
+            )
+        )
+
+    sections: list[tuple[str, str]] = []
+    for files, title in (
+        (_LOAD_FILES, "UCs no secundario dos trafos"),
+        (_GENERATOR_FILES, "GD no secundario dos trafos; Load negativa, model=1, FP 1"),
+    ):
+        for filename, _ in files.values():
+            pairs = groups.get(filename)
+            if pairs:
+                sections.append(
+                    (
+                        filename,
+                        joined(
+                            (
+                                f"! --- Modo Energia: {title} "
+                                f"({ENERGY_SECONDARY_BUS_PREFIX}<CARGA>) ---",
+                                profile_line,
+                                circuits_line,
+                            ),
+                            load_block(pairs),
+                        ),
+                    )
+                )
+
     return OpenDssEnergyExportResult(
-        text=text,
+        own_files=tuple(own_files),
+        sections=tuple(sections),
         exported_count=exported,
         load_count=load_count,
         generator_count=generator_count,
@@ -3419,6 +3664,12 @@ def build_energy_export(
         used_names=frozenset(used_names),
         replaced_load_indices=frozenset(replaced),
         voltage_base_commands=tuple(voltage_commands),
+        transformer_counts=tuple(
+            (count, len(lines)) for count, lines in transformers.items()
+        ),
+        consumer_counts=tuple(sorted(consumer_counts.items())),
+        lighting_count=lighting_count,
+        generation_counts=tuple(sorted(generation_counts.items())),
     )
 
 
@@ -4019,6 +4270,7 @@ def build_export(
     library_mappings: OpenDssLibraryMappings | None = None,
     include_solve: bool = True,
     energy: EnergyDemandModel | None = None,
+    demand_correction: DemandCorrections | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> OpenDssExportBundle:
@@ -4057,9 +4309,14 @@ def build_export(
     documenta por que o fluxo de potência interno o desliga.
 
     ``energy`` liga o modo de cargas Energia: as CARGAs que ele assume viram
-    trafo + UCs em ``trafos_energia.dss`` e saem dos arquivos de cargas, e os
-    geradores MT delas saem dos de geradores — a GD já está no secundário. Sem
-    ele, nada muda.
+    trafo + UCs (ver :func:`build_energy_export` para os arquivos) e a carga
+    agregada delas sai dos arquivos de cargas; os geradores MT delas saem dos
+    de geradores — a GD já está no secundário. Sem ele, nada muda.
+
+    ``demand_correction`` (circuito → fatores) multiplica os perfis das cargas
+    dos grupos corrigidos; geradores, GD e capacitores nunca mudam. É o mesmo
+    dicionário para exportação e fluxo, para que o fluxo resolva exatamente o
+    que seria exportado.
     """
 
     if isinstance(line_parameter_mode, OpenDssLineParameterMode):
@@ -4147,6 +4404,7 @@ def build_export(
             phase_configuration,
             selected,
             load_settings=load_settings,
+            demand_correction=demand_correction,
             cancel_check=cancel_check,
             progress=progress,
         )
@@ -4174,6 +4432,7 @@ def build_export(
                 reserved_names=reserved,
                 include_load_indices=kept_loads,
                 load_settings=load_settings,
+                demand_correction=demand_correction,
                 cancel_check=cancel_check,
                 progress=progress,
             )

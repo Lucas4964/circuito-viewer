@@ -14,11 +14,23 @@ from circuit_viewer.generator_update import (
     calculate_generator_demands,
 )
 from circuit_viewer.opendss_export import (
-    ENERGY_TRANSFORMERS_FILENAME,
+    PUBLIC_LIGHTING_FILENAME,
+    SINGLE_PHASE_GENERATORS_FILENAME,
+    SINGLE_PHASE_LOADS_FILENAME,
+    SINGLE_PHASE_TRANSFORMERS_FILENAME,
     THREE_PHASE_GENERATORS_FILENAME,
     THREE_PHASE_LOADS_FILENAME,
+    THREE_PHASE_TRANSFORMERS_FILENAME,
+    TWO_PHASE_GENERATORS_FILENAME,
+    TWO_PHASE_LOADS_FILENAME,
     _energy_secondary_nodes,
+    _merged_file_text,
     build_export,
+)
+from circuit_viewer.opendss_engine import (
+    acquire_engine,
+    ascii_workspace,
+    power_flow_available,
 )
 from circuit_viewer.phase_config import load_phase_configuration
 from circuit_viewer.source_composition import compose
@@ -69,11 +81,32 @@ def files(bundle) -> dict[str, str]:  # noqa: ANN001
     return dict(bundle.files)
 
 
+ENERGY_OWN_FILES = (
+    SINGLE_PHASE_TRANSFORMERS_FILENAME,
+    THREE_PHASE_TRANSFORMERS_FILENAME,
+    PUBLIC_LIGHTING_FILENAME,
+)
+
+
+def elements(bundle) -> str:  # noqa: ANN001
+    """Todos os arquivos de elementos juntos: para conferir conteúdo, não lugar."""
+
+    return "\n".join(text for _, text in bundle.element_files)
+
+
+def element_names(text: str, kind: str) -> list[str]:
+    return [
+        line.split()[1].split(".", 1)[1]
+        for line in text.splitlines()
+        if line.startswith(f"New {kind}.")
+    ]
+
+
 class ThreePhaseTransformerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.composed, self.energy = energy_network()
         self.bundle = export(self.composed, self.energy)
-        self.text = files(self.bundle)[ENERGY_TRANSFORMERS_FILENAME]
+        self.text = elements(self.bundle)
 
     def lines(self, prefix: str) -> list[str]:
         return [line for line in self.text.splitlines() if line.startswith(prefix)]
@@ -106,10 +139,10 @@ class ThreePhaseTransformerTests(unittest.TestCase):
         master = self.bundle.master.text.splitlines()
         position = master.index("calcvoltagebases")
         self.assertEqual(master[position + 1], f"SetkVBase bus=BT_CARGA-1 kVLN={0.22 / math.sqrt(3):.6g}")
-        self.assertIn(f"Redirect {ENERGY_TRANSFORMERS_FILENAME}", master)
+        self.assertIn(f"Redirect {THREE_PHASE_TRANSFORMERS_FILENAME}", master)
 
     def test_the_header_explains_the_fictitious_bus(self) -> None:
-        self.assertIn("barra ficticia", self.text)
+        self.assertIn("barra ficticia", files(self.bundle)[THREE_PHASE_TRANSFORMERS_FILENAME])
 
 
 class NoDoubleCountingTests(unittest.TestCase):
@@ -138,13 +171,13 @@ class NoDoubleCountingTests(unittest.TestCase):
         generators = self.files[THREE_PHASE_GENERATORS_FILENAME]
         self.assertNotIn("New Load.GER-", generators)
         self.assertEqual(
-            sum(1 for line in self.files[ENERGY_TRANSFORMERS_FILENAME].splitlines()
+            sum(1 for line in elements(self.bundle).splitlines()
                 if line.startswith("New Load.GD-MT-201")),
             1,
         )
 
     def test_exactly_one_transformer_and_the_levels_add_up(self) -> None:
-        text = self.files[ENERGY_TRANSFORMERS_FILENAME]
+        text = elements(self.bundle)
         self.assertEqual(text.count("New Transformer."), 1)
         transformer = self.energy.transformer(0)
         expected = [0.0] * 4
@@ -174,7 +207,7 @@ class SplitPhaseTests(unittest.TestCase):
         tables["CARGA"] = (CARGA_COLUMNS, [(2, 9, 34722450, "CARGA-1", 25.0, 25.0, 254.0, 1, 0, None)])
         self.composed, self.energy = energy_network(**tables)
         self.bundle = export(self.composed, self.energy)
-        self.text = files(self.bundle)[ENERGY_TRANSFORMERS_FILENAME]
+        self.text = elements(self.bundle)
 
     def test_a_single_phase_carga_is_a_split_phase_transformer(self) -> None:
         (transformer,) = [line for line in self.text.splitlines() if line.startswith("New Transformer.")]
@@ -192,6 +225,63 @@ class SplitPhaseTests(unittest.TestCase):
         self.assertIn("SetkVBase bus=BT_CARGA-1 kVLN=0.127", self.bundle.master.text)
 
 
+class PhaseToPhaseTransformerTests(unittest.TestCase):
+    """CARGA 7/8/9 (fases2_carga.json): primário entre fases, em VNOM."""
+
+    def test_the_primary_takes_the_pair_of_the_load_table(self) -> None:
+        from tests.test_transformer_consumers import CARGA_COLUMNS
+
+        for phases, pair in (("7", "1.2"), ("8", "2.3"), ("9", "3.1")):
+            with self.subTest(phases=phases):
+                tables = extended_tables()
+                tables["BT_UTC"] = (
+                    ["ID", "CODIGO", "ET_ID", "SNOM", "SADM", "VPRIMARIO", "VSECUNDA",
+                     "FASES_MT2", "FASES_BT2"],
+                    [(1, "UTC", 17, 25.0, 25.0, 13.8, 254.0, int(phases), 10)],
+                )
+                tables["CARGA"] = (
+                    CARGA_COLUMNS,
+                    [(2, 9, 34722450, "CARGA-1", 25.0, 25.0, 254.0, int(phases), 1, None)],
+                )
+                composed, energy = energy_network(**tables)
+                bundle = export(composed, energy)
+                text = files(bundle)[SINGLE_PHASE_TRANSFORMERS_FILENAME]
+
+                (transformer,) = [
+                    line for line in text.splitlines() if line.startswith("New Transformer.")
+                ]
+                self.assertIn("phases=1 windings=3", transformer)
+                self.assertIn(
+                    f"buses=[COD-C.{pair} BT_CARGA-1.1.0 BT_CARGA-1.0.2]", transformer
+                )
+                self.assertIn("kVs=[13.8 0.127 0.127]", transformer)
+                # Trafo entre fases não existe na rede: erro de cadastro avisado.
+                self.assertIn(
+                    f"FASES2 '{phases}' inválido para trafo",
+                    "\n".join(issue.reason for issue in bundle.energy.issues),
+                )
+
+    def test_a_valid_single_phase_transformer_has_no_cadastre_warning(self) -> None:
+        from tests.test_transformer_consumers import CARGA_COLUMNS
+
+        tables = extended_tables()
+        tables["BT_UTC"] = (
+            ["ID", "CODIGO", "ET_ID", "SNOM", "SADM", "VPRIMARIO", "VSECUNDA",
+             "FASES_MT2", "FASES_BT2"],
+            [(1, "UTC", 17, 25.0, 25.0, 7.967430114746094, 254.0, 1, 10)],
+        )
+        tables["CARGA"] = (
+            CARGA_COLUMNS, [(2, 9, 34722450, "CARGA-1", 25.0, 25.0, 254.0, 1, 0, None)]
+        )
+        composed, energy = energy_network(**tables)
+        bundle = export(composed, energy)
+
+        self.assertNotIn(
+            "inválido para trafo",
+            "\n".join(issue.reason for issue in bundle.energy.issues),
+        )
+
+
 class FallbackTests(unittest.TestCase):
     def test_a_transformer_without_secondary_voltage_keeps_the_interplan_load(self) -> None:
         tables = extended_tables()
@@ -206,7 +296,8 @@ class FallbackTests(unittest.TestCase):
         composed, energy = energy_network(**tables)
         bundle = export(composed, energy)
         self.assertEqual(bundle.energy.exported_count, 0)
-        self.assertNotIn(ENERGY_TRANSFORMERS_FILENAME, files(bundle))
+        for filename in ENERGY_OWN_FILES:
+            self.assertNotIn(filename, files(bundle))
         self.assertIn("New Load.CARGA-1", files(bundle)[THREE_PHASE_LOADS_FILENAME])
         self.assertTrue(any("modelo do Interplan" in issue.reason for issue in bundle.energy.issues))
 
@@ -219,14 +310,15 @@ class FallbackTests(unittest.TestCase):
         )
         composed, energy = energy_network(**tables)
         bundle = export(composed, energy)
-        self.assertIn("kVs=[13.8 0.22]", files(bundle)[ENERGY_TRANSFORMERS_FILENAME])
+        self.assertIn("kVs=[13.8 0.22]", files(bundle)[THREE_PHASE_TRANSFORMERS_FILENAME])
         self.assertTrue(any("VPRIMARIO" in issue.reason for issue in bundle.energy.issues))
 
     def test_without_energy_nothing_changes(self) -> None:
         composed, _ = energy_network()
         bundle = export(composed, None)
         self.assertIsNone(bundle.energy)
-        self.assertNotIn(ENERGY_TRANSFORMERS_FILENAME, files(bundle))
+        for filename in ENERGY_OWN_FILES:
+            self.assertNotIn(filename, files(bundle))
         self.assertNotIn("SetkVBase", bundle.master.text)
         self.assertIn("New Load.CARGA-1", files(bundle)[THREE_PHASE_LOADS_FILENAME])
 
@@ -235,6 +327,164 @@ class FallbackTests(unittest.TestCase):
         other, _ = energy_network()
         with self.assertRaises(ValueError):
             export(other, energy)
+
+
+class FileConventionTests(unittest.TestCase):
+    """Os arquivos seguem a convenção do Interplan, pelo ``phases=`` da Load."""
+
+    def setUp(self) -> None:
+        self.composed, self.energy = energy_network()
+        self.bundle = export(self.composed, self.energy)
+        self.files = files(self.bundle)
+
+    def names(self, filename: str, kind: str = "Load") -> list[str]:
+        return element_names(self.files[filename], kind)
+
+    def test_transformers_go_to_the_file_of_their_phase_count(self) -> None:
+        self.assertEqual(self.names(THREE_PHASE_TRANSFORMERS_FILENAME, "Transformer"), ["TRF-CARGA-1"])
+        self.assertEqual(self.names(SINGLE_PHASE_TRANSFORMERS_FILENAME, "Transformer"), [])
+        for filename, text in self.bundle.element_files:
+            if filename not in (SINGLE_PHASE_TRANSFORMERS_FILENAME, THREE_PHASE_TRANSFORMERS_FILENAME):
+                self.assertNotIn("New Transformer.TRF-", text, filename)
+
+    def test_consumers_go_to_the_load_file_of_their_phases(self) -> None:
+        self.assertEqual(self.names(SINGLE_PHASE_LOADS_FILENAME), ["UC-BT-1001"])
+        self.assertEqual(self.names(THREE_PHASE_LOADS_FILENAME), ["UC-MT-101"])
+        self.assertEqual(self.names(TWO_PHASE_LOADS_FILENAME), [])
+
+    def test_public_lighting_has_its_own_file(self) -> None:
+        self.assertEqual(self.names(PUBLIC_LIGHTING_FILENAME), ["IP-168662"])
+        for filename in (SINGLE_PHASE_LOADS_FILENAME, THREE_PHASE_LOADS_FILENAME):
+            self.assertNotIn("IP-", self.files[filename])
+
+    def test_generation_goes_to_the_generator_files_even_without_the_update(self) -> None:
+        self.assertEqual(self.names(SINGLE_PHASE_GENERATORS_FILENAME), ["GD-BT-71"])
+        self.assertEqual(self.names(THREE_PHASE_GENERATORS_FILENAME), ["GD-MT-201"])
+        self.assertEqual(self.names(TWO_PHASE_GENERATORS_FILENAME), [])
+
+    def test_every_profile_is_in_the_file_of_its_load_and_before_it(self) -> None:
+        for filename, text in self.bundle.element_files:
+            lines = text.splitlines()
+            for position, line in enumerate(lines):
+                if not line.startswith("New Load.") or " daily=" not in line:
+                    continue
+                shape = line.split(" daily=")[1].split()[0]
+                definition = f"New LoadShape.{shape} "
+                found = [index for index, other in enumerate(lines) if other.startswith(definition)]
+                self.assertEqual(len(found), 1, f"{shape} em {filename}")
+                self.assertLess(found[0], position, f"{shape} em {filename}")
+
+    def test_every_element_is_defined_exactly_once(self) -> None:
+        everything = elements(self.bundle)
+        for kind in ("Transformer", "Load", "LoadShape"):
+            names = [name.casefold() for name in element_names(everything, kind)]
+            self.assertEqual(len(names), len(set(names)), kind)
+        self.assertEqual(
+            len(element_names(everything, "Transformer")), self.bundle.energy.exported_count
+        )
+        energy_loads = [
+            name for name in element_names(everything, "Load")
+            if name.startswith(("UC-", "IP-", "GD-"))
+        ]
+        self.assertEqual(
+            len(energy_loads),
+            self.bundle.energy.load_count + self.bundle.energy.generator_count,
+        )
+
+    def test_the_master_reads_the_transformers_before_the_loads(self) -> None:
+        redirects = [
+            line.split(" ", 1)[1]
+            for line in self.bundle.master.text.splitlines()
+            if line.startswith("Redirect ")
+        ]
+        self.assertEqual(redirects, [name for name, _ in self.bundle.element_files])
+        self.assertLess(
+            redirects.index(THREE_PHASE_TRANSFORMERS_FILENAME),
+            redirects.index(SINGLE_PHASE_LOADS_FILENAME),
+        )
+        self.assertLess(
+            redirects.index(SINGLE_PHASE_TRANSFORMERS_FILENAME),
+            redirects.index(SINGLE_PHASE_LOADS_FILENAME),
+        )
+
+    def test_the_counts_follow_the_files(self) -> None:
+        energy = self.bundle.energy
+        self.assertEqual(dict(energy.transformer_counts), {1: 0, 3: 1})
+        self.assertEqual(dict(energy.consumer_counts), {1: 1, 3: 1})
+        self.assertEqual(energy.lighting_count, 1)
+        self.assertEqual(dict(energy.generation_counts), {1: 1, 3: 1})
+
+    def test_a_consumer_between_the_legs_is_single_phase(self) -> None:
+        """``phases=1`` vai para o mono, mesmo ligada entre fases."""
+
+        tables = extended_tables()
+        tables["BT_UTC"] = (
+            ["ID", "CODIGO", "ET_ID", "SNOM", "SADM", "VPRIMARIO", "VSECUNDA",
+             "FASES_MT2", "FASES_BT2"],
+            [(1, "UTC", 17, 25.0, 25.0, 7.967430114746094, 254.0, 1, 10)],
+        )
+        from tests.test_transformer_consumers import CARGA_COLUMNS
+
+        tables["CARGA"] = (CARGA_COLUMNS, [(2, 9, 34722450, "CARGA-1", 25.0, 25.0, 254.0, 1, 0, None)])
+        composed, energy = energy_network(**tables)
+        bundle_files = files(export(composed, energy))
+
+        self.assertEqual(
+            element_names(bundle_files[SINGLE_PHASE_TRANSFORMERS_FILENAME], "Transformer"),
+            ["TRF-CARGA-1"],
+        )
+        mono = bundle_files[SINGLE_PHASE_LOADS_FILENAME]
+        self.assertIn("New Load.UC-MT-101 phases=1 bus1=BT_CARGA-1.1.2 conn=delta", mono)
+        self.assertNotIn("UC-MT-101", bundle_files[THREE_PHASE_LOADS_FILENAME])
+
+
+class MergedFileTextTests(unittest.TestCase):
+    def test_without_section_the_interplan_text_is_untouched(self) -> None:
+        self.assertEqual(_merged_file_text("! base\n", "", "! titulo"), "! base\n")
+
+    def test_the_section_comes_after_the_interplan_text(self) -> None:
+        self.assertEqual(
+            _merged_file_text("! base\n", "! bloco\nNew Load.X\n", "! titulo"),
+            "! base\n\n! bloco\nNew Load.X\n",
+        )
+
+    def test_without_interplan_text_the_file_gets_its_own_title(self) -> None:
+        self.assertEqual(
+            _merged_file_text(None, "! bloco\nNew Load.X\n", "! titulo"),
+            "! titulo\n\n! bloco\nNew Load.X\n",
+        )
+        self.assertEqual(_merged_file_text(None, "", "! titulo"), "! titulo\n")
+
+
+@unittest.skipUnless(power_flow_available(), "DLL OpenDSS não disponível")
+class RealEngineTests(unittest.TestCase):
+    def test_the_split_files_compile_and_converge(self) -> None:
+        composed, energy = energy_network()
+        bundle = export(composed, energy)
+        with ascii_workspace() as workspace:
+            for filename, text in bundle.files:
+                (workspace / filename).write_text(text, encoding="utf-8")
+            master = workspace / bundle.master.master_filename
+            with acquire_engine() as engine:
+                engine.text(f"Compile [{master}]")
+                self.assertTrue(engine.solution.converged)
+                transformers: set[str] = set()
+                cursor = engine.transformers.first()
+                while cursor:
+                    transformers.add(engine.transformers.name.casefold())
+                    cursor = engine.transformers.next()
+                loads: set[str] = set()
+                cursor = engine.loads.first()
+                while cursor:
+                    loads.add(engine.loads.name.casefold())
+                    cursor = engine.loads.next()
+
+        self.assertIn("trf-carga-1", transformers)
+        everything = elements(bundle)
+        self.assertEqual(
+            loads,
+            {name.casefold() for name in element_names(everything, "Load")},
+        )
 
 
 class SecondaryNodeTests(unittest.TestCase):

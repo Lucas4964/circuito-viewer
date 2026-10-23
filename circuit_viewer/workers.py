@@ -27,6 +27,12 @@ from .cable_import import load_cables_csv
 from .circuit_import import load_circuits_csv
 from .circuit_level_import import load_circuit_levels_csv
 from .csv_import import CsvImportCancelled, load_csv
+from .demand_correction import (
+    CorrectionSettings,
+    DemandCorrections,
+    DemandScope,
+    PatamarTarget,
+)
 from .generator_import import load_generators_csv
 from .generator_update import (
     GeneratorScheduleMode,
@@ -67,6 +73,7 @@ from .source_composition import (
     compose,
 )
 from .opendss_engine import acquire_engine, ascii_workspace
+from .opendss_demand_correction import run_demand_correction
 from .opendss_allocation_export import build_allocation_export
 from .opendss_allocation_settings import OpenDssAllocationSettings
 from .opendss_export import build_export, stage_export_directory
@@ -891,12 +898,14 @@ class OpenDssExportWorker(QObject):
         library_mappings: OpenDssLibraryMappings | None = None,
         destination_base: Path | None = None,
         energy: EnergyDemandModel | None = None,
+        demand_correction: DemandCorrections | None = None,
     ) -> None:
         super().__init__()
         self.catalog = catalog
         self.cables = cables
         self.phase_configuration = phase_configuration
         self.circuit_indices = tuple(circuit_indices)
+        self.demand_correction = demand_correction
         # Com uma pasta base, os arquivos já saem gravados numa pasta
         # temporária dentro dela; a janela só faz a troca final, instantânea.
         self.destination_base = destination_base
@@ -938,6 +947,7 @@ class OpenDssExportWorker(QObject):
                 library_catalog=self.library_catalog,
                 library_mappings=self.library_mappings,
                 energy=self.energy,
+                demand_correction=self.demand_correction,
                 cancel_check=self._cancel_event.is_set,
                 progress=lambda current, total: self.progress.emit(current, total),
             )
@@ -1251,6 +1261,7 @@ class PowerFlowWorker(QObject):
         library_catalog: OpenDssLibraryCatalog | None = None,
         library_mappings: OpenDssLibraryMappings | None = None,
         energy: EnergyDemandModel | None = None,
+        demand_correction: DemandCorrections | None = None,
     ) -> None:
         super().__init__()
         self.catalog = catalog
@@ -1258,6 +1269,7 @@ class PowerFlowWorker(QObject):
         self.phase_configuration = phase_configuration
         self.circuit_indices = tuple(circuit_indices)
         self.energy = energy
+        self.demand_correction = demand_correction
         self.loads = loads
         self.patterns = patterns
         self.generator_updates = generator_updates
@@ -1287,6 +1299,107 @@ class PowerFlowWorker(QObject):
                     self.phase_configuration,
                     self.circuit_indices,
                     workspace=workspace,
+                    loads=self.loads,
+                    patterns=self.patterns,
+                    generator_updates=self.generator_updates,
+                    regulators=self.regulators,
+                    capacitors=self.capacitors,
+                    load_settings=self.load_settings,
+                    regulator_settings=self.regulator_settings,
+                    max_power_flow_iterations=self.max_power_flow_iterations,
+                    line_parameter_mode=self.line_parameter_mode,
+                    library_catalog=self.library_catalog,
+                    library_mappings=self.library_mappings,
+                    energy=self.energy,
+                    demand_correction=self.demand_correction,
+                    cancel_check=self._cancel_event.is_set,
+                    progress=lambda current, total: self.progress.emit(
+                        current, total
+                    ),
+                )
+        except InterruptedError:
+            self.cancelled.emit()
+        except BaseException as exc:  # noqa: BLE001 — inclui o exit() da DLL
+            self.failed.emit(str(exc) or type(exc).__name__)
+        else:
+            self.finished.emit(result)
+
+
+class DemandCorrectionWorker(QObject):
+    """Acha os fatores de P e Q de um circuito no motor do OpenDSS.
+
+    Mesmo contrato do :class:`PowerFlowWorker`, inclusive o ``except
+    BaseException``: o motor é o mesmo, e com ele o ``exit()`` da DLL.
+    """
+
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        catalog: CircuitCatalogModel,
+        cables: CableModel | None,
+        phase_configuration: PhaseConfiguration,
+        circuit_index: int,
+        targets: tuple[PatamarTarget, ...],
+        scope: frozenset[DemandScope],
+        settings: CorrectionSettings,
+        loads: LoadModel | None = None,
+        patterns: LoadPatternModel | None = None,
+        generator_updates: GeneratorUpdateModel | None = None,
+        regulators: RegulatorModel | None = None,
+        capacitors: CapacitorModel | None = None,
+        load_settings: OpenDssLoadSettings | None = None,
+        regulator_settings: OpenDssRegulatorSettings | None = None,
+        max_power_flow_iterations: int = DEFAULT_MAX_POWER_FLOW_ITER,
+        line_parameter_mode: OpenDssLineParameterMode = (
+            OpenDssLineParameterMode.ORIGINAL
+        ),
+        library_catalog: OpenDssLibraryCatalog | None = None,
+        library_mappings: OpenDssLibraryMappings | None = None,
+        energy: EnergyDemandModel | None = None,
+    ) -> None:
+        super().__init__()
+        self.catalog = catalog
+        self.cables = cables
+        self.phase_configuration = phase_configuration
+        self.circuit_index = int(circuit_index)
+        self.targets = tuple(targets)
+        self.scope = frozenset(scope)
+        self.settings = settings
+        self.loads = loads
+        self.patterns = patterns
+        self.generator_updates = generator_updates
+        self.regulators = regulators
+        self.capacitors = capacitors
+        self.load_settings = load_settings
+        self.regulator_settings = regulator_settings
+        self.max_power_flow_iterations = int(max_power_flow_iterations)
+        self.line_parameter_mode = line_parameter_mode
+        self.library_catalog = library_catalog
+        self.library_mappings = library_mappings
+        self.energy = energy
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            with ascii_workspace() as workspace, acquire_engine() as engine:
+                result = run_demand_correction(
+                    engine,
+                    self.catalog,
+                    self.cables,
+                    self.phase_configuration,
+                    self.circuit_index,
+                    self.targets,
+                    self.scope,
+                    workspace=workspace,
+                    settings=self.settings,
                     loads=self.loads,
                     patterns=self.patterns,
                     generator_updates=self.generator_updates,

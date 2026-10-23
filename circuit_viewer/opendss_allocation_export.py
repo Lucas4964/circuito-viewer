@@ -26,6 +26,8 @@ from .opendss_export import (
     MAX_CONTROL_ITER,
     SOURCE_SHORT_CIRCUIT_MVA,
     OpenDssExportBundle,
+    _DELTA_PAIR_BY_PHASE,
+    _single_phase_delta_error,
     build_export,
     bus_namer,
     parse_number,
@@ -80,6 +82,8 @@ class _ResolvedAllocationTransformer:
     letters: tuple[str, ...]
     nodes: tuple[str, ...]
     record: TransformerAllocationRecord
+    # Ligado entre fases (FASES2 7/8/9 e 13 na tabela da CARGA).
+    delta: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +200,13 @@ def _phase_nodes(
     configuration: PhaseConfiguration,
     raw_phases: str,
     letters: tuple[str, ...],
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], bool]:
+    """Nós DSS de cada fase do transformador e se ele é ligado entre fases.
+
+    ``configuration`` é a tabela da CARGA. Delta monofásico (7/8/9) usa o par
+    do próprio ``DSS``; delta trifásico (13) põe cada letra no par seguinte.
+    """
+
     by_value = {entry.fases2: entry for entry in configuration.entries}
     entry = by_value.get(str(raw_phases).strip().casefold())
     if entry is None:
@@ -208,7 +218,11 @@ def _phase_nodes(
             raise OpenDssAllocationExportError(
                 f"FASES2 {entry.fases2} não possui terminal DSS."
             )
-        return (entry.dss,)
+        if entry.is_delta:
+            error = _single_phase_delta_error(entry)
+            if error is not None:
+                raise OpenDssAllocationExportError(error)
+        return (entry.dss,), entry.is_delta
     terminals: dict[str, str] = {}
     for candidate in configuration.entries:
         if candidate.phase_count != 1 or not candidate.dss:
@@ -221,7 +235,15 @@ def _phase_nodes(
         raise OpenDssAllocationExportError(
             "Fases sem terminal DSS monofásico: " + ", ".join(missing)
         )
-    return tuple(terminals[letter] for letter in letters)
+    if entry.is_delta and len(letters) == 3:
+        return (
+            tuple(
+                ".".join(terminals[phase] for phase in _DELTA_PAIR_BY_PHASE[letter])
+                for letter in letters
+            ),
+            True,
+        )
+    return tuple(terminals[letter] for letter in letters), False
 
 
 def _base_name(code: str, load_id: str) -> str:
@@ -259,6 +281,7 @@ def _resolve_transformers(
             owners[int(raw_bar)] += 1
 
     bus_name = bus_namer(catalog)
+    load_configuration = phase_configuration.for_loads()
     candidates: dict[int, _ResolvedAllocationTransformer] = {}
     problems: dict[int, list[str]] = {}
 
@@ -277,7 +300,7 @@ def _resolve_transformers(
             )
             continue
         raw_phases = allocations.loads.phases[load_index]
-        letters = phase_configuration.phase_letters_for_value(raw_phases)
+        letters = load_configuration.phase_letters_for_value(raw_phases)
         if letters is None:
             reject(
                 load_index,
@@ -285,7 +308,7 @@ def _resolve_transformers(
             )
             continue
         try:
-            nodes = _phase_nodes(phase_configuration, raw_phases, letters)
+            nodes, delta = _phase_nodes(load_configuration, raw_phases, letters)
             base = _base_name(allocations.loads.codes[load_index], load_id)
         except OpenDssAllocationExportError as exc:
             reject(load_index, str(exc))
@@ -297,6 +320,7 @@ def _resolve_transformers(
             letters,
             nodes,
             allocations.record(load_index),
+            delta,
         )
 
     name_owners: dict[str, list[tuple[int, str]]] = {}
@@ -344,6 +368,20 @@ def _resolve_transformers(
                 "Transformador ignorado: "
                 f"CARGA_ID={load_id}, CODIGO={code}, FASES2={phases}: {reason}."
             )
+    # Trafo é monofásico fase-neutro ou trifásico: 7 a 12 é erro de cadastro.
+    # Ele segue exportado como o Interplan o modela, mas avisado.
+    for candidate in resolved:
+        entry = load_configuration.entry_for_value(
+            allocations.loads.phases[candidate.load_index]
+        )
+        if entry is not None and not entry.valid_for_transformer:
+            warnings.append(
+                "Transformador com FASES2 inválido para trafo (só monofásico "
+                "fase-neutro ou trifásico): "
+                f"CARGA_ID={allocations.loads.load_ids[candidate.load_index]}, "
+                f"CODIGO={allocations.loads.codes[candidate.load_index] or '<vazio>'}, "
+                f"FASES2={entry.fases2}; exportado como o Interplan o modela."
+            )
     return resolved, _unique_messages(warnings), len(rejected)
 
 
@@ -366,7 +404,8 @@ def _allocation_files(
         raise OpenDssAllocationExportError(
             f"Circuito {definition.circuit_id} sem VNOM numérica positiva."
         )
-    voltage = _format(phase_voltage_kv(nominal_voltage))
+    wye_voltage = _format(phase_voltage_kv(nominal_voltage))
+    delta_voltage = _format(nominal_voltage)
     level_files: list[tuple[int, str, str, str, str, int]] = []
     for level_position, level in enumerate(schedule.levels):
         multiplier = curve_value_at_reference(curve, level.reference_hour)
@@ -385,6 +424,10 @@ def _allocation_files(
             nodes = transformer.nodes
             record = transformer.record
             phase_count = len(letters)
+            if transformer.delta:
+                connection, voltage = "delta", delta_voltage
+            else:
+                connection, voltage = "wye", wye_voltage
             bt_kw = (
                 record.generation_bt_kwh
                 / (24.0 * settings.kwh_days)
@@ -403,7 +446,7 @@ def _allocation_files(
                     f"New Load.{base}-{phase_count}F-{letter}"
                     " phases=1"
                     f" bus1={bus}.{node}"
-                    " conn=wye"
+                    f" conn={connection}"
                     f" kV={voltage}"
                     " model=1"
                     f" kWh={_format(energy)}"
@@ -416,7 +459,7 @@ def _allocation_files(
                     f"New Load.GD-BT-{base}-{phase_count}F-{letter}"
                     " phases=1"
                     f" bus1={bus}.{node}"
-                    " conn=wye"
+                    f" conn={connection}"
                     f" kV={voltage}"
                     " model=1"
                     f" kW={_format(-bt_kw)} kvar=0 status=fixed class=-1"
@@ -425,7 +468,7 @@ def _allocation_files(
                     f"New Load.GD-MT-{base}-{phase_count}F-{letter}"
                     " phases=1"
                     f" bus1={bus}.{node}"
-                    " conn=wye"
+                    f" conn={connection}"
                     f" kV={voltage}"
                     " model=1"
                     f" kW={_format(-mt_kw)} kvar=0 status=fixed class=-2"

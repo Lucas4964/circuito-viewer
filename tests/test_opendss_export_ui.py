@@ -190,9 +190,11 @@ class OpenDssExportUiTests(unittest.TestCase):
                 ["10", "20", "30"],
                 ["12", "22", "32"],
                 ["220", "220", "220"],
-                # FASES2 do fases2.json real: "1" é D, "7" é DE, "13" é DEF.
-                ["1", "7", "13"],
-                ["Y", "Y", "Y"],
+                # FASES2 da tabela real da CARGA (fases2_carga.json): "1" é D,
+                # "4" é D com neutro explícito, "13" é DEF em delta — com o
+                # TIPO_LIG 2 que a acompanha nas ETs, sem aviso de divergência.
+                ["1", "4", "13"],
+                ["Y", "Y", "2"],
             )
             window._on_load_import_finished(
                 LoadCsvResult(loads, "utf-8-sig", 3, 3, 0, (), 0)
@@ -783,7 +785,7 @@ class OpenDssExportUiTests(unittest.TestCase):
         self.assertTrue(
             switches.rstrip().endswith(f"Switch=Yes {SWITCH_IMPEDANCE_DIRECTIVE}")
         )
-        # Uma carga de cada contagem de fases, cada uma no seu arquivo.
+        # Cada carga no arquivo da sua contagem de fases, pela tabela da CARGA.
         self.assertIn(
             "New LoadShape.PERFIL-CARGA-1-1F-D npts=4", single_phase
         )
@@ -791,25 +793,25 @@ class OpenDssExportUiTests(unittest.TestCase):
             "New Load.CARGA-1-1F-D phases=1 bus1=COD-B.1 conn=wye",
             single_phase,
         )
+        # A 4 é monofásica fase-neutro, com o neutro explícito do DSS.
+        self.assertIn(
+            "New Load.CARGA-2-1F-D phases=1 bus1=COD-C.1.0 conn=wye",
+            single_phase,
+        )
         self.assertTrue(single_phase.rstrip().endswith("class=1"))
-        self.assertIn(
-            "New Load.CARGA-2-2F-D phases=1 bus1=COD-C.1 conn=wye", two_phase
-        )
-        self.assertIn(
-            "New Load.CARGA-2-2F-E phases=1 bus1=COD-C.2 conn=wye", two_phase
-        )
-        self.assertTrue(two_phase.rstrip().endswith("class=2"))
-        for letter, node in (("D", "1"), ("E", "2"), ("F", "3")):
+        self.assertNotIn("New Load.", two_phase)
+        # A 13 é delta: cada letra no par que começa nela.
+        for letter, pair in (("D", "1.2"), ("E", "2.3"), ("F", "3.1")):
             self.assertIn(
-                f"New Load.CARGA-3-3F-{letter} phases=1 bus1=COD-A.{node}"
-                " conn=wye",
+                f"New Load.CARGA-3-3F-{letter} phases=1 bus1=COD-A.{pair}"
+                " conn=delta kV=13.8",
                 three_phase,
             )
         self.assertTrue(three_phase.rstrip().endswith("class=3"))
         # Cada carga aparece só no arquivo da sua contagem de fases.
-        self.assertNotIn("CARGA-2", single_phase)
         self.assertNotIn("CARGA-3", single_phase)
         self.assertNotIn("CARGA-1", two_phase)
+        self.assertNotIn("CARGA-2", two_phase)
         self.assertNotIn("CARGA-3", two_phase)
         self.assertNotIn("CARGA-1", three_phase)
         self.assertNotIn("CARGA-2", three_phase)

@@ -1,0 +1,16 @@
+[
+  {"FASES2": "1", "NOME": "D", "NUMERO_FASES": 1, "DSS": "1"},
+  {"FASES2": "2", "NOME": "E", "NUMERO_FASES": 1, "DSS": "2"},
+  {"FASES2": "3", "NOME": "F", "NUMERO_FASES": 1, "DSS": "3"},
+  {"FASES2": "4", "NOME": "DN", "NUMERO_FASES": 1, "DSS": "1.0"},
+  {"FASES2": "5", "NOME": "EN", "NUMERO_FASES": 1, "DSS": "2.0"},
+  {"FASES2": "6", "NOME": "FN", "NUMERO_FASES": 1, "DSS": "3.0"},
+  {"FASES2": "7", "NOME": "D", "NUMERO_FASES": 1, "DSS": "1.2", "LIGACAO": "delta"},
+  {"FASES2": "8", "NOME": "E", "NUMERO_FASES": 1, "DSS": "2.3", "LIGACAO": "delta"},
+  {"FASES2": "9", "NOME": "F", "NUMERO_FASES": 1, "DSS": "3.1", "LIGACAO": "delta"},
+  {"FASES2": "10", "NOME": "DEN", "NUMERO_FASES": 2, "DSS": "1.2.0"},
+  {"FASES2": "11", "NOME": "EFN", "NUMERO_FASES": 2, "DSS": "2.3.0"},
+  {"FASES2": "12", "NOME": "FDN", "NUMERO_FASES": 2, "DSS": "1.3.0"},
+  {"FASES2": "13", "NOME": "DEF", "NUMERO_FASES": 3, "DSS": "1.2.3", "LIGACAO": "delta"},
+  {"FASES2": "14", "NOME": "DEFN", "NUMERO_FASES": 3, "DSS": "1.2.3.0"}
+]

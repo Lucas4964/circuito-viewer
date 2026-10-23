@@ -648,6 +648,23 @@ ser consumidos pela exportação para OpenDSS:
 ]
 ```
 
+O `fases2.json` vale para trechos, chaves e consumidores (BT_CONS, BT_IP,
+MT_CONS). A **CARGA** (trafo/ET) usa a tabela própria do Interplan, em
+`circuit_viewer/config/fases2_carga.json`, no mesmo formato e com um campo
+opcional `LIGACAO` (`"estrela"`, o padrão, ou `"delta"`). Nela `7`/`8`/`9` são
+monofásicas **entre fases** — o `NOME` é a coluna do patamar (`D` = `PD`) e o
+`DSS` é o par de nós (`"1.2"`) —, e `13` é trifásica em delta. Uma unidade
+consumidora pode ser ligada entre fases; um trafo não: CARGA de 7 a 12 é
+exportada como no Interplan, mas avisada como erro de cadastro. A relação da 7:
+
+```json
+{"FASES2": "7", "NOME": "D", "NUMERO_FASES": 1, "DSS": "1.2", "LIGACAO": "delta"}
+```
+
+Sem o `fases2_carga.json` ao lado do `fases2.json`, a CARGA usa o
+`fases2.json`. Um erro nele aparece com o nome do arquivo e desabilita a
+configuração de fases como um erro no `fases2.json`.
+
 `NUMERO_FASES` aceita somente `1`, `2` ou `3`. Valores de `FASES2` podem ser
 texto ou número; espaços e diferenças entre maiúsculas e minúsculas são
 ignorados. Relações duplicadas ou inválidas desabilitam apenas esse modo de
@@ -863,7 +880,7 @@ interno da aplicação.
 
 As cargas que ficam fora dos ramais — entre elas todas as trifásicas, que
 estão no tronco — saem exatamente como no modo completo, inclusive a ligação
-entre fases das de `TIPO_LIG` 2. O `model` do equivalente depende de onde veio a
+entre fases das de `FASES2` 7/8/9 e 13. O `model` do equivalente depende de onde veio a
 potência do ramal:
 
 - **Por tabela**, o equivalente é a soma dos patamares nominais das cargas do
@@ -1100,13 +1117,17 @@ coeficientes, e o resto da linha permanece igual:
 New Load.CARGA-1-3F-D phases=1 bus1=COD-B.1 conn=wye kV=7.96743 model=8 ZIPV=[0.5, 0.2, 0.3, 0.4, 0.3, 0.3, 0.7] kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-D class=3
 ```
 
-#### ET e EP trifásicos (`TIPO_LIG` 2): ligação entre fases
+#### Ligação entre fases: decidida pelo `FASES2` da CARGA
 
-O Interplan liga a carga trifásica de ET e EP **entre fases** — o primário do
-transformador é em delta —, e os `PD`/`PE`/`PF` do `MODELO_CARGA` são as
-potências dos **pares `DE`/`EF`/`FD`**, não de fase-neutro. A carga de
-`TIPO_LIG` 2 sai assim, com o mesmo nome e o mesmo perfil, mas cada letra no par
-que começa nela, `conn=delta` e a **tensão de linha**:
+O Interplan não traduz o `FASES2` da CARGA pela mesma tabela dos trechos e
+consumidores: a `TCarga::FasesMT` tem tabela própria, que fica em
+`circuit_viewer/config/fases2_carga.json` (ver **Configuração de fases**). Ela
+decide a ligação; o `TIPO_LIG` não entra.
+
+**Trifásica `FASES2` 13** — ligada **entre fases**: os `PD`/`PE`/`PF` do
+`MODELO_CARGA` são as potências dos **pares `DE`/`EF`/`FD`**, não de
+fase-neutro. Sai com o mesmo nome e o mesmo perfil, mas cada letra no par que
+começa nela, `conn=delta` e a **tensão de linha**:
 
 ```
 New Load.CARGA-1-3F-D phases=1 bus1=COD-B.1.2 conn=delta kV=13.8 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-3F-D class=3
@@ -1116,9 +1137,26 @@ New Load.CARGA-1-3F-F phases=1 bus1=COD-B.3.1 conn=delta kV=13.8 model=1 kW=1 kv
 
 A evidência está nas correntes do relatório do Interplan: um ET com 2,809 /
 2,809 / 0,069 kW nos três pares tem 0,22 / 0,37 / 0,22 A nas linhas, o que só a
-ligação em delta reproduz (em estrela seriam 0,37 / 0,37 / 0,01 A). Monofásicas
-(`TIPO_LIG` 0) continuam fase-neutro; os demais códigos e as bifásicas mantêm a
-ligação em estrela, por falta de um caso conferido contra o Interplan.
+ligação em delta reproduz (em estrela seriam 0,37 / 0,37 / 0,01 A). A
+trifásica `FASES2` 14 (`DEFN`) é estrela com neutro.
+
+**Monofásica `FASES2` 7/8/9** — o Interplan a trata como trafo monofásico
+ligado **entre fases** e guarda a potência numa coluna só: `PD` na 7 (entre `D`
+e `E`), `PE` na 8 (entre `E` e `F`) e `PF` na 9 (entre `F` e `D`). Trafo
+assim não existe na rede — trafo é monofásico fase-neutro (1 a 6) ou
+trifásico (13, 14) —, então uma CARGA 7 a 12 é **erro de cadastro**. Ela sai
+como o Interplan a modela, para os resultados continuarem comparáveis, mas com
+aviso no relatório da exportação (cargas, modo Energia e alocação) e no painel
+do trafo. A 7/8/9 sai no arquivo das monofásicas como **uma** `Load` no par de
+nós, `conn=delta` e a tensão de linha:
+
+```
+New Load.CARGA-1-1F-D phases=1 bus1=COD-B.1.2 conn=delta kV=13.8 model=1 kW=1 kvar=1 daily=PERFIL-CARGA-1-1F-D class=1
+```
+
+As monofásicas 1 a 6 continuam fase-neutro. Quando o `TIPO_LIG` de uma
+trifásica discorda do `FASES2` (2 numa 14, ou outro valor numa 13), vale o
+`FASES2` e o relatório da exportação avisa a carga.
 
 #### Modelo do Interplan (botão "Preset Interplan")
 
@@ -1163,8 +1201,8 @@ que faz `DN` valer como `D` e `DEFN` como `DEF`.
   nó de neutro explícito: `DN` gera `bus.1.0`.
 - **`kV`** — a **tensão de fase** do circuito: como `VNOM` é a tensão de linha,
   ela é dividida por `√3`. É a mesma conversão usada em `C1`, pela mesma razão —
-  a carga é ligada entre fase e neutro (`conn=wye`). A exceção é a trifásica de
-  `TIPO_LIG` 2, ligada entre fases com a própria `VNOM` (seção acima).
+  a carga é ligada entre fase e neutro (`conn=wye`). A exceção são as CARGAs
+  `FASES2` 7/8/9 e 13, ligadas entre fases com a própria `VNOM` (seção acima).
 - **`kW=1 kvar=1`** — fixos de propósito. A potência real de cada patamar vive
   no `LoadShape`, e o OpenDSS multiplica os dois.
 - **`mult` e `qmult`** — os quatro patamares na ordem `NPAT` 0, 1, 2 e 3, com
@@ -1755,8 +1793,20 @@ programa avisa e a rede segue no Padrão Interplan.
 
 - **Trafo:** cada CARGA vira um trafo ideal, sem perdas (D-Y quando tem três
   fases, split-phase quando tem uma ou duas), com uma barra secundária
-  `BT_<CARGA>` que só existe no `.dss`. As cargas do trafo ficam em
-  `trafos_energia.dss`, uma `Load` por UC e por GD (negativa).
+  `BT_<CARGA>` que só existe no `.dss`. Há uma `Load` por UC, por ponto de IP
+  e por GD (negativa).
+- **Arquivos:** seguem a convenção do modo Interplan, pelo `phases=` da `Load`.
+  `phases=1` vai para o arquivo mono, mesmo quando a `Load` é ligada entre
+  fases.
+  - Trafos em `trafosmonofasicos.dss` (split-phase) e `trafostrifasicos.dss`.
+  - UCs em `cargasmonofasicas.dss`, `cargasbifasicas.dss` e
+    `cargastrifasicas.dss`, depois das CARGAs que ficaram no modelo do
+    Interplan.
+  - IP em `iluminacaopublica.dss`.
+  - GD em `geradoresmonofasicos.dss`, `geradoresbifasicos.dss` e
+    `geradorestrifasicos.dss`.
+  - Cada `LoadShape` fica no arquivo da sua `Load`. O master chama os trafos
+    antes das cargas.
 - **Sem dupla contagem:** a carga agregada do `MODELO_CARGA` e os geradores de
   MT dessas CARGAs não saem; a GD vem do cálculo.
 - **CARGA que fica no Interplan:** a CARGA sem UC cadastrada, ou cujo trafo não
@@ -1774,9 +1824,11 @@ agregado:
 
 **Diferenças a ter em mente.**
 
-- **Sem correção de demanda:** a carga sai só da energia faturada. O
+- **Correção de demanda:** a carga sai só da energia faturada. O
   `MODELO_CARGA` do Interplan pode vir corrigido pela medição do alimentador,
-  então a carga na saída pode diferir.
+  então a carga na saída pode diferir. A
+  [Correção de demanda](#correção-de-demanda) acha os fatores de P e Q por
+  patamar que fazem a saída bater com a medição.
 - **Alocação OpenDSS:** não foi adaptada ao modo Energia; ela continua usando
   a CARGA agregada.
 
@@ -1942,6 +1994,99 @@ com os detalhes:
   caixa dos nomes, então `TR-01a` e `TR-01A` seriam o mesmo objeto lá dentro; os
   dois são descartados com aviso, porque atribuir a corrente ao trecho errado
   seria pior do que não mostrar corrente alguma.
+
+## Correção de demanda
+
+**Ferramentas → Correção de demanda…** acha, para cada patamar, **dois fatores
+independentes**: `fP` multiplica o P das cargas escolhidas e `fQ` o Q. Com eles,
+o P e o Q que o OpenDSS calcula na saída do alimentador batem com os valores
+medidos. Tudo é resolvido no próprio motor do OpenDSS, com o mesmo modelo do
+fluxo de potência; não há rotina de fluxo externa.
+
+**Entrada.** No diálogo, escolha o circuito e digite P (kW) e Q (kvar) medidos
+na saída para cada `NPAT`. Aceita vírgula decimal. Um campo vazio deixa aquele
+fator em 1, e um patamar todo vazio não é corrigido. Os alvos digitados ficam
+lembrados por circuito durante a sessão. As tolerâncias e os grupos escolhidos
+ficam salvos entre sessões.
+
+**Cargas corrigidas.** Os grupos são:
+
+- **Cargas (modelo Interplan)**: a CARGA agregada;
+- **UCs de baixa tensão**, **UCs de média tensão** e **Iluminação pública**:
+  só no modo Energia, e a IP vem desmarcada por padrão.
+
+Geradores (`GER-`), GD (`GD-`) e capacitores (`CAP-`) nunca são escalados. Eles e
+as cargas fora do escopo entram no fluxo como parcela **fixa**.
+
+**Método.** É o ponto fixo multiplicativo do `CORRECAO_DEMANDA` (PQ3F), um para
+P e outro para Q:
+
+    f ← f · (medido − fixo) / (calculado − fixo)
+
+- **Parcela fixa medida.** Ela é medida no mesmo solve, não estimada. Um
+  capacitor (impedância constante) entra com o Q que de fato injeta naquela
+  tensão.
+- **Perdas.** Ficam dentro do calculado, e as iterações absorvem o efeito delas.
+- **Iterações sem recompilar.** O laço não recompila o circuito. Grava
+  `kW=fP kvar=fQ` nas `Load` já compiladas e resolve o patamar com
+  `Set time=(k, 0)`. O `kW` é gravado sempre antes do `kvar`: gravar o `kW`
+  recalcula o `kvar` pelo FP, então só o `kvar` gravado depois o mantém
+  independente.
+- **Parada.** O patamar converge quando
+  `|calculado − medido| ≤ max(tolerância relativa · |medido|, tolerância absoluta)`
+  vale para P e para Q. O padrão é 0,1% e 0,5 kW/kvar, com até 50 iterações.
+
+**Diferenças em relação ao `CORRECAO_DEMANDA`.**
+
+- **Tolerância fixa.** A referência a relaxava para 5% e depois 10%, o que
+  "aceitava" alvo inviável. Aqui a situação de cada patamar sai sempre do resíduo
+  real.
+- **`fP ≤ 0`.** Interrompe o patamar como **alvo inviável**: a geração e as
+  cargas fixas já superam o P medido.
+- **`fQ ≤ 0`.** É aceito, mas com aviso. Um alimentador capacitivo pode exigi-lo.
+
+**Resultado.** O relatório mostra, por patamar:
+
+- P e Q medidos, iniciais e finais;
+- `fP` e `fQ`;
+- iterações e situação.
+
+**Aplicar** deixa os fatores ativos na sessão:
+
+- A barra de status mostra *Correção de demanda: <circuito>*.
+- O resultado de fluxo na tela é descartado.
+- O próximo **Executar Fluxo de Potência** e a **Exportar > OpenDSS…** passam a
+  usar a carga corrigida.
+- O relatório do fluxo mostra a saída de cada patamar ao lado dos fatores, para
+  conferir a medição.
+- Um patamar que não convergiu fica com fator 1.
+
+**Na exportação, o `kW` continua `kW=1 kvar=1`.** O fator de cada patamar vai
+multiplicado para dentro do perfil:
+
+    mult=[P0·fP0 P1·fP1 P2·fP2 P3·fP3]  qmult=[Q0·fQ0 Q1·fQ1 Q2·fQ2 Q3·fQ3]
+
+Um `kW=fP` multiplicaria os quatro patamares pelo mesmo valor. No laço de
+cálculo ele é seguro porque cada solve usa um único ponto do perfil e o par é
+regravado a cada patamar.
+
+**A base dos fatores.**
+
+- No **modo Interplan** os fatores multiplicam o `MODELO_CARGA`.
+- No **modo Energia** multiplicam a demanda calculada pela energia faturada:
+  - **P:** `D·c(HORARIO_REF)`;
+  - **Q:** sai do `FAT_POT` da categoria. Por isso um `fQ` diferente do `fP`
+    corrige, na prática, o fator de potência efetivo das UCs.
+
+Os fatores pertencem àquela base. Eles são descartados, com aviso na barra de
+status, quando ela muda: reimportar circuitos, cargas ou patamares, trocar o
+modo de cargas ou refazer o cálculo do modo Energia.
+
+**Limpar correção de demanda** volta à carga de base.
+
+A correção usa o mesmo motor do fluxo e entra na mesma exclusão mútua com
+importações e análises. Ela corrige um alimentador por vez e recusa circuitos
+acoplados por conexões condutoras, como o fluxo.
 
 ## Análise de ramais
 

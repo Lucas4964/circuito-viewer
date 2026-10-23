@@ -197,11 +197,37 @@ class EnergyModeWindowTests(unittest.TestCase):
     def test_the_load_panel_lists_the_connected_loads(self) -> None:
         self.window._set_selection(FeatureSelection("load", 0))
         self.assertTrue(self.window.load_energy_section.isVisibleTo(self.window.load_details_body))
-        self.assertIn("4 carga(s)", self.window.load_energy_label.text())
+        text = self.window.load_energy_label.text()
+        self.assertIn("4 carga(s)", text)
+        lines = text.splitlines()
+        # Uma grandeza por linha, na ordem do painel.
+        self.assertTrue(lines[1].startswith("Trafo "))
+        self.assertTrue(lines[1].endswith(" (trifásico)"))
+        self.assertEqual(
+            lines[2:6],
+            ["Fase = DEF", "V1 = 13.8 kV", "V2 = 220 V", "S = 30 kVA"],
+        )
+        self.assertRegex(lines[6], r"^Σ D = \d+\.\d{3} kW$")
         self.window._open_load_energy_table()
         table = self.window._energy_table_window
         self.assertEqual(table.table_model.rowCount(), 4)
         table.close()
+
+    def test_a_transformer_is_single_or_three_phase_never_two(self) -> None:
+        kind_and_phases = self.window._transformer_kind_and_phases
+        self.assertEqual(kind_and_phases("1"), ("monofásico", "D"))
+        self.assertEqual(kind_and_phases("5"), ("monofásico", "E"))
+        self.assertEqual(kind_and_phases("6"), ("monofásico", "F"))
+        self.assertEqual(kind_and_phases("13"), ("trifásico", "DEF"))
+        self.assertEqual(kind_and_phases("14"), ("trifásico", "DEF"))
+        # Monofásico entre fases (7/8/9) e duas fases (10/11/12) não existem
+        # em trafo: são erro de cadastro, sem fase.
+        for code in ("7", "8", "9", "10", "11", "12"):
+            with self.subTest(code=code):
+                self.assertEqual(
+                    kind_and_phases(code), (f"FASES2 {code} inválido para trafo", None)
+                )
+        self.assertEqual(kind_and_phases("404"), ("FASES2 404 sem relação", None))
 
     def test_reinstalling_the_network_recalculates(self) -> None:
         """Acrescentar ou remover fonte e editar o projeto passam por aqui."""
@@ -215,6 +241,32 @@ class EnergyModeWindowTests(unittest.TestCase):
         self.assertIsNot(after, before)
         self.assertIs(self.window._exportable_energy(), after)
 
+    def test_the_power_flow_result_survives_without_patterns(self) -> None:
+        """Sem NPAT o fluxo leva as cargas; a revalidação precisa ver as mesmas."""
+
+        window = self.window
+        window._load_pattern_model = None
+        self.assertIsNone(window._exportable_loads())
+        loads, patterns = window._power_flow_loads()
+        self.assertIs(loads, window._load_model)
+        self.assertIsNone(patterns)
+        window._power_flow_snapshot = (
+            window._circuit_catalog,
+            window._cable_model,
+            window._phase_configuration,
+            loads,
+            patterns,
+            window._exportable_generators(),
+            window._opendss_line_parameter_mode,
+        )
+        result = mock.Mock()
+        with mock.patch.object(window, "_refresh_voltage_classification"), mock.patch.object(
+            window, "_apply_circuit_visibility"
+        ), mock.patch.object(window, "_show_power_flow_report") as report:
+            window._on_power_flow_finished(result)
+        self.assertIs(window._power_flow_result, result)
+        report.assert_called_once_with(result)
+
     def test_interplan_keeps_the_registry_generators(self) -> None:
         window = MainWindow()
         self.addCleanup(window.close)
@@ -224,6 +276,61 @@ class EnergyModeWindowTests(unittest.TestCase):
             window._on_mdb_import_finished(self.result)
         self.assertIs(window.generator_virtualizer.model, window._generator_model)
         self.assertIsNone(window._exportable_energy())
+
+    def _export_questions(self, window: MainWindow) -> list[str]:
+        """Títulos das perguntas feitas antes do diálogo de exportação."""
+
+        with mock.patch(
+            "circuit_viewer.main_window.QMessageBox.question",
+            return_value=mock.sentinel.cancel,
+        ) as question, mock.patch(
+            "circuit_viewer.main_window.OpenDssExportDialog.exec", return_value=0
+        ):
+            window._export_opendss()
+        return [call.args[1] for call in question.call_args_list]
+
+    def test_the_export_report_lists_the_energy_files(self) -> None:
+        from circuit_viewer.opendss_export import build_export
+
+        window = self.window
+        bundle = build_export(
+            window._circuit_catalog,
+            window._cable_model,
+            window._phase_configuration,
+            (0,),
+            loads=window._load_model,
+            patterns=window._load_pattern_model,
+            energy=window._exportable_energy(),
+        )
+        with mock.patch("circuit_viewer.main_window.QMessageBox") as box:
+            window._show_opendss_export_report(bundle, Path("destino"))
+        if bundle.has_warnings:
+            dialog = box.return_value
+            summary = dialog.setText.call_args.args[0]
+            details = dialog.setInformativeText.call_args.args[0]
+        else:
+            summary = details = window.statusBar().currentMessage()
+        self.assertIn("trafos do modo Energia", summary)
+        if bundle.has_warnings:
+            self.assertIn("trafostrifasicos.dss: 1 trafos do modo Energia", details)
+            self.assertIn("iluminacaopublica.dss:", details)
+            self.assertIn("UCs do modo Energia", details)
+
+    def test_energy_export_does_not_ask_for_the_generator_update(self) -> None:
+        """A GD de cada trafo já sai do cálculo do modo Energia."""
+
+        self.assertIsNone(self.window._exportable_generators())
+        self.assertFalse(self.window._generators_need_update())
+        self.assertNotIn("Exportar sem geradores", self._export_questions(self.window))
+
+    def test_interplan_export_still_asks_for_the_generator_update(self) -> None:
+        window = MainWindow()
+        self.addCleanup(window.close)
+        with mock.patch.object(
+            MainWindow, "_ask_load_model_mode", return_value=LoadModelMode.INTERPLAN
+        ):
+            window._on_mdb_import_finished(self.result)
+        self.assertIn("Exportar sem geradores", self._export_questions(window))
 
 
 if __name__ == "__main__":

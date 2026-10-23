@@ -217,12 +217,15 @@ from .opendss_export import (
     CABOS_FILENAME,
     LINE_GEOMETRIES_FILENAME,
     LINES_FILENAME,
+    PUBLIC_LIGHTING_FILENAME,
     REGULATORS_FILENAME,
     SINGLE_PHASE_GENERATORS_FILENAME,
     SINGLE_PHASE_LOADS_FILENAME,
+    SINGLE_PHASE_TRANSFORMERS_FILENAME,
     SWITCHES_FILENAME,
     THREE_PHASE_LOADS_FILENAME,
     THREE_PHASE_GENERATORS_FILENAME,
+    THREE_PHASE_TRANSFORMERS_FILENAME,
     TWO_PHASE_GENERATORS_FILENAME,
     TWO_PHASE_LOADS_FILENAME,
     OpenDssExportBundle,
@@ -234,6 +237,14 @@ from .opendss_export import (
     regulators_without_power,
 )
 from .opendss_export_dialog import OpenDssExportDialog
+from .demand_correction import DemandCorrection, DemandCorrectionResult
+from .demand_correction_dialog import (
+    DemandCorrectionDialog,
+    DemandCorrectionReportDialog,
+    load_demand_correction_settings,
+    save_demand_correction_settings,
+    status_summary as demand_correction_status_summary,
+)
 from .opendss_allocation_dialog import (
     OpenDssAllocationDialog,
     load_opendss_allocation_settings,
@@ -353,6 +364,7 @@ from .workers import (
     SegmentImportWorker,
     SwitchImportWorker,
     EquivalentNetworkWorker,
+    DemandCorrectionWorker,
 )
 
 
@@ -404,6 +416,18 @@ def _close_progress_dialog(dialog: QProgressDialog | None) -> None:
 
     if dialog is not None:
         dialog.close()
+
+
+def _same_objects(expected: Sequence[object], actual: Sequence[object]) -> bool:
+    """Mesmo retrato, elemento a elemento, por identidade.
+
+    Identidade basta também para os valores que entram nos retratos: ``True``,
+    ``False`` e os membros de ``Enum`` são únicos.
+    """
+
+    return len(expected) == len(actual) and all(
+        first is second for first, second in zip(expected, actual)
+    )
 
 
 def _silence_progress_dialog(dialog: QProgressDialog | None) -> None:
@@ -1025,6 +1049,18 @@ class MainWindow(QMainWindow):
         self._power_flow_snapshot: tuple[object, ...] | None = None
         self._power_flow_result: PowerFlowResult | None = None
         self._close_after_power_flow = False
+        # A correção de demanda usa o mesmo motor do fluxo e, por isso, o mesmo
+        # slot de thread (_power_flow_thread/_power_flow_worker): herda a
+        # exclusão mútua, o cancelamento ao fechar e o ao invalidar o fluxo.
+        self._demand_correction_progress_dialog: QProgressDialog | None = None
+        self._demand_correction_snapshot: tuple[object, ...] | None = None
+        # Circuito → fatores aplicados na sessão, e a base sobre a qual valem.
+        self._demand_corrections: dict[str, DemandCorrection] = {}
+        self._demand_correction_base: tuple[object, ...] | None = None
+        # Alvos digitados, por índice de circuito — por isso presos ao catálogo
+        # em que o índice vale.
+        self._demand_correction_targets: dict[int, tuple[tuple[str, str], ...]] = {}
+        self._demand_correction_targets_catalog: object | None = None
         self._generator_update_thread: QThread | None = None
         self._generator_update_worker: GeneratorUpdateWorker | None = None
         self._generator_update_progress_dialog: QProgressDialog | None = None
@@ -1621,6 +1657,28 @@ class MainWindow(QMainWindow):
             self.power_flow_action.setToolTip(engine_error)
         self.power_flow_action.triggered.connect(self._run_power_flow)
 
+        self.demand_correction_action = QAction("Correção de demanda…", self)
+        self.demand_correction_action.setObjectName("demand_correction_action")
+        self.demand_correction_action.setEnabled(False)
+        self.demand_correction_action.setToolTip(
+            "Achar, por patamar, um fator para o P e outro para o Q das cargas "
+            "que fazem a saída do alimentador bater com a medição, no OpenDSS"
+        )
+        if engine_error is not None:
+            self.demand_correction_action.setToolTip(engine_error)
+        self.demand_correction_action.triggered.connect(self._run_demand_correction)
+
+        self.clear_demand_correction_action = QAction(
+            "Limpar correção de demanda", self
+        )
+        self.clear_demand_correction_action.setObjectName(
+            "clear_demand_correction_action"
+        )
+        self.clear_demand_correction_action.setEnabled(False)
+        self.clear_demand_correction_action.triggered.connect(
+            self._clear_demand_corrections
+        )
+
         self.edit_element_action = QAction("Editar…", self)
         self.edit_element_action.setObjectName("edit_element_action")
         self.edit_element_action.setShortcut(QKeySequence(Qt.Key.Key_F2))
@@ -1736,6 +1794,8 @@ class MainWindow(QMainWindow):
         self.tools_menu.addSeparator()
         self.tools_menu.addAction(self.update_generators_action)
         self.tools_menu.addAction(self.power_flow_action)
+        self.tools_menu.addAction(self.demand_correction_action)
+        self.tools_menu.addAction(self.clear_demand_correction_action)
 
         # Menu próprio: é estado global da aplicação, e não um passo de uma
         # exportação ou de uma execução.
@@ -2522,6 +2582,10 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self.overlap_status)
         status.addPermanentWidget(self.active_status)
         status.addPermanentWidget(self.mode_status)
+        self.demand_correction_status = QLabel("")
+        self.demand_correction_status.setObjectName("demand_correction_status")
+        self.demand_correction_status.setVisible(False)
+        status.addPermanentWidget(self.demand_correction_status)
 
     def _connect_signals(self) -> None:
         self.view.selectionRequested.connect(self._set_selection)
@@ -4270,19 +4334,48 @@ class MainWindow(QMainWindow):
             )
         ]
         if spec is not None:
-            lines.append(
-                f"Trafo {spec.origin}"
-                + (f" de {spec.kva:g} kVA" if spec.kva else "")
-                + (f", secundário de {spec.secondary_v:g} V" if spec.secondary_v else "")
+            kind, phases = self._transformer_kind_and_phases(
+                consumers.loads.phases[load_index]
+            )
+            # Uma grandeza por linha; "—" quando o cadastro não a informa.
+            lines.extend(
+                (
+                    f"Trafo {spec.origin}" + (f" ({kind})" if kind else ""),
+                    f"Fase = {phases or '—'}",
+                    f"V1 = {spec.primary_kv:g} kV" if spec.primary_kv else "V1 = —",
+                    f"V2 = {spec.secondary_v:g} V" if spec.secondary_v else "V2 = —",
+                    f"S = {spec.kva:g} kVA" if spec.kva else "S = —",
+                )
             )
         if transformer is None:
             lines.append("Sem cálculo do modo Energia: a CARGA segue no modelo do Interplan.")
         else:
             demand = sum(item.demand_kw or 0.0 for item in transformer.consumers)
-            lines.append(f"Σ D = {demand:.3f} kW — {status_summary(transformer)}")
+            lines.append(f"Σ D = {demand:.3f} kW")
         self.load_energy_label.setText("\n".join(lines))
         self.load_energy_button.setEnabled(bool(record.consumers))
         self.load_energy_section.setVisible(True)
+
+    def _transformer_kind_and_phases(self, raw_phases: str) -> tuple[str | None, str | None]:
+        """Tipo do trafo de uma CARGA (``monofásico``…) e a fase (``D``, ``DEF``).
+
+        Trafo é monofásico fase-neutro (D, E ou F) ou trifásico (DEF). Os
+        FASES2 7 a 12 da tabela da CARGA são erro de cadastro e aparecem como
+        tal, sem fase.
+        """
+
+        configuration = self._phase_configuration
+        if configuration is None:
+            return None, None
+        loads = configuration.for_loads()
+        entry = loads.entry_for_value(raw_phases)
+        if entry is None:
+            return f"FASES2 {str(raw_phases).strip() or '<vazio>'} sem relação", None
+        if not entry.valid_for_transformer:
+            return f"FASES2 {entry.fases2} inválido para trafo", None
+        kind = "monofásico" if entry.phase_count == 1 else "trifásico"
+        letters = loads.phase_letters_for_value(raw_phases)
+        return kind, "".join(letters) if letters else None
 
     def _generation_summary(self, index: int) -> str:
         generation = self._generation_model
@@ -4312,7 +4405,7 @@ class MainWindow(QMainWindow):
         record = consumers.record(selection.index)
         energy = self._exportable_energy()
         transformer = None if energy is None else energy.transformer(selection.index)
-        headers, rows = consumer_rows(record, transformer)
+        headers, rows = consumer_rows(record, transformer, self._phase_configuration)
         code = self._load_model.codes[selection.index] if self._load_model is not None else ""
         self._energy_table().show_rows(
             f"Cargas do trafo {code or record.load_id}",
@@ -5570,7 +5663,7 @@ class MainWindow(QMainWindow):
     def _sync_power_flow_availability(self) -> None:
         """Exige tudo que a exportação exige, mais a lib e um circuito visível."""
 
-        self.power_flow_action.setEnabled(
+        available = (
             power_flow_import_error() is None
             and self._model is not None
             and self._line_model is not None
@@ -5590,6 +5683,14 @@ class MainWindow(QMainWindow):
             and self._power_flow_thread is None
             and self._generator_update_thread is None
         )
+        self.power_flow_action.setEnabled(available)
+        # Mesmas exigências do fluxo. A falta de cargas não deixa a ação cinza:
+        # o clique explica o que falta, como na alocação.
+        self.demand_correction_action.setEnabled(available)
+        # Os dados mudaram por algum caminho: uma correção de outra base sai
+        # agora, com aviso, e não só quando o próximo fluxo for pedido.
+        self._active_demand_corrections()
+        self._sync_demand_correction_indicator()
         self._sync_generator_update_availability()
 
     def _sync_generator_update_availability(self) -> None:
@@ -5991,16 +6092,21 @@ class MainWindow(QMainWindow):
             or self._export_thread is not None
         ):
             return
-        if (
-            self._generator_model is not None
-            and self._exportable_generators() is None
-        ):
+        # No modo Energia a GD de cada trafo sai do próprio cálculo, no
+        # secundário: só pergunta se sobrar gerador de CARGA fora dele.
+        if self._generators_need_update() and self._exportable_generators() is None:
+            which = (
+                "Há geradores de CARGAs que ficaram no modelo do Interplan (sem "
+                "cálculo do modo Energia)"
+                if self._exportable_energy() is not None
+                else "Há geradores importados"
+            )
             answer = QMessageBox.question(
                 self,
                 "Exportar sem geradores",
-                "Há geradores importados, mas eles ainda não possuem um "
-                "resultado válido de ‘Atualizar Geradores’. Eles serão "
-                "omitidos da exportação.\nDeseja continuar?",
+                f"{which}, mas eles ainda não possuem um resultado válido de "
+                "‘Atualizar Geradores’. Eles serão omitidos da exportação.\n"
+                "Deseja continuar?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
@@ -6622,6 +6728,7 @@ class MainWindow(QMainWindow):
             # destino: arquivos grandes não congelam mais a interface.
             destination_base=destination.parent,
             energy=energy,
+            demand_correction=self._active_demand_corrections(),
         )
         worker.moveToThread(thread)
 
@@ -6759,6 +6866,14 @@ class MainWindow(QMainWindow):
                 for count, generator_result in result.generators_by_phase_count
             ),
         ]
+        energy = result.energy if result.energy is not None and result.energy.exported_count else None
+        if energy is not None:
+            parts.append(
+                f"{energy.exported_count:n} trafos do modo Energia "
+                f"({sum(count for _, count in energy.consumer_counts):n} UCs, "
+                f"{energy.lighting_count:n} IP, "
+                f"{sum(count for _, count in energy.generation_counts):n} GD)"
+            )
         summary = ", ".join(parts[:-1]) + f" e {parts[-1]}"
         # O número na tela precisa ser rastreável até a configuração que o
         # produziu; sem os limites ativos a menção só faria ruído.
@@ -6851,6 +6966,26 @@ class MainWindow(QMainWindow):
                 "fases ignorados), "
                 f"{generator_result.discarded_count:n} descartados"
             )
+        if energy is not None:
+            transformer_files = {
+                1: SINGLE_PHASE_TRANSFORMERS_FILENAME,
+                3: THREE_PHASE_TRANSFORMERS_FILENAME,
+            }
+            lines.extend(
+                f"{transformer_files[count]}: {quantity:n} trafos do modo Energia"
+                for count, quantity in energy.transformer_counts
+            )
+            lines.extend(
+                f"{filenames[count]}: + {quantity:n} UCs do modo Energia"
+                for count, quantity in energy.consumer_counts
+            )
+            lines.append(
+                f"{PUBLIC_LIGHTING_FILENAME}: {energy.lighting_count:n} pontos de IP"
+            )
+            lines.extend(
+                f"{generator_filenames[count]}: + {quantity:n} GD do modo Energia"
+                for count, quantity in energy.generation_counts
+            )
         master = result.master
         if master is not None and master.text:
             lines.append(
@@ -6868,6 +7003,19 @@ class MainWindow(QMainWindow):
         if details:
             message.setDetailedText("\n".join(details))
         message.exec()
+
+    def _power_flow_loads(self) -> tuple[LoadModel | None, LoadPatternModel | None]:
+        """Cargas e patamares que o fluxo recebe.
+
+        Definição única para o início e para a revalidação do resultado: no
+        modo Energia sem patamares as cargas seguem mesmo assim, e o retrato
+        precisa ver o mesmo modelo nos dois momentos.
+        """
+
+        loads, patterns = self._exportable_loads() or (None, None)
+        if loads is None and self._exportable_energy() is not None:
+            loads = self._load_model
+        return loads, patterns
 
     def _run_power_flow(self) -> None:
         """Resolve o fluxo de potência dos circuitos visíveis.
@@ -6907,11 +7055,9 @@ class MainWindow(QMainWindow):
             )
             return
         exportable_loads = self._exportable_loads()
-        loads, patterns = exportable_loads or (None, None)
+        loads, patterns = self._power_flow_loads()
         generator_updates = self._exportable_generators()
         energy = self._exportable_energy()
-        if loads is None and energy is not None:
-            loads = self._load_model
         if (
             self._generators_need_update()
             and generator_updates is None
@@ -6978,6 +7124,7 @@ class MainWindow(QMainWindow):
             library_catalog=library_catalog,
             library_mappings=library_mappings,
             energy=energy,
+            demand_correction=self._active_demand_corrections(),
         )
         worker.moveToThread(thread)
 
@@ -7052,7 +7199,7 @@ class MainWindow(QMainWindow):
         # Revalidação por identidade, como nas demais análises: uma reimportação
         # durante a execução torna o resultado um retrato de dados que já não
         # estão na tela.
-        loads, patterns = self._exportable_loads() or (None, None)
+        loads, patterns = self._power_flow_loads()
         generator_updates = self._exportable_generators()
         current = (
             self._circuit_catalog,
@@ -7133,6 +7280,332 @@ class MainWindow(QMainWindow):
         if self._close_after_power_flow:
             self._close_after_power_flow = False
             self.close()
+
+    # -- correção de demanda -------------------------------------------------
+
+    def _demand_correction_base_now(self) -> tuple[object, ...]:
+        """A base de carga sobre a qual um fator vale.
+
+        Os fatores multiplicam a potência das cargas **deste** retrato: outro
+        catálogo, outras cargas ou patamares, outro cálculo do modo Energia
+        (curvas ou patamares de cálculo alterados o refazem) ou outro modo de
+        cargas tornam o fator um número sem referência.
+        """
+
+        return (
+            self._circuit_catalog,
+            self._load_model,
+            self._load_pattern_model,
+            self._exportable_energy(),
+            self._energy_mode(),
+        )
+
+    def _active_demand_corrections(self) -> dict[str, DemandCorrection] | None:
+        """Os fatores da sessão, se ainda valem; descarta-os com aviso se não."""
+
+        if not self._demand_corrections:
+            return None
+        base = self._demand_correction_base
+        if base is None or not _same_objects(base, self._demand_correction_base_now()):
+            self._discard_demand_corrections(
+                "A correção de demanda foi descartada: as cargas, os circuitos "
+                "ou o modo de cargas mudaram depois de ela ser calculada."
+            )
+            return None
+        return dict(self._demand_corrections)
+
+    def _discard_demand_corrections(self, message: str | None = None) -> None:
+        self._demand_corrections = {}
+        self._demand_correction_base = None
+        self._sync_demand_correction_indicator()
+        if message:
+            self.statusBar().showMessage(message, 8_000)
+
+    def _sync_demand_correction_indicator(self) -> None:
+        circuits = sorted(self._demand_corrections)
+        label = getattr(self, "demand_correction_status", None)
+        if label is not None:
+            label.setText(
+                ""
+                if not circuits
+                else "Correção de demanda: " + ", ".join(circuits)
+            )
+            label.setVisible(bool(circuits))
+        self.clear_demand_correction_action.setEnabled(
+            bool(circuits) and self._power_flow_thread is None
+        )
+
+    def _clear_demand_corrections(self) -> None:
+        if not self._demand_corrections or self._power_flow_thread is not None:
+            return
+        self._discard_demand_corrections(
+            "Correção de demanda removida; o próximo fluxo usa a carga de base."
+        )
+        # O fluxo na tela foi resolvido com os fatores: deixou de descrever o
+        # estado do estudo.
+        self._invalidate_power_flow()
+
+    def _patamar_labels(self, circuit_index: int) -> tuple[str, ...]:
+        schedule = self.calculation_level_schedule
+        controller = self._circuit_level_controller
+        if controller is not None and controller.circuits is self._circuit_catalog:
+            own = controller.schedule(int(circuit_index))
+            if own is not None:
+                schedule = own
+        if schedule is None:
+            return ()
+        return tuple(
+            level.name for level in sorted(schedule.levels, key=lambda level: level.npat)
+        )
+
+    def _run_demand_correction(self) -> None:
+        """Pede os alvos e acha os fatores de P e Q de um circuito no OpenDSS.
+
+        Mesmas exigências e mesma exclusão mútua do fluxo de potência, cujo
+        slot de thread a correção ocupa: os dois usam o mesmo motor.
+        """
+
+        catalog = self._circuit_catalog
+        cables = self._cable_model
+        configuration = self._phase_configuration
+        if (
+            catalog is None
+            or (cables is None and not self._uses_opendss_library_parameters())
+            or configuration is None
+            or self._busy()
+        ):
+            return
+        exportable_loads = self._exportable_loads()
+        loads, patterns = exportable_loads or (None, None)
+        energy = self._exportable_energy()
+        if loads is None and energy is not None:
+            loads = self._load_model
+        if loads is None:
+            QMessageBox.warning(
+                self,
+                "Correção de demanda",
+                "Importe as cargas e os patamares (ou use o modo Energia) antes "
+                "de corrigir a demanda.",
+            )
+            return
+        circuit_indices = self._visible_circuit_indices() or tuple(range(len(catalog)))
+        settings, scope = load_demand_correction_settings(self._settings)
+        if self._demand_correction_targets_catalog is not catalog:
+            self._demand_correction_targets = {}
+            self._demand_correction_targets_catalog = catalog
+        dialog = DemandCorrectionDialog(
+            catalog,
+            circuit_indices,
+            energy_mode=energy is not None,
+            settings=settings,
+            scope=scope,
+            patamar_labels=self._patamar_labels,
+            remembered_targets=self._demand_correction_targets,
+            parent=self,
+        )
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        self._demand_correction_targets = dialog.remembered_targets()
+        if not accepted:
+            return
+        circuit_index = dialog.selected_circuit_index()
+        targets = dialog.selected_targets()
+        scope = dialog.selected_scope()
+        settings = dialog.selected_settings()
+        save_demand_correction_settings(self._settings, settings, scope)
+
+        if self._project_topology is not None:
+            self._project_topology.assert_current(self._project)
+            if any(
+                circuit_index in group
+                for group in self._project_topology.coupled_circuits
+            ):
+                QMessageBox.warning(
+                    self,
+                    "Estudo acoplado necessário",
+                    "O alimentador está unido a outro por conexões condutoras; "
+                    "a correção individual não representa esse estado do projeto.",
+                )
+                return
+        generator_updates = self._exportable_generators()
+        if self._generators_need_update() and generator_updates is None:
+            answer = QMessageBox.question(
+                self,
+                "Correção sem geradores",
+                "Há geradores importados sem resultado válido de ‘Atualizar "
+                "Geradores’. Sem eles, a geração não entra no fluxo e os "
+                "fatores vão compensá-la nas cargas.\n\nDeseja continuar?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        library = self._uses_opendss_library_parameters()
+        thread = QThread(self)
+        worker = DemandCorrectionWorker(
+            catalog,
+            cables,
+            configuration,
+            circuit_index,
+            targets,
+            scope,
+            settings,
+            loads=loads,
+            patterns=patterns,
+            generator_updates=generator_updates,
+            regulators=self._regulator_model,
+            capacitors=self._capacitor_model,
+            load_settings=self._opendss_load_settings,
+            regulator_settings=self._opendss_regulator_settings,
+            max_power_flow_iterations=self._max_power_flow_iterations,
+            line_parameter_mode=self._opendss_line_parameter_mode,
+            library_catalog=(
+                self.opendss_library_session.saved_catalog() if library else None
+            ),
+            library_mappings=(
+                self.opendss_mapping_session.mappings if library else None
+            ),
+            energy=energy,
+        )
+        worker.moveToThread(thread)
+
+        progress = QProgressDialog(
+            "Corrigindo a demanda no OpenDSS…", "Cancelar", 0, 4, self
+        )
+        progress.setWindowTitle("Correção de demanda")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        self._power_flow_thread = thread
+        self._power_flow_worker = worker
+        worker.input_revision = self._study_input_revision()
+        self._demand_correction_progress_dialog = progress
+        self._demand_correction_snapshot = (
+            *self._demand_correction_base_now(),
+            cables,
+            configuration,
+            generator_updates,
+            self._opendss_line_parameter_mode,
+        )
+        self.import_action.setEnabled(False)
+        self._sync_power_flow_availability()
+        self._sync_branches_availability()
+
+        thread.started.connect(worker.run)
+        self._connect_operation_signal(worker.progress, worker, self._on_demand_correction_progress)
+        self._connect_operation_signal(worker.finished, worker, self._on_demand_correction_finished)
+        self._connect_operation_signal(worker.failed, worker, self._on_demand_correction_failed)
+        self._connect_operation_signal(worker.cancelled, worker, self._on_demand_correction_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        progress.canceled.connect(lambda: worker.cancel())
+        thread.finished.connect(worker.deleteLater)
+        self._connect_operation_signal(
+            thread.finished, thread, self._on_demand_correction_thread_finished
+        )
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_demand_correction_progress(self, current: int, total: int) -> None:
+        if not self._is_current_signal_source(self._power_flow_worker):
+            return
+        maximum = max(1, int(total))
+        _update_progress_dialog(
+            self._demand_correction_progress_dialog,
+            maximum=maximum,
+            label=f"Corrigindo a demanda no OpenDSS… {current:n}/{total:n} patamares",
+            value=min(int(current), maximum),
+        )
+
+    def _on_demand_correction_finished(self, result: DemandCorrectionResult) -> None:
+        _close_progress_dialog(self._demand_correction_progress_dialog)
+        revision = getattr(self._power_flow_worker, "input_revision", None)
+        current = (
+            *self._demand_correction_base_now(),
+            self._cable_model,
+            self._phase_configuration,
+            self._exportable_generators(),
+            self._opendss_line_parameter_mode,
+        )
+        snapshot = self._demand_correction_snapshot
+        if (
+            (revision is not None and revision != self._study_input_revision())
+            or snapshot is None
+            or not _same_objects(snapshot, current)
+        ):
+            self.statusBar().showMessage(
+                "Os dados mudaram durante a execução; a correção de demanda foi "
+                "descartada.",
+                5_000,
+            )
+            return
+        catalog = self._circuit_catalog
+        definition = catalog.definition(result.circuit_index)
+        label = definition.code or definition.circuit_id
+        dialog = DemandCorrectionReportDialog(
+            result,
+            circuit_label=f"{label} (CIRC_ID {definition.circuit_id})",
+            patamar_labels=self._patamar_labels(result.circuit_index),
+            parent=self,
+        )
+        self.statusBar().showMessage(demand_correction_status_summary(result), 8_000)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._apply_demand_correction(result)
+
+    def _apply_demand_correction(self, result: DemandCorrectionResult) -> None:
+        correction = result.correction()
+        if correction is None:
+            return
+        base = self._demand_correction_base_now()
+        if self._demand_correction_base is not None and not _same_objects(
+            self._demand_correction_base, base
+        ):
+            # Fatores de outra base não convivem com os novos.
+            self._demand_corrections = {}
+        self._demand_correction_base = base
+        self._demand_corrections[correction.circuit_id] = correction
+        self._sync_demand_correction_indicator()
+        # O fluxo na tela foi resolvido com a carga anterior.
+        self._invalidate_power_flow()
+        self.statusBar().showMessage(
+            f"Correção de demanda aplicada a {correction.circuit_id}; execute o "
+            "fluxo de potência para ver o resultado corrigido.",
+            8_000,
+        )
+
+    def _on_demand_correction_failed(self, reason: str) -> None:
+        _close_progress_dialog(self._demand_correction_progress_dialog)
+        QMessageBox.critical(self, "Falha na correção de demanda", reason)
+
+    def _on_demand_correction_cancelled(self) -> None:
+        _close_progress_dialog(self._demand_correction_progress_dialog)
+        self.statusBar().showMessage(
+            "Correção de demanda cancelada; nada foi alterado.", 5_000
+        )
+
+    def _on_demand_correction_thread_finished(self) -> None:
+        if not self._is_current_signal_source(self._power_flow_thread):
+            return
+        progress = self._demand_correction_progress_dialog
+        self._power_flow_thread = None
+        self._power_flow_worker = None
+        self._demand_correction_progress_dialog = None
+        self._demand_correction_snapshot = None
+        _close_progress_dialog(progress)
+        self._sync_import_availability()
+        self._sync_power_flow_availability()
+        self._sync_branches_availability()
+        if self._close_after_power_flow:
+            self._close_after_power_flow = False
+            self.close()
+            return
+        # Retoma o que a exclusão mútua tenha represado; inócuo sem pendência.
+        QTimer.singleShot(0, self._start_equivalent_build)
 
     def _divergence_notes(self, result: PowerFlowResult) -> tuple[str, ...]:
         """Linhas que explicam uma divergência, com os números medidos.
@@ -7226,6 +7699,28 @@ class MainWindow(QMainWindow):
             + (f" e mais {remainder:n}." if remainder > 0 else ".")
         )
 
+    def _head_power_lines(self, result: PowerFlowResult) -> list[str]:
+        """Saída dos circuitos com correção de demanda, ao lado dos fatores."""
+
+        corrections = result.demand_correction or {}
+        lines: list[str] = []
+        for circuit_id, steps in result.head_powers.items():
+            correction = corrections.get(circuit_id)
+            if correction is None:
+                continue
+            lines.append(f"Saída de {circuit_id} com correção de demanda:")
+            for step, (active, reactive) in enumerate(steps):
+                factors = (
+                    correction.factors[step]
+                    if step < len(correction.factors)
+                    else (1.0, 1.0)
+                )
+                lines.append(
+                    f"    NPAT {step}: P {active:,.2f} kW, Q {reactive:,.2f} kvar "
+                    f"(fP {factors[0]:.6g}, fQ {factors[1]:.6g})"
+                )
+        return lines
+
     def _show_power_flow_report(self, result: PowerFlowResult) -> None:
         summary = (
             f"{len(result.solved_circuits):n} circuito(s) resolvido(s): "
@@ -7237,6 +7732,16 @@ class MainWindow(QMainWindow):
                 else f"; {result.exported_generators:n} gerador(es) no modelo"
             )
         )
+        head_lines = self._head_power_lines(result)
+        if not result.has_warnings and head_lines:
+            # Com a correção ativa, a saída é o que o usuário quer conferir.
+            message = QMessageBox(self)
+            message.setWindowTitle("Fluxo de potência concluído")
+            message.setIcon(QMessageBox.Icon.Information)
+            message.setText(f"{summary}.")
+            message.setInformativeText("\n".join(head_lines))
+            message.exec()
+            return
         if not result.has_warnings:
             limits = (
                 ""
@@ -7289,6 +7794,7 @@ class MainWindow(QMainWindow):
         overloaded = self._overloaded_regulator_note(result)
         if overloaded is not None:
             lines.append(overloaded)
+        lines.extend(head_lines)
         message.setInformativeText("\n".join(lines))
         details = [
             f"{issue.element_id}: {issue.reason}" for issue in result.issues

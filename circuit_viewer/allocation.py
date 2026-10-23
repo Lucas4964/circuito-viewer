@@ -221,9 +221,12 @@ def build_transformer_allocations(
     generation_mt = [0.0] * len(loads)
     issues: list[AllocationDataIssue] = []
 
+    # As fases do transformador vêm da tabela da CARGA: 7/8/9 são monofásicos
+    # entre fases, com toda a potência numa coluna só (PD, PE ou PF).
+    load_configuration = phase_configuration.for_loads()
     transformer_phases: list[tuple[str, ...] | None] = []
     for load_index, raw_phases in enumerate(loads.phases):
-        letters = phase_configuration.phase_letters_for_value(raw_phases)
+        letters = load_configuration.phase_letters_for_value(raw_phases)
         transformer_phases.append(letters)
         if letters is None:
             issues.append(
@@ -372,10 +375,11 @@ def build_transformer_allocations(
                     load_id,
                 )
                 continue
-            if bt and len(allowed) == 1:
-                # BT_CONS.FASES2 describes the secondary connection.  Behind a
-                # monophase transformer, all of that energy is supplied by the
-                # transformer's single primary phase, even for biphase clients.
+            if len(allowed) == 1:
+                # Behind a monophase transformer, all of the consumer's energy
+                # is supplied by the transformer's single column (PD, PE or
+                # PF), whatever the consumer's own FASES2 says.  For BT_CONS
+                # that FASES2 describes the secondary connection.
                 destination_letters = allowed
             elif not set(letters).issubset(allowed):
                 report(

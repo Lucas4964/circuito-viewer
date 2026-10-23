@@ -65,6 +65,8 @@ class DssEngine(Protocol):
     # Os reguladores são Transformer no modelo exportado, e o tap resolvido só
     # sai por esta coleção — o laço de ``lines`` nunca os alcança.
     transformers: Any
+    # A correção de demanda reescreve kW/kvar das cargas já compiladas.
+    loads: Any
 
     def text(self, command: str) -> str:
         """Envia um comando à interface de texto do OpenDSS."""

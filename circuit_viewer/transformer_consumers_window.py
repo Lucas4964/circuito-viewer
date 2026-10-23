@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 from .blocks_window import BlockTableView
 from .calculation_levels import CalculationLevelSchedule
 from .energy_demand import STATUS_LABELS, ConsumerDemand, TransformerDemand
+from .phase_config import PhaseConfiguration
 from .table_columns import EXCEL_LIKE_TABLE_STYLE, enable_interactive_columns
 from .transformer_consumers import (
     CONSUMER_KIND_IP,
@@ -50,20 +51,53 @@ def _number(value: float | None, decimals: int) -> Cell:
     return f"{value:.{decimals}f}", float(value)
 
 
-def _class(value: int | None) -> Cell:
+def _class_id(value: int | None) -> Cell:
+    """A ``CLASSE`` do MDB, só o número."""
+
     if value is None:
         return "", float("-inf")
-    label = CLASS_LABELS.get(value)
-    return (f"{value} {label}" if label else str(value)), float(value)
+    return str(value), float(value)
 
 
-def _curve(demand: ConsumerDemand | None, *, generation: bool = False) -> Cell:
+def _class_label(value: int | None) -> Cell:
+    return _text(None if value is None else CLASS_LABELS.get(value, ""))
+
+
+def _demand_curve(demand: ConsumerDemand | None, *, generation: bool):  # noqa: ANN202
     if demand is None:
-        return "", ""
-    curve = demand.generation_curve if generation else demand.load_curve
+        return None
+    return demand.generation_curve if generation else demand.load_curve
+
+
+def _curve_id(demand: ConsumerDemand | None, *, generation: bool = False) -> Cell:
+    """O ``CAT_ID`` da categoria de curva do MDB, só o número."""
+
+    curve = _demand_curve(demand, generation=generation)
     if curve is None:
-        return "", ""
-    return f"{curve.category_id} {curve.category.description}", int(curve.category_id) if curve.category_id.isdigit() else curve.category_id
+        return "", float("-inf")
+    category_id = curve.category_id
+    try:
+        return category_id, float(category_id)
+    except ValueError:
+        return category_id, float("inf")
+
+
+def _curve_name(demand: ConsumerDemand | None, *, generation: bool = False) -> Cell:
+    """O ``CAT_DESC`` da categoria de curva."""
+
+    curve = _demand_curve(demand, generation=generation)
+    return _text(None if curve is None else curve.category.description)
+
+
+def _phases(raw: str, phase_configuration: PhaseConfiguration | None) -> Cell:
+    """As fases do consumidor pelo ``fases2.json`` (``7`` → ``DE``)."""
+
+    letters = (
+        None
+        if phase_configuration is None
+        else phase_configuration.phase_letters_for_value(raw)
+    )
+    return _text("".join(letters) if letters else "")
 
 
 def level_names(schedule: CalculationLevelSchedule | None) -> tuple[str, ...]:
@@ -81,13 +115,20 @@ def _levels(values: Sequence[float], count: int) -> tuple[Cell, ...]:
 def consumer_rows(
     record: TransformerConsumersRecord,
     transformer: TransformerDemand | None,
+    phase_configuration: PhaseConfiguration | None = None,
 ) -> tuple[tuple[str, ...], tuple[Row, ...]]:
-    """Uma linha por carga do secundário, com o cálculo quando houver."""
+    """Uma linha por carga do secundário, com o cálculo quando houver.
+
+    ``CLASSE`` e ``CAT_ID`` trazem só o código, com o nome da coluna do MDB;
+    a descrição de cada um vem na coluna seguinte. ``Fases`` é o ``FASES2``
+    traduzido pelo ``fases2.json`` (a tabela dos consumidores).
+    """
 
     names = level_names(None if transformer is None else transformer.schedule)
     headers = (
-        "Tipo", "ID", "Código", "Nome", "Classe", "FASES2", "Consumo (kWh)",
-        "Curva de carga", "Sorteio (%)", "D (kW)", "Status",
+        "Tipo", "ID", "Código", "Nome", "CLASSE", "Descrição da classe",
+        "FASES2", "Fases", "Consumo (kWh)", "CAT_ID", "Curva de carga",
+        "Sorteio (%)", "D (kW)", "Status",
         *(f"P {name} (kW)" for name in names),
     )
     demands = {} if transformer is None else {
@@ -96,16 +137,20 @@ def consumer_rows(
     rows: list[Row] = []
     for consumer in record.consumers:
         demand = demands.get((consumer.kind, consumer.consumer_id))
+        consumer_class = 5 if consumer.kind == CONSUMER_KIND_IP else consumer.consumer_class
         rows.append(
             (
                 _text(consumer.kind),
                 _text(consumer.consumer_id),
                 _text(consumer.code),
                 _text(consumer.name),
-                _class(5 if consumer.kind == CONSUMER_KIND_IP else consumer.consumer_class),
+                _class_id(consumer_class),
+                _class_label(consumer_class),
                 _text(consumer.phases),
+                _phases(consumer.phases, phase_configuration),
                 _number(consumer.consumption_kwh, 2),
-                _curve(demand),
+                _curve_id(demand),
+                _curve_name(demand),
                 _number(None if demand is None else demand.draw_percent, 2),
                 _number(None if demand is None else demand.demand_kw, 3),
                 _text("" if demand is None else demand.status),
@@ -124,7 +169,7 @@ def generator_rows(
     names = level_names(None if transformer is None else transformer.schedule)
     headers = (
         "Tipo", "GERADOR_ID", "Código", "UC", "TIPOGD", "Injetada (kWh)",
-        "Curva de geração", "G (kW)", "Status da UC",
+        "CAT_ID", "Curva de geração", "G (kW)", "Status da UC",
         *(f"G {name} (kW)" for name in names),
     )
     shares = {} if transformer is None else {
@@ -145,7 +190,8 @@ def generator_rows(
                 _text(generator.consumer_id),
                 _number(None if generator.generation_type is None else float(generator.generation_type), 0),
                 _number(generator.generation_kwh, 2),
-                _curve(demand, generation=True),
+                _curve_id(demand, generation=True),
+                _curve_name(demand, generation=True),
                 _number(None if share is None else share.generation_kw, 3),
                 _text("" if demand is None else demand.status),
                 *_levels(() if share is None else share.levels, len(names)),

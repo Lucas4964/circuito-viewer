@@ -52,7 +52,12 @@ from circuit_viewer.opendss_export import (
 from circuit_viewer.opendss_regulator_settings import OpenDssRegulatorSettings
 from circuit_viewer.opendss_settings import OpenDssLoadSettings
 from circuit_viewer.opendss_solution import DEFAULT_MAX_POWER_FLOW_ITER
-from circuit_viewer.phase_config import PhaseConfiguration, PhaseMappingEntry
+from circuit_viewer.phase_config import (
+    PhaseConfiguration,
+    PhaseMappingEntry,
+    default_load_phase_configuration_path,
+    load_phase_configuration,
+)
 
 
 PHASES = PhaseConfiguration(
@@ -76,6 +81,24 @@ PHASES = PhaseConfiguration(
         PhaseMappingEntry("99", "SEM_DSS", 3, None),
     )
 )
+
+# As mesmas relações, com a tabela real da CARGA (``fases2_carga.json``): 7/8/9
+# monofásicas entre fases e 13 delta, como a ``TCarga::FasesMT`` do Interplan.
+WITH_LOAD_TABLE = PhaseConfiguration(
+    PHASES.entries,
+    load_phase_configuration(
+        load_path=default_load_phase_configuration_path()
+    ).for_loads(),
+)
+
+def invalid_transformer(fases2: str) -> str:
+    """Aviso da CARGA cujo FASES2 não descreve um trafo que existe."""
+
+    return (
+        f"FASES2 '{fases2}' inválido para trafo (só monofásico fase-neutro ou "
+        "trifásico); exportada como o Interplan a modela"
+    )
+
 
 # Sem nenhuma entrada monofásica para F, uma carga "EF" não consegue resolver o
 # terminal daquela fase.
@@ -1765,7 +1788,11 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
         result = self._export(loads, make_patterns(loads))
 
         self.assertEqual(result.exported_count, 1)
-        self.assertFalse(result.has_warnings)
+        self.assertEqual(result.discarded_count, 0)
+        # Trafo de duas fases não existe: sai como o Interplan, com aviso.
+        self.assertEqual(
+            [issue.reason for issue in result.issues], [invalid_transformer("7")]
+        )
         kv = phase_voltage_kv(13.8)
         self.assertEqual(
             data_lines(result.text),
@@ -1875,7 +1902,11 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
 
         self.assertEqual(result.exported_count, 1)
         self.assertEqual(result.skipped_other_phase_count, 2)
-        self.assertEqual(result.issues, ())
+        # As de outra contagem não geram diagnóstico; só a própria BI avisa.
+        self.assertEqual(
+            [(issue.segment_id, issue.reason) for issue in result.issues],
+            [("CG3", invalid_transformer("7"))],
+        )
 
     def test_name_without_two_phases_is_reported(self) -> None:
         bars = make_bars()
@@ -1915,7 +1946,9 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
         result = self._export(loads, make_patterns(loads))
 
         self.assertEqual(result.exported_count, 1)
-        self.assertEqual(result.issues, ())
+        self.assertEqual(
+            [issue.reason for issue in result.issues], [invalid_transformer("11")]
+        )
 
     def test_empty_code_falls_back_to_the_load_id(self) -> None:
         bars = make_bars()
@@ -1983,7 +2016,10 @@ class TwoPhaseLoadExportTests(unittest.TestCase):
         self.assertEqual(result.exported_count, 1)
         self.assertEqual(
             [(issue.segment_id, issue.reason) for issue in result.issues],
-            [("CG1", "sem os quatro patamares (NPAT 0 a 3)")],
+            [
+                ("CG1", "sem os quatro patamares (NPAT 0 a 3)"),
+                ("CG2", invalid_transformer("7")),
+            ],
         )
 
     def test_circuit_without_voltage_discards_the_load(self) -> None:
@@ -2083,13 +2119,13 @@ class ThreePhaseLoadExportTests(unittest.TestCase):
             ],
         )
 
-    def test_tipo_lig_2_is_connected_between_phases_like_the_interplan(self) -> None:
-        """ET/EP trifásicos: PD/PE/PF são os pares DE/EF/FD, não fase-neutro."""
+    def test_fases2_13_is_connected_between_phases_like_the_interplan(self) -> None:
+        """FASES2 13: PD/PE/PF são os pares DE/EF/FD, não fase-neutro."""
 
         bars = make_bars()
         loads = make_loads(bars, phases=("13",), connection_types=("2",))
 
-        result = self._export(loads, make_patterns(loads))
+        result = self._export(loads, make_patterns(loads), configuration=WITH_LOAD_TABLE)
 
         self.assertEqual(result.exported_count, 1)
         self.assertFalse(result.has_warnings)
@@ -2120,11 +2156,11 @@ class ThreePhaseLoadExportTests(unittest.TestCase):
             load_ids=("CG1", "CG2"),
             bar_indices=(1, 2),
             codes=("ET", "OUTRA"),
-            phases=("14", "13"),
+            phases=("13", "14"),
             connection_types=(" 2 ", "Y"),
         )
 
-        result = self._export(loads, make_patterns(loads))
+        result = self._export(loads, make_patterns(loads), configuration=WITH_LOAD_TABLE)
 
         buses = [
             line.split(" bus1=")[1].split(" conn=")
@@ -2141,9 +2177,50 @@ class ThreePhaseLoadExportTests(unittest.TestCase):
                 ("BARRA_C.3", "wye"),
             ],
         )
+        self.assertFalse(result.has_warnings)
         # Com as duas ligações no arquivo, os dois avisos de kV aparecem.
         self.assertIn("kV e a tensao de fase", result.text)
         self.assertIn("conn=delta e kV de linha", result.text)
+
+    def test_fases2_decides_the_connection_and_tipo_lig_disagreement_is_reported(
+        self,
+    ) -> None:
+        """O Interplan ignora o TIPO_LIG da TCarga: vale o FASES2."""
+
+        bars = make_bars()
+        loads = make_loads(
+            bars,
+            load_ids=("CG1", "CG2"),
+            bar_indices=(1, 2),
+            codes=("ESTRELA", "DELTA"),
+            phases=("14", "13"),
+            connection_types=("2", "Y"),
+        )
+
+        result = self._export(loads, make_patterns(loads), configuration=WITH_LOAD_TABLE)
+
+        buses = [
+            line.split(" bus1=")[1].split(" conn=")
+            for line in load_entries(result.text)
+        ]
+        self.assertEqual(
+            [(bus, conn.split(" ")[0]) for bus, conn in buses],
+            [
+                ("BARRA_B.1", "wye"),
+                ("BARRA_B.2", "wye"),
+                ("BARRA_B.3", "wye"),
+                ("BARRA_C.1.2", "delta"),
+                ("BARRA_C.2.3", "delta"),
+                ("BARRA_C.3.1", "delta"),
+            ],
+        )
+        self.assertEqual(result.exported_count, 2)
+        self.assertEqual(result.discarded_count, 0)
+        reasons = {issue.segment_id: issue.reason for issue in result.issues}
+        self.assertIn("TIPO_LIG '2' discorda do FASES2 '14'", reasons["CG1"])
+        self.assertIn("ligada em estrela", reasons["CG1"])
+        self.assertIn("TIPO_LIG 'Y' discorda do FASES2 '13'", reasons["CG2"])
+        self.assertIn("ligada em delta", reasons["CG2"])
 
     def test_tipo_lig_2_does_not_touch_single_phase_loads(self) -> None:
         bars = make_bars()
@@ -2286,6 +2363,100 @@ class ThreePhaseLoadExportTests(unittest.TestCase):
         self.assertEqual(events[-1], (1, 1))
         with self.assertRaises(InterruptedError):
             self._export(loads, patterns, cancel_check=lambda: True)
+
+
+class PhaseToPhaseLoadExportTests(unittest.TestCase):
+    """CARGA 7/8/9: monofásica entre fases, como a ``TCarga::FasesMT``.
+
+    O Interplan guarda a potência numa coluna só — PD na 7, PE na 8, PF na 9 —
+    e liga a carga entre D-E, E-F e F-D, na tensão de linha. Trafo entre fases
+    não existe na rede: a exportação reproduz o Interplan, mas avisa o erro de
+    cadastro.
+    """
+
+    def test_each_code_is_one_delta_load_on_its_pair_with_its_column(self) -> None:
+        bars = make_bars()
+        for phases, letter, bus, mult, qmult in (
+            ("7", "D", "1.2", "1.500000 2.500000 3.500000 4.500000",
+             "0.250000 1.250000 2.250000 3.250000"),
+            ("8", "E", "2.3", "2.500000 3.500000 4.500000 5.500000",
+             "0.350000 1.350000 2.350000 3.350000"),
+            ("9", "F", "3.1", "3.500000 4.500000 5.500000 6.500000",
+             "0.450000 1.450000 2.450000 3.450000"),
+        ):
+            with self.subTest(phases=phases):
+                loads = make_loads(bars, phases=(phases,))
+
+                result = export_loads(
+                    loads, make_patterns(loads), 1, configuration=WITH_LOAD_TABLE
+                )
+
+                self.assertEqual(result.exported_count, 1)
+                self.assertEqual(result.discarded_count, 0)
+                self.assertEqual(
+                    [issue.reason for issue in result.issues],
+                    [invalid_transformer(phases)],
+                )
+                self.assertEqual(
+                    data_lines(result.text),
+                    [
+                        f"New LoadShape.PERFIL-CARGA-1-1F-{letter} npts=4 interval=1"
+                        f" mult=[{mult}] qmult=[{qmult}]",
+                        f"New Load.CARGA-1-1F-{letter} phases=1"
+                        f" bus1=BARRA_B.{bus} conn=delta kV=13.8 model=1 kW=1 kvar=1"
+                        f" daily=PERFIL-CARGA-1-1F-{letter} class=1",
+                    ],
+                )
+                self.assertIn("conn=delta e kV de linha", result.text)
+                self.assertNotIn("kV e a tensao de fase", result.text)
+
+    def test_phase_to_phase_load_is_not_in_the_two_phase_file(self) -> None:
+        bars = make_bars()
+        loads = make_loads(bars, phases=("7",))
+
+        result = export_loads(
+            loads, make_patterns(loads), 2, configuration=WITH_LOAD_TABLE
+        )
+
+        self.assertEqual(result.exported_count, 0)
+        self.assertEqual(result.skipped_other_phase_count, 1)
+        self.assertEqual(load_entries(result.text), [])
+
+    def test_without_the_load_table_the_main_table_still_applies(self) -> None:
+        # Configuração sem fases2_carga.json: a CARGA segue o fases2.json.
+        bars = make_bars()
+        loads = make_loads(bars, phases=("7",))
+
+        result = export_loads(loads, make_patterns(loads), 2)
+
+        self.assertEqual(result.exported_count, 1)
+        self.assertIn("bus1=BARRA_B.1 conn=wye", result.text)
+
+    def test_delta_single_phase_without_a_phase_pair_is_discarded(self) -> None:
+        configuration = PhaseConfiguration(
+            PHASES.entries,
+            PhaseConfiguration(
+                (
+                    PhaseMappingEntry("1", "D", 1, "1"),
+                    PhaseMappingEntry("7", "D", 1, "1.0", "delta"),
+                )
+            ),
+        )
+        bars = make_bars()
+        loads = make_loads(bars, phases=("7",))
+
+        result = export_loads(
+            loads, make_patterns(loads), 1, configuration=configuration
+        )
+
+        self.assertEqual(result.exported_count, 0)
+        self.assertEqual(
+            [issue.reason for issue in result.issues],
+            [
+                "FASES2 '7' com LIGACAO delta precisa de DSS com duas fases "
+                "(ex.: 1.2), não '1.0'"
+            ],
+        )
 
 
 def make_two_circuit_catalog(network: LineNetworkModel) -> CircuitCatalogModel:
@@ -2822,7 +2993,15 @@ class ExportBundleTests(unittest.TestCase):
             [(count, result.exported_count) for count, result in bundle.loads_by_phase_count],
             [(1, 1), (2, 1), (3, 1)],
         )
-        self.assertFalse(bundle.has_warnings)
+        # O único aviso é o da CARGA de duas fases, que não existe como trafo.
+        self.assertEqual(
+            [
+                issue.reason
+                for _, result in bundle.loads_by_phase_count
+                for issue in result.issues
+            ],
+            [invalid_transformer("7")],
+        )
 
     def test_every_load_file_is_written_even_when_empty(self) -> None:
         # A lista de arquivos gerados não pode depender do conteúdo do CSV.
@@ -2850,7 +3029,15 @@ class ExportBundleTests(unittest.TestCase):
 
         bundle = self._bundle_with_loads(loads)
 
-        self.assertFalse(bundle.has_warnings)
+        # Nenhuma colisão: o único aviso é o do trafo de duas fases.
+        self.assertEqual(
+            [
+                issue.reason
+                for _, result in bundle.loads_by_phase_count
+                for issue in result.issues
+            ],
+            [invalid_transformer("7")],
+        )
         names = sorted(
             name
             for _, result in bundle.loads_by_phase_count

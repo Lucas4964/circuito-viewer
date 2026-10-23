@@ -164,6 +164,7 @@ from .phase_config import (
     PhaseConfiguration,
     PhaseConfigurationError,
     PhaseMappingEntry,
+    default_load_phase_configuration_path,
     default_phase_configuration_path,
     load_phase_configuration,
 )
@@ -768,6 +769,7 @@ __all__ = [
     "PhaseConfiguration",
     "PhaseConfigurationError",
     "PhaseMappingEntry",
+    "default_load_phase_configuration_path",
     "default_phase_configuration_path",
     "load_phase_configuration",
     "SearchCancelled",
